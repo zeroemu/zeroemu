@@ -47,6 +47,15 @@ check "compressed APEX"     "dalvikvm64"          /system/bin/toybox ls /apex/co
 check "file read"           "ro.build.version.sdk" /system/bin/toybox grep -m1 ro.build.version.sdk /system/build.prop
 check "mksh arithmetic"     "42"                  /system/bin/sh -c 'x=6; echo $((x * 7))'
 check "mksh glob + cwd"     "/system/bin"         /system/bin/sh -c 'cd /system/bin && set -- t*; echo "$PWD $#"'
+# M2: processes, pipes, signals
+check "command substitution" "[nested]"           /system/bin/sh -c 'echo "[$(echo nested)]"'
+check "pipeline"            "404"                 /system/bin/sh -c 'ls /system/bin | wc -l'
+check "4-stage pipeline"    "ro.build.date="      /system/bin/sh -c 'cat /system/build.prop | grep ro.build | sort | head -3'
+check "subshell status"     "status 3"            /system/bin/sh -c '(exit 3); echo "status $?"'
+check "background + wait"   "bg exited 0"         /system/bin/sh -c 'sleep 0.2 & wait $!; echo "bg exited $?"'
+check "trap handler"        "caught USR1"         /system/bin/sh -c 'trap "echo caught USR1" USR1; kill -USR1 $$; echo after'
+check "SIGTERM a child"     "status 143"          /system/bin/sh -c 'sleep 5 & p=$!; sleep 0.3; kill $p; wait $p; echo "status $?"'
+check "while read pipe"     "apex: com.android.adbd" /system/bin/sh -c 'ls /apex | head -1 | while read a; do echo "apex: $a"; done'
 
 # Exit status needs its own path: the program's code must become droidrt's.
 perl -e 'alarm 60; exec @ARGV' "$BIN" --system "$IMG" /system/bin/sh -c 'exit 3' >/dev/null 2>&1

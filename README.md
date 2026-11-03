@@ -12,8 +12,9 @@ is the same idea as Fuchsia's Starnix, aimed at desktop OSes.
 ```
  guest (EL0 / ring 3)        Android binaries: init, servicemanager, ART, apps…
  ─────────────────────────── syscall / fault = VM exit, no guest kernel
- kernel (src/kernel.rs)      Linux personality in Rust: syscalls, fds, memory,
-                             (later) binder, signals, processes. Host-OS independent.
+ kernel (src/kernel/)        Linux personality in Rust: processes, threads, fds,
+                             pipes, futexes, signals. Host-OS independent.
+ mm (src/mm.rs, paging.rs)   per-process page tables we own, filled on page faults
  vfs (src/vfs.rs, android.rs) Android's mount namespace, built from the SDK image
  image (src/image/)          GPT → super (LP) → EROFS/ext4, APEX zips, LZ4, inflate
  hv backend (src/hv/)        hvf.rs: Hypervisor.framework (macOS, arm64)
@@ -29,9 +30,9 @@ arm64 Android on Apple Silicon and Windows on ARM, x86_64 Android on x86_64 PCs.
 | Milestone | State |
 |---|---|
 | M0: kernel-less VM, static ELF, basic syscalls (macOS) | done |
-| M0: Windows Hypervisor Platform backend (x86_64) | written, type-checks; untested on Windows |
+| M0: Windows Hypervisor Platform backend (x86_64) | written for M1's memory model; being ported to M2's |
 | M1: Android's own `linker64`, `toybox`, and `mksh` straight from an SDK `system.img` | done (macOS, Android 16 image) |
-| M2: demand paging, threads (`clone`), futex, epoll, signals, pipes, `fork`/`exec` | next |
+| M2: demand paging, threads, futex, `fork`/`execve`/`wait4`, pipes, signals | done on macOS; `epoll`/`eventfd` and x86_64 signal frames remain |
 | M3: binder, `servicemanager`, property service, `logd` | |
 | M4: SurfaceFlinger with a composer HAL that renders to Metal / D3D12 | |
 | M5: zygote, ART, `system_server`, launcher, apps | |
@@ -41,12 +42,23 @@ M1 reads the image directly; nothing is extracted to disk. The chain is
 zip (CRC-checked) → `original_apex` (deflate, for compressed APEXes) → ext4
 payload, mounted at `/apex/<name>` on first use. A program launch takes ~50 ms.
 
-Known gaps after M1:
+M2 gives each process its own page tables (39-bit VA on arm64, 48-bit on
+x86_64), built by `mm` and populated on page faults, so bionic's 8 GiB
+allocator reservation costs nothing until touched. Each guest thread runs on
+its own host thread with its own vCPU; `fork` copies the address space, and
+signals use Linux-compatible frames, so mksh pipelines, `$(...)`, background
+jobs, `trap`, and `kill` all work. 40 rounds of `$(ls /system/bin | wc -l)`
+(120 processes) take ~1 s.
 
-- No `fork`, pipes, or threads yet, so shell pipelines and `$(...)` fail.
-- Guest memory is identity mapped: 16 GiB on macOS (bionic's allocator reserves
-  ~8.25 GiB up front), only 1 GiB on Windows. Demand-paged per-process page
-  tables (M2) replace this on both.
+Known gaps:
+
+- At most 64 guest threads in total: Hypervisor.framework allows 64 vCPUs per
+  VM and threads map 1:1 onto them. Android's `system_server` alone runs 100+,
+  so M5 needs threads multiplexed onto vCPUs (CPU state is already saved and
+  restored in full, which that scheduler builds on).
+- `fork` copies memory eagerly; copy-on-write comes before zygote (M5).
+- No memory shared between processes yet (`MAP_SHARED` anonymous is private).
+- No `epoll`, `eventfd`, `timerfd`, or sockets yet (M3 needs them).
 - Images older than Android 10 (no `super` partition) aren't supported.
 - APEX mount names come from file names (`com.android.tzdata6` should be
   `com.android.tzdata`); reading `apex_manifest.pb` lazily would fix it.
@@ -83,8 +95,9 @@ On Windows, enable the "Windows Hypervisor Platform" optional feature.
   descriptors are implemented inside the runtime and never delegated to the host.
 - Syscalls are decoded through `arch::Sysno`, so one implementation serves both
   the arm64 (generic) and x86_64 syscall tables.
-- Each backend owns `KERNEL_BASE..MEM_SIZE` of guest memory for its page tables
-  and trap stubs. Everything below it belongs to the guest.
+- `mm` owns all page tables. Backends contribute only kernel-window pages
+  (trap stubs at `paging::KERNEL_WINDOW`, mapped privileged-only into every
+  address space) and enter the guest on the page-table root they are given.
 
 ## Performance notes
 

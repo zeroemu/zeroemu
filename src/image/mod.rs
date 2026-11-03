@@ -116,6 +116,7 @@ pub struct ExtentDev {
 }
 
 impl ExtentDev {
+    #[allow(clippy::new_ret_no_self)] // devices are handed around as `Dev`
     pub fn new(inner: Dev, extents: Vec<(u64, u64, Option<u64>)>) -> Dev {
         let len = extents.last().map_or(0, |&(s, l, _)| s + l);
         Arc::new(ExtentDev {

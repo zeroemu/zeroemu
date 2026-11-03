@@ -131,8 +131,10 @@ pub fn open_fs(dev: crate::image::Dev) -> io::Result<Arc<dyn FileSystem>> {
 }
 
 /// A filesystem that is only opened on first use (APEX payloads are big).
+type Opener = Box<dyn FnOnce() -> io::Result<Arc<dyn FileSystem>> + Send>;
+
 pub struct LazyFs {
-    open: Mutex<Option<Box<dyn FnOnce() -> io::Result<Arc<dyn FileSystem>> + Send>>>,
+    open: Mutex<Option<Opener>>,
     fs: OnceLock<Result<Arc<dyn FileSystem>, String>>,
 }
 

@@ -53,6 +53,11 @@ pub const HV_SYS_REG_MAIR_EL1: u16 = 0xc510;
 pub const HV_SYS_REG_VBAR_EL1: u16 = 0xc600;
 pub const HV_SYS_REG_TPIDR_EL0: u16 = 0xde82;
 pub const HV_SYS_REG_SP_EL1: u16 = 0xe208;
+pub const HV_SYS_REG_CNTKCTL_EL1: u16 = 0xc708;
+pub const HV_SYS_REG_TPIDRRO_EL0: u16 = 0xde83;
+
+/// hv_simd_fp_reg_t: Q0..Q31.
+pub const HV_SIMD_FP_REG_Q0: u32 = 0;
 
 #[link(name = "Hypervisor", kind = "framework")]
 unsafe extern "C" {
@@ -60,6 +65,7 @@ unsafe extern "C" {
     pub fn hv_vm_destroy() -> hv_return_t;
     pub fn hv_vm_map(addr: *mut c_void, ipa: u64, size: usize, flags: u64) -> hv_return_t;
     pub fn hv_vm_unmap(ipa: u64, size: usize) -> hv_return_t;
+    pub fn hv_vm_get_max_vcpu_count(count: *mut u32) -> hv_return_t;
     pub fn hv_vcpu_create(
         vcpu: *mut hv_vcpu_t,
         exit: *mut *const hv_vcpu_exit_t,
@@ -72,6 +78,31 @@ unsafe extern "C" {
     pub fn hv_vcpu_set_reg(vcpu: hv_vcpu_t, reg: u32, value: u64) -> hv_return_t;
     pub fn hv_vcpu_get_sys_reg(vcpu: hv_vcpu_t, reg: u16, value: *mut u64) -> hv_return_t;
     pub fn hv_vcpu_set_sys_reg(vcpu: hv_vcpu_t, reg: u16, value: u64) -> hv_return_t;
+    /// `value` points to a 16-byte (16-aligned) vector.
+    pub fn hv_vcpu_get_simd_fp_reg(vcpu: hv_vcpu_t, reg: u32, value: *mut u128) -> hv_return_t;
+    /// Takes the vector by value in v0, which stable Rust cannot express in
+    /// FFI; only ever called through `set_simd_fp_reg`.
+    fn hv_vcpu_set_simd_fp_reg();
+}
+
+/// Calls `hv_vcpu_set_simd_fp_reg(vcpu, reg, value)` with the 128-bit vector
+/// passed in v0 per AAPCS64.
+pub fn set_simd_fp_reg(vcpu: hv_vcpu_t, reg: u32, value: u128) -> hv_return_t {
+    let ret: u64;
+    unsafe {
+        core::arch::asm!(
+            "fmov d0, {lo}",
+            "mov v0.d[1], {hi}",
+            "bl {f}",
+            lo = in(reg) value as u64,
+            hi = in(reg) (value >> 64) as u64,
+            f = sym hv_vcpu_set_simd_fp_reg,
+            inlateout("x0") vcpu => ret,
+            in("x1") reg as u64,
+            clobber_abi("C"),
+        );
+    }
+    ret as hv_return_t
 }
 
 pub fn check(what: &str, ret: hv_return_t) {

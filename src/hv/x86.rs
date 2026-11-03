@@ -5,7 +5,11 @@
 
 #![cfg_attr(not(all(windows, target_arch = "x86_64")), allow(dead_code))]
 
-use crate::mem::{BLOCK, KERNEL_BASE, MEM_SIZE};
+// The identity-mapped 1 GiB layout this backend was written against. Kept
+// local until the backend is ported to paged memory (crate::mm / paging).
+const MEM_SIZE: u64 = 1 << 30;
+const BLOCK: u64 = 2 << 20;
+const KERNEL_BASE: u64 = MEM_SIZE - 32 * BLOCK;
 
 pub const PTE_PRESENT: u64 = 1 << 0;
 pub const PTE_WRITE: u64 = 1 << 1;

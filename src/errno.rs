@@ -1,6 +1,5 @@
 //! Linux errno values (identical on arm64 and x86_64).
 
-pub const EPERM: i64 = 1;
 pub const ENOENT: i64 = 2;
 pub const EIO: i64 = 5;
 pub const EBADF: i64 = 9;
@@ -19,3 +18,13 @@ pub const EROFS: i64 = 30;
 pub const ERANGE: i64 = 34;
 pub const ENOSYS: i64 = 38;
 pub const ELOOP: i64 = 40;
+pub const ESRCH: i64 = 3;
+pub const EINTR: i64 = 4;
+pub const ECHILD: i64 = 10;
+pub const EEXIST: i64 = 17;
+pub const ENOEXEC: i64 = 8;
+pub const E2BIG: i64 = 7;
+pub const EPIPE: i64 = 32;
+pub const ENAMETOOLONG: i64 = 36;
+pub const ETIMEDOUT: i64 = 110;
+pub const EOPNOTSUPP: i64 = 95;

@@ -69,8 +69,10 @@ syscalls! {
     fstatfs = 44, 138;
     faccessat = 48, 269;
     chdir = 49, 80;
+    fchdir = 50, 81;
     openat = 56, 257;
     close = 57, 3;
+    pipe2 = 59, 293;
     getdents64 = 61, 217;
     lseek = 62, 8;
     read = 63, 0;
@@ -78,6 +80,8 @@ syscalls! {
     readv = 65, 19;
     writev = 66, 20;
     pread64 = 67, 17;
+    pwrite64 = 68, 18;
+    ppoll = 73, 271;
     readlinkat = 78, 267;
     newfstatat = 79, 262;
     fstat = 80, 5;
@@ -92,17 +96,24 @@ syscalls! {
     clock_nanosleep = 115, 230;
     sched_getscheduler = 120, 145;
     sched_getparam = 121, 143;
+    sched_setaffinity = 122, 203;
     sched_getaffinity = 123, 204;
     sched_yield = 124, 24;
     kill = 129, 62;
+    tkill = 130, 200;
     tgkill = 131, 234;
     sigaltstack = 132, 131;
     rt_sigaction = 134, 13;
     rt_sigprocmask = 135, 14;
+    rt_sigsuspend = 133, 130;
+    rt_sigreturn = 139, 15;
+    rt_sigqueueinfo = 138, 129;
+    rt_tgsigqueueinfo = 240, 297;
     uname = 160, 63;
     setpgid = 154, 109;
     getpgid = 155, 121;
     getsid = 156, 124;
+    setsid = 157, 112;
     getgroups = 158, 115;
     getrusage = 165, 98;
     umask = 166, 95;
@@ -121,16 +132,26 @@ syscalls! {
     brk = 214, 12;
     munmap = 215, 11;
     mremap = 216, 25;
+    clone = 220, 56;
+    execve = 221, 59;
     mmap = 222, 9;
     mprotect = 226, 10;
     madvise = 233, 28;
+    wait4 = 260, 61;
     prlimit64 = 261, 302;
     getrandom = 278, 318;
+    membarrier = 283, 324;
     statx = 291, 332;
     rseq = 293, 334;
+    clone3 = 435, 435;
     faccessat2 = 439, 439;
     // x86_64-only (sets the FS base for TLS); arm64 sets TPIDR_EL0 directly.
     arch_prctl = 0xffff_0000, 158;
+    // x86_64-only legacy calls (the generic table has only the *at/clone forms).
+    dup2 = 0xffff_0001, 33;
+    fork = 0xffff_0002, 57;
+    vfork = 0xffff_0003, 58;
+    pipe = 0xffff_0004, 22;
 }
 
 /// Open flags whose values differ between the generic (arm64) and x86_64 ABIs.
@@ -140,6 +161,15 @@ pub struct OpenFlags {
 }
 
 impl Arch {
+    /// clone(2) arguments as (flags, stack, parent_tid, child_tid, tls): arm64
+    /// passes tls before child_tid (CLONE_BACKWARDS), x86_64 after.
+    pub fn clone_args(self, a: [u64; 6]) -> (u64, u64, u64, u64, u64) {
+        match self {
+            Arch::Aarch64 => (a[0], a[1], a[2], a[4], a[3]),
+            Arch::X86_64 => (a[0], a[1], a[2], a[3], a[4]),
+        }
+    }
+
     pub fn open_flags(self) -> OpenFlags {
         match self {
             Arch::Aarch64 => OpenFlags {
@@ -185,4 +215,10 @@ impl Arch {
         }
         b
     }
+}
+
+/// Strips an arm64 pointer tag (top byte). Android tags heap pointers and
+/// passes them to syscalls under the tagged-address ABI; x86_64 has no tags.
+pub fn untag(addr: u64) -> u64 {
+    if Arch::HOST == Arch::Aarch64 { addr & 0x00ff_ffff_ffff_ffff } else { addr }
 }

@@ -8,13 +8,12 @@ mod errno;
 mod hv;
 mod image;
 mod kernel;
-mod mem;
+mod mm;
+mod paging;
+mod phys;
 mod vfs;
 
-use arch::Arch;
-use hv::Exit;
-use kernel::{Flow, Process};
-use mem::{GuestMem, STACK_TOP};
+use kernel::Kernel;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -49,88 +48,46 @@ fn run() -> Result<i32, String> {
         }
     }
     let vfs = match &system {
-        Some(img) => {
-            Some(android::open_system_image(img).map_err(|e| format!("{}: {e}", img.display()))?)
-        }
+        Some(img) => Some(android::open_system_image(img).map_err(|e| format!("{}: {e}", img.display()))?),
         None => None,
     };
     if let Some((cmd, path)) = inspect {
         return inspect_image(vfs.as_ref().ok_or("--ls/--cat need --system")?, &cmd, &path);
     }
-    let guest_argv: Vec<String> = args.collect();
-    let program = guest_argv.first().ok_or(USAGE)?.clone();
-    let vfs = vfs.map(Arc::new);
-
-    // Programs and their interpreter come from the image when one is given,
-    // otherwise from the host filesystem (for the freestanding test guests).
-    let read_file = |path: &str| -> Result<Vec<u8>, String> {
-        match &vfs {
-            Some(v) => {
-                let node = v
-                    .resolve("/", path, true)
-                    .map_err(|e| format!("{path}: errno {e}"))?;
-                Ok(v.read_all(&node)
-                    .map_err(|e| format!("{path}: errno {e}"))?
-                    .to_vec())
-            }
-            None => std::fs::read(root.join(path.trim_start_matches('/')).as_path())
-                .or_else(|_| std::fs::read(path))
-                .map_err(|e| format!("{path}: {e}")),
-        }
-    };
-
-    let mem = GuestMem::new();
-    let hv = hv::create(&mem)?;
-
-    let main_image = elf::load(&mem, &read_file(&program)?, &program, false)?;
-    let (entry, interp_base, brk_limit) = match &main_image.interp {
-        Some(interp) => {
-            let li = elf::load(&mem, &read_file(interp)?, interp, true)?;
-            (li.entry, li.bias, elf::INTERP_BIAS)
-        }
-        None => (main_image.entry, 0, mem::MMAP_BASE),
-    };
-
+    let argv: Vec<String> = args.collect();
+    let program = argv.first().ok_or(USAGE)?.clone();
     let envp = vec![
-        "PATH=/product/bin:/apex/com.android.runtime/bin:/system/bin:/system_ext/bin:/vendor/bin"
-            .to_string(),
+        "PATH=/product/bin:/apex/com.android.runtime/bin:/system/bin:/system_ext/bin:/vendor/bin".to_string(),
         "ANDROID_ROOT=/system".to_string(),
         "ANDROID_DATA=/data".to_string(),
         "HOME=/".to_string(),
     ];
-    let sp = elf::build_stack(
-        &mem,
-        STACK_TOP,
-        &main_image,
-        interp_base,
-        &guest_argv,
-        &envp,
-    );
 
-    let mut vcpu = hv.create_vcpu(entry, sp)?;
-    let mut proc = Process::new(
-        Arch::HOST,
-        vfs.clone(),
-        program.clone(),
-        main_image.end,
-        brk_limit,
-    );
-    proc.strace = strace;
-
-    loop {
-        match vcpu.run() {
-            Exit::Syscall => {
-                if let Flow::Exit(code) = proc.syscall(&mem, vcpu.as_mut()) {
-                    return Ok(code);
-                }
+    let kernel = Kernel::new(hv::create()?, vfs.map(Arc::new), strace)?;
+    let mut mm = kernel.new_address_space().map_err(|e| format!("address space: errno {e}"))?;
+    let (state, exe) = if kernel.vfs.is_some() {
+        kernel
+            .load_program(&mut mm, "/", &program, argv, &envp)
+            .map_err(|e| format!("{program}: cannot execute (errno {e})"))?
+    } else {
+        // No image: a freestanding host binary (the test guests).
+        let read = |p: &str| std::fs::read(root.join(p.trim_start_matches('/'))).or_else(|_| std::fs::read(p)).map_err(|e| format!("{p}: {e}"));
+        let main = elf::load(&mut mm, &read(&program)?, &program, false)?;
+        let (entry, base) = match &main.interp {
+            Some(i) => {
+                let li = elf::load(&mut mm, &read(i)?, i, true)?;
+                (li.entry, li.bias)
             }
-            Exit::Fault { pc, addr, detail } => {
-                return Err(format!(
-                    "guest fault at pc={pc:#x} addr={addr:#x}: {detail}"
-                ));
-            }
-        }
-    }
+            None => (main.entry, 0),
+        };
+        mm.set_brk_start(main.end);
+        let sp = elf::build_stack(&mut mm, &main, base, &argv, &envp).map_err(|e| format!("stack: errno {e}"))?;
+        (hv::CpuState::new_user(entry, sp), program.clone())
+    };
+    kernel.start(mm, exe, state)?;
+    let status = kernel.wait_root();
+    // Like a shell: the exit code, or 128 + the signal that killed it.
+    Ok(if status & 0x7f == 0 { (status >> 8) & 0xff } else { 128 + (status & 0x7f) })
 }
 
 fn inspect_image(vfs: &vfs::Vfs, cmd: &str, path: &str) -> Result<i32, String> {

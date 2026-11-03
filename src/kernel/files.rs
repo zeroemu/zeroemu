@@ -1,6 +1,10 @@
 //! File descriptors: the open files of a process, pipes, and the file and
 //! directory syscalls over the read-only VFS.
 
+use super::epoll::Epoll;
+use super::specialfd::{EventFd, SignalFd, TimerFd};
+use super::unix::{self, Socket};
+use super::wait::EVENTS;
 use super::{ERESTARTSYS, Kernel, POLL, Thread, int};
 use crate::arch::Sysno;
 use crate::errno::*;
@@ -8,7 +12,7 @@ use crate::phys;
 use crate::vfs::{Dirent, Node, S_IFDIR, S_IFLNK, S_IFMT, Stat};
 use std::collections::VecDeque;
 use std::io::{Read, Write};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -42,7 +46,8 @@ pub fn handles(no: Sysno) -> bool {
         no,
         openat | close | read | pread64 | readv | write | writev | pwrite64 | lseek | fstat | newfstatat | statx | faccessat
             | faccessat2 | readlinkat | getdents64 | getcwd | chdir | fchdir | dup | dup2 | dup3 | fcntl | ioctl | statfs
-            | fstatfs | umask | pipe2 | ppoll
+            | fstatfs | umask | pipe2 | ppoll | eventfd2 | epoll_create1 | epoll_ctl | epoll_pwait | timerfd_create
+            | timerfd_settime | timerfd_gettime | signalfd4
     )
 }
 
@@ -55,6 +60,11 @@ pub enum Kind {
     Random,
     Node(Mutex<NodeFile>),
     Pipe(PipeEnd),
+    Event(EventFd),
+    Timer(TimerFd),
+    Signal(SignalFd),
+    Epoll(Epoll),
+    Socket(Arc<Socket>),
 }
 
 /// An open file description, shared by dup'd and inherited descriptors.
@@ -64,10 +74,10 @@ pub struct File {
 }
 
 impl File {
-    fn new(kind: Kind, flags: u32) -> Arc<File> {
+    pub(super) fn new(kind: Kind, flags: u32) -> Arc<File> {
         Arc::new(File { kind, flags: AtomicU32::new(flags) })
     }
-    fn nonblock(&self) -> bool {
+    pub(super) fn nonblock(&self) -> bool {
         self.flags.load(Ordering::Relaxed) & O_NONBLOCK != 0
     }
 }
@@ -101,7 +111,7 @@ impl FdTable {
         FdTable { fds: Vec::new() }
     }
 
-    fn get(&self, fd: i64) -> Result<Arc<File>, i64> {
+    pub(super) fn get(&self, fd: i64) -> Result<Arc<File>, i64> {
         usize::try_from(fd).ok().and_then(|i| self.fds.get(i)).and_then(|e| e.as_ref()).map(|e| e.file.clone()).ok_or(EBADF)
     }
 
@@ -109,7 +119,7 @@ impl FdTable {
         usize::try_from(fd).ok().and_then(|i| self.fds.get_mut(i)).and_then(|e| e.as_mut()).ok_or(EBADF)
     }
 
-    fn alloc(&mut self, file: Arc<File>, cloexec: bool, min: usize) -> Result<i64, i64> {
+    pub(super) fn alloc(&mut self, file: Arc<File>, cloexec: bool, min: usize) -> Result<i64, i64> {
         let slot = (min..).find(|&i| self.fds.get(i).is_none_or(|s| s.is_none())).unwrap();
         if slot >= 1024 {
             return Err(EMFILE);
@@ -119,6 +129,12 @@ impl FdTable {
         }
         self.fds[slot] = Some(Entry { file, cloexec });
         Ok(slot as i64)
+    }
+
+    pub(super) fn close(&mut self, fd: i64) {
+        if let Some(slot) = usize::try_from(fd).ok().and_then(|i| self.fds.get_mut(i)) {
+            *slot = None;
+        }
     }
 
     fn put(&mut self, fd: usize, file: Arc<File>, cloexec: bool) {
@@ -164,6 +180,8 @@ impl Drop for PipeEnd {
             st.readers -= 1;
         }
         self.pipe.cv.notify_all();
+        drop(st);
+        EVENTS.bump();
     }
 }
 
@@ -175,6 +193,8 @@ impl Pipe {
                 let n = max.min(st.buf.len());
                 let out: Vec<u8> = st.buf.drain(..n).collect();
                 self.cv.notify_all();
+                drop(st);
+                EVENTS.bump();
                 return Ok(out);
             }
             if st.writers == 0 || max == 0 {
@@ -203,6 +223,7 @@ impl Pipe {
                 st.buf.extend(&data[done..done + n]);
                 done += n;
                 self.cv.notify_all();
+                EVENTS.bump();
                 if done == data.len() {
                     return Ok(done);
                 }
@@ -224,8 +245,14 @@ const POLLERR: u16 = 0x8;
 const POLLHUP: u16 = 0x10;
 const POLLNVAL: u16 = 0x20;
 
-fn poll_ready(f: &File) -> u16 {
+/// Current poll(2) readiness of an open file. `depth` bounds nested epolls.
+pub(super) fn poll_ready(f: &File, t: &Thread, depth: u32) -> u16 {
     match &f.kind {
+        Kind::Event(e) => (if e.ready_in() { POLLIN } else { 0 }) | if e.ready_out() { POLLOUT } else { 0 },
+        Kind::Timer(tf) => if tf.ready_in() { POLLIN } else { 0 },
+        Kind::Signal(sf) => if sf.ready_in(t) { POLLIN } else { 0 },
+        Kind::Epoll(ep) => if ep.is_ready(t, depth) { POLLIN } else { 0 },
+        Kind::Socket(s) => s.poll(),
         Kind::Stdin => POLLIN,
         Kind::Stdout | Kind::Stderr => POLLOUT,
         Kind::Null | Kind::Zero | Kind::Random | Kind::Node(_) => POLLIN | POLLOUT,
@@ -464,7 +491,69 @@ impl Kernel {
                 }
                 Ok(0)
             }
-            ppoll => self.ppoll(t, a[0], a[1], a[2]),
+            ppoll => self.ppoll(t, a[0], a[1], a[2], a[3]),
+            eventfd2 => {
+                let f = File::new(Kind::Event(EventFd::new(a[0] as u32 as u64, a[1])), a[1] as u32 & O_NONBLOCK);
+                t.proc.files.lock().unwrap().alloc(f, a[1] & O_CLOEXEC != 0, 0)
+            }
+            epoll_create1 => {
+                if a[0] & !O_CLOEXEC != 0 {
+                    return Err(EINVAL);
+                }
+                let f = File::new(Kind::Epoll(Epoll::default()), 0);
+                t.proc.files.lock().unwrap().alloc(f, a[0] & O_CLOEXEC != 0, 0)
+            }
+            epoll_ctl => {
+                let (ep, target) = {
+                    let files = t.proc.files.lock().unwrap();
+                    (files.get(int(a[0]))?, files.get(int(a[2]))?)
+                };
+                let Kind::Epoll(epoll) = &ep.kind else { return Err(EINVAL) };
+                if Arc::ptr_eq(&ep, &target) {
+                    return Err(EINVAL);
+                }
+                let (events, data) = if a[1] == 2 {
+                    (0, 0) // EPOLL_CTL_DEL ignores the event
+                } else {
+                    let (size, data_off) = self.arch.epoll_event_layout();
+                    let b = t.proc.mm().read_vec(a[3], size)?;
+                    (u32::from_le_bytes(b[0..4].try_into().unwrap()), u64::from_le_bytes(b[data_off..data_off + 8].try_into().unwrap()))
+                };
+                epoll.ctl(a[1], int(a[2]) as i32, &target, events, data).map(|_| 0)
+            }
+            epoll_pwait => self.epoll_pwait(t, int(a[0]), a[1], int(a[2]), int(a[3]), a[4]),
+            timerfd_create => {
+                let tf = TimerFd::new(a[0], self.boot)?;
+                let f = File::new(Kind::Timer(tf), a[1] as u32 & O_NONBLOCK);
+                t.proc.files.lock().unwrap().alloc(f, a[1] & O_CLOEXEC != 0, 0)
+            }
+            timerfd_settime => {
+                let f = t.proc.files.lock().unwrap().get(int(a[0]))?;
+                let Kind::Timer(tf) = &f.kind else { return Err(EINVAL) };
+                let new = t.proc.mm().read_vec(a[2], 32)?;
+                let old = tf.settime(a[1], &new);
+                if a[3] != 0 {
+                    t.proc.mm().write(a[3], &old)?;
+                }
+                Ok(0)
+            }
+            timerfd_gettime => {
+                let f = t.proc.files.lock().unwrap().get(int(a[0]))?;
+                let Kind::Timer(tf) = &f.kind else { return Err(EINVAL) };
+                t.proc.mm().write(a[1], &tf.gettime())?;
+                Ok(0)
+            }
+            signalfd4 => {
+                let mask = t.proc.mm().read_u64(a[1])? & !((1 << 8) | (1 << 18)); // never SIGKILL/SIGSTOP
+                if int(a[0]) != -1 {
+                    let f = t.proc.files.lock().unwrap().get(int(a[0]))?;
+                    let Kind::Signal(sf) = &f.kind else { return Err(EINVAL) };
+                    sf.mask.store(mask, Ordering::Relaxed);
+                    return Ok(int(a[0]));
+                }
+                let f = File::new(Kind::Signal(SignalFd { mask: AtomicU64::new(mask) }), a[3] as u32 & O_NONBLOCK);
+                t.proc.files.lock().unwrap().alloc(f, a[3] & O_CLOEXEC != 0, 0)
+            }
             _ => Err(ENOSYS),
         }
     }
@@ -576,6 +665,20 @@ impl Kernel {
                 v
             }
             Kind::Pipe(end) if !end.write => end.pipe.read(t, count, f.nonblock())?,
+            Kind::Event(e) => {
+                if count < 8 {
+                    return Err(EINVAL);
+                }
+                e.read(t, f.nonblock())?.to_le_bytes().to_vec()
+            }
+            Kind::Timer(tf) => {
+                if count < 8 {
+                    return Err(EINVAL);
+                }
+                tf.read(t, f.nonblock())?.to_le_bytes().to_vec()
+            }
+            Kind::Signal(sf) => sf.read(t, count, f.nonblock())?,
+            Kind::Socket(sock) => unix::read(sock, t, count, f.nonblock())?,
             Kind::Node(nf) => {
                 let mut nf = nf.lock().unwrap();
                 let data = self.node_data(&mut nf)?;
@@ -606,6 +709,20 @@ impl Kernel {
                 }
                 r => r?,
             },
+            Kind::Event(e) => {
+                if data.len() < 8 {
+                    return Err(EINVAL);
+                }
+                e.write(t, u64::from_le_bytes(data[..8].try_into().unwrap()), f.nonblock())?;
+                8
+            }
+            Kind::Socket(sock) => match unix::write(sock, t, data, f.nonblock()) {
+                Err(EPIPE) => {
+                    self.send_thread_signal(t, super::signal::SIGPIPE, super::signal::SigInfo::user(super::signal::SIGPIPE, t.proc.pid));
+                    return Err(EPIPE);
+                }
+                r => r?,
+            },
             Kind::Node(_) => return Err(EBADF), // opened read-only
             _ => return Err(EBADF),
         };
@@ -621,6 +738,8 @@ impl Kernel {
             Kind::Zero => chr(0x0105),
             Kind::Random => chr(0x0109),
             Kind::Pipe(_) => Stat { mode: 0o010600, nlink: 1, ..Default::default() },
+            Kind::Socket(_) => Stat { mode: 0o140777, nlink: 1, ..Default::default() },
+            Kind::Event(_) | Kind::Timer(_) | Kind::Signal(_) | Kind::Epoll(_) => Stat { mode: 0o600, nlink: 1, ..Default::default() }, // anon_inode
             Kind::Node(nf) => nf.lock().unwrap().stat.clone(),
         })
     }
@@ -651,6 +770,11 @@ impl Kernel {
                 Kind::Zero => b"/dev/zero".to_vec(),
                 Kind::Random => b"/dev/urandom".to_vec(),
                 Kind::Pipe(_) => b"pipe:[0]".to_vec(),
+                Kind::Socket(_) => b"socket:[0]".to_vec(),
+                Kind::Event(_) => b"anon_inode:[eventfd]".to_vec(),
+                Kind::Timer(_) => b"anon_inode:[timerfd]".to_vec(),
+                Kind::Signal(_) => b"anon_inode:[signalfd]".to_vec(),
+                Kind::Epoll(_) => b"anon_inode:[eventpoll]".to_vec(),
                 _ => b"/dev/pts/0".to_vec(),
             }
         } else {
@@ -702,7 +826,28 @@ impl Kernel {
         Ok(out.len() as i64)
     }
 
-    fn ppoll(&self, t: &Thread, fds: u64, nfds: u64, timeout: u64) -> Result<i64, i64> {
+    /// Applies a temporary signal mask for ppoll/epoll_pwait; returns the old one.
+    fn swap_mask(&self, t: &Thread, sigmask: u64) -> Result<Option<u64>, i64> {
+        if sigmask == 0 {
+            return Ok(None);
+        }
+        let m = t.proc.mm().read_u64(sigmask)? & !((1 << 8) | (1 << 18));
+        Ok(Some(t.mask.swap(m, Ordering::Relaxed)))
+    }
+
+    /// Ends a wait that ran under a temporary mask. On EINTR the handler runs
+    /// first under that mask, then sigreturn restores the original.
+    fn restore_mask(&self, t: &Thread, old: Option<u64>, r: &Result<i64, i64>) {
+        if let Some(m) = old {
+            if matches!(r, Err(EINTR)) {
+                *t.saved_mask.lock().unwrap() = Some(m);
+            } else {
+                t.mask.store(m, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn ppoll(&self, t: &Thread, fds: u64, nfds: u64, timeout: u64, sigmask: u64) -> Result<i64, i64> {
         if nfds > 1024 {
             return Err(EINVAL);
         }
@@ -711,11 +856,20 @@ impl Kernel {
         } else {
             let mut mm = t.proc.mm();
             let (s, ns) = (mm.read_u64(timeout)?, mm.read_u64(timeout + 8)?);
-            Some(Instant::now() + Duration::new(s, ns as u32))
+            Some(Instant::now() + Duration::new(s, ns.min(999_999_999) as u32))
         };
-        let mut raw = t.proc.mm().read_vec(fds, nfds as usize * 8)?;
+        let raw = t.proc.mm().read_vec(fds, nfds as usize * 8)?;
+        let old = self.swap_mask(t, sigmask)?;
+        let r = self.ppoll_wait(t, fds, raw, deadline);
+        self.restore_mask(t, old, &r);
+        r
+    }
+
+    fn ppoll_wait(&self, t: &Thread, fds: u64, mut raw: Vec<u8>, deadline: Option<Instant>) -> Result<i64, i64> {
         loop {
+            let seen = EVENTS.current();
             let mut ready = 0;
+            let mut timer: Option<Instant> = None;
             {
                 let files = t.proc.files.lock().unwrap();
                 for p in raw.chunks_exact_mut(8) {
@@ -725,7 +879,12 @@ impl Kernel {
                         0
                     } else {
                         match files.get(fd as i64) {
-                            Ok(f) => poll_ready(&f) & (events | POLLERR | POLLHUP),
+                            Ok(f) => {
+                                if let Kind::Timer(tf) = &f.kind {
+                                    timer = timer.into_iter().chain(tf.deadline()).min();
+                                }
+                                poll_ready(&f, t, 0) & (events | POLLERR | POLLHUP)
+                            }
                             Err(_) => POLLNVAL,
                         }
                     };
@@ -735,18 +894,55 @@ impl Kernel {
                     }
                 }
             }
-            let expired = deadline.is_some_and(|d| Instant::now() >= d);
-            if ready > 0 || expired {
+            if ready > 0 || deadline.is_some_and(|d| Instant::now() >= d) {
                 t.proc.mm().write(fds, &raw)?;
                 return Ok(ready);
             }
             if t.interrupted() {
                 return Err(EINTR);
             }
-            let nap = deadline.map_or(POLL, |d| d.saturating_duration_since(Instant::now()).min(POLL));
-            std::thread::sleep(nap.min(Duration::from_millis(2)).max(Duration::from_micros(200)));
+            EVENTS.wait(seen, nap(deadline, timer));
         }
     }
+
+    fn epoll_pwait(&self, t: &Thread, epfd: i64, events: u64, max: i64, timeout_ms: i64, sigmask: u64) -> Result<i64, i64> {
+        if max <= 0 {
+            return Err(EINVAL);
+        }
+        let f = t.proc.files.lock().unwrap().get(epfd)?;
+        let Kind::Epoll(ep) = &f.kind else { return Err(EINVAL) };
+        let deadline = (timeout_ms >= 0).then(|| Instant::now() + Duration::from_millis(timeout_ms as u64));
+        let old = self.swap_mask(t, sigmask)?;
+        let r = loop {
+            let seen = EVENTS.current();
+            let ready = ep.collect(t, max.min(1024) as usize, 0);
+            if !ready.is_empty() {
+                let (size, data_off) = self.arch.epoll_event_layout();
+                let mut out = vec![0u8; ready.len() * size];
+                for (i, (ev, data)) in ready.iter().enumerate() {
+                    out[i * size..i * size + 4].copy_from_slice(&ev.to_le_bytes());
+                    out[i * size + data_off..i * size + data_off + 8].copy_from_slice(&data.to_le_bytes());
+                }
+                break t.proc.mm().write(events, &out).map(|_| ready.len() as i64);
+            }
+            if deadline.is_some_and(|d| Instant::now() >= d) {
+                break Ok(0);
+            }
+            if t.interrupted() {
+                break Err(EINTR);
+            }
+            EVENTS.wait(seen, nap(deadline, ep.deadline()));
+        };
+        self.restore_mask(t, old, &r);
+        r
+    }
+}
+
+/// How long a poller may sleep: until its deadline or the next timer, and
+/// never longer than POLL (signals and exits are noticed by polling).
+fn nap(deadline: Option<Instant>, timer: Option<Instant>) -> Duration {
+    let until = deadline.into_iter().chain(timer).min();
+    until.map_or(POLL, |d| d.saturating_duration_since(Instant::now()).min(POLL)).max(Duration::from_micros(50))
 }
 
 /// `struct statfs` (same 120-byte layout on arm64 and x86_64): a read-only ext4-like volume.

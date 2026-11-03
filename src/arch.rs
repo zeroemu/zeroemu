@@ -60,6 +60,10 @@ macro_rules! syscalls {
 
 // name = arm64/generic number, x86_64 number
 syscalls! {
+    eventfd2 = 19, 290;
+    epoll_create1 = 20, 291;
+    epoll_ctl = 21, 233;
+    epoll_pwait = 22, 281;
     getcwd = 17, 79;
     dup = 23, 32;
     dup3 = 24, 292;
@@ -82,6 +86,10 @@ syscalls! {
     pread64 = 67, 17;
     pwrite64 = 68, 18;
     ppoll = 73, 271;
+    signalfd4 = 74, 289;
+    timerfd_create = 85, 283;
+    timerfd_settime = 86, 286;
+    timerfd_gettime = 87, 287;
     readlinkat = 78, 267;
     newfstatat = 79, 262;
     fstat = 80, 5;
@@ -109,6 +117,7 @@ syscalls! {
     rt_sigreturn = 139, 15;
     rt_sigqueueinfo = 138, 129;
     rt_tgsigqueueinfo = 240, 297;
+    accept4 = 242, 288;
     uname = 160, 63;
     setpgid = 154, 109;
     getpgid = 155, 121;
@@ -128,7 +137,20 @@ syscalls! {
     gettid = 178, 186;
     sysinfo = 179, 99;
     socket = 198, 41;
+    socketpair = 199, 53;
+    bind = 200, 49;
+    listen = 201, 50;
+    accept = 202, 43;
     connect = 203, 42;
+    getsockname = 204, 51;
+    getpeername = 205, 52;
+    sendto = 206, 44;
+    recvfrom = 207, 45;
+    setsockopt = 208, 54;
+    getsockopt = 209, 55;
+    shutdown = 210, 48;
+    sendmsg = 211, 46;
+    recvmsg = 212, 47;
     brk = 214, 12;
     munmap = 215, 11;
     mremap = 216, 25;
@@ -167,6 +189,15 @@ impl Arch {
         match self {
             Arch::Aarch64 => (a[0], a[1], a[2], a[4], a[3]),
             Arch::X86_64 => (a[0], a[1], a[2], a[3], a[4]),
+        }
+    }
+
+    /// `struct epoll_event` as (size, offset of `data`): packed on x86_64,
+    /// naturally aligned on arm64.
+    pub fn epoll_event_layout(self) -> (usize, usize) {
+        match self {
+            Arch::Aarch64 => (16, 8),
+            Arch::X86_64 => (12, 4),
         }
     }
 

@@ -133,8 +133,6 @@ impl Kernel {
                 vcpu.set_state(&st);
                 Ok(0)
             }
-            // No sockets yet: logd and property-service clients fall back quietly.
-            socket | connect => Err(EACCES),
             rseq | membarrier | clone3 => Err(ENOSYS), // bionic falls back cleanly
             _ => Err(ENOSYS),
         }

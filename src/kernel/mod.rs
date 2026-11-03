@@ -7,12 +7,16 @@
 //! vCPU (Hypervisor.framework binds a vCPU to its creating thread). Blocking
 //! syscalls simply block that host thread.
 
+mod epoll;
 mod files;
 mod futex;
 mod memory;
 mod misc;
 mod process;
 mod signal;
+mod specialfd;
+mod unix;
+mod wait;
 
 use crate::arch::{Arch, Sysno};
 use crate::errno::*;
@@ -399,6 +403,12 @@ impl Kernel {
             // futexes
             futex => self.sys_futex(t, a[0], a[1] as u32, a[2] as u32, a[3], a[4], a[5] as u32),
             set_robust_list => 0,
+
+            // sockets
+            n if unix::handles(n) => match self.socket_syscall(n, t, a) {
+                Ok(v) => v,
+                Err(e) => -e,
+            },
 
             // files
             n if files::handles(n) => match self.file_syscall(n, t, a) {

@@ -1,0 +1,75 @@
+//! Assembles an Android root filesystem from an SDK system image, the way
+//! first-stage init and apexd would on a device: the logical partitions from
+//! `super`, plus every APEX payload under /apex.
+
+use crate::image::{Dev, FileDev, MemDev, erofs::Erofs, gpt, lp, zip};
+use crate::vfs::{FileSystem, LazyFs, Vfs, open_fs};
+use std::io;
+use std::path::Path;
+use std::sync::Arc;
+
+/// Logical partitions and where they are mounted ("system" is the root).
+const PARTITIONS: [(&str, &str); 5] = [
+    ("system", "/"),
+    ("vendor", "/vendor"),
+    ("system_ext", "/system_ext"),
+    ("product", "/product"),
+    ("system_dlkm", "/system_dlkm"),
+];
+
+pub fn open_system_image(path: &Path) -> io::Result<Vfs> {
+    let disk = FileDev::open(path)?;
+    let sup = gpt::partitions(&disk)?
+        .into_iter()
+        .find(|p| p.name == "super")
+        .ok_or_else(|| io::Error::other(format!("{}: no `super` partition", path.display())))?;
+    let logical = lp::partitions(&sup.dev)?;
+
+    let mut vfs = Vfs::default();
+    for (name, mountpoint) in PARTITIONS {
+        if let Some(p) = logical.iter().find(|p| p.name == name) {
+            vfs.mount(
+                mountpoint,
+                Erofs::open(p.dev.clone())? as Arc<dyn FileSystem>,
+            );
+        } else if name == "system" {
+            return Err(io::Error::other("super has no `system` partition"));
+        }
+    }
+    mount_apexes(&mut vfs, "/system/apex")?;
+    Ok(vfs)
+}
+
+/// Mounts each `<dir>/*.apex` at /apex/<name>, opened lazily on first access.
+fn mount_apexes(vfs: &mut Vfs, dir: &str) -> io::Result<()> {
+    let Ok(node) = vfs.resolve("/", dir, true) else {
+        return Ok(());
+    };
+    let entries = vfs
+        .readdir(&node)
+        .map_err(|e| io::Error::other(format!("readdir {dir}: errno {e}")))?;
+    for e in entries {
+        let Some(stem) = e.name.strip_suffix(".apex") else {
+            continue;
+        };
+        // Google-signed builds ship com.google.android.X; it mounts as com.android.X.
+        let name = stem.replacen("com.google.android.", "com.android.", 1);
+        let file = vfs
+            .resolve("/", &format!("{dir}/{}", e.name), true)
+            .map_err(|errno| io::Error::other(format!("{dir}/{}: errno {errno}", e.name)))?;
+        let (fs, ino) = (vfs.fs_arc(&file), file.ino);
+        vfs.mount(
+            &format!("/apex/{name}"),
+            LazyFs::new(move || {
+                let mut apex: Dev = Arc::new(MemDev(fs.read_all(ino)?));
+                // A compressed APEX wraps the real one, deflated, as `original_apex`
+                // (apexd decompresses it at boot on a device).
+                if zip::has_entry(&apex, "original_apex")? {
+                    apex = zip::open(&apex, "original_apex")?;
+                }
+                open_fs(zip::open(&apex, "apex_payload.img")?)
+            }),
+        );
+    }
+    Ok(())
+}

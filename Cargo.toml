@@ -1,0 +1,17 @@
+[package]
+name = "droidrt"
+version = "0.1.0"
+edition = "2024"
+description = "Run Android's Linux userspace natively on macOS and Windows, without a guest kernel"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security_Cryptography",
+    "Win32_System_Hypervisor",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+] }

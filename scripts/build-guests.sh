@@ -17,7 +17,7 @@ for arch in aarch64 x86_64; do
     "$LLD" -flavor gnu -static -o "$OUT/smoke_$arch" "$OUT/smoke_$arch.o"
 done
 
-for t in m2 m3; do
+for t in m2 m3 shm; do
     clang -target aarch64-linux-gnu -O2 -ffreestanding -fno-stack-protector -fno-pic \
         -fno-builtin -nostdlib -c "guest/$t.c" -o "$OUT/${t}_aarch64.o"
     "$LLD" -flavor gnu -static -o "$OUT/${t}_aarch64" "$OUT/${t}_aarch64.o"

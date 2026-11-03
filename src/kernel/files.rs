@@ -8,8 +8,10 @@ use super::wait::EVENTS;
 use super::{ERESTARTSYS, Kernel, POLL, Thread, int};
 use crate::arch::Sysno;
 use crate::errno::*;
+use crate::mm::SharedObject;
 use crate::phys;
-use crate::vfs::{Dirent, Node, S_IFDIR, S_IFLNK, S_IFMT, Stat};
+use crate::tmpfs::MemFile;
+use crate::vfs::{Dirent, Node, S_IFDIR, S_IFLNK, S_IFMT, S_IFREG, Stat};
 use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -21,7 +23,13 @@ const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
 const AT_EMPTY_PATH: u64 = 0x1000;
 const O_ACCMODE: u32 = 3;
 const O_WRONLY: u32 = 1;
+const O_RDWR: u32 = 2;
 const O_CREAT: u64 = 0o100;
+const O_EXCL: u64 = 0o200;
+const O_TRUNC: u64 = 0o1000;
+const O_TMPFILE: u64 = 0o20000000;
+const AT_REMOVEDIR: u64 = 0x200;
+const S_IFCHR: u32 = 0o020000;
 const O_APPEND: u32 = 0o2000;
 const O_NONBLOCK: u32 = 0o4000;
 const O_CLOEXEC: u64 = 0o2000000;
@@ -47,7 +55,9 @@ pub fn handles(no: Sysno) -> bool {
         openat | close | read | pread64 | readv | write | writev | pwrite64 | lseek | fstat | newfstatat | statx | faccessat
             | faccessat2 | readlinkat | getdents64 | getcwd | chdir | fchdir | dup | dup2 | dup3 | fcntl | ioctl | statfs
             | fstatfs | umask | pipe2 | ppoll | eventfd2 | epoll_create1 | epoll_ctl | epoll_pwait | timerfd_create
-            | timerfd_settime | timerfd_gettime | signalfd4
+            | timerfd_settime | timerfd_gettime | signalfd4 | mknodat | mkdirat | unlinkat | symlinkat | linkat | renameat
+            | renameat2 | truncate | ftruncate | fallocate | fchmod | fchmodat | fchown | fchownat | sync | fsync | fdatasync
+            | utimensat | memfd_create
     )
 }
 
@@ -59,6 +69,8 @@ pub enum Kind {
     Zero,
     Random,
     Node(Mutex<NodeFile>),
+    /// A writable regular file (tmpfs or memfd): live contents.
+    Mem(MemOpen),
     Pipe(PipeEnd),
     Event(EventFd),
     Timer(TimerFd),
@@ -80,6 +92,16 @@ impl File {
     pub(super) fn nonblock(&self) -> bool {
         self.flags.load(Ordering::Relaxed) & O_NONBLOCK != 0
     }
+}
+
+pub struct MemOpen {
+    /// None for memfds, which have no name in the namespace.
+    node: Option<Node>,
+    name: String,
+    pub file: Arc<MemFile>,
+    pos: Mutex<u64>,
+    readable: bool,
+    writable: bool,
 }
 
 pub struct NodeFile {
@@ -255,7 +277,7 @@ pub(super) fn poll_ready(f: &File, t: &Thread, depth: u32) -> u16 {
         Kind::Socket(s) => s.poll(),
         Kind::Stdin => POLLIN,
         Kind::Stdout | Kind::Stderr => POLLOUT,
-        Kind::Null | Kind::Zero | Kind::Random | Kind::Node(_) => POLLIN | POLLOUT,
+        Kind::Null | Kind::Zero | Kind::Random | Kind::Node(_) | Kind::Mem(_) => POLLIN | POLLOUT,
         Kind::Pipe(end) => {
             let st = end.pipe.st.lock().unwrap();
             if end.write {
@@ -277,7 +299,7 @@ impl Kernel {
     pub(super) fn file_syscall(&self, no: Sysno, t: &Arc<Thread>, a: [u64; 6]) -> Result<i64, i64> {
         use Sysno::*;
         match no {
-            openat => self.openat(t, int(a[0]), a[1], a[2]),
+            openat => self.openat(t, int(a[0]), a[1], a[2], a[3]),
             close => {
                 let mut files = t.proc.files.lock().unwrap();
                 let slot = usize::try_from(int(a[0])).ok().and_then(|i| files.fds.get_mut(i)).ok_or(EBADF)?;
@@ -306,7 +328,7 @@ impl Kernel {
                 Ok(total)
             }
             write => self.write(t, int(a[0]), a[1], a[2]),
-            pwrite64 => Err(EROFS),
+            pwrite64 => self.write_at(t, int(a[0]), a[1], a[2], Some(a[3])),
             writev => {
                 let mut total = 0;
                 for i in 0..a[2].min(1024) {
@@ -324,6 +346,18 @@ impl Kernel {
             }
             lseek => {
                 let f = t.proc.files.lock().unwrap().get(int(a[0]))?;
+                if let Kind::Mem(m) = &f.kind {
+                    let mut pos = m.pos.lock().unwrap();
+                    let base = match a[2] {
+                        0 => 0,
+                        1 => *pos as i64,
+                        2 => m.file.size() as i64,
+                        _ => return Err(EINVAL),
+                    };
+                    let new = base.checked_add(a[1] as i64).filter(|&n| n >= 0).ok_or(EINVAL)?;
+                    *pos = new as u64;
+                    return Ok(new);
+                }
                 let Kind::Node(nf) = &f.kind else { return Err(ESPIPE) };
                 let mut nf = nf.lock().unwrap();
                 let base = match a[2] {
@@ -352,8 +386,9 @@ impl Kernel {
                 Ok(0)
             }
             faccessat | faccessat2 => {
-                self.path_stat(t, int(a[0]), a[1], 0)?;
-                if a[2] & 2 != 0 { Err(EROFS) } else { Ok(0) } // W_OK on a read-only image
+                let path = t.proc.mm().read_cstr(a[1])?;
+                let node = self.resolve(t, int(a[0]), &path, true)?;
+                if a[2] & 2 != 0 && !self.vfs()?.writable(&node) { Err(EROFS) } else { Ok(0) } // W_OK
             }
             readlinkat => self.readlinkat(t, int(a[0]), a[1], a[2], a[3]),
             getdents64 => self.getdents64(t, int(a[0]), a[1], a[2]),
@@ -492,6 +527,8 @@ impl Kernel {
                 Ok(0)
             }
             ppoll => self.ppoll(t, a[0], a[1], a[2], a[3]),
+            mknodat | mkdirat | unlinkat | symlinkat | linkat | renameat | renameat2 | truncate | ftruncate | fallocate | fchmod
+            | fchmodat | fchown | fchownat | sync | fsync | fdatasync | utimensat | memfd_create => self.change_syscall(no, t, a),
             eventfd2 => {
                 let f = File::new(Kind::Event(EventFd::new(a[0] as u32 as u64, a[1])), a[1] as u32 & O_NONBLOCK);
                 t.proc.files.lock().unwrap().alloc(f, a[1] & O_CLOEXEC != 0, 0)
@@ -586,44 +623,214 @@ impl Kernel {
             }
             if let Some(fd) = rel.strip_prefix("fd/").and_then(|n| n.parse::<i64>().ok()) {
                 let f = t.proc.files.lock().unwrap().get(fd).map_err(|_| ENOENT)?;
-                if let Kind::Node(nf) = &f.kind {
-                    return Ok(nf.lock().unwrap().node.clone());
-                }
-                return Err(ENOENT);
+                return match &f.kind {
+                    Kind::Node(nf) => Ok(nf.lock().unwrap().node.clone()),
+                    Kind::Mem(m) => m.node.clone().ok_or(ENOENT),
+                    _ => Err(ENOENT),
+                };
             }
         }
         let base = if path.starts_with('/') { "/".to_string() } else { self.dir_path(t, dirfd)? };
         self.vfs()?.resolve(&base, path, follow)
     }
 
-    fn openat(&self, t: &Arc<Thread>, dirfd: i64, path: u64, flags: u64) -> Result<i64, i64> {
+    fn openat(&self, t: &Arc<Thread>, dirfd: i64, path: u64, flags: u64, mode: u64) -> Result<i64, i64> {
         let path = t.proc.mm().read_cstr(path)?;
         let cloexec = flags & O_CLOEXEC != 0;
         let status = flags as u32 & (O_NONBLOCK | O_APPEND);
-        let special = match path.as_str() {
-            "/dev/null" => Some(Kind::Null),
-            "/dev/zero" => Some(Kind::Zero),
-            "/dev/urandom" | "/dev/random" => Some(Kind::Random),
-            _ => None,
-        };
-        if let Some(kind) = special {
-            return t.proc.files.lock().unwrap().alloc(File::new(kind, status), cloexec, 0);
-        }
+        let access = flags as u32 & O_ACCMODE;
         let of = self.arch.open_flags();
+        if flags & O_TMPFILE == O_TMPFILE {
+            return Err(EOPNOTSUPP);
+        }
         let node = match self.resolve(t, dirfd, &path, flags & of.nofollow == 0) {
+            Ok(_) if flags & O_CREAT != 0 && flags & O_EXCL != 0 => return Err(EEXIST),
             Ok(n) => n,
-            Err(ENOENT) if flags & O_CREAT != 0 => return Err(EROFS),
+            Err(ENOENT) if flags & O_CREAT != 0 => {
+                let (dir, name) = self.parent(t, dirfd, &path)?;
+                self.vfs()?.create(&dir, &name, S_IFREG | (mode as u32 & 0o7777 & !0o022), 0)?
+            }
             Err(e) => return Err(e),
         };
-        if flags as u32 & O_ACCMODE != 0 {
-            return Err(EROFS);
+        let vfs = self.vfs()?;
+        let stat = vfs.stat(&node)?;
+        let kind = match stat.mode & S_IFMT {
+            S_IFCHR => match stat.rdev {
+                0x103 => Kind::Null,
+                0x105 => Kind::Zero,
+                0x108 | 0x109 => Kind::Random,
+                _ => return Err(ENXIO),
+            },
+            S_IFDIR if access != 0 => return Err(EISDIR),
+            _ if flags & of.directory != 0 && stat.mode & S_IFMT != S_IFDIR => return Err(ENOTDIR),
+            S_IFREG if vfs.writable(&node) => {
+                let file = vfs.mem_file(&node).ok_or(EIO)?;
+                if flags & O_TRUNC != 0 && access != 0 {
+                    file.truncate(0);
+                }
+                Kind::Mem(MemOpen {
+                    name: node.path.clone(),
+                    node: Some(node),
+                    file,
+                    pos: Mutex::new(0),
+                    readable: access != O_WRONLY,
+                    writable: access == O_WRONLY || access == O_RDWR,
+                })
+            }
+            _ if access != 0 => return Err(EROFS),
+            _ => Kind::Node(Mutex::new(NodeFile { node, stat, pos: 0, data: None, dents: None })),
+        };
+        t.proc.files.lock().unwrap().alloc(File::new(kind, status), cloexec, 0)
+    }
+
+    /// (directory, final name) of a path relative to `dirfd`.
+    fn parent(&self, t: &Thread, dirfd: i64, path: &str) -> Result<(Node, String), i64> {
+        let base = if path.starts_with('/') { "/".to_string() } else { self.dir_path(t, dirfd)? };
+        self.vfs()?.resolve_parent(&base, path)
+    }
+
+    /// The node a path-or-fd syscall (fchmodat, utimensat…) refers to.
+    fn target(&self, t: &Thread, dirfd: i64, path: u64, flags: u64) -> Result<Node, i64> {
+        let p = if path == 0 { String::new() } else { t.proc.mm().read_cstr(path)? };
+        if p.is_empty() && (path == 0 || flags & AT_EMPTY_PATH != 0) {
+            let f = t.proc.files.lock().unwrap().get(dirfd)?;
+            return match &f.kind {
+                Kind::Node(nf) => Ok(nf.lock().unwrap().node.clone()),
+                Kind::Mem(m) => m.node.clone().ok_or(EBADF),
+                _ => Err(EBADF),
+            };
         }
-        let stat = self.vfs()?.stat(&node)?;
-        if flags & of.directory != 0 && stat.mode & S_IFMT != S_IFDIR {
-            return Err(ENOTDIR);
+        self.resolve(t, dirfd, &p, flags & AT_SYMLINK_NOFOLLOW == 0)
+    }
+
+    fn mem(&self, t: &Thread, fd: i64) -> Result<Arc<File>, i64> {
+        let f = t.proc.files.lock().unwrap().get(fd)?;
+        match &f.kind {
+            Kind::Mem(_) => Ok(f),
+            Kind::Node(_) => Err(EINVAL),
+            _ => Err(EINVAL),
         }
-        let file = File::new(Kind::Node(Mutex::new(NodeFile { node, stat, pos: 0, data: None, dents: None })), status);
-        t.proc.files.lock().unwrap().alloc(file, cloexec, 0)
+    }
+
+    /// Namespace-changing and attribute syscalls over the writable mounts.
+    fn change_syscall(&self, no: Sysno, t: &Arc<Thread>, a: [u64; 6]) -> Result<i64, i64> {
+        use Sysno::*;
+        let vfs = self.vfs()?;
+        match no {
+            mknodat | mkdirat => {
+                let path = t.proc.mm().read_cstr(a[1])?;
+                let (dir, name) = self.parent(t, int(a[0]), &path)?;
+                if no == mkdirat {
+                    vfs.mkdir(&dir, &name, a[2] as u32 & !0o022)?;
+                } else {
+                    vfs.create(&dir, &name, a[2] as u32, a[3])?;
+                }
+                Ok(0)
+            }
+            unlinkat => {
+                let path = t.proc.mm().read_cstr(a[1])?;
+                let (dir, name) = self.parent(t, int(a[0]), &path)?;
+                vfs.unlink(&dir, &name, a[2] & AT_REMOVEDIR != 0)?;
+                Ok(0)
+            }
+            symlinkat => {
+                let target = t.proc.mm().read_cstr(a[0])?;
+                let path = t.proc.mm().read_cstr(a[2])?;
+                let (dir, name) = self.parent(t, int(a[1]), &path)?;
+                vfs.symlink(&dir, &name, &target)?;
+                Ok(0)
+            }
+            linkat => {
+                let old = self.target(t, int(a[0]), a[1], a[4] ^ AT_SYMLINK_NOFOLLOW)?; // no-follow by default
+                let path = t.proc.mm().read_cstr(a[3])?;
+                let (dir, name) = self.parent(t, int(a[2]), &path)?;
+                vfs.link(&old, &dir, &name)?;
+                Ok(0)
+            }
+            renameat | renameat2 => {
+                const RENAME_NOREPLACE: u64 = 1;
+                let flags = if no == renameat2 { a[4] } else { 0 };
+                if flags & !RENAME_NOREPLACE != 0 {
+                    return Err(EINVAL);
+                }
+                let (op, np) = {
+                    let mut mm = t.proc.mm();
+                    (mm.read_cstr(a[1])?, mm.read_cstr(a[3])?)
+                };
+                let (odir, oname) = self.parent(t, int(a[0]), &op)?;
+                let (ndir, nname) = self.parent(t, int(a[2]), &np)?;
+                vfs.rename(&odir, &oname, &ndir, &nname, flags & RENAME_NOREPLACE != 0)?;
+                Ok(0)
+            }
+            truncate => {
+                let path = t.proc.mm().read_cstr(a[0])?;
+                let node = self.resolve(t, AT_FDCWD, &path, true)?;
+                vfs.mem_file(&node).ok_or(if vfs.writable(&node) { EISDIR } else { EROFS })?.truncate(a[1]);
+                Ok(0)
+            }
+            ftruncate | fallocate => {
+                let f = self.mem(t, int(a[0]))?;
+                let Kind::Mem(m) = &f.kind else { unreachable!() };
+                if !m.writable {
+                    return Err(EINVAL);
+                }
+                if no == ftruncate {
+                    m.file.truncate(a[1]);
+                } else if a[2] + a[3] > m.file.size() && a[1] & 1 == 0 {
+                    m.file.truncate(a[2] + a[3]); // FALLOC_FL_KEEP_SIZE (1) unset: extend
+                }
+                Ok(0)
+            }
+            fchmod | fchown => {
+                let node = self.target(t, int(a[0]), 0, 0)?;
+                if no == fchmod {
+                    vfs.set_attr(&node, Some(a[1] as u32), None, None)?;
+                } else {
+                    vfs.set_attr(&node, None, Some((a[1] as u32, a[2] as u32)), None)?;
+                }
+                Ok(0)
+            }
+            fchmodat => {
+                let node = self.target(t, int(a[0]), a[1], 0)?;
+                vfs.set_attr(&node, Some(a[2] as u32), None, None)?;
+                Ok(0)
+            }
+            fchownat => {
+                let node = self.target(t, int(a[0]), a[1], a[4])?;
+                vfs.set_attr(&node, None, Some((a[2] as u32, a[3] as u32)), None)?;
+                Ok(0)
+            }
+            utimensat => {
+                let node = self.target(t, int(a[0]), a[1], a[3])?;
+                let mtime = if a[2] == 0 {
+                    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
+                } else {
+                    t.proc.mm().read_u64(a[2] + 16)? // times[1].tv_sec
+                };
+                match vfs.set_attr(&node, None, None, Some(mtime)) {
+                    Err(EROFS) => Ok(0), // touching image files: accepted, not recorded
+                    r => r.map(|_| 0),
+                }
+            }
+            sync | fsync | fdatasync => Ok(0),
+            memfd_create => {
+                const MFD_CLOEXEC: u64 = 1;
+                let name = t.proc.mm().read_cstr(a[0])?;
+                let file = MemFile::new(self.phys.clone());
+                let m = MemOpen { node: None, name: format!("/memfd:{name} (deleted)"), file, pos: Mutex::new(0), readable: true, writable: true };
+                t.proc.files.lock().unwrap().alloc(File::new(Kind::Mem(m), 0), a[1] & MFD_CLOEXEC != 0, 0)
+            }
+            _ => Err(ENOSYS),
+        }
+    }
+
+    /// For MAP_SHARED of a file: the shared pages behind a writable file.
+    pub(super) fn fd_shared_object(&self, t: &Thread, fd: i64) -> Result<Option<Arc<SharedObject>>, i64> {
+        let f = t.proc.files.lock().unwrap().get(fd)?;
+        Ok(match &f.kind {
+            Kind::Mem(m) => Some(m.file.obj.clone()),
+            _ => None,
+        })
     }
 
     fn node_data(&self, nf: &mut NodeFile) -> Result<Arc<[u8]>, i64> {
@@ -639,6 +846,9 @@ impl Kernel {
     /// Contents of a regular file behind `fd` (for file-backed mmap).
     pub(super) fn fd_file_data(&self, t: &Thread, fd: i64) -> Result<Arc<[u8]>, i64> {
         let f = t.proc.files.lock().unwrap().get(fd)?;
+        if let Kind::Mem(m) = &f.kind {
+            return Ok(m.file.read_at(0, usize::MAX).into()); // MAP_PRIVATE: a snapshot
+        }
         let Kind::Node(nf) = &f.kind else { return Err(ENODEV) };
         let mut nf = nf.lock().unwrap();
         if nf.stat.mode & S_IFMT == S_IFDIR {
@@ -678,6 +888,18 @@ impl Kernel {
                 tf.read(t, f.nonblock())?.to_le_bytes().to_vec()
             }
             Kind::Signal(sf) => sf.read(t, count, f.nonblock())?,
+            Kind::Mem(m) => {
+                if !m.readable {
+                    return Err(EBADF);
+                }
+                let mut pos = m.pos.lock().unwrap();
+                let off = at.unwrap_or(*pos);
+                let data = m.file.read_at(off, count);
+                if at.is_none() {
+                    *pos += data.len() as u64;
+                }
+                data
+            }
             Kind::Socket(sock) => unix::read(sock, t, count, f.nonblock())?,
             Kind::Node(nf) => {
                 let mut nf = nf.lock().unwrap();
@@ -696,6 +918,10 @@ impl Kernel {
     }
 
     fn write(&self, t: &Arc<Thread>, fd: i64, buf: u64, count: u64) -> Result<i64, i64> {
+        self.write_at(t, fd, buf, count, None)
+    }
+
+    fn write_at(&self, t: &Arc<Thread>, fd: i64, buf: u64, count: u64, at: Option<u64>) -> Result<i64, i64> {
         let f = t.proc.files.lock().unwrap().get(fd)?;
         let data = t.proc.mm().read_vec(buf, count.min(IO_MAX) as usize)?;
         let n = match &f.kind {
@@ -723,6 +949,23 @@ impl Kernel {
                 }
                 r => r?,
             },
+            Kind::Mem(m) => {
+                if !m.writable {
+                    return Err(EBADF);
+                }
+                let mut pos = m.pos.lock().unwrap();
+                let append = f.flags.load(Ordering::Relaxed) & O_APPEND != 0;
+                let off = match at {
+                    Some(o) => o,
+                    None if append => m.file.size(),
+                    None => *pos,
+                };
+                m.file.write_at(off, &data)?;
+                if at.is_none() {
+                    *pos = off + data.len() as u64;
+                }
+                data.len()
+            }
             Kind::Node(_) => return Err(EBADF), // opened read-only
             _ => return Err(EBADF),
         };
@@ -741,6 +984,10 @@ impl Kernel {
             Kind::Socket(_) => Stat { mode: 0o140777, nlink: 1, ..Default::default() },
             Kind::Event(_) | Kind::Timer(_) | Kind::Signal(_) | Kind::Epoll(_) => Stat { mode: 0o600, nlink: 1, ..Default::default() }, // anon_inode
             Kind::Node(nf) => nf.lock().unwrap().stat.clone(),
+            Kind::Mem(m) => match &m.node {
+                Some(n) => self.vfs()?.stat(n)?,
+                None => Stat { mode: S_IFREG | 0o600, nlink: 1, size: m.file.size(), ..Default::default() },
+            },
         })
     }
 
@@ -766,6 +1013,7 @@ impl Kernel {
             let f = t.proc.files.lock().unwrap().get(fd).map_err(|_| ENOENT)?;
             match &f.kind {
                 Kind::Node(nf) => nf.lock().unwrap().node.path.clone().into_bytes(),
+                Kind::Mem(m) => m.name.clone().into_bytes(),
                 Kind::Null => b"/dev/null".to_vec(),
                 Kind::Zero => b"/dev/zero".to_vec(),
                 Kind::Random => b"/dev/urandom".to_vec(),

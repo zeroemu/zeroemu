@@ -7,7 +7,7 @@ use crate::hv::{KernelPage, PageTableRoot};
 use crate::paging::{self, KERNEL_WINDOW, PROT_EXEC, PROT_READ, PROT_WRITE, USER_TOP};
 use crate::phys::{PAGE, PhysMem};
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// Lowest mappable address (Linux's mmap_min_addr on Android).
 pub const MIN_ADDR: u64 = 0x8000;
@@ -28,6 +28,102 @@ pub enum Backing {
     Anon,
     /// Private copy of a read-only file; `offset` is the file offset of the VMA start.
     File { data: Arc<[u8]>, offset: u64 },
+    /// MAP_SHARED memory: the object owns the frames, every mapping (in any
+    /// address space) points at the same ones.
+    Shared { obj: Arc<SharedObject>, offset: u64 },
+}
+
+/// Memory shared between mappings: tmpfs/memfd file contents and
+/// MAP_SHARED|MAP_ANONYMOUS regions. Frames are allocated on first use and
+/// freed when the last mapping or file reference goes away.
+pub struct SharedObject {
+    phys: Arc<PhysMem>,
+    pages: Mutex<Vec<u64>>,
+}
+
+impl SharedObject {
+    pub fn new(phys: Arc<PhysMem>) -> Arc<SharedObject> {
+        Arc::new(SharedObject { phys, pages: Mutex::new(Vec::new()) })
+    }
+
+    /// The frame holding page `idx`, allocated (zeroed) if needed.
+    pub fn frame(&self, idx: usize) -> Result<u64, i64> {
+        let mut pages = self.pages.lock().unwrap();
+        if pages.len() <= idx {
+            pages.resize(idx + 1, 0);
+        }
+        if pages[idx] == 0 {
+            pages[idx] = self.phys.alloc()?;
+        }
+        Ok(pages[idx])
+    }
+
+    pub fn read(&self, off: u64, buf: &mut [u8]) {
+        let pages = self.pages.lock().unwrap();
+        let mut done = 0;
+        while done < buf.len() {
+            let at = off + done as u64;
+            let (idx, po) = ((at / PAGE) as usize, (at % PAGE) as usize);
+            let n = (PAGE as usize - po).min(buf.len() - done);
+            match pages.get(idx).copied().filter(|&f| f != 0) {
+                Some(f) => unsafe { std::ptr::copy_nonoverlapping(self.phys.host(f).add(po), buf.as_mut_ptr().add(done), n) },
+                None => buf[done..done + n].fill(0), // a hole
+            }
+            done += n;
+        }
+    }
+
+    pub fn write(&self, off: u64, data: &[u8]) -> Result<(), i64> {
+        let mut done = 0;
+        while done < data.len() {
+            let at = off + done as u64;
+            let (idx, po) = ((at / PAGE) as usize, (at % PAGE) as usize);
+            let n = (PAGE as usize - po).min(data.len() - done);
+            let f = self.frame(idx)?;
+            unsafe { std::ptr::copy_nonoverlapping(data.as_ptr().add(done), self.phys.host(f).add(po), n) };
+            done += n;
+        }
+        Ok(())
+    }
+
+    /// Zeroes everything from `off` on (truncation). Frames stay allocated,
+    /// since other address spaces may still map them.
+    pub fn zero_from(&self, off: u64) {
+        let pages = self.pages.lock().unwrap();
+        for (idx, &f) in pages.iter().enumerate() {
+            let start = idx as u64 * PAGE;
+            if f == 0 || start + PAGE <= off {
+                continue;
+            }
+            let from = off.saturating_sub(start) as usize;
+            unsafe { self.phys.host(f).add(from).write_bytes(0, PAGE as usize - from) };
+        }
+    }
+}
+
+impl Drop for SharedObject {
+    fn drop(&mut self) {
+        for &f in self.pages.get_mut().unwrap().iter().filter(|&&f| f != 0) {
+            self.phys.free(f);
+        }
+    }
+}
+
+/// What an unmap left behind: frames and shared objects that must outlive the
+/// next TLB flush.
+#[derive(Default)]
+pub struct Stale {
+    frames: Vec<u64>,
+    objs: Vec<Arc<SharedObject>>,
+}
+
+impl Stale {
+    pub fn release(&mut self, phys: &PhysMem) {
+        for f in self.frames.drain(..) {
+            phys.free(f);
+        }
+        self.objs.clear();
+    }
 }
 
 #[derive(Clone)]
@@ -97,7 +193,7 @@ pub struct AddressSpace {
     /// Set when entries were removed or downgraded: vCPUs must flush before
     /// re-entering the guest, and `stale` frames may be freed only after that.
     pub tlb_dirty: bool,
-    stale: Vec<u64>,
+    stale: Stale,
 }
 
 impl AddressSpace {
@@ -121,7 +217,7 @@ impl AddressSpace {
             brk_start: 0,
             brk: 0,
             tlb_dirty: false,
-            stale: Vec::new(),
+            stale: Stale::default(),
         })
     }
 
@@ -154,7 +250,7 @@ impl AddressSpace {
             return;
         }
         let mut right = vma.clone();
-        if let Backing::File { offset, .. } = &mut right.backing {
+        if let Backing::File { offset, .. } | Backing::Shared { offset, .. } = &mut right.backing {
             *offset += at - start;
         }
         self.vmas.get_mut(&start).unwrap().end = at;
@@ -213,17 +309,14 @@ impl AddressSpace {
         }
         self.split(start);
         self.split(end);
+        let freed = self.clear_pages(start, end);
         let doomed: Vec<u64> = self.vmas.range(start..end).map(|(&s, _)| s).collect();
         for s in doomed {
-            self.vmas.remove(&s);
+            if let Some(Vma { backing: Backing::Shared { obj, .. }, .. }) = self.vmas.remove(&s) {
+                self.stale.objs.push(obj);
+            }
         }
-        let mut freed = Vec::new();
-        self.visit(start, end, &mut |phys, slot, _va, e| {
-            phys.write_u64(slot, 0);
-            freed.push(paging::addr(e));
-        });
-        if !freed.is_empty() {
-            self.stale.extend(freed);
+        if freed {
             self.tlb_dirty = true;
         }
         Ok(())
@@ -235,16 +328,31 @@ impl AddressSpace {
         if !start.is_multiple_of(PAGE) {
             return Err(EINVAL);
         }
-        let mut freed = Vec::new();
-        self.visit(start, start.saturating_add(page_up(len)), &mut |phys, slot, _va, e| {
-            phys.write_u64(slot, 0);
-            freed.push(paging::addr(e));
-        });
-        if !freed.is_empty() {
-            self.stale.extend(freed);
+        if self.clear_pages(start, start.saturating_add(page_up(len))) {
             self.tlb_dirty = true;
         }
         Ok(())
+    }
+
+    fn is_shared(&self, va: u64) -> bool {
+        matches!(self.find(va), Some((_, Vma { backing: Backing::Shared { .. }, .. })))
+    }
+
+    /// Clears the present pages of [start, end): private frames go to `stale`,
+    /// shared ones stay with their object. Returns whether anything was present.
+    fn clear_pages(&mut self, start: u64, end: u64) -> bool {
+        let mut cleared = Vec::new();
+        self.visit(start, end, &mut |phys, slot, va, e| {
+            phys.write_u64(slot, 0);
+            cleared.push((va, paging::addr(e)));
+        });
+        let any = !cleared.is_empty();
+        for (va, frame) in cleared {
+            if !self.is_shared(va) {
+                self.stale.frames.push(frame);
+            }
+        }
+        any
     }
 
     pub fn protect(&mut self, start: u64, len: u64, prot: u32) -> Result<(), i64> {
@@ -314,7 +422,7 @@ impl AddressSpace {
             }
             None => self.gap(new_len)?,
         };
-        if let Backing::File { offset, .. } = &mut backing {
+        if let Backing::File { offset, .. } | Backing::Shared { offset, .. } = &mut backing {
             *offset += old - vstart;
         }
         let keep = old_len.min(new_len);
@@ -414,6 +522,9 @@ impl AddressSpace {
     }
 
     fn populate(&self, vma_start: u64, vma: &Vma, page: u64) -> Result<u64, i64> {
+        if let Backing::Shared { obj, offset } = &vma.backing {
+            return obj.frame(((offset + (page - vma_start)) / PAGE) as usize);
+        }
         let frame = self.phys.alloc()?;
         if let Backing::File { data, offset } = &vma.backing {
             let off = (offset + (page - vma_start)) as usize;
@@ -518,7 +629,8 @@ impl AddressSpace {
 
     // ---- lifecycle ----
 
-    /// fork(): a copy with its own frames (eager; copy-on-write comes later).
+    /// fork(): private pages are copied (eagerly; copy-on-write comes later),
+    /// shared ones stay shared.
     pub fn fork(&self, kernel: &KernelWindow, asid: u16) -> Result<AddressSpace, i64> {
         let mut child = AddressSpace::new(self.phys.clone(), kernel, asid)?;
         child.vmas = self.vmas.clone();
@@ -527,16 +639,21 @@ impl AddressSpace {
         let mut pages = Vec::new();
         self.visit(0, USER_TOP, &mut |_, _, va, e| pages.push((va, e)));
         for (va, e) in pages {
-            let frame = self.phys.alloc()?;
-            unsafe { std::ptr::copy_nonoverlapping(self.phys.host(paging::addr(e)), self.phys.host(frame), PAGE as usize) };
+            let frame = if self.is_shared(va) {
+                paging::addr(e) // MAP_SHARED: both processes see the same frame
+            } else {
+                let f = self.phys.alloc()?;
+                unsafe { std::ptr::copy_nonoverlapping(self.phys.host(paging::addr(e)), self.phys.host(f), PAGE as usize) };
+                f
+            };
             let slot = walk(&self.phys, &mut child.tables, child.root.root, 0, va, true)?.unwrap();
             self.phys.write_u64(slot, (e & !paging::addr(u64::MAX)) | frame);
         }
         Ok(child)
     }
 
-    /// Frames unmapped since the last flush; free them once it has happened.
-    pub fn take_stale(&mut self) -> Vec<u64> {
+    /// What was unmapped since the last flush; release it once that happened.
+    pub fn take_stale(&mut self) -> Stale {
         std::mem::take(&mut self.stale)
     }
 
@@ -546,12 +663,17 @@ impl Drop for AddressSpace {
     fn drop(&mut self) {
         // Callers flush TLBs before dropping a space a vCPU may still cache
         // (exec switches roots first; exited processes have no vCPUs left).
-        let mut frames = Vec::new();
-        self.visit(0, USER_TOP, &mut |_, _, _, e| frames.push(paging::addr(e)));
-        frames.append(&mut self.stale);
-        frames.append(&mut self.tables);
-        for f in frames {
-            self.phys.free(f);
+        let mut pages = Vec::new();
+        self.visit(0, USER_TOP, &mut |_, _, va, e| pages.push((va, paging::addr(e))));
+        for (va, frame) in pages {
+            if !self.is_shared(va) {
+                self.phys.free(frame);
+            }
+        }
+        let phys = self.phys.clone();
+        self.stale.release(&phys);
+        for f in self.tables.drain(..) {
+            phys.free(f);
         }
     }
 }

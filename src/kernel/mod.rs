@@ -74,6 +74,27 @@ pub struct Kernel {
     exit: (Mutex<Option<i32>>, Condvar),
 }
 
+/// The writable filesystems a device has after first-stage init, empty
+/// apart from the basics (init itself is not run yet).
+fn mount_tmpfs(vfs: &mut Vfs, phys: &Arc<PhysMem>) {
+    use crate::tmpfs::Tmpfs;
+    use crate::vfs::FileSystem;
+    let dev = Tmpfs::new(phys.clone(), 0o755);
+    for (name, rdev) in [("null", 0x103), ("zero", 0x105), ("random", 0x108), ("urandom", 0x109)] {
+        dev.create(1, name, 0o020666, rdev).expect("tmpfs /dev");
+    }
+    dev.mkdir_p("socket", 0o755);
+    dev.mkdir_p("pts", 0o755);
+    vfs.mount("/dev", dev);
+    let data = Tmpfs::new(phys.clone(), 0o771);
+    data.mkdir_p("local/tmp", 0o771);
+    data.mkdir_p("system", 0o775);
+    vfs.mount("/data", data);
+    vfs.mount("/tmp", Tmpfs::new(phys.clone(), 0o1777));
+    vfs.mount("/mnt", Tmpfs::new(phys.clone(), 0o755));
+    vfs.mount("/cache", Tmpfs::new(phys.clone(), 0o770));
+}
+
 pub struct Process {
     pub pid: i32,
     pub ppid: AtomicI32,
@@ -155,8 +176,16 @@ impl Thread {
 }
 
 impl Kernel {
-    pub fn new(hv: Arc<dyn Hypervisor>, vfs: Option<Arc<Vfs>>, strace: bool) -> Result<Arc<Kernel>, String> {
+    pub fn new(hv: Arc<dyn Hypervisor>, vfs: Option<Vfs>, strace: bool) -> Result<Arc<Kernel>, String> {
         let phys = PhysMem::new(hv.clone());
+        // Without an image the root itself is a tmpfs (for freestanding guests).
+        let mut v = vfs.unwrap_or_else(|| {
+            let mut v = Vfs::default();
+            v.mount("/", crate::tmpfs::Tmpfs::new(phys.clone(), 0o755));
+            v
+        });
+        mount_tmpfs(&mut v, &phys);
+        let vfs = Some(Arc::new(v));
         let pages = hv.kernel_pages(&mut || {
             let gpa = phys.alloc().expect("no memory for the kernel window");
             (gpa, phys.host(gpa))
@@ -265,7 +294,7 @@ impl Kernel {
             }
         };
         *t.kick.lock().unwrap() = Some(vcpu.kicker());
-        let mut stale = Vec::new();
+        let mut stale = crate::mm::Stale::default();
         let mut restart: Option<SyscallRegs> = None;
         let mut exit_code = 0;
 
@@ -279,9 +308,7 @@ impl Kernel {
             }
             let exit = vcpu.run();
             // The flush requested last time ran on entry; now frames are safe to reuse.
-            for f in stale.drain(..) {
-                self.phys.free(f);
-            }
+            stale.release(&self.phys);
             match exit {
                 Exit::Syscall => {
                     let regs = vcpu.syscall_regs();
@@ -318,9 +345,7 @@ impl Kernel {
         }
         *t.kick.lock().unwrap() = None;
         drop(vcpu); // destroyed on the thread that owns it
-        for f in stale {
-            self.phys.free(f);
-        }
+        stale.release(&self.phys);
         self.thread_exit(t, exit_code);
     }
 

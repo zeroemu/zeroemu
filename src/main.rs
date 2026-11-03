@@ -11,12 +11,12 @@ mod kernel;
 mod mm;
 mod paging;
 mod phys;
+mod tmpfs;
 mod vfs;
 
 use kernel::Kernel;
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::sync::Arc;
 
 const USAGE: &str = "usage: droidrt [--system <system.img>] [--strace] <program> [args...]
        droidrt --system <system.img> --ls <path> | --cat <path>";
@@ -63,9 +63,9 @@ fn run() -> Result<i32, String> {
         "HOME=/".to_string(),
     ];
 
-    let kernel = Kernel::new(hv::create()?, vfs.map(Arc::new), strace)?;
+    let kernel = Kernel::new(hv::create()?, vfs, strace)?;
     let mut mm = kernel.new_address_space().map_err(|e| format!("address space: errno {e}"))?;
-    let (state, exe) = if kernel.vfs.is_some() {
+    let (state, exe) = if system.is_some() {
         kernel
             .load_program(&mut mm, "/", &program, argv, &envp)
             .map_err(|e| format!("{program}: cannot execute (errno {e})"))?

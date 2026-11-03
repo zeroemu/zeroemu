@@ -380,6 +380,10 @@ impl Vfs {
         self.mounts.iter().map(|m| (m.path.clone(), m.fs.fs_type())).collect()
     }
 
+    pub fn fs_type(&self, node: &Node) -> &'static str {
+        self.fs(node).fs_type()
+    }
+
     pub fn writable(&self, node: &Node) -> bool {
         self.fs(node).writable()
     }

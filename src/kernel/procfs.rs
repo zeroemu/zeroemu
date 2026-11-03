@@ -172,14 +172,15 @@ impl ProcFs {
             }
             K::Loadavg => text(format!("0.00 0.00 0.00 1/{} {}\n", kernel.procs.lock().unwrap().len(), kernel.next_id.load(Ordering::Relaxed) - 1)),
             K::Version => text("Linux version 6.6.0-droidrt (droidrt) #1 SMP PREEMPT\n".into()),
-            K::Filesystems => text("nodev\tproc\nnodev\ttmpfs\nnodev\tsysfs\n\terofs\n\text4\n".into()),
+            K::Filesystems => text("nodev\tproc\nnodev\ttmpfs\nnodev\tsysfs\nnodev\tselinuxfs\n\terofs\n\text4\n".into()),
             K::Cmdline => text("androidboot.hardware=droidrt androidboot.selinux=permissive\n".into()),
             K::Mounts | K::PMounts => {
                 let vfs = kernel.vfs.as_deref().ok_or_else(|| err(ENOENT))?;
                 let mut s = String::new();
                 for (path, ty) in vfs.mounts() {
-                    let src = if ty == "tmpfs" || ty == "proc" || ty == "sysfs" { ty } else { "/dev/block/droidrt" };
-                    let opts = if ty == "tmpfs" { "rw" } else { "ro" };
+                    let virtual_fs = matches!(ty, "tmpfs" | "proc" | "sysfs" | "selinuxfs");
+                    let src = if virtual_fs { ty } else { "/dev/block/droidrt" };
+                    let opts = if matches!(ty, "tmpfs" | "selinuxfs" | "sysfs") { "rw" } else { "ro" };
                     s += &format!("{src} {path} {ty} {opts},relatime 0 0\n");
                 }
                 text(s)

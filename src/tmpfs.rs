@@ -76,6 +76,8 @@ struct Node {
 
 pub struct Tmpfs {
     phys: Arc<PhysMem>,
+    /// What statfs and /proc/mounts call it ("tmpfs", "sysfs", "selinuxfs").
+    type_name: &'static str,
     nodes: Mutex<HashMap<u64, Node>>,
     next: AtomicU64,
 }
@@ -100,9 +102,14 @@ fn valid_name(name: &str) -> Result<(), i64> {
 
 impl Tmpfs {
     pub fn new(phys: Arc<PhysMem>, mode: u32) -> Arc<Tmpfs> {
+        Tmpfs::with_type(phys, mode, "tmpfs")
+    }
+
+    /// An in-memory filesystem presenting itself as another type.
+    pub fn with_type(phys: Arc<PhysMem>, mode: u32, type_name: &'static str) -> Arc<Tmpfs> {
         let mut nodes = HashMap::new();
         nodes.insert(ROOT, Node { mode: S_IFDIR | mode, uid: 0, gid: 0, nlink: 2, mtime: now(), kind: Kind::Dir { entries: BTreeMap::new(), parent: ROOT } });
-        Arc::new(Tmpfs { phys, nodes: Mutex::new(nodes), next: AtomicU64::new(ROOT + 1) })
+        Arc::new(Tmpfs { phys, type_name, nodes: Mutex::new(nodes), next: AtomicU64::new(ROOT + 1) })
     }
 
     fn add(&self, dir: u64, name: &str, mode: u32, kind: Kind) -> Result<u64, i64> {
@@ -164,7 +171,7 @@ impl Tmpfs {
 
 impl FileSystem for Tmpfs {
     fn fs_type(&self) -> &'static str {
-        "tmpfs"
+        self.type_name
     }
     fn root(&self) -> io::Result<u64> {
         Ok(ROOT)

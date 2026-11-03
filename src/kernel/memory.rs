@@ -33,6 +33,27 @@ impl Kernel {
         } else {
             Placement::Hint(addr)
         };
+        // A binder fd's receive area: read-only to the process, filled by the driver.
+        if flags & MAP_ANONYMOUS == 0
+            && let Ok(f) = t.proc.files.lock().unwrap().get(fd)
+            && let Some(b) = super::binder::mmap_area(&f)
+        {
+            if prot & 2 != 0 {
+                return -EPERM;
+            }
+            let len = len.min(4 << 20);
+            let mut mm = t.proc.mm();
+            let a = match mm.map(place, len, 1, Backing::Anon) {
+                Ok(a) => a,
+                Err(e) => return -e,
+            };
+            mm.set_name(a, len, "/dev/binderfs/binder");
+            drop(mm);
+            return match super::binder::set_area(b, a, len) {
+                Ok(()) => a as i64,
+                Err(e) => -e,
+            };
+        }
         let shared = flags & MAP_SHARED != 0;
         let backing = if flags & MAP_ANONYMOUS != 0 {
             if shared { Backing::Shared { obj: SharedObject::new(self.phys.clone()), offset: 0 } } else { Backing::Anon }

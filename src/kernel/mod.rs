@@ -7,6 +7,7 @@
 //! vCPU (Hypervisor.framework binds a vCPU to its creating thread). Blocking
 //! syscalls simply block that host thread.
 
+mod binder;
 mod epoll;
 mod files;
 mod futex;
@@ -85,7 +86,10 @@ fn mount_tmpfs(vfs: &mut Vfs, phys: &Arc<PhysMem>) {
     use crate::tmpfs::Tmpfs;
     use crate::vfs::FileSystem;
     let dev = Tmpfs::new(phys.clone(), 0o755);
-    for (name, rdev) in [("null", 0x103), ("zero", 0x105), ("random", 0x108), ("urandom", 0x109)] {
+    for (name, rdev) in [("null", 0x103), ("zero", 0x105), ("random", 0x108), ("urandom", 0x109), ("kmsg", 0x10b)] {
+        dev.create(1, name, 0o020666, rdev).expect("tmpfs /dev");
+    }
+    for (name, rdev) in binder::DEVICES {
         dev.create(1, name, 0o020666, rdev).expect("tmpfs /dev");
     }
     dev.mkdir_p("socket", 0o755);
@@ -100,7 +104,7 @@ fn mount_tmpfs(vfs: &mut Vfs, phys: &Arc<PhysMem>) {
     vfs.mount("/cache", Tmpfs::new(phys.clone(), 0o770));
     // sysfs: what bionic's sysconf and friends read. No /sys/fs/selinux, so
     // libselinux sees SELinux as disabled.
-    let sys = Tmpfs::new(phys.clone(), 0o755);
+    let sys = Tmpfs::with_type(phys.clone(), 0o755, "sysfs");
     let n = std::thread::available_parallelism().map_or(1, |n| n.get()).min(64);
     for f in ["online", "possible", "present"] {
         sys.write_file(&format!("devices/system/cpu/{f}"), 0o444, &format!("0-{}\n", n - 1));
@@ -110,6 +114,16 @@ fn mount_tmpfs(vfs: &mut Vfs, phys: &Arc<PhysMem>) {
         sys.mkdir_p(d, 0o755);
     }
     vfs.mount("/sys", sys);
+    // selinuxfs, permissive and policy-less: libselinux finds it (statfs
+    // says SELINUX_MAGIC), maps its status page, and with deny_unknown=0
+    // every access check on an unknown class is allowed.
+    let selinux = Tmpfs::with_type(phys.clone(), 0o755, "selinuxfs");
+    for (name, content) in [("enforce", "0"), ("deny_unknown", "0"), ("reject_unknown", "0"), ("policyvers", "33"), ("mls", "1"), ("checkreqprot", "0")] {
+        selinux.write_file(name, 0o644, content);
+    }
+    // struct selinux_kernel_status: version 1, sequence 0, enforcing 0, policyload 0, deny_unknown 0.
+    selinux.write_file("status", 0o444, "\u{1}\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0");
+    vfs.mount("/sys/fs/selinux", selinux);
 }
 
 pub struct Process {

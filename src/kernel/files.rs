@@ -1,6 +1,7 @@
 //! File descriptors: the open files of a process, pipes, and the file and
 //! directory syscalls over the read-only VFS.
 
+use super::binder::{self, BinderFile};
 use super::epoll::Epoll;
 use super::specialfd::{EventFd, SignalFd, TimerFd};
 use super::unix::{self, Socket};
@@ -68,6 +69,8 @@ pub enum Kind {
     Null,
     Zero,
     Random,
+    /// The kernel log: writes go to the host's stderr.
+    Kmsg,
     Node(Mutex<NodeFile>),
     /// A writable regular file (tmpfs or memfd): live contents.
     Mem(MemOpen),
@@ -77,6 +80,7 @@ pub enum Kind {
     Signal(SignalFd),
     Epoll(Epoll),
     Socket(Arc<Socket>),
+    Binder(BinderFile),
 }
 
 /// An open file description, shared by dup'd and inherited descriptors.
@@ -280,9 +284,13 @@ pub(super) fn poll_ready(f: &File, t: &Thread, depth: u32) -> u16 {
         Kind::Signal(sf) => if sf.ready_in(t) { POLLIN } else { 0 },
         Kind::Epoll(ep) => if ep.is_ready(t, depth) { POLLIN } else { 0 },
         Kind::Socket(s) => s.poll(),
+        Kind::Binder(b) => {
+            (if binder::readable(b, t.tid) { POLLIN } else { 0 }) | POLLOUT
+        }
         Kind::Stdin => POLLIN,
         Kind::Stdout | Kind::Stderr => POLLOUT,
         Kind::Null | Kind::Zero | Kind::Random | Kind::Node(_) | Kind::Mem(_) => POLLIN | POLLOUT,
+        Kind::Kmsg => POLLOUT,
         Kind::Pipe(end) => {
             let st = end.pipe.st.lock().unwrap();
             if end.write {
@@ -472,6 +480,10 @@ impl Kernel {
                 }
             }
             ioctl => {
+                let f = t.proc.files.lock().unwrap().get(int(a[0]))?;
+                if let Kind::Binder(b) = &f.kind {
+                    return self.binder_ioctl(t, &f, b, a[1] as u32 as u64, a[2]);
+                }
                 const FIONCLEX: u64 = 0x5450;
                 const FIOCLEX: u64 = 0x5451;
                 const FIONBIO: u64 = 0x5421;
@@ -492,14 +504,24 @@ impl Kernel {
                 }
             }
             fstatfs => {
-                t.proc.files.lock().unwrap().get(int(a[0]))?;
-                t.proc.mm().write(a[1], &statfs_bytes())?;
+                let f = t.proc.files.lock().unwrap().get(int(a[0]))?;
+                let node = match &f.kind {
+                    Kind::Node(nf) => Some(nf.lock().unwrap().node.clone()),
+                    Kind::Mem(m) => m.node.clone(),
+                    _ => None,
+                };
+                let bytes = match node {
+                    Some(n) => statfs_bytes(self.vfs()?.fs_type(&n), self.vfs()?.writable(&n)),
+                    None => statfs_bytes(if matches!(f.kind, Kind::Mem(_)) { "tmpfs" } else { "pipefs" }, true),
+                };
+                t.proc.mm().write(a[1], &bytes)?;
                 Ok(0)
             }
             statfs => {
                 let path = t.proc.mm().read_cstr(a[0])?;
-                self.resolve(t, AT_FDCWD, &path, true)?;
-                t.proc.mm().write(a[1], &statfs_bytes())?;
+                let node = self.resolve(t, AT_FDCWD, &path, true)?;
+                let vfs = self.vfs()?;
+                t.proc.mm().write(a[1], &statfs_bytes(vfs.fs_type(&node), vfs.writable(&node)))?;
                 Ok(0)
             }
             umask => Ok(0o022),
@@ -675,7 +697,8 @@ impl Kernel {
                 0x103 => Kind::Null,
                 0x105 => Kind::Zero,
                 0x108 | 0x109 => Kind::Random,
-                _ => return Err(ENXIO),
+                0x10b => Kind::Kmsg,
+                rdev => binder::file_for(t, rdev).ok_or(ENXIO)?,
             },
             S_IFDIR if access != 0 => return Err(EISDIR),
             _ if flags & of.directory != 0 && stat.mode & S_IFMT != S_IFDIR => return Err(ENOTDIR),
@@ -889,7 +912,7 @@ impl Kernel {
                 v.truncate(n);
                 v
             }
-            Kind::Null => Vec::new(),
+            Kind::Null | Kind::Kmsg => Vec::new(),
             Kind::Zero => vec![0; count],
             Kind::Random => {
                 let mut v = vec![0; count];
@@ -950,6 +973,13 @@ impl Kernel {
             Kind::Stdout => std::io::stdout().write_all(&data).and_then(|_| std::io::stdout().flush()).map(|_| data.len()).map_err(|_| EIO)?,
             Kind::Stderr => std::io::stderr().write_all(&data).map(|_| data.len()).map_err(|_| EIO)?,
             Kind::Null | Kind::Zero | Kind::Random => data.len(),
+            Kind::Kmsg => {
+                // "<prio>tag: message" records, one per write.
+                let text = String::from_utf8_lossy(&data);
+                let text = text.trim_start_matches(|c: char| c == '<' || c.is_ascii_digit() || c == '>');
+                eprintln!("[kmsg] {}", text.trim_end());
+                data.len()
+            }
             Kind::Pipe(end) if end.write => match end.pipe.write(t, &data, f.nonblock()) {
                 Err(EPIPE) => {
                     self.send_thread_signal(t, super::signal::SIGPIPE, super::signal::SigInfo::user(super::signal::SIGPIPE, t.proc.pid));
@@ -1002,9 +1032,11 @@ impl Kernel {
             Kind::Null => chr(0x0103),
             Kind::Zero => chr(0x0105),
             Kind::Random => chr(0x0109),
+            Kind::Kmsg => chr(0x010b),
             Kind::Pipe(_) => Stat { mode: 0o010600, nlink: 1, ..Default::default() },
             Kind::Socket(_) => Stat { mode: 0o140777, nlink: 1, ..Default::default() },
             Kind::Event(_) | Kind::Timer(_) | Kind::Signal(_) | Kind::Epoll(_) => Stat { mode: 0o600, nlink: 1, ..Default::default() }, // anon_inode
+            Kind::Binder(_) => Stat { mode: 0o020666, nlink: 1, rdev: 0xa36, ..Default::default() },
             Kind::Node(nf) => nf.lock().unwrap().stat.clone(),
             Kind::Mem(m) => match &m.node {
                 Some(n) => self.vfs()?.stat(n)?,
@@ -1217,24 +1249,36 @@ pub(super) fn file_name(f: &File) -> String {
         Kind::Null => "/dev/null".into(),
         Kind::Zero => "/dev/zero".into(),
         Kind::Random => "/dev/urandom".into(),
+        Kind::Kmsg => "/dev/kmsg".into(),
         Kind::Pipe(p) => format!("pipe:[{}]", Arc::as_ptr(&p.pipe) as usize % 100_000),
         Kind::Socket(s) => format!("socket:[{}]", Arc::as_ptr(s) as usize % 100_000),
         Kind::Event(_) => "anon_inode:[eventfd]".into(),
         Kind::Timer(_) => "anon_inode:[timerfd]".into(),
         Kind::Signal(_) => "anon_inode:[signalfd]".into(),
         Kind::Epoll(_) => "anon_inode:[eventpoll]".into(),
+        Kind::Binder(_) => "/dev/binder".into(),
         Kind::Stdin | Kind::Stdout | Kind::Stderr => "/dev/pts/0".into(),
     }
 }
 
-/// `struct statfs` (same 120-byte layout on arm64 and x86_64): a read-only ext4-like volume.
-fn statfs_bytes() -> [u8; 120] {
+/// `struct statfs` (same 120-byte layout on arm64 and x86_64) for a mount.
+/// libselinux finds selinuxfs by its magic number.
+fn statfs_bytes(fs_type: &str, writable: bool) -> [u8; 120] {
+    let magic: u64 = match fs_type {
+        "erofs" => 0xe0f5_e1e2,
+        "ext4" => 0xef53,
+        "tmpfs" => 0x0102_1994,
+        "proc" => 0x9fa0,
+        "sysfs" => 0x6265_6572,
+        "selinuxfs" => 0xf97c_ff8c,
+        _ => 0x5049_5045, // pipefs
+    };
     let mut b = [0u8; 120];
-    b[0..8].copy_from_slice(&0xef53u64.to_le_bytes()); // f_type
+    b[0..8].copy_from_slice(&magic.to_le_bytes()); // f_type
     b[8..16].copy_from_slice(&4096u64.to_le_bytes()); // f_bsize
     b[64..72].copy_from_slice(&255u64.to_le_bytes()); // f_namelen
     b[72..80].copy_from_slice(&4096u64.to_le_bytes()); // f_frsize
-    b[80..88].copy_from_slice(&1u64.to_le_bytes()); // f_flags = ST_RDONLY
+    b[80..88].copy_from_slice(&(if writable { 0u64 } else { 1 }).to_le_bytes()); // f_flags: ST_RDONLY
     b
 }
 

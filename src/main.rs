@@ -55,6 +55,7 @@ fn run() -> Result<i32, String> {
         return inspect_image(vfs.as_ref().ok_or("--ls/--cat need --system")?, &cmd, &path);
     }
     let argv: Vec<String> = args.collect();
+    let argv_copy = argv.clone();
     let program = argv.first().ok_or(USAGE)?.clone();
     let envp = vec![
         "PATH=/product/bin:/apex/com.android.runtime/bin:/system/bin:/system_ext/bin:/vendor/bin".to_string(),
@@ -82,9 +83,10 @@ fn run() -> Result<i32, String> {
         };
         mm.set_brk_start(main.end);
         let sp = elf::build_stack(&mut mm, &main, base, &argv, &envp).map_err(|e| format!("stack: errno {e}"))?;
+        mm.set_name(main.lo, main.end - main.lo, &program);
         (hv::CpuState::new_user(entry, sp), program.clone())
     };
-    kernel.start(mm, exe, state)?;
+    kernel.start(mm, exe, &argv_copy, state)?;
     let status = kernel.wait_root();
     // Like a shell: the exit code, or 128 + the signal that killed it.
     Ok(if status & 0x7f == 0 { (status >> 8) & 0xff } else { 128 + (status & 0x7f) })

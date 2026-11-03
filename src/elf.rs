@@ -22,6 +22,8 @@ const PF_R: u32 = 4;
 const MAIN_PIE_BASE: u64 = 0x55_5555_0000;
 
 pub struct Image {
+    /// First mapped address of the image.
+    pub lo: u64,
     pub entry: u64,
     pub bias: u64,
     pub phdr: u64,
@@ -130,6 +132,7 @@ pub fn load(mm: &mut AddressSpace, file: &[u8], name: &str, is_interp: bool) -> 
     }
 
     Ok(Image {
+        lo: lo + bias,
         entry: u64_at(file, 24) + bias,
         bias,
         // No PT_PHDR: the headers sit at file offset phoff inside the first segment.
@@ -223,5 +226,6 @@ pub fn build_stack(mm: &mut AddressSpace, main: &Image, interp_base: u64, argv: 
         push(v);
     }
     mm.write(start, &table)?;
+    mm.set_name(STACK_TOP - STACK_SIZE, STACK_SIZE, "[stack]");
     Ok(start)
 }

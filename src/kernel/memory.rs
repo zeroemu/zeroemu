@@ -47,8 +47,15 @@ impl Kernel {
                 },
             }
         };
-        match t.proc.mm().map(place, len, prot & !PROT_IGNORED, backing) {
-            Ok(a) => a as i64,
+        let name = if flags & MAP_ANONYMOUS == 0 { self.fd_name(t, fd) } else { None };
+        let mut mm = t.proc.mm();
+        match mm.map(place, len, prot & !PROT_IGNORED, backing) {
+            Ok(a) => {
+                if let Some(n) = name {
+                    mm.set_name(a, len, &n);
+                }
+                a as i64
+            }
             Err(e) => -e,
         }
     }

@@ -131,7 +131,12 @@ pub struct Vma {
     pub end: u64,
     pub prot: u32,
     pub backing: Backing,
+    /// Shown in /proc/<pid>/maps (a file path, "[stack]", …).
+    pub name: Option<Arc<str>>,
 }
+
+/// (start, end, prot, shared, file offset, name) of one mapping.
+pub type MapEntry = (u64, u64, u32, bool, u64, Option<Arc<str>>);
 
 pub enum Placement {
     /// MAP_FIXED: replace whatever is there.
@@ -295,8 +300,42 @@ impl AddressSpace {
                 if h != 0 && self.is_free(h, h.saturating_add(len)) { h } else { self.gap(len)? }
             }
         };
-        self.vmas.insert(start, Vma { end: start + len, prot, backing });
+        self.vmas.insert(start, Vma { end: start + len, prot, backing, name: None });
         Ok(start)
+    }
+
+    /// Labels the mappings in [start, start+len) for /proc/<pid>/maps.
+    pub fn set_name(&mut self, start: u64, len: u64, name: &str) {
+        let end = start.saturating_add(page_up(len));
+        self.split(start);
+        self.split(end);
+        let name: Arc<str> = name.into();
+        for (_, v) in self.vmas.range_mut(start..end) {
+            v.name = Some(name.clone());
+        }
+    }
+
+    /// Every mapping, for /proc/<pid>/maps.
+    pub fn maps(&self) -> Vec<MapEntry> {
+        self.vmas
+            .iter()
+            .map(|(&s, v)| {
+                let (shared, offset) = match &v.backing {
+                    Backing::Anon => (false, 0),
+                    Backing::File { offset, .. } => (false, *offset),
+                    Backing::Shared { offset, .. } => (true, *offset),
+                };
+                (s, v.end, v.prot, shared, offset, v.name.clone())
+            })
+            .collect()
+    }
+
+    /// Bytes of address space mapped, and bytes actually resident.
+    pub fn usage(&self) -> (u64, u64) {
+        let virt = self.vmas.iter().map(|(&s, v)| v.end - s).sum();
+        let mut resident = 0;
+        self.visit(0, USER_TOP, &mut |_, _, _, _| resident += PAGE);
+        (virt, resident)
     }
 
     pub fn unmap(&mut self, start: u64, len: u64) -> Result<(), i64> {
@@ -401,7 +440,7 @@ impl AddressSpace {
         if old + old_len > vma.end {
             return Err(EFAULT);
         }
-        let (prot, mut backing) = (vma.prot, vma.backing.clone());
+        let (prot, mut backing, vma_name) = (vma.prot, vma.backing.clone(), vma.name.clone());
         if fixed.is_none() && new_len <= old_len {
             self.unmap(old + new_len, old_len - new_len)?;
             return Ok(old);
@@ -436,7 +475,7 @@ impl AddressSpace {
         self.split(old + old_len);
         self.vmas.remove(&old);
         self.unmap(old + keep, old_len - keep)?;
-        self.vmas.insert(dst, Vma { end: dst + new_len, prot, backing });
+        self.vmas.insert(dst, Vma { end: dst + new_len, prot, backing, name: vma_name });
         for (off, e) in moves {
             let slot = walk(&self.phys, &mut self.tables, self.root.root, 0, dst + off, true)?.unwrap();
             self.phys.write_u64(slot, e);
@@ -454,6 +493,7 @@ impl AddressSpace {
             if !self.is_free(old_end, new_end) || self.map(Placement::Fixed(old_end), new_end - old_end, PROT_READ | PROT_WRITE, Backing::Anon).is_err() {
                 return self.brk;
             }
+            self.set_name(old_end, new_end - old_end, "[heap]");
         } else if new_end < old_end && self.unmap(new_end, old_end - new_end).is_err() {
             return self.brk;
         }

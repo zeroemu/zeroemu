@@ -40,6 +40,11 @@ pub trait FileSystem: Send + Sync {
     fn readdir(&self, dir: u64) -> io::Result<Vec<Dirent>>;
     fn read_all(&self, ino: u64) -> io::Result<Arc<[u8]>>;
 
+    /// For /proc/mounts.
+    fn fs_type(&self) -> &'static str {
+        "unknown"
+    }
+
     // Writable filesystems (tmpfs) override these; images are read-only.
     fn writable(&self) -> bool {
         false
@@ -73,6 +78,9 @@ pub trait FileSystem: Send + Sync {
 }
 
 impl FileSystem for Erofs {
+    fn fs_type(&self) -> &'static str {
+        "erofs"
+    }
     fn root(&self) -> io::Result<u64> {
         Ok(self.root_nid())
     }
@@ -118,6 +126,9 @@ fn ft_to_dt(ft: u8) -> u8 {
 }
 
 impl FileSystem for Ext4 {
+    fn fs_type(&self) -> &'static str {
+        "ext4"
+    }
     fn root(&self) -> io::Result<u64> {
         Ok(self.root_ino())
     }
@@ -195,6 +206,9 @@ impl LazyFs {
 }
 
 impl FileSystem for LazyFs {
+    fn fs_type(&self) -> &'static str {
+        self.fs.get().and_then(|r| r.as_ref().ok()).map_or("ext4", |f| f.fs_type())
+    }
     fn root(&self) -> io::Result<u64> {
         self.get()?.root()
     }
@@ -359,6 +373,11 @@ impl Vfs {
 
     pub fn read_all(&self, node: &Node) -> Result<Arc<[u8]>, i64> {
         self.fs(node).read_all(node.ino).map_err(io_errno)
+    }
+
+    /// (mount point, filesystem type) in mount order.
+    pub fn mounts(&self) -> Vec<(String, &'static str)> {
+        self.mounts.iter().map(|m| (m.path.clone(), m.fs.fs_type())).collect()
     }
 
     pub fn writable(&self, node: &Node) -> bool {

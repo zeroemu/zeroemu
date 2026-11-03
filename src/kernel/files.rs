@@ -166,6 +166,11 @@ impl FdTable {
         self.fds[fd] = Some(Entry { file, cloexec });
     }
 
+    /// Open descriptors, in order.
+    pub(super) fn list(&self) -> Vec<(i64, Arc<File>)> {
+        self.fds.iter().enumerate().filter_map(|(i, e)| e.as_ref().map(|e| (i as i64, e.file.clone()))).collect()
+    }
+
     pub fn close_on_exec(&mut self) {
         for slot in &mut self.fds {
             if slot.as_ref().is_some_and(|e| e.cloexec) {
@@ -613,7 +618,18 @@ impl Kernel {
     }
 
     pub(super) fn resolve(&self, t: &Thread, dirfd: i64, path: &str, follow: bool) -> Result<Node, i64> {
-        // The two /proc entries bionic and toybox rely on, as magic links.
+        // /proc/self and /proc/thread-self name the caller.
+        let rewritten;
+        let path = if let Some(rest) = path.strip_prefix("/proc/self").filter(|r| r.is_empty() || r.starts_with('/')) {
+            rewritten = format!("/proc/{}{rest}", t.proc.pid);
+            rewritten.as_str()
+        } else if let Some(rest) = path.strip_prefix("/proc/thread-self").filter(|r| r.is_empty() || r.starts_with('/')) {
+            rewritten = format!("/proc/{}/task/{}{rest}", t.proc.pid, t.tid);
+            rewritten.as_str()
+        } else {
+            path
+        };
+        // Magic links: reopening the file itself, not its name.
         let self_pid = format!("/proc/{}/", t.proc.pid);
         let proc_rel = path.strip_prefix("/proc/self/").or_else(|| path.strip_prefix(self_pid.as_str()));
         if let Some(rel) = proc_rel.filter(|_| follow) {
@@ -824,6 +840,12 @@ impl Kernel {
         }
     }
 
+    /// The path of a mapped file, for /proc/<pid>/maps.
+    pub(super) fn fd_name(&self, t: &Thread, fd: i64) -> Option<String> {
+        let f = t.proc.files.lock().unwrap().get(fd).ok()?;
+        Some(file_name(&f))
+    }
+
     /// For MAP_SHARED of a file: the shared pages behind a writable file.
     pub(super) fn fd_shared_object(&self, t: &Thread, fd: i64) -> Result<Option<Arc<SharedObject>>, i64> {
         let f = t.proc.files.lock().unwrap().get(fd)?;
@@ -1011,20 +1033,7 @@ impl Kernel {
             t.proc.exe.lock().unwrap().clone().into_bytes()
         } else if let Some(fd) = self_fd {
             let f = t.proc.files.lock().unwrap().get(fd).map_err(|_| ENOENT)?;
-            match &f.kind {
-                Kind::Node(nf) => nf.lock().unwrap().node.path.clone().into_bytes(),
-                Kind::Mem(m) => m.name.clone().into_bytes(),
-                Kind::Null => b"/dev/null".to_vec(),
-                Kind::Zero => b"/dev/zero".to_vec(),
-                Kind::Random => b"/dev/urandom".to_vec(),
-                Kind::Pipe(_) => b"pipe:[0]".to_vec(),
-                Kind::Socket(_) => b"socket:[0]".to_vec(),
-                Kind::Event(_) => b"anon_inode:[eventfd]".to_vec(),
-                Kind::Timer(_) => b"anon_inode:[timerfd]".to_vec(),
-                Kind::Signal(_) => b"anon_inode:[signalfd]".to_vec(),
-                Kind::Epoll(_) => b"anon_inode:[eventpoll]".to_vec(),
-                _ => b"/dev/pts/0".to_vec(),
-            }
+            file_name(&f).into_bytes()
         } else {
             let node = self.resolve(t, dirfd, &path, false)?;
             let vfs = self.vfs()?;
@@ -1041,13 +1050,20 @@ impl Kernel {
     fn getdents64(&self, t: &Thread, fd: i64, buf: u64, count: u64) -> Result<i64, i64> {
         let f = t.proc.files.lock().unwrap().get(fd)?;
         let Kind::Node(nf) = &f.kind else { return Err(ENOTDIR) };
-        let mut nf = nf.lock().unwrap();
-        if nf.stat.mode & S_IFMT != S_IFDIR {
+        let mut guard = nf.lock().unwrap();
+        if guard.stat.mode & S_IFMT != S_IFDIR {
             return Err(ENOTDIR);
         }
-        if nf.dents.is_none() {
-            nf.dents = Some(self.vfs()?.readdir(&nf.node)?);
+        if guard.dents.is_none() {
+            // Listing may need this very file's lock (procfs names every open
+            // descriptor, including this directory), so list without holding it.
+            let node = guard.node.clone();
+            drop(guard);
+            let dents = self.vfs()?.readdir(&node)?;
+            guard = nf.lock().unwrap();
+            guard.dents.get_or_insert(dents);
         }
+        let mut nf = guard;
         let mut out = Vec::new();
         let mut idx = nf.pos as usize;
         let dents = nf.dents.as_ref().unwrap();
@@ -1191,6 +1207,24 @@ impl Kernel {
 fn nap(deadline: Option<Instant>, timer: Option<Instant>) -> Duration {
     let until = deadline.into_iter().chain(timer).min();
     until.map_or(POLL, |d| d.saturating_duration_since(Instant::now()).min(POLL)).max(Duration::from_micros(50))
+}
+
+/// What /proc/<pid>/fd/<n> points at.
+pub(super) fn file_name(f: &File) -> String {
+    match &f.kind {
+        Kind::Node(nf) => nf.lock().unwrap().node.path.clone(),
+        Kind::Mem(m) => m.name.clone(),
+        Kind::Null => "/dev/null".into(),
+        Kind::Zero => "/dev/zero".into(),
+        Kind::Random => "/dev/urandom".into(),
+        Kind::Pipe(p) => format!("pipe:[{}]", Arc::as_ptr(&p.pipe) as usize % 100_000),
+        Kind::Socket(s) => format!("socket:[{}]", Arc::as_ptr(s) as usize % 100_000),
+        Kind::Event(_) => "anon_inode:[eventfd]".into(),
+        Kind::Timer(_) => "anon_inode:[timerfd]".into(),
+        Kind::Signal(_) => "anon_inode:[signalfd]".into(),
+        Kind::Epoll(_) => "anon_inode:[eventpoll]".into(),
+        Kind::Stdin | Kind::Stdout | Kind::Stderr => "/dev/pts/0".into(),
+    }
 }
 
 /// `struct statfs` (same 120-byte layout on arm64 and x86_64): a read-only ext4-like volume.

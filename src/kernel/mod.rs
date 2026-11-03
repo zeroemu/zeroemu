@@ -13,6 +13,7 @@ mod futex;
 mod memory;
 mod misc;
 mod process;
+mod procfs;
 mod signal;
 mod specialfd;
 mod unix;
@@ -74,6 +75,10 @@ pub struct Kernel {
     exit: (Mutex<Option<i32>>, Condvar),
 }
 
+fn cmdline_bytes(argv: &[String]) -> Vec<u8> {
+    argv.iter().flat_map(|a| a.bytes().chain([0])).collect()
+}
+
 /// The writable filesystems a device has after first-stage init, empty
 /// apart from the basics (init itself is not run yet).
 fn mount_tmpfs(vfs: &mut Vfs, phys: &Arc<PhysMem>) {
@@ -93,6 +98,18 @@ fn mount_tmpfs(vfs: &mut Vfs, phys: &Arc<PhysMem>) {
     vfs.mount("/tmp", Tmpfs::new(phys.clone(), 0o1777));
     vfs.mount("/mnt", Tmpfs::new(phys.clone(), 0o755));
     vfs.mount("/cache", Tmpfs::new(phys.clone(), 0o770));
+    // sysfs: what bionic's sysconf and friends read. No /sys/fs/selinux, so
+    // libselinux sees SELinux as disabled.
+    let sys = Tmpfs::new(phys.clone(), 0o755);
+    let n = std::thread::available_parallelism().map_or(1, |n| n.get()).min(64);
+    for f in ["online", "possible", "present"] {
+        sys.write_file(&format!("devices/system/cpu/{f}"), 0o444, &format!("0-{}\n", n - 1));
+    }
+    sys.write_file("devices/system/cpu/kernel_max", 0o444, "63\n");
+    for d in ["fs", "kernel", "class", "bus", "block", "dev/char", "dev/block", "module"] {
+        sys.mkdir_p(d, 0o755);
+    }
+    vfs.mount("/sys", sys);
 }
 
 pub struct Process {
@@ -102,6 +119,8 @@ pub struct Process {
     pub files: Mutex<FdTable>,
     pub cwd: Mutex<String>,
     pub exe: Mutex<String>,
+    /// argv, NUL-separated, for /proc/<pid>/cmdline.
+    pub cmdline: Mutex<Vec<u8>>,
     sig: Mutex<Actions>,
     threads: Mutex<Vec<Arc<Thread>>>,
     children: Mutex<Vec<i32>>,
@@ -178,6 +197,11 @@ impl Thread {
 impl Kernel {
     pub fn new(hv: Arc<dyn Hypervisor>, vfs: Option<Vfs>, strace: bool) -> Result<Arc<Kernel>, String> {
         let phys = PhysMem::new(hv.clone());
+        let pages = hv.kernel_pages(&mut || {
+            let gpa = phys.alloc().expect("no memory for the kernel window");
+            (gpa, phys.host(gpa))
+        });
+        let kwin = KernelWindow::new(&phys, &pages).map_err(|e| format!("kernel window: errno {e}"))?;
         // Without an image the root itself is a tmpfs (for freestanding guests).
         let mut v = vfs.unwrap_or_else(|| {
             let mut v = Vfs::default();
@@ -185,15 +209,12 @@ impl Kernel {
             v
         });
         mount_tmpfs(&mut v, &phys);
-        let vfs = Some(Arc::new(v));
-        let pages = hv.kernel_pages(&mut || {
-            let gpa = phys.alloc().expect("no memory for the kernel window");
-            (gpa, phys.host(gpa))
-        });
-        let kwin = KernelWindow::new(&phys, &pages).map_err(|e| format!("kernel window: errno {e}"))?;
-        Ok(Arc::new(Kernel {
+        // /proc reads kernel state, so the kernel is built around it.
+        Ok(Arc::new_cyclic(|me| {
+            v.mount("/proc", procfs::ProcFs::new(me.clone()));
+            Kernel {
             arch: Arch::HOST,
-            vfs,
+            vfs: Some(Arc::new(v)),
             hv,
             phys,
             kwin,
@@ -206,6 +227,7 @@ impl Kernel {
             futex: futex::Futexes::default(),
             root_pid: AtomicI32::new(0),
             exit: (Mutex::new(None), Condvar::new()),
+            }
         }))
     }
 
@@ -218,6 +240,7 @@ impl Kernel {
         let mut mm = AddressSpace::new(self.phys.clone(), &self.kwin, self.alloc_asid())?;
         // Where signal handlers return to (Linux puts this in the vDSO).
         mm.map(Placement::Fixed(signal::SIGRETURN_TRAMPOLINE), PAGE, PROT_READ | PROT_EXEC, Backing::File { data: signal::trampoline_page(), offset: 0 })?;
+        mm.set_name(signal::SIGRETURN_TRAMPOLINE, PAGE, "[sigpage]");
         Ok(mm)
     }
 
@@ -226,7 +249,7 @@ impl Kernel {
     }
 
     /// Starts the first process: `mm` already holds the program and its stack.
-    pub fn start(self: &Arc<Self>, mm: AddressSpace, exe: String, state: CpuState) -> Result<(), String> {
+    pub fn start(self: &Arc<Self>, mm: AddressSpace, exe: String, argv: &[String], state: CpuState) -> Result<(), String> {
         let pid = self.next_id.fetch_add(1, Ordering::Relaxed);
         let proc = Arc::new(Process {
             pid,
@@ -235,6 +258,7 @@ impl Kernel {
             files: Mutex::new(FdTable::stdio()),
             cwd: Mutex::new("/".into()),
             exe: Mutex::new(exe),
+            cmdline: Mutex::new(cmdline_bytes(argv)),
             sig: Mutex::new(Actions::default()),
             threads: Mutex::new(Vec::new()),
             children: Mutex::new(Vec::new()),

@@ -139,6 +139,16 @@ impl Tmpfs {
         dir
     }
 
+    /// Convenience for populating a fresh tree: a file with `content`.
+    pub fn write_file(&self, path: &str, mode: u32, content: &str) {
+        let (dir, name) = path.rsplit_once('/').unwrap_or(("", path));
+        let d = self.mkdir_p(dir, 0o755);
+        let ino = self.add(d, name, S_IFREG | mode, Kind::File(MemFile::new(self.phys.clone()))).expect("tmpfs write_file");
+        if let Some(Kind::File(f)) = self.nodes.lock().unwrap().get(&ino).map(|n| &n.kind) {
+            f.write_at(0, content.as_bytes()).expect("tmpfs write_file");
+        }
+    }
+
     fn lookup_ino(&self, dir: u64, name: &str) -> Option<u64> {
         let nodes = self.nodes.lock().unwrap();
         match &nodes.get(&dir)?.kind {
@@ -153,6 +163,9 @@ impl Tmpfs {
 }
 
 impl FileSystem for Tmpfs {
+    fn fs_type(&self) -> &'static str {
+        "tmpfs"
+    }
     fn root(&self) -> io::Result<u64> {
         Ok(ROOT)
     }

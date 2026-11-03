@@ -56,6 +56,16 @@ check "background + wait"   "bg exited 0"         /system/bin/sh -c 'sleep 0.2 &
 check "trap handler"        "caught USR1"         /system/bin/sh -c 'trap "echo caught USR1" USR1; kill -USR1 $$; echo after'
 check "SIGTERM a child"     "status 143"          /system/bin/sh -c 'sleep 5 & p=$!; sleep 0.3; kill $p; wait $p; echo "status $?"'
 check "while read pipe"     "apex: com.android.adbd" /system/bin/sh -c 'ls /apex | head -1 | while read a; do echo "apex: $a"; done'
+# writable filesystems, /proc, /sys
+check "write /data"         "hello tmpfs"         /system/bin/sh -c 'echo "hello tmpfs" > /data/local/tmp/a && cat /data/local/tmp/a'
+check "mkdir/cp/mv/rm"      "moved"               /system/bin/sh -c 'cd /data/local/tmp && mkdir -p d/e && echo x > f && cp f d/e/g && mv d/e/g d/h && rm f && ls d && echo moved'
+check "/system read-only"   "ro"                  /system/bin/sh -c 'test -w /system || echo ro'
+check "/dev/null node"      "crw-rw-rw-"          /system/bin/toybox ls -l /dev/null
+check "ps"                  "toybox"              /system/bin/toybox ps -A -o NAME
+check "/proc/self/maps"     "/system/bin/toybox"  /system/bin/toybox cat /proc/self/maps
+check "/proc/self/fd"       "/dev/pts/0"          /system/bin/toybox ls -l /proc/self/fd
+check "mount"               "on /data type tmpfs" /system/bin/toybox mount
+check "nproc via /sys"      "0-"                  /system/bin/toybox cat /sys/devices/system/cpu/possible
 
 # Exit status needs its own path: the program's code must become droidrt's.
 perl -e 'alarm 60; exec @ARGV' "$BIN" --system "$IMG" /system/bin/sh -c 'exit 3' >/dev/null 2>&1

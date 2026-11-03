@@ -84,6 +84,7 @@ impl Kernel {
             files: Mutex::new(parent.files.lock().unwrap().clone()),
             cwd: Mutex::new(parent.cwd.lock().unwrap().clone()),
             exe: Mutex::new(parent.exe.lock().unwrap().clone()),
+            cmdline: Mutex::new(parent.cmdline.lock().unwrap().clone()),
             sig: Mutex::new(parent.sig.lock().unwrap().clone()),
             threads: Mutex::new(Vec::new()),
             children: Mutex::new(Vec::new()),
@@ -122,6 +123,7 @@ impl Kernel {
             Ok(m) => m,
             Err(e) => return Ret::Value(-e),
         };
+        let cmdline = super::cmdline_bytes(&argv);
         let (state, exe) = match self.load_program(&mut mm, &cwd, &path, argv, &envp) {
             Ok(x) => x,
             Err(e) => return Ret::Value(-e),
@@ -134,6 +136,7 @@ impl Kernel {
         t.proc.sig.lock().unwrap().reset_on_exec();
         *t.altstack.lock().unwrap() = (0, 0, super::signal::SS_DISABLE);
         *t.proc.exe.lock().unwrap() = exe;
+        *t.proc.cmdline.lock().unwrap() = cmdline;
         vcpu.set_page_tables(mm.root);
         vcpu.set_state(&state);
         let old = t.proc.mm.lock().unwrap().replace(mm);
@@ -184,6 +187,7 @@ impl Kernel {
                 eprintln!("[droidrt] exec: {e}");
                 ENOEXEC
             })?;
+            let mut interp_range = None;
             let (entry, base) = match &main.interp {
                 Some(interp) => {
                     let inode = vfs.resolve("/", interp, true)?;
@@ -192,12 +196,17 @@ impl Kernel {
                         eprintln!("[droidrt] exec: {e}");
                         ENOEXEC
                     })?;
+                    interp_range = Some((li.lo, li.end, inode.path.clone()));
                     (li.entry, li.bias)
                 }
                 None => (main.entry, 0),
             };
             mm.set_brk_start(main.end);
             let sp = elf::build_stack(mm, &main, base, &argv, envp)?;
+            mm.set_name(main.lo, main.end - main.lo, &node.path);
+            if let Some((lo, end, name)) = interp_range {
+                mm.set_name(lo, end - lo, &name);
+            }
             return Ok((CpuState::new_user(entry, sp), node.path));
         }
         Err(ELOOP)

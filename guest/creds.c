@@ -25,7 +25,9 @@ typedef unsigned short u16;
 #define NR_personality 92
 #define NR_exit_group 94
 #define NR_waitid 95
+#define NR_signalfd4 74
 #define NR_nanosleep 101
+#define NR_rt_sigprocmask 135
 #define NR_sched_setparam 118
 #define NR_sched_setscheduler 119
 #define NR_sched_getscheduler 120
@@ -479,34 +481,39 @@ static void prctls(void) {
 }
 
 static void groups_and_sessions(void) {
-    check(sys(NR_getpgid, 0) == 1 && sys(NR_getsid, 0) == 1 && sys(NR_setsid) == -EPERM, "pid 1 leads its session and group");
-    int p[2];
+    check(sys(NR_getpgid, 0) == 0 && sys(NR_getsid, 0) == 0, "pid 1 is in group and session 0, like init");
+    int p[2], q[2];
     sys(NR_pipe2, p, 0);
+    sys(NR_pipe2, q, 0);
     i64 pid = fork_();
     if (pid == 0) {
         failures = 0;
         int me = pid_self();
-        check(sys(NR_getpgid, 0) == 1 && sys(NR_getsid, 0) == 1, "a child inherits group and session");
-        check(sys(NR_setpgid, 0, 0) == 0 && sys(NR_getpgid, 0) == me && sys(NR_setsid) == -EPERM, "setpgid(0, 0); a group leader cannot setsid");
+        check(sys(NR_getpgid, 0) == 0 && sys(NR_getsid, 0) == 0, "a child inherits group and session");
+        char x;
+        sys(NR_write, q[1], "r", 1);
+        sys(NR_read, p[0], &x, 1); // the parent moves us first
+        check(sys(NR_getpgid, 0) == me && sys(NR_setsid) == -EPERM, "the parent's setpgid made us a group leader, which cannot setsid");
+        check(sys(NR_setpgid, 0, 0) == 0 && sys(NR_getpgid, 0) == me, "setpgid(0, 0) on ourselves");
         i64 c = fork_();
         if (c == 0) {
             failures = 0;
             int gc = pid_self();
-            check(sys(NR_setsid) == gc && sys(NR_getsid, 0) == gc && sys(NR_getpgid, 0) == gc, "setsid makes a new session and group");
+            check(sys(NR_getpgid, 0) == me && sys(NR_setsid) == gc && sys(NR_getsid, 0) == gc && sys(NR_getpgid, 0) == gc, "setsid makes a new session and group");
             check(sys(NR_setpgid, 0, me) == -EPERM, "joining a group in another session: EPERM");
             exit_(failures);
         }
         child_passed(c);
-        char x;
-        sys(NR_read, p[0], &x, 1); // parent moved us
-        check(sys(NR_getpgid, 0) == 1, "the parent's setpgid moved us back");
         exit_(failures);
     }
-    check(sys(NR_getpgid, pid) == pid || sys(NR_getpgid, pid) == 1, "getpgid of a child");
-    for (int i = 0; i < 200 && sys(NR_getpgid, pid) != pid; i++) sleep_ms(5);
-    check(sys(NR_setpgid, pid, 1) == 0 && sys(NR_getpgid, pid) == 1, "setpgid on a child");
+    char ready;
+    sys(NR_read, q[0], &ready, 1);
+    sys(NR_close, q[0]);
+    sys(NR_close, q[1]);
+    check(sys(NR_setpgid, pid, 0) == 0 && sys(NR_getpgid, pid) == pid && sys(NR_getsid, pid) == 0, "setpgid on a child");
     sys(NR_write, p[1], "x", 1);
     child_passed(pid);
+    check(sys(NR_kill, 0, 0) == 0, "kill(0) reaches our own group");
     check(sys(NR_setpgid, 99999, 0) == -ESRCH && sys(NR_getpgid, 99999) == -ESRCH && sys(NR_setpgid, 0, -1) == -EINVAL, "setpgid/getpgid errors");
 
     // kill(-pgid) reaches the whole group, including a grandchild
@@ -658,6 +665,41 @@ static void process_tree(void) {
     set_sigchld(0, 0);
     sys(NR_close, p[0]);
     sys(NR_close, p[1]);
+
+    // pid 1 gets only the signals it handles, like init.
+    a = fork_();
+    if (a == 0) exit_(sys(NR_kill, 1, 15) == 0 && sys(NR_kill, 1, 9) == 0 ? 0 : 1);
+    check(wait_status(a) == 0, "SIGTERM and SIGKILL to pid 1 are accepted");
+    sleep_ms(20);
+    check(1, "and ignored: pid 1 still runs");
+
+    // A blocked SIGCHLD is queued despite its default disposition: init reads it from a signalfd.
+    u64 chld = 1ul << 16;
+    sys(NR_rt_sigprocmask, 0 /* SIG_BLOCK */, &chld, 0, 8);
+    int sfd = (int)sys(NR_signalfd4, -1, &chld, 8, 0);
+    a = fork_();
+    if (a == 0) exit_(6);
+    unsigned char rec[128];
+    check(sys(NR_read, sfd, rec, 128) == 128 && *(u32 *)rec == 17 && *(int *)(rec + 12) == (int)a && *(int *)(rec + 40) == 6, "a blocked SIGCHLD reaches pid 1's signalfd");
+    check(wait_status(a) >> 8 == 6, "and the child is still there to reap");
+    sys(NR_close, sfd);
+    sys(NR_rt_sigprocmask, 1 /* SIG_UNBLOCK */, &chld, 0, 8);
+
+    // A pid 1 that never reaps cannot pile up orphaned zombies without bound.
+    a = fork_();
+    if (a == 0) {
+        for (int i = 0; i < 300; i++) {
+            i64 k;
+            while ((k = fork_()) < 0) sleep_ms(1);
+            if (k == 0) exit_(0);
+            sys(NR_waitid, 1, k, &si, 4 | 0x01000000, 0); // a zombie, left unreaped
+        }
+        exit_(0);
+    }
+    check(wait_status(a) == 0, "a process exits leaving 300 zombies");
+    int reaped = 0;
+    while (sys(NR_wait4, -1, &st, 1 /* WNOHANG */, 0) > 0) reaped++;
+    check(reaped == 256, "pid 1 keeps at most 256 adopted zombies");
 }
 
 static void vm_access(void) {

@@ -337,7 +337,7 @@ impl Kernel {
             exiting: Mutex::new(None),
             pending: Mutex::new(HashMap::new()),
             creds: Mutex::new(creds::Creds::root()),
-            attrs: Mutex::new(control::ProcAttrs::first(pid)),
+            attrs: Mutex::new(control::ProcAttrs::first()),
         });
         self.root_pid.store(pid, Ordering::Relaxed);
         self.procs.lock().unwrap().insert(pid, proc.clone());

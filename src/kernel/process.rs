@@ -1,6 +1,7 @@
 //! Process lifecycle: clone (threads and fork), execve, wait4/waitid, kill,
 //! process groups and sessions, and reparenting when a parent exits.
 
+use super::creds::Creds;
 use super::signal::{SIGCHLD, SIGCONT, SigInfo};
 use super::{ERESTARTSYS, Kernel, POLL, Process, Ret, Thread, int};
 use crate::arch::Sysno;
@@ -353,9 +354,12 @@ impl Kernel {
     /// ignores SIGCHLD (SIG_IGN or SA_NOCLDWAIT) has the child reaped at once.
     pub(super) fn notify_parent(&self, parent: &Arc<Process>, child: &Process, status: i32) {
         let (ignored, nocldwait) = parent.sig.lock().unwrap().child_ignore();
+        let adopted = child.attrs.lock().unwrap().adopted;
         if ignored || nocldwait {
             parent.children.lock().unwrap().retain(|&c| c != child.pid);
             self.procs.lock().unwrap().remove(&child.pid);
+        } else if adopted && parent.pid == self.root_pid.load(Ordering::Relaxed) {
+            self.trim_adopted_zombies(parent);
         }
         {
             let _children = parent.children.lock().unwrap();
@@ -377,7 +381,8 @@ impl Kernel {
         let Some(reaper) = (!orphans.is_empty()).then(|| self.find_reaper(proc)).flatten() else { return };
         for c in &orphans {
             c.ppid.store(reaper.pid, Ordering::Relaxed);
-            c.attrs.lock().unwrap().parent_tid = reaper.pid;
+            let mut a = c.attrs.lock().unwrap();
+            (a.parent_tid, a.adopted) = (reaper.pid, true);
         }
         reaper.children.lock().unwrap().extend(orphans.iter().map(|c| c.pid));
         for c in &orphans {
@@ -389,6 +394,24 @@ impl Kernel {
         }
         let _children = reaper.children.lock().unwrap();
         reaper.child_cv.notify_all();
+    }
+
+    /// The root may be a program that never waits for anything (droidrt runs
+    /// arbitrary ones as pid 1): orphans it adopted and never reaped are
+    /// released, oldest first, once there are more than ADOPTED_ZOMBIES.
+    fn trim_adopted_zombies(&self, root: &Process) {
+        const ADOPTED_ZOMBIES: usize = 256;
+        let mut children = root.children.lock().unwrap();
+        let zombies: Vec<i32> = children
+            .iter()
+            .filter_map(|&c| self.process(c))
+            .filter(|c| c.status.lock().unwrap().is_some() && c.attrs.lock().unwrap().adopted)
+            .map(|c| c.pid)
+            .collect();
+        for pid in zombies.iter().take(zombies.len().saturating_sub(ADOPTED_ZOMBIES)) {
+            children.retain(|c| c != pid);
+            self.procs.lock().unwrap().remove(pid);
+        }
     }
 
     fn find_reaper(&self, proc: &Process) -> Option<Arc<Process>> {
@@ -446,8 +469,9 @@ impl Kernel {
             Sysno::getsid => Ok(lookup(pid).ok_or(ESRCH)?.attrs.lock().unwrap().sid as i64),
             Sysno::setsid => {
                 let procs = self.procs.lock().unwrap();
+                let leader = t.proc.attrs.lock().unwrap().leader;
                 // Fails if a process group with our id exists (ours, if we lead one).
-                if t.proc.attrs.lock().unwrap().leader || procs.values().any(|p| p.attrs.lock().unwrap().pgid == me) {
+                if leader || procs.values().any(|p| p.attrs.lock().unwrap().pgid == me) {
                     return Err(EPERM);
                 }
                 let mut attrs = t.proc.attrs.lock().unwrap();
@@ -499,11 +523,12 @@ impl Kernel {
         }
         let me = sender.proc.pid;
         let root = self.root_pid.load(Ordering::Relaxed);
+        let own_group = sender.proc.attrs.lock().unwrap().pgid;
         let all = || -> Vec<Arc<Process>> { self.procs.lock().unwrap().values().cloned().collect() };
         let in_group = |g: i32| -> Vec<Arc<Process>> { all().into_iter().filter(|p| p.attrs.lock().unwrap().pgid == g).collect() };
         let targets: Vec<Arc<Process>> = match pid {
             p if p > 0 => self.process(p).or_else(|| self.live_process(p)).into_iter().collect(),
-            0 => in_group(sender.proc.attrs.lock().unwrap().pgid),
+            0 => in_group(own_group),
             -1 => all().into_iter().filter(|p| p.pid != root && p.pid != me).collect(),
             i32::MIN => Vec::new(),
             p => in_group(-p),
@@ -512,11 +537,9 @@ impl Kernel {
             return -ESRCH;
         }
         let creds = self.creds(sender);
-        let session = sender.proc.attrs.lock().unwrap().sid;
         let (mut sent, mut err) = (false, -ESRCH);
         for p in targets {
-            let allowed = p.pid == me || creds.may_kill(&p.creds.lock().unwrap()) || (sig == SIGCONT && p.attrs.lock().unwrap().sid == session);
-            if !allowed {
+            if !self.may_signal(sender, &creds, &p, sig) {
                 err = -EPERM;
                 continue;
             }
@@ -535,13 +558,27 @@ impl Kernel {
         }
         let Some(th) = self.task(tid).filter(|th| tgid <= 0 || th.proc.pid == tgid) else { return -ESRCH };
         let creds = self.creds(sender);
-        if !Arc::ptr_eq(&th.proc, &sender.proc) && !creds.may_kill(&th.proc.creds.lock().unwrap()) && !(sig == SIGCONT && th.proc.attrs.lock().unwrap().sid == sender.proc.attrs.lock().unwrap().sid) {
+        if !self.may_signal(sender, &creds, &th.proc, sig) {
             return -EPERM;
         }
         if sig != 0 {
             self.send_thread_signal(&th, sig, SigInfo::user(sig, sender.proc.pid).with_uid(creds.uid));
         }
         0
+    }
+
+    /// check_kill_permission: our own process, matching uids, CAP_KILL, or
+    /// SIGCONT within our session.
+    fn may_signal(&self, sender: &Thread, creds: &Creds, target: &Process, sig: u32) -> bool {
+        if std::ptr::eq(&*sender.proc, target) {
+            return true;
+        }
+        let theirs = target.creds.lock().unwrap().clone();
+        if creds.may_kill(&theirs) {
+            return true;
+        }
+        let sid = target.attrs.lock().unwrap().sid;
+        sig == SIGCONT && sid == sender.proc.attrs.lock().unwrap().sid
     }
 }
 

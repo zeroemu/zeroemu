@@ -51,6 +51,8 @@ pub struct ProcAttrs {
     pub execed: bool,
     /// The thread that forked us; its exit sends our threads their parent-death signal.
     pub parent_tid: i32,
+    /// Reparented to a reaper after our parent exited.
+    pub adopted: bool,
     pub subreaper: bool,
     pub dumpable: u32,
     pub limits: [(u64, u64); RLIM_NLIMITS as usize],
@@ -59,8 +61,9 @@ pub struct ProcAttrs {
 }
 
 impl ProcAttrs {
-    /// The first process, a session and group leader like a login shell or init.
-    pub fn first(pid: i32) -> ProcAttrs {
+    /// The first process. Like Linux's init it is in process group and
+    /// session 0, inherited from the idle task, and leads neither.
+    pub fn first() -> ProcAttrs {
         let mut limits = [(INF, INF); RLIM_NLIMITS as usize];
         limits[3] = (STACK_SIZE, INF); // RLIMIT_STACK
         limits[4] = (0, INF); // RLIMIT_CORE
@@ -71,11 +74,11 @@ impl ProcAttrs {
         limits[12] = (819_200, 819_200); // RLIMIT_MSGQUEUE
         limits[RLIMIT_NICE] = (0, 0);
         limits[RLIMIT_RTPRIO] = (0, 0);
-        ProcAttrs { pgid: pid, sid: pid, leader: true, execed: false, parent_tid: 0, subreaper: false, dumpable: 1, limits, personality: 0, thp_disable: false }
+        ProcAttrs { pgid: 0, sid: 0, leader: false, execed: false, parent_tid: 0, adopted: false, subreaper: false, dumpable: 1, limits, personality: 0, thp_disable: false }
     }
 
     pub fn fork(&self, parent_tid: i32) -> ProcAttrs {
-        ProcAttrs { leader: false, execed: false, parent_tid, subreaper: false, ..self.clone() }
+        ProcAttrs { leader: false, execed: false, parent_tid, adopted: false, subreaper: false, ..self.clone() }
     }
 }
 
@@ -402,7 +405,8 @@ impl Kernel {
                         return Err(EINVAL);
                     }
                     t.proc.mm().read_vec(ptr, len as usize * 8)?;
-                    if !t.attrs.lock().unwrap().no_new_privs && !self.creds(t).capable(CAP_SYS_ADMIN) {
+                    let nnp = t.attrs.lock().unwrap().no_new_privs;
+                    if !nnp && !self.creds(t).capable(CAP_SYS_ADMIN) {
                         return Err(EACCES);
                     }
                     if flags & FLAG_NEW_LISTENER != 0 {

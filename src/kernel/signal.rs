@@ -207,15 +207,31 @@ impl Thread {
 }
 
 impl Kernel {
-    fn discarded(&self, proc: &Process, sig: u32) -> bool {
+    /// sig_ignored: whether sending `sig` is a no-op. A blocked signal is
+    /// always queued (its disposition may change, or signalfd reads it).
+    /// The root process is pid 1: like Linux's init (SIGNAL_UNKILLABLE) it
+    /// gets only signals it handles, never SIGKILL; faults still kill it.
+    fn discarded(&self, proc: &Process, sig: u32, blocked: bool) -> bool {
+        let init = self.is_init(proc);
+        if init && (sig == SIGKILL || sig == SIGSTOP) {
+            return true;
+        }
+        if blocked {
+            return false;
+        }
         let act = proc.sig.lock().unwrap().get(sig);
         sig != SIGKILL
             && (act.handler == SIG_IGN
-                || (act.handler == SIG_DFL && default_action(sig) == Default_::Ignore))
+                || (act.handler == SIG_DFL && (init || default_action(sig) == Default_::Ignore)))
+    }
+
+    fn is_init(&self, proc: &Process) -> bool {
+        proc.pid == self.root_pid.load(Ordering::Relaxed)
     }
 
     pub(super) fn send_process_signal(&self, proc: &Arc<Process>, sig: u32, info: SigInfo) {
-        if proc.status.lock().unwrap().is_some() || self.discarded(proc, sig) {
+        let blocked = proc.threads.lock().unwrap().iter().any(|t| t.mask.load(Ordering::Relaxed) & bit(sig) != 0);
+        if proc.status.lock().unwrap().is_some() || self.discarded(proc, sig, blocked) {
             return;
         }
         if sig == SIGKILL {
@@ -223,6 +239,9 @@ impl Kernel {
             return;
         }
         proc.pending.lock().unwrap().insert(sig, info);
+        if blocked {
+            super::wait::EVENTS.bump(); // a signalfd reader may be polling for it
+        }
         // Wake a thread that can take it.
         let threads = proc.threads.lock().unwrap();
         if let Some(th) = threads
@@ -234,7 +253,7 @@ impl Kernel {
     }
 
     pub(super) fn send_thread_signal(&self, th: &Arc<Thread>, sig: u32, info: SigInfo) {
-        if self.discarded(&th.proc, sig) {
+        if self.discarded(&th.proc, sig, th.mask.load(Ordering::Relaxed) & bit(sig) != 0) {
             return;
         }
         if sig == SIGKILL {
@@ -280,6 +299,7 @@ impl Kernel {
             if act.handler == SIG_DFL {
                 match default_action(sig) {
                     Default_::Ignore => continue,
+                    _ if self.is_init(&t.proc) => continue, // queued while blocked
                     d => {
                         if d == Default_::Core || self.strace {
                             eprintln!(

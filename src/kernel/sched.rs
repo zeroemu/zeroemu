@@ -121,7 +121,7 @@ impl Kernel {
                     let c = th.proc.creds.lock().unwrap().clone();
                     let nice_limit = th.proc.attrs.lock().unwrap().limits[RLIMIT_NICE].0;
                     let mut ta = th.attrs.lock().unwrap();
-                    if me.euid != c.uid && me.euid != c.euid && !me.capable(CAP_SYS_NICE) {
+                    if (me.euid != c.uid && me.euid != c.euid && !me.capable(CAP_SYS_NICE)) || !me.safe_nice(&c) {
                         err = Some(EPERM);
                     } else if nice < ta.sched.nice && (20 - nice) as u64 > nice_limit && !me.capable(CAP_SYS_NICE) {
                         err = Some(EACCES);
@@ -243,7 +243,7 @@ impl Kernel {
                     }
                     for th in targets {
                         let c = th.proc.creds.lock().unwrap().clone();
-                        if c.uid != me.euid && c.uid != me.uid && !me.capable(CAP_SYS_NICE) {
+                        if (c.uid != me.euid && c.uid != me.uid && !me.capable(CAP_SYS_NICE)) || !me.safe_nice(&c) {
                             return Err(EPERM);
                         }
                         th.attrs.lock().unwrap().sched.ioprio = ioprio;
@@ -359,7 +359,8 @@ impl Kernel {
         if !me.capable(CAP_SYS_NICE) {
             let nice_ok = |n: i32| (20 - n) as u64 <= limits[RLIMIT_NICE].0;
             let rtprio = limits[RLIMIT_RTPRIO].0;
-            let denied = (fair(policy) && nice < cur.nice && !nice_ok(nice))
+            let denied = c.prm & !me.prm != 0
+                || (fair(policy) && nice < cur.nice && !nice_ok(nice))
                 || (rt(policy) && ((policy != cur.policy && rtprio == 0) || (prio > cur.prio && prio as u64 > rtprio)))
                 || policy == SCHED_DEADLINE
                 || (cur.policy == SCHED_IDLE && policy != SCHED_IDLE && !nice_ok(cur.nice))

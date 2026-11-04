@@ -717,6 +717,8 @@ static void process_tree(void) {
 // Linux ptrace_may_access (REALCREDS) requires the caller's real uid and gid
 // to equal every one of the target's real, effective and saved ids. Matching
 // only the effective uid, while dumpable, must not allow process_vm.
+// cap_safe_nice: without CAP_SYS_NICE, a task whose permitted set is not a
+// superset of the target's cannot change its nice, scheduler or ioprio.
 static void cross_cred(void) {
     int p[2], q[2];
     sys(NR_pipe2, p, 0);
@@ -756,6 +758,32 @@ static void cross_cred(void) {
         check(sys(NR_process_vm_readv, peer, &l2, 1, &r2, 1, 0) == 7 && seq(got2, "peer-ok", 7), "process_vm: equal ids and dumpable");
         sys(NR_write, q[1], "d", 1);
         wait_status(peer);
+        exit_(failures);
+    }
+    child_passed(mid);
+
+    mid = fork_();
+    if (mid == 0) {
+        failures = 0;
+        i64 strong = fork_();
+        if (strong == 0) {
+            prctl(PR_SET_KEEPCAPS, 1, 0, 0, 0);
+            sys(NR_setresuid, 1000, 1000, 1000);
+            sys(NR_write, p[1], "s", 1);
+            char d;
+            sys(NR_read, q[0], &d, 1);
+            exit_(0);
+        }
+        char c;
+        sys(NR_read, p[0], &c, 1);
+        sys(NR_setresuid, 1000, 1000, 1000);
+        int prio = 0;
+        int be3 = 2 << 13 | 3;
+        check(sys(NR_setpriority, 0, strong, 5) == -EPERM, "setpriority of a more-capable peer: EPERM");
+        check(sys(NR_ioprio_set, 1, strong, be3) == -EPERM, "ioprio_set of a more-capable peer: EPERM");
+        check(sys(NR_sched_setscheduler, strong, 0, &prio) == -EPERM, "sched_setscheduler of a more-capable peer: EPERM");
+        sys(NR_write, q[1], "d", 1);
+        wait_status(strong);
         exit_(failures);
     }
     child_passed(mid);

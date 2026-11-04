@@ -110,27 +110,36 @@ fn head(stmt: &str) -> (&str, &str) {
     (w.next().unwrap_or(""), w.next().unwrap_or(""))
 }
 
-/// The texts of a CIL file's top-level statements that the model uses.
-/// Policy files hold a statement per line (secilc's and Android's build
-/// output), so a line opening with an unwanted keyword is skipped without
-/// looking further, which keeps the allow rules (most of the text) off the
-/// paren matcher; a wanted statement is matched exactly, over any lines.
+/// The texts of a CIL file's top-level statements that the model uses; the
+/// rest (mostly allow rules) are only paren-matched.
 fn statements<'a>(text: &'a str, out: &mut Vec<&'a str>) {
     let b = text.as_bytes();
     let mut i = 0;
     while i < b.len() {
-        let end = text[i..].find('\n').map_or(b.len(), |p| i + p);
-        let start = i + b[i..end].iter().take_while(|c| c.is_ascii_whitespace()).count();
-        let kw_len = b[start..end].iter().skip(1).take_while(|c| c.is_ascii_lowercase() || **c == b'_').count();
-        if start == end || b[start] != b'(' || !wanted(&text[start + 1..start + 1 + kw_len]) {
-            i = end + 1;
-            continue;
+        match b[i] {
+            b'(' => {
+                let kw = b[i + 1..].iter().take_while(|c| c.is_ascii_lowercase() || **c == b'_').count();
+                let end = skip(b, i);
+                if wanted(&text[i + 1..i + 1 + kw]) {
+                    out.push(&text[i..end]);
+                }
+                i = end;
+            }
+            b';' => i = text[i..].find('\n').map_or(b.len(), |p| i + p),
+            _ => i += 1,
         }
-        let stmt_end = skip(b, start);
-        out.push(&text[start..stmt_end]);
-        i = stmt_end;
     }
 }
+
+/// Bytes the paren matcher stops at.
+const SPECIAL: [bool; 256] = {
+    let mut t = [false; 256];
+    t[b'(' as usize] = true;
+    t[b')' as usize] = true;
+    t[b'"' as usize] = true;
+    t[b';' as usize] = true;
+    t
+};
 
 /// The index just past the expression starting with '(' at `i`.
 fn skip(b: &[u8], mut i: usize) -> usize {
@@ -149,6 +158,9 @@ fn skip(b: &[u8], mut i: usize) -> usize {
             _ => {}
         }
         i += 1;
+        while i < b.len() && !SPECIAL[b[i] as usize] {
+            i += 1;
+        }
     }
     b.len()
 }
@@ -507,5 +519,86 @@ impl Eval<'_, '_> {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Policy;
+
+    const MINI: &str = include_str!("../../../testdata/sepolicy_mini.cil");
+    /// A second file, as a vendor policy would be: attributes defined by
+    /// expressions over other attributes, used by a transition.
+    const EXTRA: &str = "
+        ; comment (with parens
+        (typeattribute domain)
+        (typeattributeset domain (init kernel shell logd toolbox hal_audio_default test_t))
+        (typeattributeset not_init (and (domain) (not (init kernel))))
+        (type test_exec)
+        (type test_t)
+        (allow domain test_exec (file (read
+            execute)))
+        (typetransition not_init test_exec process test_t)
+        (boolean test_bool true)
+    ";
+
+    #[test]
+    fn class_indices_and_permission_bits() {
+        let p = Policy::parse(&[MINI]);
+        // classorder: security process system capability ... (index = position + 1)
+        assert_eq!(p.class_index("security"), Some(1));
+        assert_eq!(p.class_index("process"), Some(2));
+        assert_eq!(p.class_index("file"), Some(6));
+        assert_eq!(p.class_index("property_service"), Some(99));
+        assert_eq!(p.classes.len(), 107);
+        // A class's own permissions follow its common's.
+        let file = p.class(6).unwrap();
+        assert_eq!(file.perms[0], "ioctl");
+        assert_eq!(file.perms.iter().position(|x| x == "execute_no_trans"), Some(25));
+        assert_eq!(p.class(2).unwrap().perms[1], "transition");
+        assert_eq!(p.class(99).unwrap().perms, ["set"]);
+        assert_eq!(p.class_index("capability").and_then(|c| p.class(c)).map(|c| c.perms.len()), Some(32));
+    }
+
+    #[test]
+    fn sids_and_caps() {
+        let p = Policy::parse(&[MINI]);
+        assert_eq!(p.sids[0], ("kernel".to_string(), "u:r:kernel:s0".to_string()));
+        assert_eq!(p.sids.last().unwrap(), &("devnull".to_string(), "u:object_r:null_device:s0".to_string()));
+        assert!(p.caps.iter().any(|c| c == "open_perms"));
+    }
+
+    #[test]
+    fn type_transitions() {
+        let p = Policy::parse(&[MINI, EXTRA]);
+        let process = p.class_index("process").unwrap();
+        assert_eq!(p.transition("init", "logd_exec", process, None), Some("logd"));
+        assert_eq!(p.transition("kernel", "init_exec", process, None), Some("init"));
+        assert_eq!(p.transition("init", "system_file", process, None), None);
+        // The source is init_202504, an attribute holding init (the vendor mapping).
+        assert_eq!(p.transition("init", "hal_audio_default_exec", process, None), Some("hal_audio_default"));
+        assert_eq!(p.transition("shell", "hal_audio_default_exec", process, None), None);
+        // An attribute given by (and (domain) (not (init kernel))).
+        assert_eq!(p.transition("shell", "test_exec", process, None), Some("test_t"));
+        assert_eq!(p.transition("init", "test_exec", process, None), None);
+        let file = p.class_index("file").unwrap();
+        assert_eq!(p.transition("shell", "tmpfs", file, None), Some("appdomain_tmpfs"));
+        assert_eq!(p.transition("shell", "tmpfs", process, None), None);
+        // Named transitions apply only to their name.
+        let anon = p.class_index("anon_inode").unwrap();
+        assert_eq!(p.transition("shell", "shell", anon, Some("[userfaultfd]")), Some("shell_userfaultfd"));
+        assert_eq!(p.transition("shell", "shell", anon, Some("[io_uring]")), None);
+        assert_eq!(p.bools, [("test_bool".to_string(), true)]);
+    }
+
+    #[test]
+    fn context_validity() {
+        let p = Policy::parse(&[MINI, EXTRA]);
+        assert!(p.valid("u", "r", "init"));
+        assert!(p.valid("u", "object_r", "system_file"));
+        assert!(!p.valid("u", "r", "system_file")); // not a domain
+        assert!(!p.valid("u", "r", "no_such_type"));
+        assert!(!p.valid("x", "r", "init"));
+        assert_eq!(p.type_name("rs_data_file"), Some("app_exec_data_file"));
     }
 }

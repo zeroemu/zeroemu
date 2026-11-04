@@ -326,7 +326,7 @@ impl Kernel {
             status: Mutex::new(None),
             exiting: Mutex::new(None),
             pending: Mutex::new(HashMap::new()),
-            sec: selinux::ProcSec::new(self.selinux.initial),
+            sec: self.selinux.initial_sec(),
         });
         self.root_pid.store(pid, Ordering::Relaxed);
         self.procs.lock().unwrap().insert(pid, proc.clone());

@@ -213,6 +213,43 @@ fn canonical_level(l: &str) -> Result<String, i64> {
     Ok(if lo == hi { lo.to_string() } else { format!("{lo}-{hi}") })
 }
 
+/// Checks a context against the policy; returns its canonical form
+/// (aliases resolved, "s0-s0" shortened). Without a policy only the shape
+/// user:role:type:level is checked.
+fn canonical(p: &Policy, ctx: &str) -> Result<String, i64> {
+    let ctx = ctx.trim_end_matches('\0');
+    let mut f = ctx.splitn(4, ':');
+    let (Some(u), Some(r), Some(t), Some(l)) = (f.next(), f.next(), f.next(), f.next()) else { return Err(EINVAL) };
+    if [u, r, t, l].iter().any(|s| s.is_empty() || s.contains(|c: char| c.is_whitespace() || c == '\0')) {
+        return Err(EINVAL);
+    }
+    let level = canonical_level(l)?;
+    if p.is_empty() {
+        return Ok(format!("{u}:{r}:{t}:{level}"));
+    }
+    if !p.valid(u, r, t) {
+        return Err(EINVAL);
+    }
+    Ok(format!("{u}:{r}:{}:{level}", p.type_name(t).unwrap_or(t)))
+}
+
+/// security_compute_create: the context of an object of `class` that `scon`
+/// creates with `tcon` as its parent (or, for class process, of the domain
+/// `scon` enters by executing a `tcon` file). As the kernel's
+/// security_compute_sid with no default_* statements: processes and sockets
+/// keep the creator's role, type and level unless a type transition applies;
+/// other objects take object_r, the parent's type and the creator's low level.
+fn compute_create(p: &Policy, scon: &str, tcon: &str, class: u16, name: Option<&str>) -> Result<String, i64> {
+    let (s, t) = (canonical(p, scon)?, canonical(p, tcon)?);
+    let s: Vec<&str> = s.splitn(4, ':').collect();
+    let t: Vec<&str> = t.splitn(4, ':').collect();
+    let cname = p.class(class).map_or("", |c| c.name.as_str());
+    let subject = cname == "process" || cname.ends_with("socket");
+    let (role, ty, level) = if subject { (s[1], s[2], s[3]) } else { ("object_r", t[2], s[3].split('-').next().unwrap()) };
+    let ty = p.transition(s[2], t[2], class, name).unwrap_or(ty);
+    Ok(format!("{}:{role}:{ty}:{level}", s[0]))
+}
+
 /// The policy files init's first stage would compile, in secilc's order.
 fn load(vfs: Option<&Vfs>) -> Policy {
     let Some(vfs) = vfs else { return Policy::default() };
@@ -274,44 +311,36 @@ impl Selinux {
         let _ = self.status.write_at(0, &fields.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>());
     }
 
-    /// Checks a context against the policy; returns its canonical form
-    /// (aliases resolved, "s0-s0" shortened). Without a policy only the
-    /// shape user:role:type:level is checked.
-    pub fn canonical(&self, ctx: &str) -> Result<String, i64> {
-        let ctx = ctx.trim_end_matches('\0');
-        let mut f = ctx.splitn(4, ':');
-        let (Some(u), Some(r), Some(t), Some(l)) = (f.next(), f.next(), f.next(), f.next()) else { return Err(EINVAL) };
-        if [u, r, t, l].iter().any(|s| s.is_empty() || s.contains(|c: char| c.is_whitespace() || c == '\0')) {
-            return Err(EINVAL);
+    /// The first process's contexts: init came from the kernel domain (by
+    /// first-stage init's exec); a shell's previous context is its own.
+    pub fn initial_sec(&self) -> ProcSec {
+        let sec = ProcSec::new(self.initial);
+        if context(self.initial).as_deref() == Some("u:r:init:s0") {
+            sec.prev.store(sid("u:r:kernel:s0"), Ordering::Relaxed);
         }
-        let level = canonical_level(l)?;
-        let p = self.policy();
-        if p.is_empty() {
-            return Ok(format!("{u}:{r}:{t}:{level}"));
-        }
-        if !p.valid(u, r, t) {
-            return Err(EINVAL);
-        }
-        Ok(format!("{u}:{r}:{}:{level}", p.type_name(t).unwrap_or(t)))
+        sec
     }
 
-    /// security_compute_create: the context of an object of `class` that
-    /// `scon` creates with `tcon` as its parent (or, for class process, of
-    /// the domain `scon` enters by executing a `tcon` file). As the kernel's
-    /// security_compute_sid with no default_* statements: processes and
-    /// sockets keep the creator's role, type and level unless a type
-    /// transition applies; other objects take object_r, the parent's type
-    /// and the creator's low level.
+    pub fn canonical(&self, ctx: &str) -> Result<String, i64> {
+        canonical(&self.policy(), ctx)
+    }
+
     pub fn compute_create(&self, scon: &str, tcon: &str, class: u16, name: Option<&str>) -> Result<String, i64> {
-        let (s, t) = (self.canonical(scon)?, self.canonical(tcon)?);
-        let s: Vec<&str> = s.splitn(4, ':').collect();
-        let t: Vec<&str> = t.splitn(4, ':').collect();
+        compute_create(&self.policy(), scon, tcon, class, name)
+    }
+
+    /// The label a file that `t` creates as `name` in a directory labelled
+    /// `dir` gets, as Linux's selinux_inode_init_security: the thread's
+    /// fscreate context, else the policy's type transition for `class`
+    /// ("file", "dir", "sock_file", …), else the directory's type.
+    #[allow(dead_code)] // for tmpfs labels once the VFS has xattrs
+    pub fn new_file_context(&self, t: &Thread, dir: &str, class: &str, name: &str) -> String {
+        if let Some(c) = context(t.sec.get(3)) {
+            return c.to_string();
+        }
         let p = self.policy();
-        let cname = p.class(class).map_or("", |c| c.name.as_str());
-        let subject = cname == "process" || cname.ends_with("socket");
-        let (role, ty, level) = if subject { (s[1], s[2], s[3]) } else { ("object_r", t[2], s[3].split('-').next().unwrap()) };
-        let ty = p.transition(s[2], t[2], class, name).unwrap_or(ty);
-        Ok(format!("{}:{role}:{ty}:{level}", s[0]))
+        let scon = context(t.proc.sec.current()).unwrap_or_default();
+        p.class_index(class).and_then(|c| compute_create(&p, &scon, dir, c, Some(name)).ok()).unwrap_or_else(|| dir.to_string())
     }
 
     /// Applies an execve's transition to the calling thread: its exec
@@ -322,9 +351,9 @@ impl Selinux {
         let new = match t.sec.0[0].swap(0, Ordering::Relaxed) {
             0 => {
                 let file = vfs.resolve(cwd, path, true).map(|n| file_context(vfs, &n)).unwrap_or_else(|_| "u:object_r:system_file:s0".into());
-                let scon = context(cur).unwrap_or_default();
-                let process = self.policy().class_index("process");
-                process.and_then(|c| self.compute_create(&scon, &file, c, None).ok()).map_or(cur, |c| sid(&c))
+                let (p, scon) = (self.policy(), context(cur).unwrap_or_default());
+                let process = p.class_index("process");
+                process.and_then(|c| compute_create(&p, &scon, &file, c, None).ok()).map_or(cur, |c| sid(&c))
             }
             s => s,
         };
@@ -646,4 +675,71 @@ pub(super) fn open(k: &Kernel, vfs: &Vfs, node: &Node) -> Result<Box<dyn Special
         return Ok(Box::new(AttrFile { se: k.selinux.clone(), proc, tid, which }));
     }
     Ok(Box::new(FsFile { se: k.selinux.clone(), ino: node.ino, reply: Mutex::new(Vec::new()) }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mini() -> Policy {
+        let domains = "(typeattribute domain) (typeattributeset domain (init kernel shell logd toolbox hal_audio_default))";
+        Policy::parse(&[include_str!("../../testdata/sepolicy_mini.cil"), domains])
+    }
+
+    #[test]
+    fn contexts() {
+        let p = mini();
+        assert_eq!(canonical(&p, "u:r:init:s0\0"), Ok("u:r:init:s0".into()));
+        assert_eq!(canonical(&p, "u:r:init:s0-s0"), Ok("u:r:init:s0".into()));
+        assert_eq!(canonical(&p, "u:object_r:rs_data_file:s0"), Ok("u:object_r:app_exec_data_file:s0".into()));
+        assert_eq!(canonical(&p, "u:r:shell:s0:c512,c768"), Ok("u:r:shell:s0:c512,c768".into()));
+        assert_eq!(canonical(&p, "u:r:shell:s0-s0:c0.c1023"), Ok("u:r:shell:s0-s0:c0.c1023".into()));
+        for bad in ["u:r:init", "u:r:nope:s0", "u:r:system_file:s0", "u:r:init:x0", "u:r:init:s0 ", "u:r:init:s0:d1"] {
+            assert_eq!(canonical(&p, bad), Err(EINVAL), "{bad}");
+        }
+        // Without a policy, only the shape counts.
+        assert_eq!(canonical(&Policy::default(), "u:r:anything:s0"), Ok("u:r:anything:s0".into()));
+    }
+
+    #[test]
+    fn create() {
+        let p = mini();
+        let class = |n| p.class_index(n).unwrap();
+        // init's ComputeContextFromExecutable for logd.
+        assert_eq!(compute_create(&p, "u:r:init:s0", "u:object_r:logd_exec:s0", class("process"), None), Ok("u:r:logd:s0".into()));
+        // No rule: a process keeps its context (init refuses such services).
+        assert_eq!(compute_create(&p, "u:r:init:s0", "u:object_r:system_file:s0", class("process"), None), Ok("u:r:init:s0".into()));
+        assert_eq!(compute_create(&p, "u:r:shell:s0", "u:object_r:tmpfs:s0", class("file"), None), Ok("u:object_r:appdomain_tmpfs:s0".into()));
+        // Objects take the parent's type and the creator's low level.
+        assert_eq!(compute_create(&p, "u:r:shell:s0-s0:c0.c1023", "u:object_r:system_file:s0", class("dir"), None), Ok("u:object_r:system_file:s0".into()));
+        assert_eq!(compute_create(&p, "u:r:shell:s0", "u:r:shell:s0", class("anon_inode"), Some("[userfaultfd]")), Ok("u:object_r:shell_userfaultfd:s0".into()));
+        assert_eq!(compute_create(&p, "u:r:shell:s0", "u:r:shell:s0", class("unix_stream_socket"), None), Ok("u:r:shell:s0".into()));
+        assert_eq!(compute_create(&p, "u:r:bogus:s0", "u:r:shell:s0", class("process"), None), Err(EINVAL));
+    }
+
+    #[test]
+    fn request_helpers() {
+        assert_eq!(decode_name("%5Buserfaultfd%5D"), Ok("[userfaultfd]".into()));
+        assert_eq!(decode_name("a+b"), Ok("a b".into()));
+        assert_eq!(decode_name("%zz"), Err(EINVAL));
+        assert_eq!(int_arg(b"1\0"), Ok(1));
+        assert_eq!(int_arg(b" 0\n"), Ok(0));
+        assert_eq!(int_arg(b"x"), Err(EINVAL));
+    }
+
+    /// The real policy, when the SDK image the end-to-end tests use is installed.
+    #[test]
+    fn image_policy() {
+        let Some(home) = std::env::var_os("HOME") else { return };
+        let img = std::path::Path::new(&home).join("Library/Android/sdk/system-images/android-36.1/google_apis_playstore/arm64-v8a/system.img");
+        let Ok(vfs) = crate::android::open_system_image(&img) else { return };
+        let p = load(Some(&vfs));
+        let process = p.class_index("process").unwrap();
+        assert_eq!(p.class_index("property_service"), Some(99));
+        assert_eq!(p.transition("init", "logd_exec", process, None), Some("logd"));
+        assert_eq!(p.transition("init", "hal_audio_default_exec", process, None), Some("hal_audio_default"));
+        assert_eq!(p.transition("init", "system_file", process, None), None);
+        assert!(p.valid("u", "r", "untrusted_app"));
+        assert_eq!(compute_create(&p, "u:r:init:s0", "u:object_r:apexd_exec:s0", process, None), Ok("u:r:apexd:s0".into()));
+    }
 }

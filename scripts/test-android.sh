@@ -78,6 +78,16 @@ check "log to stderr"       "I droidrt-test: hello log" /system/bin/log -t droid
 check "logcat -d"           "W/t2      (    3): two"  /system/bin/sh -c 'log -t t1 one; log -p w -t t2 two; logcat -d -v brief -s t2 2>&1'
 check "logcat stream"       "I/t3      (    4): live" /system/bin/sh -c 'logcat -v brief -s t3 > /data/local/tmp/o & sleep 0.3; log -t t3 live; sleep 0.3; kill %1; cat /data/local/tmp/o'
 check "logcat -c"           "one=0 two=1"         /system/bin/sh -c 'log -t t one; logcat -c; log -t t two; d=$(logcat -d -s t); echo "one=$(echo "$d" | grep -c one) two=$(echo "$d" | grep -c two)"'
+# credentials, limits, scheduling, process tree
+check "CapEff in status"    "000001ffffffffff"    /system/bin/toybox grep CapEff /proc/self/status
+check "ulimit -n"           "soft=256 hard=4096"  /system/bin/sh -c 'ulimit -Sn 256; echo "soft=$(ulimit -Sn) hard=$(ulimit -Hn)"'
+check "renice"              "nice=4"              /system/bin/sh -c 'renice -n 4 -p $$ >/dev/null; echo "nice=$(cut -d" " -f19 /proc/$$/stat)"'
+check "nice"                " 26 6 1 "            /system/bin/toybox nice -n 6 cat /proc/self/stat
+check "chrt"                "policy: SCHED_FIFO"  /system/bin/sh -c 'chrt -f -p $$ 10; chrt -p $$'
+check "ionice"              "Best-effort: prio 3" /system/bin/sh -c 'ionice -c 2 -n 3 -p $$; ionice -p $$'
+check "hostname"            "droidrt-host"        /system/bin/sh -c 'hostname droidrt-host; uname -n'
+check "setsid"              "own session"         /system/bin/toybox setsid /system/bin/sh -c '[ "$(cut -d" " -f6 /proc/$$/stat)" = $$ ] && echo "own session"'
+check "orphan adopted by 1" "ppid=1 ok"           /system/bin/sh -c '(sh -c "sleep 0.3; echo ppid=\$(cut -d\" \" -f4 /proc/\$\$/stat) ok" &); sleep 0.6'
 
 # Exit status needs its own path: the program's code must become droidrt's.
 perl -e 'alarm 60; exec @ARGV' "$BIN" --system "$IMG" /system/bin/sh -c 'exit 3' >/dev/null 2>&1

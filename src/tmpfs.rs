@@ -5,7 +5,7 @@
 use crate::errno::*;
 use crate::mm::SharedObject;
 use crate::phys::PhysMem;
-use crate::vfs::{Dirent, FileSystem, S_IFDIR, S_IFLNK, S_IFMT, S_IFREG, Stat};
+use crate::vfs::{Dirent, FileSystem, S_IFDIR, S_IFLNK, S_IFMT, S_IFREG, Stat, XATTR_CREATE, XATTR_REPLACE};
 use std::collections::{BTreeMap, HashMap};
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -18,11 +18,13 @@ const ROOT: u64 = 1;
 pub struct MemFile {
     pub obj: Arc<SharedObject>,
     size: Mutex<u64>,
+    /// A memfd's extended attributes (it has no tmpfs node to hold them).
+    pub xattrs: Mutex<Xattrs>,
 }
 
 impl MemFile {
     pub fn new(phys: Arc<PhysMem>) -> Arc<MemFile> {
-        Arc::new(MemFile { obj: SharedObject::new(phys), size: Mutex::new(0) })
+        Arc::new(MemFile { obj: SharedObject::new(phys), size: Mutex::new(0), xattrs: Mutex::default() })
     }
 
     pub fn size(&self) -> u64 {
@@ -72,6 +74,46 @@ struct Node {
     nlink: u32,
     mtime: u64,
     kind: Kind,
+    xattrs: Xattrs,
+}
+
+pub const XATTR_SELINUX: &str = "security.selinux";
+
+/// An inode's extended attributes, by full name. Like Linux's tmpfs, only
+/// the security.*, trusted.* and user.* namespaces are stored.
+#[derive(Clone, Default)]
+pub struct Xattrs(BTreeMap<String, Vec<u8>>);
+
+impl Xattrs {
+    pub fn get(&self, name: &str) -> Result<Vec<u8>, i64> {
+        self.0.get(name).cloned().ok_or(ENODATA)
+    }
+
+    pub fn set(&mut self, name: &str, value: &[u8], flags: u32) -> Result<(), i64> {
+        if !["security.", "trusted.", "user."].iter().any(|p| name.starts_with(p)) {
+            return Err(EOPNOTSUPP);
+        }
+        match self.0.contains_key(name) {
+            true if flags & XATTR_CREATE != 0 => return Err(EEXIST),
+            false if flags & XATTR_REPLACE != 0 => return Err(ENODATA),
+            _ => {}
+        }
+        self.0.insert(name.to_string(), value.to_vec());
+        Ok(())
+    }
+
+    pub fn list(&self) -> Vec<String> {
+        self.0.keys().cloned().collect()
+    }
+
+    pub fn remove(&mut self, name: &str) -> Result<(), i64> {
+        self.0.remove(name).map(|_| ()).ok_or(ENODATA)
+    }
+
+    /// What a new child of a directory with these attributes starts with.
+    fn inherited(&self) -> Xattrs {
+        Xattrs(self.0.get_key_value(XATTR_SELINUX).map(|(k, v)| (k.clone(), v.clone())).into_iter().collect())
+    }
 }
 
 pub struct Tmpfs {
@@ -108,7 +150,7 @@ impl Tmpfs {
     /// An in-memory filesystem presenting itself as another type.
     pub fn with_type(phys: Arc<PhysMem>, mode: u32, type_name: &'static str) -> Arc<Tmpfs> {
         let mut nodes = HashMap::new();
-        nodes.insert(ROOT, Node { mode: S_IFDIR | mode, uid: 0, gid: 0, nlink: 2, mtime: now(), kind: Kind::Dir { entries: BTreeMap::new(), parent: ROOT } });
+        nodes.insert(ROOT, Node { mode: S_IFDIR | mode, uid: 0, gid: 0, nlink: 2, mtime: now(), kind: Kind::Dir { entries: BTreeMap::new(), parent: ROOT }, xattrs: Xattrs::default() });
         Arc::new(Tmpfs { phys, type_name, nodes: Mutex::new(nodes), next: AtomicU64::new(ROOT + 1) })
     }
 
@@ -127,10 +169,13 @@ impl Tmpfs {
             Some(_) => return Err(ENOTDIR),
             None => return Err(ENOENT),
         }
+        let parent = nodes.get_mut(&dir).unwrap();
         if is_dir {
-            nodes.get_mut(&dir).unwrap().nlink += 1;
+            parent.nlink += 1;
         }
-        nodes.insert(ino, Node { mode, uid: 0, gid: 0, nlink: if is_dir { 2 } else { 1 }, mtime: now(), kind });
+        // New nodes take their directory's label, until policy-driven labeling exists.
+        let xattrs = parent.xattrs.inherited();
+        nodes.insert(ino, Node { mode, uid: 0, gid: 0, nlink: if is_dir { 2 } else { 1 }, mtime: now(), kind, xattrs });
         Ok(ino)
     }
 
@@ -373,5 +418,21 @@ impl FileSystem for Tmpfs {
             n.mtime = t;
         }
         Ok(())
+    }
+
+    fn getxattr(&self, ino: u64, name: &str) -> Result<Vec<u8>, i64> {
+        self.nodes.lock().unwrap().get(&ino).ok_or(ENOENT)?.xattrs.get(name)
+    }
+
+    fn setxattr(&self, ino: u64, name: &str, value: &[u8], flags: u32) -> Result<(), i64> {
+        self.nodes.lock().unwrap().get_mut(&ino).ok_or(ENOENT)?.xattrs.set(name, value, flags)
+    }
+
+    fn listxattr(&self, ino: u64) -> Result<Vec<String>, i64> {
+        Ok(self.nodes.lock().unwrap().get(&ino).ok_or(ENOENT)?.xattrs.list())
+    }
+
+    fn removexattr(&self, ino: u64, name: &str) -> Result<(), i64> {
+        self.nodes.lock().unwrap().get_mut(&ino).ok_or(ENOENT)?.xattrs.remove(name)
     }
 }

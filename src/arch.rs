@@ -60,6 +60,18 @@ macro_rules! syscalls {
 
 // name = arm64/generic number, x86_64 number
 syscalls! {
+    setxattr = 5, 188;
+    lsetxattr = 6, 189;
+    fsetxattr = 7, 190;
+    getxattr = 8, 191;
+    lgetxattr = 9, 192;
+    fgetxattr = 10, 193;
+    listxattr = 11, 194;
+    llistxattr = 12, 195;
+    flistxattr = 13, 196;
+    removexattr = 14, 197;
+    lremovexattr = 15, 198;
+    fremovexattr = 16, 199;
     eventfd2 = 19, 290;
     epoll_create1 = 20, 291;
     epoll_ctl = 21, 233;

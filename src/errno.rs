@@ -43,6 +43,7 @@ pub const EBUSY: i64 = 16;
 pub const EXDEV: i64 = 18;
 pub const EFBIG: i64 = 27;
 pub const ENOTEMPTY: i64 = 39;
+pub const ENODATA: i64 = 61;
 
 /// A Linux errno carried inside an `io::Error` (host error codes differ).
 #[derive(Debug)]

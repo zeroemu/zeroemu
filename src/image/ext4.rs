@@ -1,5 +1,6 @@
 //! Read-only ext4 (APEX payloads and older system images): extent trees and
-//! indirect block maps, linear and htree directories, fast symlinks.
+//! indirect block maps, linear and htree directories, fast symlinks, and
+//! extended attributes (in-inode and block, as fs/ext4/xattr.c lays them out).
 
 use super::{Dev, invalid, le16, le32};
 use std::collections::HashMap;
@@ -17,6 +18,9 @@ const INCOMPAT_SUPPORTED: u32 = INCOMPAT_FILETYPE | INCOMPAT_EXTENTS | INCOMPAT_
 const EXTENTS_FL: u32 = 0x80000;
 const INLINE_DATA_FL: u32 = 0x1000_0000;
 const EXTENT_MAGIC: u16 = 0xf30a;
+const XATTR_MAGIC: u32 = 0xea02_0000;
+/// Name prefixes by EXT4_XATTR_INDEX_* that Linux exposes.
+const XATTR_PREFIXES: [&str; 11] = ["", "user.", "system.posix_acl_access", "system.posix_acl_default", "trusted.", "", "security.", "", "", "", "gnu."];
 
 pub struct Ext4 {
     dev: Dev,
@@ -85,7 +89,8 @@ impl Ext4 {
         ROOT_INO
     }
 
-    pub fn inode(&self, ino: u64) -> io::Result<Inode> {
+    /// The first `len` bytes of an on-disk inode.
+    fn raw_inode(&self, ino: u64, len: u64) -> io::Result<Vec<u8>> {
         if ino == 0 {
             return Err(invalid("ext4: inode 0"));
         }
@@ -99,9 +104,11 @@ impl Ext4 {
         if self.has_64bit && self.desc_size >= 64 {
             table |= (le32(&desc, 0x28) as u64) << 32;
         }
-        let raw = self
-            .dev
-            .read_vec(table * self.bs + index * self.inode_size, 128)?;
+        self.dev.read_vec(table * self.bs + index * self.inode_size, len as usize)
+    }
+
+    pub fn inode(&self, ino: u64) -> io::Result<Inode> {
+        let raw = self.raw_inode(ino, 128)?;
         let mut block = [0u8; 60];
         block.copy_from_slice(&raw[40..100]);
         Ok(Inode {
@@ -115,6 +122,52 @@ impl Ext4 {
             flags: le32(&raw, 32),
             block,
         })
+    }
+
+    /// An inode's extended attributes as (full name, value): those in the
+    /// inode body after i_extra_isize, then those in its xattr block.
+    pub fn xattrs(&self, ino: u64) -> io::Result<Vec<(String, Vec<u8>)>> {
+        let mut out = Vec::new();
+        let raw = self.raw_inode(ino, self.inode_size.max(128))?;
+        if raw.len() > 132 {
+            let start = 128 + le16(&raw, 128) as usize;
+            if start + 4 <= raw.len() && le32(&raw, start) == XATTR_MAGIC {
+                // In-inode value offsets count from the first entry.
+                self.parse_xattrs(&raw[start + 4..], 0, ino, &mut out)?;
+            }
+        }
+        let block = le32(&raw, 104) as u64 | (le16(&raw, 118) as u64) << 32; // i_file_acl
+        if block != 0 {
+            let b = self.dev.read_vec(block * self.bs, self.bs as usize)?;
+            if le32(&b, 0) != XATTR_MAGIC || le32(&b, 8) != 1 {
+                return Err(invalid(format!("ext4: bad xattr block (inode {ino})")));
+            }
+            self.parse_xattrs(&b, 32, ino, &mut out)?;
+        }
+        Ok(out)
+    }
+
+    /// struct ext4_xattr_entry records from `first` up to a zero word;
+    /// values sit at offsets into `area`, or in an EA inode.
+    fn parse_xattrs(&self, area: &[u8], first: usize, ino: u64, out: &mut Vec<(String, Vec<u8>)>) -> io::Result<()> {
+        let bad = || invalid(format!("ext4: corrupt xattrs (inode {ino})"));
+        let mut p = first;
+        while p + 4 <= area.len() && le32(area, p) != 0 {
+            let e = area.get(p..p + 16).ok_or_else(bad)?;
+            let (nlen, index, voff, inum, vsize) = (e[0] as usize, e[1], le16(e, 2) as usize, le32(e, 4) as u64, le32(e, 8) as usize);
+            let name = area.get(p + 16..p + 16 + nlen).ok_or_else(bad)?;
+            let value = if inum != 0 {
+                self.read(&self.inode(inum)?)?.get(..vsize).ok_or_else(bad)?.to_vec()
+            } else {
+                area.get(voff..voff + vsize).ok_or_else(bad)?.to_vec()
+            };
+            // Namespaces Linux hides (system.data, encryption) are skipped.
+            if let Some(prefix) = XATTR_PREFIXES.get(index as usize).filter(|p| !p.is_empty()) {
+                out.push((format!("{prefix}{}", String::from_utf8_lossy(name)), value));
+            }
+            p += (16 + nlen).next_multiple_of(4);
+        }
+        Ok(())
     }
 
     /// Whole file contents (holes read as zeros), cached.
@@ -279,5 +332,114 @@ impl Ext4 {
             .into_iter()
             .find(|e| e.name == name)
             .map(|e| e.ino))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::errno::{ENODATA, EROFS};
+    use crate::image::MemDev;
+    use crate::vfs::FileSystem;
+
+    fn put(img: &mut [u8], at: usize, b: &[u8]) {
+        img[at..at + b.len()].copy_from_slice(b);
+    }
+
+    /// struct ext4_xattr_entry with its name, padded to 4 bytes.
+    fn entry(index: u8, name: &str, value_offs: u16, inum: u32, size: u32) -> Vec<u8> {
+        let mut e = vec![name.len() as u8, index];
+        e.extend(value_offs.to_le_bytes());
+        e.extend(inum.to_le_bytes());
+        e.extend(size.to_le_bytes());
+        e.extend([0; 4]); // e_hash
+        e.extend(name.as_bytes());
+        e.resize(e.len().next_multiple_of(4), 0);
+        e
+    }
+
+    /// 1 KiB blocks, 256-byte inodes in a table at block 4. Inode 12 has an
+    /// in-inode label and an xattr block (block 9); 13 has none; 14 keeps its
+    /// value in EA inode 15, whose data is block 10.
+    fn fixture() -> Arc<Ext4> {
+        let mut img = vec![0u8; 12 * 1024];
+        let sb = 1024;
+        put(&mut img, sb + 20, &1u32.to_le_bytes()); // s_first_data_block
+        put(&mut img, sb + 40, &16u32.to_le_bytes()); // s_inodes_per_group
+        put(&mut img, sb + 56, &MAGIC.to_le_bytes());
+        put(&mut img, sb + 76, &1u32.to_le_bytes()); // s_rev_level
+        put(&mut img, sb + 88, &256u16.to_le_bytes()); // s_inode_size
+        put(&mut img, 2048 + 8, &4u32.to_le_bytes()); // bg_inode_table
+        let inode = |img: &mut Vec<u8>, ino: usize| {
+            let at = 4096 + (ino - 1) * 256;
+            put(img, at, &0o100644u16.to_le_bytes());
+            put(img, at + 26, &1u16.to_le_bytes());
+            put(img, at + 128, &32u16.to_le_bytes()); // i_extra_isize
+            at
+        };
+        // Inode 12: in-inode security.selinux (value at the end of the inode), then block 9.
+        let at = inode(&mut img, 12);
+        put(&mut img, at + 104, &9u32.to_le_bytes()); // i_file_acl
+        put(&mut img, at + 160, &XATTR_MAGIC.to_le_bytes());
+        put(&mut img, at + 164, &entry(6, "selinux", 68, 0, 24));
+        put(&mut img, at + 164 + 68, b"u:object_r:adbd_exec:s0\0");
+        let blk = 9 * 1024;
+        put(&mut img, blk, &XATTR_MAGIC.to_le_bytes());
+        put(&mut img, blk + 4, &1u32.to_le_bytes()); // h_refcount
+        put(&mut img, blk + 8, &1u32.to_le_bytes()); // h_blocks
+        let e1 = entry(1, "mime_type", 1000, 0, 10);
+        put(&mut img, blk + 32, &e1);
+        put(&mut img, blk + 32 + e1.len(), &entry(7, "data", 1012, 0, 0)); // system.data: hidden
+        put(&mut img, blk + 1000, b"text/plain");
+        inode(&mut img, 13);
+        // Inode 14: trusted.big lives in EA inode 15 (block map, one block).
+        let at = inode(&mut img, 14);
+        put(&mut img, at + 160, &XATTR_MAGIC.to_le_bytes());
+        put(&mut img, at + 164, &entry(4, "big", 0, 15, 5));
+        let at = inode(&mut img, 15);
+        put(&mut img, at + 4, &5u32.to_le_bytes()); // i_size
+        put(&mut img, at + 40, &10u32.to_le_bytes()); // i_block[0]
+        put(&mut img, 10 * 1024, b"hello");
+        Ext4::open(Arc::new(MemDev(img.into()))).unwrap()
+    }
+
+    #[test]
+    fn xattrs_in_inode_block_and_ea_inode() {
+        let fs = fixture();
+        let attrs = fs.xattrs(12).unwrap();
+        let names: Vec<&str> = attrs.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["security.selinux", "user.mime_type"]);
+        assert_eq!(fs.getxattr(12, "security.selinux").unwrap(), b"u:object_r:adbd_exec:s0\0");
+        assert_eq!(fs.getxattr(12, "user.mime_type").unwrap(), b"text/plain");
+        assert_eq!(fs.getxattr(12, "system.data"), Err(ENODATA));
+        assert_eq!(fs.listxattr(13).unwrap(), Vec::<String>::new());
+        assert_eq!(fs.getxattr(14, "trusted.big").unwrap(), b"hello");
+        assert_eq!(fs.setxattr(12, "user.x", b"", 0), Err(EROFS));
+    }
+
+    #[test]
+    fn xattr_value_out_of_bounds_is_corrupt() {
+        let fs = fixture();
+        let mut img = fs.dev.read_vec(0, fs.dev.len() as usize).unwrap();
+        put(&mut img, 4096 + 11 * 256 + 164, &entry(6, "selinux", 200, 0, 24)); // runs past the inode
+        let fs = Ext4::open(Arc::new(MemDev(img.into()))).unwrap();
+        assert!(fs.xattrs(12).is_err());
+    }
+
+    /// APEX payloads in the SDK image are ext4; their labels come from the build.
+    #[test]
+    fn sdk_image_apex_labels() {
+        let Some(vfs) = crate::image::sdk_image() else { return eprintln!("skip: no Android SDK image") };
+        for (path, label) in [
+            ("/apex/com.android.adbd/bin/adbd", "u:object_r:adbd_exec:s0"),
+            ("/apex/com.android.runtime/bin/linker64", "u:object_r:system_linker_exec:s0"),
+            ("/apex/com.android.adbd", "u:object_r:system_file:s0"),
+        ] {
+            let node = vfs.resolve("/", path, false).unwrap();
+            assert_eq!(vfs.fs_type(&node), "ext4");
+            let v = vfs.getxattr(&node, "security.selinux").unwrap();
+            assert_eq!(String::from_utf8_lossy(&v).trim_end_matches('\0'), label, "{path}");
+            assert_eq!(vfs.setxattr(&node, "security.selinux", b"u:object_r:x:s0", 0), Err(EROFS));
+        }
     }
 }

@@ -46,6 +46,12 @@ const F_SETFL: u64 = 4;
 const F_GETLK: u64 = 5;
 const F_SETLK: u64 = 6;
 const F_SETLKW: u64 = 7;
+const F_OFD_GETLK: u64 = 36;
+const F_OFD_SETLK: u64 = 37;
+const F_OFD_SETLKW: u64 = 38;
+const F_RDLCK: i16 = 0;
+const F_WRLCK: i16 = 1;
+const F_UNLCK: i16 = 2;
 const F_DUPFD_CLOEXEC: u64 = 1030;
 const F_SETPIPE_SZ: u64 = 1031;
 const F_GETPIPE_SZ: u64 = 1032;
@@ -64,7 +70,7 @@ pub fn handles(no: Sysno) -> bool {
             | fstatfs | umask | pipe2 | ppoll | eventfd2 | epoll_create1 | epoll_ctl | epoll_pwait | epoll_pwait2 | timerfd_create
             | timerfd_settime | timerfd_gettime | signalfd4 | mknodat | mkdirat | unlinkat | symlinkat | linkat | renameat
             | renameat2 | truncate | ftruncate | fallocate | fchmod | fchmodat | fchown | fchownat | sync | fsync | fdatasync
-            | utimensat | memfd_create
+            | utimensat | memfd_create | flock
     )
 }
 
@@ -87,6 +93,8 @@ pub enum Kind {
     Epoll(Epoll),
     Socket(Arc<Socket>),
     Netlink(Arc<Netlink>),
+    /// AF_INET / AF_INET6 (inet.rs): no network yet.
+    Inet(Arc<super::inet::Inet>),
     Binder(BinderFile),
     /// A loop or device-mapper device (block.rs).
     Block(BlockOpen),
@@ -137,6 +145,28 @@ impl File {
     pub(super) fn new(kind: Kind, flags: u32) -> Arc<File> {
         Arc::new(File { kind, flags: AtomicU32::new(flags) })
     }
+
+    /// The inode advisory locks are on. Every BPF fd shares one, as Linux's
+    /// anon inode; pipes, sockets and the like stand alone.
+    pub fn lock_key(self: &Arc<Self>) -> super::locks::Key {
+        match &self.kind {
+            Kind::Node(n) => {
+                let n = n.lock().unwrap();
+                (n.node.fs_id(), n.node.ino)
+            }
+            Kind::Mem(m) => (Arc::as_ptr(&m.file) as usize, 0),
+            Kind::Bpf(_) => (1, 0),
+            _ => (Arc::as_ptr(self) as usize, 0),
+        }
+    }
+
+    /// The canonical path of an opened file or directory.
+    pub fn node_path(&self) -> Option<String> {
+        match &self.kind {
+            Kind::Node(n) => Some(n.lock().unwrap().node.path.clone()),
+            _ => None,
+        }
+    }
     pub(super) fn nonblock(&self) -> bool {
         self.flags.load(Ordering::Relaxed) & O_NONBLOCK != 0
     }
@@ -183,6 +213,13 @@ impl NodeFile {
 struct Entry {
     file: Arc<File>,
     cloexec: bool,
+}
+
+/// The open file description is gone: so are its OFD and flock locks.
+impl Drop for File {
+    fn drop(&mut self) {
+        super::locks::LOCKS.release(super::locks::Owner::File(self as *const File as usize));
+    }
 }
 
 /// RLIMIT_NOFILE's initial soft limit.
@@ -363,6 +400,7 @@ pub(super) fn poll_ready(f: &File, t: &Thread, depth: u32) -> u16 {
         Kind::Pty(p) => p.poll(),
         Kind::Bpf(_) => 0,
         Kind::Netlink(n) => n.poll(),
+        Kind::Inet(_) => POLLOUT,
         Kind::Binder(b) => {
             (if binder::readable(b, t.tid) { POLLIN } else { 0 }) | POLLOUT
         }
@@ -403,14 +441,90 @@ pub(super) fn poll_ready(f: &File, t: &Thread, depth: u32) -> u16 {
 // ---- syscalls ----
 
 impl Kernel {
+    /// fcntl's record locks: struct flock in, a conflicting lock out (GETLK).
+    fn record_lock(&self, t: &Arc<Thread>, fd: i64, f: &Arc<File>, cmd: u64, arg: u64) -> Result<i64, i64> {
+        use super::locks::{LOCKS, Owner, Range};
+        let mut raw = [0u8; 32]; // struct flock (LP64)
+        t.proc.mm().read(arg, &mut raw)?;
+        let ty = i16::from_le_bytes([raw[0], raw[1]]);
+        let whence = i16::from_le_bytes([raw[2], raw[3]]);
+        let start = i64::from_le_bytes(raw[8..16].try_into().unwrap());
+        let len = i64::from_le_bytes(raw[16..24].try_into().unwrap());
+        let ofd = matches!(cmd, F_OFD_GETLK | F_OFD_SETLK | F_OFD_SETLKW);
+        if ofd && i32::from_le_bytes(raw[24..28].try_into().unwrap()) != 0 {
+            return Err(EINVAL); // OFD requests must leave l_pid zero
+        }
+        if !matches!(ty, F_RDLCK | F_WRLCK | F_UNLCK) {
+            return Err(EINVAL);
+        }
+        let base = match whence {
+            0 => 0,
+            1 => self.file_syscall(Sysno::lseek, t, [fd as u64, 0, 1, 0, 0, 0])?,
+            2 => self.fd_stat(t, fd)?.size as i64,
+            _ => return Err(EINVAL),
+        };
+        let from = base.checked_add(start).ok_or(EINVAL)?;
+        let (lo, hi) = match len {
+            0 => (from, u64::MAX),
+            l if l > 0 => (from, from.checked_add(l).ok_or(EINVAL)? as u64),
+            l => (from + l, from as u64),
+        };
+        if lo < 0 {
+            return Err(EINVAL);
+        }
+        let owner = if ofd { Owner::File(Arc::as_ptr(f) as usize) } else { Owner::Process(t.proc.pid) };
+        let want = Range { owner, write: ty == F_WRLCK, start: lo as u64, end: hi, pid: if ofd { -1 } else { t.proc.pid } };
+        let key = f.lock_key();
+        if matches!(cmd, F_GETLK | F_OFD_GETLK) {
+            if ty == F_UNLCK {
+                return Err(EINVAL);
+            }
+            let mut out = raw;
+            match LOCKS.conflict(key, &want) {
+                Some(l) => {
+                    out[0..2].copy_from_slice(&(if l.write { F_WRLCK } else { F_RDLCK }).to_le_bytes());
+                    out[2..4].copy_from_slice(&0i16.to_le_bytes());
+                    out[8..16].copy_from_slice(&(l.start as i64).to_le_bytes());
+                    out[16..24].copy_from_slice(&(if l.end == u64::MAX { 0 } else { (l.end - l.start) as i64 }).to_le_bytes());
+                    out[24..28].copy_from_slice(&l.pid.to_le_bytes());
+                }
+                None => out[0..2].copy_from_slice(&F_UNLCK.to_le_bytes()),
+            }
+            t.proc.mm().write(arg, &out)?;
+            return Ok(0);
+        }
+        LOCKS.set(t, key, want, ty == F_UNLCK, matches!(cmd, F_SETLKW | F_OFD_SETLKW))?;
+        Ok(0)
+    }
+
     pub(super) fn file_syscall(&self, no: Sysno, t: &Arc<Thread>, a: [u64; 6]) -> Result<i64, i64> {
         use Sysno::*;
         match no {
             openat => self.openat(t, int(a[0]), a[1], a[2], a[3]),
             close => {
-                let mut files = t.proc.files.lock().unwrap();
-                let slot = usize::try_from(int(a[0])).ok().and_then(|i| files.fds.get_mut(i)).ok_or(EBADF)?;
-                slot.take().map(|_| 0).ok_or(EBADF)
+                let entry = {
+                    let mut files = t.proc.files.lock().unwrap();
+                    let slot = usize::try_from(int(a[0])).ok().and_then(|i| files.fds.get_mut(i)).ok_or(EBADF)?;
+                    slot.take().ok_or(EBADF)?
+                };
+                // POSIX record locks go with any close of the file.
+                super::locks::LOCKS.release_on(entry.file.lock_key(), t.proc.pid);
+                Ok(0)
+            }
+            flock => {
+                let f = t.proc.files.lock().unwrap().get(int(a[0]))?;
+                const LOCK_SH: u64 = 1;
+                const LOCK_EX: u64 = 2;
+                const LOCK_NB: u64 = 4;
+                const LOCK_UN: u64 = 8;
+                let op = match a[1] & !LOCK_NB {
+                    LOCK_SH => Some(false),
+                    LOCK_EX => Some(true),
+                    LOCK_UN => None,
+                    _ => return Err(EINVAL),
+                };
+                super::locks::LOCKS.flock(t, f.lock_key(), Arc::as_ptr(&f) as usize, op, a[1] & LOCK_NB == 0)?;
+                Ok(0)
             }
             read => self.read(t, int(a[0]), a[1], a[2], None),
             pread64 => self.read(t, int(a[0]), a[1], a[2], Some(a[3])),
@@ -585,7 +699,11 @@ impl Kernel {
                         f.flags.store(a[2] as u32 & (O_NONBLOCK | O_APPEND), Ordering::Relaxed);
                         Ok(0)
                     }
-                    F_GETLK | F_SETLK | F_SETLKW => files.get(fd).map(|_| 0), // no locking: one writer can't exist on a read-only image
+                    F_GETLK | F_SETLK | F_SETLKW | F_OFD_GETLK | F_OFD_SETLK | F_OFD_SETLKW => {
+                        let f = files.get(fd)?;
+                        drop(files);
+                        self.record_lock(t, fd, &f, a[1], a[2])
+                    }
                     F_GETPIPE_SZ | F_SETPIPE_SZ => {
                         let f = files.get(fd)?;
                         drop(files);
@@ -1169,6 +1287,7 @@ impl Kernel {
             }
             Kind::Socket(sock) => unix::read(sock, t, count, f.nonblock())?,
             Kind::Netlink(nl) => netlink::read(nl, t, count, f.nonblock())?,
+            Kind::Inet(_) => return Err(ENOTCONN),
             Kind::Block(b) => {
                 let dev = self.blocks.device(b.devt).ok_or(ENXIO)?;
                 let mut pos = b.pos.lock().unwrap();
@@ -1253,6 +1372,7 @@ impl Kernel {
                 r => r?,
             },
             Kind::Netlink(nl) => netlink::write(nl, t, data, f.nonblock())?,
+            Kind::Inet(_) => return Err(ENETUNREACH),
             Kind::Pty(p) => p.write(t, &data, f.nonblock())?,
             Kind::Mem(m) => {
                 if !m.writable {
@@ -1301,7 +1421,7 @@ impl Kernel {
             Kind::Random => chr(0x0109),
             Kind::Kmsg => chr(0x010b),
             Kind::Pipe(_) => Stat { mode: 0o010600, nlink: 1, ..Default::default() },
-            Kind::Socket(_) | Kind::Netlink(_) => Stat { mode: 0o140777, nlink: 1, ..Default::default() },
+            Kind::Socket(_) | Kind::Netlink(_) | Kind::Inet(_) => Stat { mode: 0o140777, nlink: 1, ..Default::default() },
             Kind::Event(_) | Kind::Timer(_) | Kind::Signal(_) | Kind::Epoll(_) | Kind::Bpf(_) | Kind::Sync(_) => Stat { mode: 0o600, nlink: 1, ..Default::default() }, // anon_inode
             Kind::Drm(d) => Stat { mode: 0o020666, rdev: d.rdev(), nlink: 1, ..Default::default() },
             Kind::DmaBuf(b) => Stat { mode: 0o600, nlink: 1, size: b.size(), ..Default::default() },
@@ -1552,6 +1672,7 @@ pub(super) fn file_name(f: &File) -> String {
         Kind::Pipe(p) => format!("pipe:[{}]", Arc::as_ptr(&p.pipe) as usize % 100_000),
         Kind::Socket(s) => format!("socket:[{}]", Arc::as_ptr(s) as usize % 100_000),
         Kind::Netlink(s) => format!("socket:[{}]", Arc::as_ptr(s) as usize % 100_000),
+        Kind::Inet(s) => format!("socket:[{}]", Arc::as_ptr(s) as usize % 100_000),
         Kind::Event(_) => "anon_inode:[eventfd]".into(),
         Kind::Timer(_) => "anon_inode:[timerfd]".into(),
         Kind::Signal(_) => "anon_inode:[signalfd]".into(),

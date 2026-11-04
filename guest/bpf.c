@@ -7,6 +7,7 @@ typedef long i64;
 typedef unsigned int u32;
 
 #define NR_mkdirat 34
+#define NR_openat 56
 #define NR_mount 40
 #define NR_close 57
 #define NR_write 64
@@ -122,6 +123,26 @@ int cmain(void) {
     int seen = 0;
     while (bpf(12 /* MAP_GET_NEXT_ID */) == 0) { seen++; ia[0] = ia[1]; }
     check(seen == 4, "map ids iterate over the four live maps");
+
+    // netd aborts unless a query finds the programs attached to the root cgroup.
+    int cg = (int)sys(NR_openat, -100, "/tmp", 0x4000 /* O_DIRECTORY */, 0);
+    static u32 ids[4];
+    clear();
+    pa[0] = (u32)cg, pa[1] = (u32)prog, pa[2] = 1 /* CGROUP_INET_EGRESS */;
+    check(bpf(8 /* PROG_ATTACH */) == 0, "attach a program to a cgroup");
+    clear();
+    pa[0] = (u32)cg, pa[1] = 1, pa[6] = 4;
+    attr[2] = (u64)ids;
+    check(bpf(16 /* PROG_QUERY */) == 0 && pa[6] == 1 && ids[0] == info[1], "query lists the attached program");
+    clear();
+    pa[0] = (u32)cg, pa[1] = 0 /* CGROUP_INET_INGRESS */;
+    check(bpf(16) == 0 && pa[6] == 0, "other attach types are empty");
+    clear();
+    pa[0] = (u32)cg, pa[1] = (u32)prog, pa[2] = 1;
+    int detached = bpf(9 /* PROG_DETACH */) == 0;
+    clear();
+    pa[0] = (u32)cg, pa[1] = 1;
+    check(detached && bpf(16) == 0 && pa[6] == 0, "detach removes it");
 
     if (failures) {
         puts_("SOME CHECKS FAILED\n");

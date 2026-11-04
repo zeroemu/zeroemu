@@ -94,7 +94,16 @@ struct Registry {
     btfs: BTreeMap<u32, Weak<BpfObj>>,
     /// Pinned objects, by bpffs node (filesystem, inode): pinning keeps them alive.
     pins: HashMap<(usize, u64), Arc<BpfObj>>,
+    /// Programs attached to a cgroup (by path) for an attach type, with
+    /// their attach flags. Attaching keeps a program alive.
+    attached: HashMap<(String, u32), Vec<Attached>>,
 }
+
+/// An attached program and its attach flags.
+type Attached = (Arc<BpfObj>, u32);
+
+/// BPF_F_ALLOW_MULTI: more than one program per cgroup and attach type.
+const ALLOW_MULTI: u32 = 2;
 
 static REG: LazyLock<Mutex<Registry>> = LazyLock::new(Mutex::default);
 static NEXT_ID: AtomicU32 = AtomicU32::new(1);
@@ -231,6 +240,12 @@ impl Kernel {
         t.proc.files.lock().unwrap().alloc(File::new(Kind::Bpf(obj), 0), true, 0)
     }
 
+    /// What a program attaches to: a cgroup directory, by its path.
+    fn attach_target(&self, t: &Thread, fd: u32) -> Result<String, i64> {
+        let file = t.proc.files.lock().unwrap().get(fd as i64)?;
+        file.node_path().ok_or(EINVAL)
+    }
+
     fn bpf_obj(&self, t: &Thread, fd: u32) -> Result<Arc<BpfObj>, i64> {
         match &t.proc.files.lock().unwrap().get(fd as i64)?.kind {
             Kind::Bpf(o) => Ok(o.clone()),
@@ -338,17 +353,54 @@ impl Kernel {
                 let obj = REG.lock().unwrap().pins.get(&key).cloned().ok_or(if vfs.fs_type(&node) == "bpf" { EINVAL } else { EPERM })?;
                 self.bpf_fd(t, obj)
             }
-            PROG_ATTACH | PROG_DETACH => {
-                t.proc.files.lock().unwrap().get(u32_at(&attr, 0) as i64)?;
-                if cmd == PROG_ATTACH {
-                    self.bpf_obj(t, u32_at(&attr, 4))?;
+            PROG_ATTACH => {
+                let target = self.attach_target(t, u32_at(&attr, 0))?;
+                let prog = self.bpf_obj(t, u32_at(&attr, 4))?;
+                if !matches!(prog.kind, Obj::Prog(_)) {
+                    return Err(EINVAL);
+                }
+                let (ty, flags) = (u32_at(&attr, 8), u32_at(&attr, 12));
+                let mut reg = REG.lock().unwrap();
+                let list = reg.attached.entry((target, ty)).or_default();
+                if flags & ALLOW_MULTI == 0 {
+                    list.clear(); // one program per type: attaching replaces it
+                } else if list.iter().any(|(p, _)| p.id == prog.id) {
+                    return Err(EEXIST);
+                }
+                list.push((prog, flags));
+                Ok(0)
+            }
+            PROG_DETACH => {
+                let target = self.attach_target(t, u32_at(&attr, 0))?;
+                let ty = u32_at(&attr, 8);
+                // A program fd picks one of several; none detaches them all.
+                let prog = self.bpf_obj(t, u32_at(&attr, 4)).ok().map(|p| p.id);
+                let mut reg = REG.lock().unwrap();
+                let list = reg.attached.get_mut(&(target, ty)).ok_or(ENOENT)?;
+                let before = list.len();
+                list.retain(|(p, _)| prog.is_some_and(|id| id != p.id));
+                if list.len() == before {
+                    return Err(ENOENT);
                 }
                 Ok(0)
             }
             PROG_QUERY => {
-                t.proc.files.lock().unwrap().get(u32_at(&attr, 0) as i64)?;
-                mm().write(uattr + 12, &0u32.to_le_bytes())?; // attach_flags
-                mm().write(uattr + 24, &0u32.to_le_bytes())?; // prog_cnt
+                let target = self.attach_target(t, u32_at(&attr, 0))?;
+                let ty = u32_at(&attr, 4);
+                let (ids, flags): (Vec<u32>, u32) = match REG.lock().unwrap().attached.get(&(target, ty)) {
+                    Some(list) => (list.iter().map(|(p, _)| p.id).collect(), list.first().map_or(0, |(_, f)| *f)),
+                    None => (Vec::new(), 0),
+                };
+                let (ptr, room) = (u64_at(&attr, 16), u32_at(&attr, 24) as usize);
+                mm().write(uattr + 12, &flags.to_le_bytes())?; // attach_flags
+                mm().write(uattr + 24, &(ids.len() as u32).to_le_bytes())?; // prog_cnt
+                if ptr != 0 && room > 0 {
+                    let bytes: Vec<u8> = ids.iter().take(room).flat_map(|id| id.to_le_bytes()).collect();
+                    mm().write(ptr, &bytes)?;
+                    if room < ids.len() {
+                        return Err(ENOSPC);
+                    }
+                }
                 Ok(0)
             }
             BTF_LOAD => {
@@ -435,7 +487,12 @@ impl Kernel {
                 self.bpf_obj(t, u32_at(&attr, 0))?.map()?;
                 Ok(0)
             }
-            _ => Err(EINVAL),
+            // BPF_TOKEN_CREATE (Linux 6.9): libbpf probes for it.
+            36 => Err(EINVAL),
+            _ => {
+                eprintln!("[droidrt] unimplemented bpf command {cmd}");
+                Err(EINVAL)
+            }
         }
     }
 }

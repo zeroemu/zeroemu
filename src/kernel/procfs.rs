@@ -328,7 +328,10 @@ impl ProcFs {
             K::PStatus | K::PStat | K::PStatm => {
                 let p = self.proc(pid)?;
                 let threads = p.threads.lock().unwrap().len().max(1);
-                let (virt, rss) = p.mm.lock().unwrap().as_ref().map_or((0, 0), |m| m.usage());
+                let (virt, rss, stack) = p.mm.lock().unwrap().as_ref().map_or((0, 0, 0), |m| {
+                    let (v, r) = m.usage();
+                    (v, r, m.start_stack)
+                });
                 let ppid = p.ppid.load(Ordering::Relaxed);
                 let name = comm(&p, extra as i32);
                 let c = p.creds.lock().unwrap().clone();
@@ -353,7 +356,7 @@ impl ProcFs {
                         ))
                     }
                     K::PStat => text(format!(
-                        "{pid} ({name}) R {ppid} {pgid} {sid} 0 -1 4194560 0 0 0 0 0 0 0 0 {} {} {threads} 0 0 {virt} {} 18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 17 0 {} {} 0 0 0 0 0 0 0 0 0 0 0\n",
+                        "{pid} ({name}) R {ppid} {pgid} {sid} 0 -1 4194560 0 0 0 0 0 0 0 0 {} {} {threads} 0 0 {virt} {} 18446744073709551615 0 0 {stack} 0 0 0 0 0 0 0 0 0 0 17 0 {} {} 0 0 0 0 0 0 0 0 0 0 0\n",
                         ta.sched.proc_priority(),
                         ta.sched.nice,
                         rss / PAGE,

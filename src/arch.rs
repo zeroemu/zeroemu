@@ -82,6 +82,7 @@ syscalls! {
     dup3 = 24, 292;
     fcntl = 25, 72;
     ioctl = 29, 16;
+    flock = 32, 73;
     mknodat = 33, 259;
     mkdirat = 34, 258;
     unlinkat = 35, 263;

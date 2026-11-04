@@ -31,6 +31,7 @@ fn main() -> ExitCode {
     // A panic is a droidrt bug. Unhandled, it kills only the host thread that
     // was running one guest thread, which then freezes without a trace; stop
     // everything loudly instead.
+    kernel::reserve_dump_signal();
     let default = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         default(info);

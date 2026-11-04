@@ -17,6 +17,8 @@ mod drm;
 mod epoll;
 mod files;
 mod futex;
+mod inet;
+mod locks;
 mod logd;
 mod memory;
 mod misc;
@@ -278,11 +280,13 @@ pub struct Thread {
     pub attrs: Mutex<control::ThreadAttrs>,
     /// SELinux exec/fscreate/keycreate/sockcreate contexts.
     pub sec: selinux::ThreadSec,
-    /// The syscall in progress, recorded only for DROIDRT_DUMP.
+    /// The syscall in progress, for thread dumps.
     in_syscall: Mutex<Option<SyscallSnap>>,
 }
 
-/// Where a thread entered the kernel: what DROIDRT_DUMP prints for it.
+/// Where a thread entered the kernel: what a thread dump prints for it. The
+/// registers for its backtrace are read only under DROIDRT_DUMP (they cost a
+/// trip to the hypervisor on every syscall).
 struct SyscallSnap {
     nr: u64,
     args: [u64; 6],
@@ -293,7 +297,38 @@ struct SyscallSnap {
 }
 
 /// DROIDRT_DUMP=<secs>: every that many seconds, print every guest thread,
-/// the syscall it is in, and its backtrace (for diagnosing hangs).
+/// the syscall it is in, and its backtrace (for diagnosing hangs). SIGUSR1
+/// prints one dump any time, without backtraces unless this is set.
+#[cfg(unix)]
+fn dump_signal() -> libc::sigset_t {
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, libc::SIGUSR1);
+        set
+    }
+}
+
+/// Holds SIGUSR1 for the dump thread's sigwait. Call before any thread
+/// starts: threads inherit the mask, and one that took the signal itself
+/// would die of it.
+pub fn reserve_dump_signal() {
+    #[cfg(unix)]
+    unsafe {
+        libc::pthread_sigmask(libc::SIG_BLOCK, &dump_signal(), std::ptr::null_mut());
+    }
+}
+
+/// DROIDRT_STRACE=<name> traces only processes whose executable path
+/// contains it; 1 (or --strace) traces everything.
+fn strace_wanted(t: &Thread) -> bool {
+    static ONLY: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    match ONLY.get_or_init(|| std::env::var("DROIDRT_STRACE").ok().filter(|v| v != "1" && !v.is_empty())) {
+        None => true,
+        Some(name) => t.proc.exe.try_lock().is_ok_and(|e| e.contains(name.as_str())),
+    }
+}
+
 fn dump_after() -> Option<u64> {
     static AFTER: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
     *AFTER.get_or_init(|| std::env::var("DROIDRT_DUMP").ok().and_then(|v| v.parse().ok()))
@@ -456,16 +491,33 @@ impl Kernel {
 
     /// Starts the first process: `mm` already holds the program and its stack.
     /// Prints every guest thread: comm, the syscall it is in, backtrace.
+    /// Only try_lock: a dump is for when something holds a lock forever.
     fn dump_threads(&self) {
-        let mut procs: Vec<Arc<Process>> = self.procs.lock().unwrap().values().cloned().collect();
+        let procs = (0..50).find_map(|_| match self.procs.try_lock() {
+            Ok(p) => Some(p.values().cloned().collect::<Vec<Arc<Process>>>()),
+            Err(_) => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                None
+            }
+        });
+        let Some(mut procs) = procs else {
+            eprintln!("[droidrt] ---- thread dump: the process table stays locked ----");
+            return;
+        };
         procs.sort_by_key(|p| p.pid);
         eprintln!("[droidrt] ---- thread dump: {} processes ----", procs.len());
         for p in procs {
-            let threads: Vec<Arc<Thread>> = p.threads.lock().unwrap().clone();
-            let exe = p.exe.lock().unwrap().clone();
+            let Ok(threads) = p.threads.try_lock().map(|t| t.clone()) else {
+                eprintln!("[droidrt] {}: thread list locked", p.pid);
+                continue;
+            };
+            let exe = p.exe.try_lock().map(|e| e.clone()).unwrap_or_else(|_| "?".into());
             for t in threads {
-                let comm = t.attrs.lock().unwrap().comm.clone();
-                let snap = t.in_syscall.lock().unwrap().as_ref().map(|s| (s.nr, s.args, s.pc, s.lr, s.fp, s.since.elapsed()));
+                let comm = t.attrs.try_lock().map(|a| a.comm.clone()).unwrap_or_else(|_| "?".into());
+                let Ok(snap) = t.in_syscall.try_lock().map(|s| s.as_ref().map(|s| (s.nr, s.args, s.pc, s.lr, s.fp, s.since.elapsed()))) else {
+                    eprintln!("[droidrt] {} {} {comm} ({exe}): entering or leaving a syscall", p.pid, t.tid);
+                    continue;
+                };
                 let Some((nr, a, pc, lr, mut fp, held)) = snap else {
                     eprintln!("[droidrt] {} {} {comm} ({exe}): running", p.pid, t.tid);
                     continue;
@@ -477,6 +529,9 @@ impl Kernel {
                     Err(_) => String::new(),
                 };
                 eprintln!("[droidrt] {} {} {comm} ({exe}): {name}({:#x}, {:#x}, {:#x}, {:#x}) for {:.1}s {fd}", p.pid, t.tid, a[0], a[1], a[2], a[3], held.as_secs_f64());
+                if pc == 0 {
+                    continue; // no registers without DROIDRT_DUMP
+                }
                 // The address space may be busy; skip rather than wait.
                 let Ok(mut guard) = p.mm.try_lock() else { continue };
                 let Some(mm) = guard.as_mut() else { continue };
@@ -503,6 +558,16 @@ impl Kernel {
             std::thread::spawn(move || loop {
                 std::thread::sleep(std::time::Duration::from_secs(secs.max(1)));
                 k.dump_threads();
+            });
+        }
+        #[cfg(unix)]
+        {
+            let k = self.clone();
+            let _ = std::thread::Builder::new().name("dump".into()).spawn(move || loop {
+                let mut sig = 0;
+                if unsafe { libc::sigwait(&dump_signal(), &mut sig) } == 0 {
+                    k.dump_threads();
+                }
             });
         }
         let pid = self.next_id.fetch_add(1, Ordering::Relaxed);
@@ -627,19 +692,17 @@ impl Kernel {
     fn syscall(self: &Arc<Self>, t: &Arc<Thread>, vcpu: &mut dyn Vcpu, regs: &SyscallRegs) -> Ret {
         let sysno = self.arch.sysno(regs.nr);
         let a = regs.args;
-        if dump_after().is_some()
-            && let CpuState::Aarch64(st) = vcpu.state()
-        {
-            *t.in_syscall.lock().unwrap() = Some(SyscallSnap { nr: regs.nr, args: a, pc: st.pc, lr: st.x[30], fp: st.x[29], since: Instant::now() });
-        }
+        let (pc, lr, fp) = match dump_after().map(|_| vcpu.state()) {
+            Some(CpuState::Aarch64(st)) => (st.pc, st.x[30], st.x[29]),
+            _ => (0, 0, 0),
+        };
+        *t.in_syscall.lock().unwrap() = Some(SyscallSnap { nr: regs.nr, args: a, pc, lr, fp, since: Instant::now() });
         let ret = match sysno {
             None => Ret::Value(-ENOSYS),
             Some(no) => self.dispatch(no, t, vcpu, a),
         };
-        if dump_after().is_some() {
-            *t.in_syscall.lock().unwrap() = None;
-        }
-        if self.strace {
+        *t.in_syscall.lock().unwrap() = None;
+        if self.strace && strace_wanted(t) {
             let name = sysno.map_or_else(|| format!("syscall_{}", regs.nr), |s| format!("{s:?}"));
             let path = match sysno {
                 Some(Sysno::openat | Sysno::newfstatat | Sysno::readlinkat | Sysno::faccessat | Sysno::faccessat2 | Sysno::statx | Sysno::execve) => {
@@ -820,6 +883,7 @@ impl Kernel {
     fn process_exit(self: &Arc<Self>, proc: &Arc<Process>, status: i32) {
         // Closing files first lets pipe readers see EOF.
         drop(std::mem::replace(&mut *proc.files.lock().unwrap(), FdTable::empty()));
+        locks::LOCKS.release(locks::Owner::Process(proc.pid));
         drop(proc.mm.lock().unwrap().take());
         // Children move before we become a zombie: whoever reaps us finds them in place.
         self.reparent_children(proc);

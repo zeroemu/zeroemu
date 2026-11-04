@@ -545,12 +545,16 @@ impl Kernel {
             if let Kind::Netlink(nl) = &f.kind {
                 return self.netlink_syscall(no, t, nl, &f, a);
             }
+            if let Kind::Inet(s) = &f.kind {
+                return self.inet_syscall(no, t, s, a);
+            }
         }
         match no {
             socket if a[0] == netlink::AF_NETLINK => self.netlink_socket(t, a),
+            socket if a[0] == super::inet::AF_INET || a[0] == super::inet::AF_INET6 => self.inet_socket(t, a),
             socket => {
                 if a[0] != AF_UNIX {
-                    return Err(EAFNOSUPPORT); // inet sockets: not yet
+                    return Err(EAFNOSUPPORT);
                 }
                 let ty = sock_type(a[1])?;
                 let file = File::new(Kind::Socket(Socket::new(ty, Cred::of(t))), (a[1] & SOCK_NONBLOCK) as u32);

@@ -232,6 +232,9 @@ pub struct AddressSpace {
     /// Page-table frames owned by this address space.
     tables: Vec<u64>,
     pub brk_start: u64,
+    /// The stack pointer exec started the program with (/proc/<pid>/stat
+    /// startstack: bionic finds the main thread's stack mapping by it).
+    pub start_stack: u64,
     pub brk: u64,
     /// Set when entries were removed or downgraded: vCPUs must flush before
     /// re-entering the guest, and `stale` frames may be freed only after that.
@@ -258,6 +261,7 @@ impl AddressSpace {
             vmas: BTreeMap::new(),
             tables,
             brk_start: 0,
+            start_stack: 0,
             brk: 0,
             tlb_dirty: false,
             stale: Stale::default(),
@@ -752,6 +756,25 @@ impl AddressSpace {
         self.write(va, &v.to_le_bytes())
     }
 
+    /// Atomically replaces the word at `va` with `f(current)` until that
+    /// sticks or `f` declines (None). Guest threads on other vCPUs change the
+    /// same word with their own atomics (the PI futex fast paths). Returns
+    /// the value last seen and whether it was replaced.
+    pub fn update_u32(&mut self, va: u64, mut f: impl FnMut(u32) -> Option<u32>) -> Result<(u32, bool), i64> {
+        if !va.is_multiple_of(4) {
+            return Err(EINVAL);
+        }
+        let word = unsafe { std::sync::atomic::AtomicU32::from_ptr(self.host_ptr(va, true, false)? as *mut u32) };
+        let mut cur = word.load(std::sync::atomic::Ordering::SeqCst);
+        loop {
+            let Some(new) = f(cur) else { return Ok((cur, false)) };
+            match word.compare_exchange_weak(cur, new, std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst) {
+                Ok(_) => return Ok((cur, true)),
+                Err(seen) => cur = seen,
+            }
+        }
+    }
+
     /// A NUL-terminated string of at most 4 KiB (PATH_MAX).
     pub fn read_cstr(&mut self, va: u64) -> Result<String, i64> {
         let mut out = Vec::new();
@@ -774,6 +797,7 @@ impl AddressSpace {
         let mut child = AddressSpace::new(self.phys.clone(), kernel, asid)?;
         child.vmas = self.vmas.clone();
         child.brk_start = self.brk_start;
+        child.start_stack = self.start_stack;
         child.brk = self.brk;
         let mut pages = Vec::new();
         self.visit(0, USER_TOP, &mut |_, _, va, e| pages.push((va, e)));

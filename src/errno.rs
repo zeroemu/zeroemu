@@ -16,6 +16,7 @@ pub const ENOTTY: i64 = 25;
 pub const ESPIPE: i64 = 29;
 pub const EROFS: i64 = 30;
 pub const ERANGE: i64 = 34;
+pub const EDEADLK: i64 = 35;
 pub const ENOSYS: i64 = 38;
 pub const ELOOP: i64 = 40;
 pub const ESRCH: i64 = 3;

@@ -180,7 +180,7 @@ static void on_segv(int sig, void *info, void *uc) {
     sys(NR_mprotect, fault_page, 4096, PROT_RW); // fix it; the store is retried
 }
 
-int cmain(void) {
+int cmain(i64 *sp) {
     // Threads + atomics + futex mutex + CLONE_CHILD_CLEARTID join.
     int tids[4];
     for (int i = 0; i < 4; i++) {
@@ -257,17 +257,27 @@ int cmain(void) {
     char *ax2 = (char *)sys(NR_mremap, ax, 8192, 16384, 1 /* MREMAP_MAYMOVE */, 0);
     check((i64)ax2 > 0 && ax2[0] == 5, "mremap after mprotect splits and rejoins");
 
+    // Linux lays the argv then envp strings out contiguously, ascending.
+    i64 argc = sp[0];
+    char **argv = (char **)(sp + 1), **envp = argv + argc + 1;
+    int ascending = argc > 0;
+    for (char **a = argv; ascending && *a; a++) {
+        char *next = a[1] ? a[1] : envp[0];
+        if (next && next != *a + slen(*a) + 1) ascending = 0;
+    }
+    check(ascending, "argv and envp strings are contiguous and ascending");
+
     puts_(failures ? "SOME CHECKS FAILED\n" : "all checks passed\n");
     return failures;
 }
 
-void __attribute__((noreturn)) cstart(void) {
-    sys(NR_exit_group, cmain());
+void __attribute__((noreturn)) cstart(i64 *sp) {
+    sys(NR_exit_group, cmain(sp));
     __builtin_unreachable();
 }
 
 #if defined(__aarch64__)
-__asm__(".global _start\n_start:\n bl cstart\n");
+__asm__(".global _start\n_start:\n mov x0, sp\n bl cstart\n");
 #elif defined(__x86_64__)
-__asm__(".global _start\n_start:\n call cstart\n");
+__asm__(".global _start\n_start:\n mov %rsp, %rdi\n call cstart\n");
 #endif

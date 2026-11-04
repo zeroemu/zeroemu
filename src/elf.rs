@@ -172,22 +172,24 @@ pub fn build_stack(mm: &mut AddressSpace, main: &Image, interp_base: u64, argv: 
         mm.write(sp, data)?;
         Ok(sp)
     };
+    // As Linux lays them out: the argv strings, then the envp strings, in
+    // order upwards from argv[0]. app_process renames itself by overwriting
+    // argv[0] through the end of argv[argc - 1].
+    let mut block = Vec::new();
+    let mut offsets = Vec::with_capacity(argv.len() + envp.len());
+    for s in argv.iter().chain(envp) {
+        offsets.push(block.len() as u64);
+        block.extend_from_slice(s.as_bytes());
+        block.push(0);
+    }
+    let strings = push_bytes(mm, &block)?;
+    let argv_ptrs: Vec<u64> = offsets[..argv.len()].iter().map(|o| strings + o).collect();
+    let envp_ptrs: Vec<u64> = offsets[argv.len()..].iter().map(|o| strings + o).collect();
+    let execfn = argv_ptrs.first().copied().unwrap_or(0);
+    let platform = push_bytes(mm, if Arch::HOST == Arch::Aarch64 { b"aarch64\0" } else { b"x86_64\0" })?;
     let mut random = [0u8; 16];
     phys::random_bytes(&mut random);
     let random = push_bytes(mm, &random)?;
-    let platform = push_bytes(mm, if Arch::HOST == Arch::Aarch64 { b"aarch64\0" } else { b"x86_64\0" })?;
-    let mut strings = |mm: &mut AddressSpace, list: &[String]| -> Result<Vec<u64>, i64> {
-        list.iter()
-            .map(|s| {
-                let mut b = s.clone().into_bytes();
-                b.push(0);
-                push_bytes(mm, &b)
-            })
-            .collect()
-    };
-    let argv_ptrs = strings(mm, argv)?;
-    let envp_ptrs = strings(mm, envp)?;
-    let execfn = argv_ptrs.first().copied().unwrap_or(0);
 
     let auxv: [(u64, u64); 18] = [
         (AT_PHDR, main.phdr),
@@ -227,5 +229,6 @@ pub fn build_stack(mm: &mut AddressSpace, main: &Image, interp_base: u64, argv: 
     }
     mm.write(start, &table)?;
     mm.set_name(STACK_TOP - STACK_SIZE, STACK_SIZE, "[stack]");
+    mm.start_stack = start;
     Ok(start)
 }

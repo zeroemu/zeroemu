@@ -11,6 +11,7 @@ typedef long i64;
 #define NR_write 64
 #define NR_exit_group 94
 #define NR_clone 220
+#define NR_gettid 178
 
 static i64 sys6(i64 n, i64 a, i64 b, i64 c, i64 d, i64 e, i64 f) {
     register i64 x8 __asm__("x8") = n;
@@ -94,6 +95,48 @@ static void spinner(void *arg) {
     }
 }
 
+// A priority-inheritance mutex, as bionic and libc++ use it: the word holds
+// the owner's tid; contended paths go through FUTEX_LOCK_PI / UNLOCK_PI.
+#define N_PI 8
+#define PI_ROUNDS 2000
+static volatile unsigned pi_word;
+static long pi_counter;
+
+static void pi_lock(unsigned tid) {
+    unsigned zero = 0;
+    if (__atomic_compare_exchange_n(&pi_word, &zero, tid, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) return;
+    while (sys(NR_futex, &pi_word, 6 | 128 /* LOCK_PI|PRIVATE */, 0, 0) != 0) {}
+}
+
+static void pi_unlock(unsigned tid) {
+    unsigned mine = tid;
+    if (__atomic_compare_exchange_n(&pi_word, &mine, 0, 0, __ATOMIC_RELEASE, __ATOMIC_RELAXED)) return;
+    sys(NR_futex, &pi_word, 7 | 128 /* UNLOCK_PI|PRIVATE */, 0, 0);
+}
+
+static void pi_worker(void *arg) {
+    (void)arg;
+    unsigned tid = (unsigned)sys(NR_gettid, 0);
+    for (int i = 0; i < PI_ROUNDS; i++) {
+        pi_lock(tid);
+        long c = pi_counter;
+        for (volatile int k = 0; k < 20; k++) {}
+        pi_counter = c + 1;
+        pi_unlock(tid);
+    }
+}
+
+static volatile int pi_held, pi_release;
+
+static void pi_holder(void *arg) {
+    (void)arg;
+    unsigned tid = (unsigned)sys(NR_gettid, 0);
+    pi_lock(tid);
+    __atomic_store_n(&pi_held, 1, __ATOMIC_RELEASE);
+    while (__atomic_load_n(&pi_release, __ATOMIC_ACQUIRE) == 0) {}
+    pi_unlock(tid);
+}
+
 int cmain(void) {
     char *stacks = (char *)sys(NR_mmap, 0, (u64)STACK * N_BLOCK, 3, 0x22, -1, 0);
     check((i64)stacks > 0, "stacks mapped");
@@ -116,6 +159,24 @@ int cmain(void) {
     }
     for (int i = 0; i < N_SPIN; i++) join(&tids[i]);
     check(started == N_SPIN && spinning == N_SPIN, "100 threads spinning at once all ran");
+
+    unsigned me = (unsigned)sys(NR_gettid, 0);
+    pi_lock(me);
+    check(sys(NR_futex, &pi_word, 6 | 128, 0, 0) == -35, "PI lock: relocking your own lock is EDEADLK");
+    pi_unlock(me);
+    for (int i = 0; i < N_PI; i++) {
+        tids[i] = 1;
+        spawn(stacks + (u64)STACK * (i + 1), pi_worker, 0, &tids[i]);
+    }
+    for (int i = 0; i < N_PI; i++) join(&tids[i]);
+    check(pi_counter == N_PI * PI_ROUNDS && pi_word == 0, "PI mutex: 8 threads contend, none lost, lock free after");
+    tids[0] = 1;
+    spawn(stacks + STACK, pi_holder, 0, &tids[0]);
+    while (__atomic_load_n(&pi_held, __ATOMIC_ACQUIRE) == 0) {}
+    check(sys(NR_futex, &pi_word, 8 | 128 /* TRYLOCK_PI */, 0, 0) == -11, "PI trylock on a held lock is EAGAIN");
+    check(sys(NR_futex, &pi_word, 7 | 128, 0, 0) == -1, "PI unlock by a non-owner is EPERM");
+    __atomic_store_n(&pi_release, 1, __ATOMIC_RELEASE);
+    join(&tids[0]);
 
     if (failures) {
         puts_("SOME CHECKS FAILED\n");

@@ -114,7 +114,8 @@ underneath (`ANGLE_DEFAULT_PLATFORM` overrides). For development, `--push
 is up, its output on stderr. `droidrt --gpu-selftest` checks the renderer and
 window alone.
 
-`DROIDRT_STRACE=1` (or `--strace`) logs every syscall; `DROIDRT_BINDER_TRACE=1`
+`DROIDRT_STRACE=1` (or `--strace`) logs every syscall (`DROIDRT_STRACE=<name>`:
+only of programs whose path contains it); `DROIDRT_BINDER_TRACE=1`
 logs every binder transaction; `DROIDRT_WATCHDOG=<secs>` forces a stuck guest
 out of the VM and dumps its registers. Fatal faults print a backtrace as
 library+offset, and writes to `/dev/kmsg` (where `servicemanager` and `init`

@@ -442,6 +442,13 @@ pub struct Node {
     pub path: String,
 }
 
+impl Node {
+    /// Which filesystem the inode number belongs to.
+    pub fn fs_id(&self) -> usize {
+        Arc::as_ptr(&self.mnt.sb.fs) as *const () as usize
+    }
+}
+
 impl std::fmt::Debug for Node {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "Node({} ino {} on mount {})", self.path, self.ino, self.mnt.id)

@@ -138,6 +138,10 @@ int cmain(void) {
     check(get("/data/local/tmp", "security.selinux") > 0 && is("u:object_r:shell_data_file:s0"), "/data/local/tmp is shell_data_file");
     check(get("/", "security.selinux") == -ENODATA, "unlabeled root: ENODATA");
     check(get("/nonexistent", "security.selinux") == -ENOENT, "missing path: ENOENT");
+    // get looks the path up before the name; set/remove copy the name first.
+    check(sys(NR_getxattr, "/nonexistent", "", buf, 8) == -ENOENT, "get: missing path before empty name");
+    check(sys(NR_setxattr, "/nonexistent", "", buf, 1, 0) == -ERANGE, "set: empty name before missing path");
+    check(sys(NR_removexattr, "/nonexistent", "") == -ERANGE, "remove: empty name before missing path");
 
     // New nodes inherit their directory's label.
     check(sys(NR_mkdirat, AT_FDCWD, "/tmp/x", 0755) == 0, "mkdir /tmp/x");
@@ -168,6 +172,8 @@ int cmain(void) {
     check(set("/tmp/x/f", "user.", "1", 0) == -EINVAL, "empty suffix: EINVAL");
     check(set("/tmp/x/f", "", "1", 0) == -ERANGE && get("/tmp/x/f", "") == -ERANGE, "empty name: ERANGE");
     check(set("/tmp/x/f", "system.posix_acl_access", "1", 0) == -EOPNOTSUPP, "tmpfs has no ACLs");
+    check(get("/tmp/x/f", "system.posix_acl_access") == -EOPNOTSUPP, "get system.*: EOPNOTSUPP");
+    check(sys(NR_removexattr, "/tmp/x/f", "system.posix_acl_access") == -EOPNOTSUPP, "remove system.*: EOPNOTSUPP");
     char name[300];
     memcpy(name, "user.", 5);
     memset(name + 5, 'n', 250);
@@ -211,11 +217,17 @@ int cmain(void) {
     int sv[2];
     sys(NR_socketpair, 1 /* AF_UNIX */, 1 /* SOCK_STREAM */, 0, sv);
     check(sys(NR_fsetxattr, sv[0], "security.selinux", custom, slen(custom) + 1, 0) == 0, "socket: label accepted");
+    check(sys(NR_fsetxattr, sv[0], "security.", custom, 1, 0) == -EINVAL, "socket: empty security suffix EINVAL");
     i64 mfd = sys(NR_memfd_create, "x", 0);
     check(sys(NR_fsetxattr, mfd, "user.m", "M", 1, 0) == 0 && sys(NR_fgetxattr, mfd, "user.m", buf, 256) == 1 && buf[0] == 'M', "memfd xattrs");
+    check(sys(NR_fgetxattr, mfd, "system.posix_acl_access", buf, 8) == -EOPNOTSUPP, "memfd get system.*: EOPNOTSUPP");
     i64 nfd = sys(NR_openat, AT_FDCWD, "/dev/null", O_RDWR, 0);
     check(sys(NR_fgetxattr, nfd, "security.selinux", buf, 256) == 26 && is("u:object_r:null_device:s0"), "fgetxattr on /dev/null");
     check(sys(NR_fgetxattr, 999, "security.selinux", buf, 256) == -EBADF, "bad fd: EBADF");
+    // A bad fd fails before the name is inspected.
+    check(sys(NR_fgetxattr, 999, "", buf, 8) == -EBADF, "fgetxattr: bad fd before empty name");
+    check(sys(NR_fsetxattr, 999, "", buf, 1, 0) == -EBADF, "fsetxattr: bad fd before empty name");
+    check(sys(NR_fremovexattr, 999, "") == -EBADF, "fremovexattr: bad fd before empty name");
 
     // Attributes belong to the inode: they follow rename and link, and die with it.
     set("/tmp/x/f", "user.k", "keep", 0);

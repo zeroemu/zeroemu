@@ -77,7 +77,18 @@ impl Kernel {
             listxattr | llistxattr | flistxattr => Op::List,
             _ => Op::Remove,
         };
-        // Flags, name and value are checked and copied in before the path is looked up.
+        let is_fd = matches!(no, fsetxattr | fgetxattr | flistxattr | fremovexattr);
+        let follow = matches!(no, setxattr | getxattr | listxattr | removexattr);
+        // f* fails with EBADF before the name, flags or value are inspected.
+        let fd_target = if is_fd { Some(self.fd_xattr_target(t, int(a[0]))?) } else { None };
+        // get/list walk the path before copying the name. set/remove copy the
+        // name first, so a bad name wins over a missing path (setxattr_copy).
+        let early_node = if !is_fd && matches!(op, Op::Get | Op::List) {
+            let path = t.proc.mm().read_cstr(a[0])?;
+            Some(self.resolve(t, AT_FDCWD, &path, follow)?)
+        } else {
+            None
+        };
         if matches!(op, Op::Set) && a[4] as u32 & !(XATTR_CREATE | XATTR_REPLACE) != 0 {
             return Err(EINVAL);
         }
@@ -87,11 +98,12 @@ impl Kernel {
             Op::Set => t.proc.mm().read_vec(a[2], a[3] as usize)?,
             _ => Vec::new(),
         };
-        let target = match no {
-            fsetxattr | fgetxattr | flistxattr | fremovexattr => self.fd_xattr_target(t, int(a[0]))?,
-            _ => {
+        let target = match (early_node, fd_target) {
+            (Some(n), _) => Target::Node(n),
+            (None, Some(target)) => target,
+            (None, None) => {
                 let path = t.proc.mm().read_cstr(a[0])?;
-                Target::Node(self.resolve(t, AT_FDCWD, &path, matches!(no, setxattr | getxattr | listxattr | removexattr))?)
+                Target::Node(self.resolve(t, AT_FDCWD, &path, follow)?)
             }
         };
         let vfs = self.vfs.as_deref().ok_or(ENOENT)?;
@@ -110,7 +122,11 @@ impl Kernel {
                 check_namespace(&name)?;
                 f.xattrs.lock().unwrap().set(&name, &value, a[4] as u32).map(|_| 0)
             }
-            (Op::Set, Target::Socket) if name.starts_with("security.") => Ok(0),
+            (Op::Set, Target::Socket) => {
+                // An empty suffix ("security.") is EINVAL; only security.* is accepted.
+                check_namespace(&name)?;
+                if name.starts_with("security.") { Ok(0) } else { Err(EOPNOTSUPP) }
+            }
             (Op::Get, Target::Node(n)) => {
                 check_namespace(&name)?;
                 if !user_allowed(vfs, &n, &name)? {

@@ -116,6 +116,10 @@ struct State {
 
 pub struct Socket {
     ty: u32,
+    /// Label from socket() (selinux_socket_post_create). setsockcreatecon is
+    /// cleared before listen/connect — init's CreateSocket does that — so
+    /// later calls must not sample the task again. 0 for a kernel service.
+    sid: u32,
     rx: Mutex<Queue>,
     st: Mutex<State>,
     /// Answered inside the kernel (e.g. the property service), not by a process.
@@ -137,7 +141,7 @@ pub trait Service: Send + Sync {
 }
 
 fn service_socket(name: &str, ty: u32, service: Arc<dyn Service>, listening: bool) -> Arc<Socket> {
-    let sock = Arc::new(Socket { ty, rx: Mutex::new(Queue::default()), st: Mutex::new(State::default()), service: Some(service), svc_buf: Mutex::new(Vec::new()) });
+    let sock = Arc::new(Socket { ty, sid: 0, rx: Mutex::new(Queue::default()), st: Mutex::new(State::default()), service: Some(service), svc_buf: Mutex::new(Vec::new()) });
     {
         let mut st = sock.st.lock().unwrap();
         st.name = Some(name.as_bytes().to_vec());
@@ -181,8 +185,8 @@ impl Drop for Socket {
 }
 
 impl Socket {
-    fn new(ty: u32) -> Arc<Socket> {
-        Arc::new(Socket { ty, rx: Mutex::new(Queue::default()), st: Mutex::new(State::default()), service: None, svc_buf: Mutex::new(Vec::new()) })
+    fn new(ty: u32, sid: u32) -> Arc<Socket> {
+        Arc::new(Socket { ty, sid, rx: Mutex::new(Queue::default()), st: Mutex::new(State::default()), service: None, svc_buf: Mutex::new(Vec::new()) })
     }
 
     /// Sends a packet to the client of a kernel-service connection.
@@ -462,7 +466,7 @@ impl Kernel {
                     return Err(EAFNOSUPPORT); // inet and netlink sockets: not yet
                 }
                 let ty = sock_type(a[1])?;
-                let file = File::new(Kind::Socket(Socket::new(ty)), (a[1] & SOCK_NONBLOCK) as u32);
+                let file = File::new(Kind::Socket(Socket::new(ty, super::selinux::socket_sid(t))), (a[1] & SOCK_NONBLOCK) as u32);
                 t.proc.files.lock().unwrap().alloc(file, a[1] & SOCK_CLOEXEC != 0, 0)
             }
             socketpair => {
@@ -470,7 +474,8 @@ impl Kernel {
                     return Err(EAFNOSUPPORT);
                 }
                 let ty = sock_type(a[1])?;
-                let (x, y) = (Socket::new(ty), Socket::new(ty));
+                let sid = super::selinux::socket_sid(t);
+                let (x, y) = (Socket::new(ty, sid), Socket::new(ty, sid));
                 Socket::connect_pair(&x, &y, Cred::of(t), Cred::of(t));
                 let flags = (a[1] & SOCK_NONBLOCK) as u32;
                 let cloexec = a[1] & SOCK_CLOEXEC != 0;
@@ -516,7 +521,9 @@ impl Kernel {
                     return Err(EINVAL);
                 }
                 st.backlog.get_or_insert_with(VecDeque::new);
-                st.listen_cred = Cred::of(t);
+                let mut cred = Cred::of(t);
+                cred.sid = sock.sid;
+                st.listen_cred = cred;
                 Ok(0)
             }
             accept | accept4 => {
@@ -572,12 +579,14 @@ impl Kernel {
                 }
                 if let Some(svc) = &listener.service {
                     // A kernel-side service answers on its own; nothing to accept.
-                    let server = Arc::new(Socket { ty: sock.ty, rx: Mutex::new(Queue::default()), st: Mutex::new(State::default()), service: Some(svc.clone()), svc_buf: Mutex::new(Vec::new()) });
-                    Socket::connect_pair(&sock, &server, Cred::of(t), Cred { pid: 1, uid: 0, gid: 0, sid: 0 });
+                    let server = Arc::new(Socket { ty: sock.ty, sid: 0, rx: Mutex::new(Queue::default()), st: Mutex::new(State::default()), service: Some(svc.clone()), svc_buf: Mutex::new(Vec::new()) });
+                    let mut client = Cred::of(t);
+                    client.sid = sock.sid;
+                    Socket::connect_pair(&sock, &server, client, Cred { pid: 1, uid: 0, gid: 0, sid: 0 });
                     sock.st.lock().unwrap().peer_server = Some(server);
                     return Ok(0);
                 }
-                let server = Socket::new(sock.ty);
+                let server = Socket::new(sock.ty, listener.sid);
                 let mut lst = listener.st.lock().unwrap();
                 let (listen_cred, listen_name) = (lst.listen_cred, lst.name.clone());
                 let backlog = lst.backlog.as_mut().ok_or(ECONNREFUSED)?;
@@ -585,7 +594,9 @@ impl Kernel {
                     return Err(EAGAIN);
                 }
                 server.st.lock().unwrap().name = listen_name;
-                Socket::connect_pair(&sock, &server, Cred::of(t), listen_cred);
+                let mut client = Cred::of(t);
+                client.sid = sock.sid;
+                Socket::connect_pair(&sock, &server, client, listen_cred);
                 backlog.push_back(server);
                 drop(lst);
                 EVENTS.bump();
@@ -658,7 +669,7 @@ impl Kernel {
                     return Err(ENOPROTOOPT);
                 }
                 if a[2] == SO_PEERSEC {
-                    // The peer's label from connect/socketpair time; ERANGE says how much room it needs.
+                    // The peer socket's label from its socket(); ERANGE says how much room it needs.
                     let sid = if sock.ty == SOCK_DGRAM { 0 } else { sock.st.lock().unwrap().peer_cred.sid };
                     let ctx = super::selinux::context_bytes(sid).ok_or(ENOPROTOOPT)?;
                     let mut mm = t.proc.mm();

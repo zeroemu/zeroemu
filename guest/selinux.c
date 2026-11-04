@@ -247,6 +247,26 @@ int cmain(void) {
     len = sizeof buf;
     r = sys(NR_getsockopt, cli, 1, 31, buf, &len);
     check(r == 0 && is(buf, len, "u:r:shell:s0", 13), "SO_PEERSEC: a client sees the server's label");
+    // setsockcreatecon applies at socket(). init clears it before listen(); a client may clear it before connect().
+    put("/proc/thread-self/attr/sockcreate", "u:r:logd:s0", 1);
+    int srv2 = (int)sys(NR_socket, 1, 1, 0);
+    put("/proc/thread-self/attr/sockcreate", "", 0);
+    struct { unsigned short family; char path[14]; } addr2 = { 1, "\0selinux-sock" };
+    sys(NR_bind, srv2, &addr2, sizeof addr2);
+    sys(NR_listen, srv2, 1);
+    int cli2 = (int)sys(NR_socket, 1, 1, 0);
+    conn = sys(NR_connect, cli2, &addr2, sizeof addr2);
+    len = sizeof buf;
+    r = sys(NR_getsockopt, cli2, 1, 31, buf, &len);
+    check(conn == 0 && r == 0 && is(buf, len, "u:r:logd:s0", 12), "SO_PEERSEC: server label is fixed at socket(), not listen()");
+    put("/proc/thread-self/attr/sockcreate", "u:r:logd:s0", 1);
+    int cli3 = (int)sys(NR_socket, 1, 1, 0);
+    put("/proc/thread-self/attr/sockcreate", "", 0);
+    conn = sys(NR_connect, cli3, &addr, sizeof addr);
+    int acc3 = (int)sys(NR_accept, srv, 0, 0);
+    len = sizeof buf;
+    r = sys(NR_getsockopt, acc3, 1, 31, buf, &len);
+    check(conn == 0 && r == 0 && is(buf, len, "u:r:logd:s0", 12), "SO_PEERSEC: client label is fixed at socket(), not connect()");
 
     // ---- setcon ----
     check(put("/proc/self/attr/current", "u:r:logd:s0", 1) == 12, "setcon: write current");

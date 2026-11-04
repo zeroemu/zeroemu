@@ -330,6 +330,19 @@ impl AddressSpace {
             .collect()
     }
 
+    /// "path+0xoffset" for a code address (for crash reports).
+    pub fn symbolize(&self, va: u64) -> String {
+        match self.find(crate::arch::untag(va)) {
+            Some((start, v)) => {
+                let name = v.name.as_deref().unwrap_or("[anon]");
+                // Offsets are relative to the first mapping of the same file.
+                let base = self.vmas.range(..=start).rev().take_while(|(_, x)| x.name.as_deref() == Some(name)).last().map_or(start, |(&s, _)| s);
+                format!("{name}+{:#x}", va - base)
+            }
+            None => "?".into(),
+        }
+    }
+
     /// Bytes of address space mapped, and bytes actually resident.
     pub fn usage(&self) -> (u64, u64) {
         let virt = self.vmas.iter().map(|(&s, v)| v.end - s).sum();
@@ -371,6 +384,16 @@ impl AddressSpace {
             self.tlb_dirty = true;
         }
         Ok(())
+    }
+
+    /// Guest-physical address of `va` if it lies in shared memory (the key
+    /// for futexes that other processes can wake).
+    pub fn shared_frame(&self, va: u64) -> Option<u64> {
+        let va = crate::arch::untag(va);
+        let (start, vma) = self.find(va)?;
+        let Backing::Shared { obj, offset } = &vma.backing else { return None };
+        let idx = ((offset + (page_down(va) - start)) / PAGE) as usize;
+        Some(obj.frame(idx).ok()? + va % PAGE)
     }
 
     fn is_shared(&self, va: u64) -> bool {

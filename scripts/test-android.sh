@@ -66,6 +66,13 @@ check "/proc/self/maps"     "/system/bin/toybox"  /system/bin/toybox cat /proc/s
 check "/proc/self/fd"       "/dev/pts/0"          /system/bin/toybox ls -l /proc/self/fd
 check "mount"               "on /data type tmpfs" /system/bin/toybox mount
 check "nproc via /sys"      "0-"                  /system/bin/toybox cat /sys/devices/system/cpu/possible
+# properties and binder
+check "getprop"             "16"                  /system/bin/getprop ro.build.version.release
+check "derived fingerprint" "release-keys"        /system/bin/getprop ro.build.fingerprint
+check "setprop round trip"  "value=world"         /system/bin/sh -c 'setprop debug.droidrt.t world && echo "value=$(getprop debug.droidrt.t)"'
+check "ro.* is read-only"   "still 36"            /system/bin/sh -c 'setprop ro.build.version.sdk 1 2>/dev/null; echo "still $(getprop ro.build.version.sdk)"'
+check "servicemanager"      "manager: [android.os.IServiceManager]" /system/bin/sh -c 'servicemanager 2>/dev/null & sleep 0.5; service list; kill %1'
+check "service check"       "Service manager: found" /system/bin/sh -c 'servicemanager 2>/dev/null & sleep 0.5; service check manager; kill %1'
 
 # Exit status needs its own path: the program's code must become droidrt's.
 perl -e 'alarm 60; exec @ARGV' "$BIN" --system "$IMG" /system/bin/sh -c 'exit 3' >/dev/null 2>&1

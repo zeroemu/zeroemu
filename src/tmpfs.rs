@@ -146,6 +146,13 @@ impl Tmpfs {
         dir
     }
 
+    /// Places an existing file's contents at `path` (e.g. the property area).
+    pub fn add_file(&self, path: &str, mode: u32, file: Arc<MemFile>) {
+        let (dir, name) = path.rsplit_once('/').unwrap_or(("", path));
+        let d = self.mkdir_p(dir, 0o755);
+        self.add(d, name, S_IFREG | mode, Kind::File(file)).expect("tmpfs add_file");
+    }
+
     /// Convenience for populating a fresh tree: a file with `content`.
     pub fn write_file(&self, path: &str, mode: u32, content: &str) {
         let (dir, name) = path.rsplit_once('/').unwrap_or(("", path));

@@ -107,12 +107,37 @@ struct State {
     passcred: bool,
     shut_rd: bool,
     shut_wr: bool,
+    /// For a client of a kernel-side service: keeps the server end alive.
+    peer_server: Option<Arc<Socket>>,
 }
 
 pub struct Socket {
     ty: u32,
     rx: Mutex<Queue>,
     st: Mutex<State>,
+    /// Answered inside the kernel (e.g. the property service), not by a process.
+    service: Option<Arc<dyn Service>>,
+    svc_buf: Mutex<Vec<u8>>,
+}
+
+/// A kernel-side socket server: given the bytes received so far on one
+/// connection, consumes complete requests and returns a reply for each.
+pub trait Service: Send + Sync {
+    fn handle(&self, buf: &mut Vec<u8>) -> Option<Vec<u8>>;
+}
+
+/// Registers a kernel-side stream service under `name` (a path); the
+/// returned socket must be kept alive.
+pub fn listen_service(name: &str, service: Arc<dyn Service>) -> Arc<Socket> {
+    let sock = Arc::new(Socket { ty: SOCK_STREAM, rx: Mutex::new(Queue::default()), st: Mutex::new(State::default()), service: Some(service), svc_buf: Mutex::new(Vec::new()) });
+    {
+        let mut st = sock.st.lock().unwrap();
+        st.name = Some(name.as_bytes().to_vec());
+        st.backlog = Some(VecDeque::new());
+        st.listen_cred = Cred { pid: 1, uid: 0, gid: 0 };
+    }
+    NAMES.lock().unwrap().insert(name.as_bytes().to_vec(), Arc::downgrade(&sock));
+    sock
 }
 
 /// Bound names (path or "\0abstract") -> sockets.
@@ -136,7 +161,30 @@ impl Drop for Socket {
 
 impl Socket {
     fn new(ty: u32) -> Arc<Socket> {
-        Arc::new(Socket { ty, rx: Mutex::new(Queue::default()), st: Mutex::new(State::default()) })
+        Arc::new(Socket { ty, rx: Mutex::new(Queue::default()), st: Mutex::new(State::default()), service: None, svc_buf: Mutex::new(Vec::new()) })
+    }
+
+    /// Feeds what arrived on a kernel-service connection to its service,
+    /// queueing the replies for the client.
+    fn serve(&self) {
+        let Some(svc) = &self.service else { return };
+        let mut buf = self.svc_buf.lock().unwrap();
+        {
+            let mut q = self.rx.lock().unwrap();
+            for m in q.msgs.drain(..) {
+                buf.extend_from_slice(&m.data[m.off..]);
+            }
+            q.bytes = 0;
+        }
+        let Some(client) = self.peer() else { return };
+        while let Some(reply) = svc.handle(&mut buf) {
+            if !reply.is_empty() {
+                let mut q = client.rx.lock().unwrap();
+                q.bytes += reply.len();
+                q.msgs.push_back(Msg { data: reply, off: 0, fds: Vec::new(), from: Vec::new(), cred: Cred { pid: 1, uid: 0, gid: 0 } });
+            }
+        }
+        EVENTS.bump();
     }
 
     fn peer(&self) -> Option<Arc<Socket>> {
@@ -196,6 +244,7 @@ impl Socket {
                     q.bytes += msg.data.len();
                     q.msgs.push_back(msg);
                     drop(q);
+                    target.serve();
                     EVENTS.bump();
                     return Ok(());
                 }
@@ -462,6 +511,13 @@ impl Kernel {
                 let listener = target.ok_or(ENOENT)?;
                 if listener.ty != sock.ty {
                     return Err(EPROTOTYPE);
+                }
+                if let Some(svc) = &listener.service {
+                    // A kernel-side service answers on its own; nothing to accept.
+                    let server = Arc::new(Socket { ty: sock.ty, rx: Mutex::new(Queue::default()), st: Mutex::new(State::default()), service: Some(svc.clone()), svc_buf: Mutex::new(Vec::new()) });
+                    Socket::connect_pair(&sock, &server, Cred::of(t), Cred { pid: 1, uid: 0, gid: 0 });
+                    sock.st.lock().unwrap().peer_server = Some(server);
+                    return Ok(0);
                 }
                 let server = Socket::new(sock.ty);
                 let mut lst = listener.st.lock().unwrap();

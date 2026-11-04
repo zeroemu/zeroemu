@@ -17,6 +17,9 @@ const FUTEX_WAIT_BITSET: u32 = 9;
 const FUTEX_WAKE_BITSET: u32 = 10;
 const FUTEX_CLOCK_REALTIME: u32 = 256;
 const FUTEX_CMD_MASK: u32 = 0x7f;
+const FUTEX_PRIVATE_FLAG: u32 = 128;
+/// Key "pid" for futexes in shared memory, keyed by guest-physical address.
+pub const SHARED: i32 = -1;
 
 struct Waiter {
     woken: Mutex<bool>,
@@ -33,9 +36,9 @@ pub struct Futexes {
 }
 
 impl Futexes {
-    pub fn wake(&self, pid: i32, addr: u64, n: u32, bitset: u32) -> i64 {
+    pub fn wake(&self, key: (i32, u64), n: u32, bitset: u32) -> i64 {
         let mut map = self.waiters.lock().unwrap();
-        let Some(list) = map.get_mut(&(pid, addr)) else { return 0 };
+        let Some(list) = map.get_mut(&key) else { return 0 };
         let mut woken = 0;
         list.retain(|w| {
             if woken < n && w.bitset & bitset != 0 {
@@ -48,7 +51,7 @@ impl Futexes {
             }
         });
         if list.is_empty() {
-            map.remove(&(pid, addr));
+            map.remove(&key);
         }
         woken as i64
     }
@@ -65,10 +68,21 @@ impl Futexes {
 }
 
 impl Kernel {
+    /// Private futexes are per process; others in shared memory are keyed
+    /// by the physical frame so any process mapping it can wake them.
+    pub(super) fn futex_key(&self, t: &Thread, addr: u64, private: bool) -> (i32, u64) {
+        let addr = crate::arch::untag(addr);
+        if !private && let Some(gpa) = t.proc.mm.lock().unwrap().as_ref().and_then(|m| m.shared_frame(addr)) {
+            return (SHARED, gpa);
+        }
+        (t.proc.pid, addr)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) fn sys_futex(&self, t: &Thread, uaddr: u64, op: u32, val: u32, timeout: u64, uaddr2: u64, val3: u32) -> i64 {
         let addr = crate::arch::untag(uaddr);
-        let pid = t.proc.pid;
+        let private = op & FUTEX_PRIVATE_FLAG != 0;
+        let key = self.futex_key(t, addr, private);
         match op & FUTEX_CMD_MASK {
             FUTEX_WAIT | FUTEX_WAIT_BITSET => {
                 let bitset = if op & FUTEX_CMD_MASK == FUTEX_WAIT { u32::MAX } else { val3 };
@@ -95,12 +109,12 @@ impl Kernel {
                         self.boot + d // absolute CLOCK_MONOTONIC
                     })
                 };
-                self.futex_wait(t, (pid, addr), addr, val, deadline, bitset)
+                self.futex_wait(t, key, addr, val, deadline, bitset)
             }
-            FUTEX_WAKE => self.futex.wake(pid, addr, val, u32::MAX),
-            FUTEX_WAKE_BITSET => self.futex.wake(pid, addr, val, val3),
+            FUTEX_WAKE => self.futex.wake(key, val, u32::MAX),
+            FUTEX_WAKE_BITSET => self.futex.wake(key, val, val3),
             FUTEX_REQUEUE | FUTEX_CMP_REQUEUE => {
-                let addr2 = crate::arch::untag(uaddr2);
+                let key2 = self.futex_key(t, uaddr2, private);
                 let mut map = self.futex.waiters.lock().unwrap();
                 if op & FUTEX_CMD_MASK == FUTEX_CMP_REQUEUE {
                     match t.proc.mm().read_u32(addr) {
@@ -109,7 +123,7 @@ impl Kernel {
                         Err(e) => return -e,
                     }
                 }
-                let Some(mut list) = map.remove(&(pid, addr)) else { return 0 };
+                let Some(mut list) = map.remove(&key) else { return 0 };
                 let wake_n = (val as usize).min(list.len());
                 for w in list.drain(..wake_n) {
                     *w.woken.lock().unwrap() = true;
@@ -118,10 +132,10 @@ impl Kernel {
                 let move_n = (timeout as usize).min(list.len()); // val2 travels in the timeout slot
                 let moved: Vec<_> = list.drain(..move_n).collect();
                 if !list.is_empty() {
-                    map.insert((pid, addr), list);
+                    map.insert(key, list);
                 }
                 if !moved.is_empty() {
-                    map.entry((pid, addr2)).or_default().extend(moved);
+                    map.entry(key2).or_default().extend(moved);
                 }
                 wake_n as i64
             }

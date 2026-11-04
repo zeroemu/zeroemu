@@ -236,6 +236,12 @@ pub fn readable(b: &BinderFile, tid: i32) -> bool {
     th.is_some_and(|t| !t.todo.is_empty()) || (th.is_none_or(|t| t.stack.is_empty()) && !p.todo.is_empty())
 }
 
+/// DROIDRT_BINDER_TRACE=1 logs every transaction.
+fn tracing() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("DROIDRT_BINDER_TRACE").is_some())
+}
+
 fn align8(v: u64) -> u64 {
     (v + 7) & !7
 }
@@ -395,6 +401,10 @@ impl Kernel {
                     return Err(EBUSY);
                 }
                 let n = w.node_for(b.id, 0, 0, flags);
+                // Like Linux, the context manager's node starts out referenced:
+                // its owner is never sent BR_INCREFS/BR_ACQUIRE (ptr 0 has no
+                // RefBase behind it to take them).
+                w.nodes.get_mut(&n).unwrap().acquired = true;
                 w.mgr[ctx] = Some(n);
                 Ok(0)
             }
@@ -604,6 +614,9 @@ impl Kernel {
                 w.procs[&me].refs.get(&handle).map(|r| r.node)
             };
             let Some(node) = node.filter(|n| w.nodes.get(n).is_some_and(|n| !n.dead && w.procs.contains_key(&n.owner))) else {
+                if tracing() {
+                    eprintln!("[binder] pid {} call to handle {handle}: dead or unknown", t.proc.pid);
+                }
                 w.thread(me, t.tid).todo.push_back(Work::DeadReply);
                 drop(g);
                 EVENTS.bump();
@@ -778,6 +791,34 @@ impl Kernel {
 
         let txn = w.id();
         let oneway = out.flags & TF_ONE_WAY != 0 && !out.reply;
+        if tracing() {
+            let kinds: Vec<String> = out
+                .offsets
+                .iter()
+                .map(|&o| match u32_at(&out.data, o as usize) {
+                    TYPE_BINDER => "binder".into(),
+                    TYPE_WEAK_BINDER => "weak-binder".into(),
+                    TYPE_HANDLE => format!("handle {}", u32_at(&out.data, o as usize + 8)),
+                    TYPE_WEAK_HANDLE => "weak-handle".into(),
+                    TYPE_FD => "fd".into(),
+                    TYPE_FDA => "fd[]".into(),
+                    TYPE_PTR => "ptr".into(),
+                    t => format!("{t:#x}"),
+                })
+                .collect();
+            eprintln!(
+                "[binder] pid {} tid {} {} code={:#x} flags={:#x} -> pid {}{} data={} objs={:?}",
+                t.proc.pid,
+                t.tid,
+                if out.reply { "REPLY" } else if oneway { "ONEWAY" } else { "CALL" },
+                out.code,
+                out.flags,
+                w.procs[&to].pid,
+                to_thread.map_or(String::new(), |th| format!(" tid {th}")),
+                out.data.len(),
+                kinds
+            );
+        }
         w.txns.insert(
             txn,
             Txn {

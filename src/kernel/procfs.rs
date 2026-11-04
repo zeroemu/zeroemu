@@ -50,7 +50,6 @@ enum K {
     PStatm,
     PTask,
     PAttr,
-    PAttrCurrent,
     PMounts,
     POom,
     PEnviron,
@@ -66,15 +65,31 @@ enum K {
     NsFile,
     Cgroups,
     PCgroup,
+    // SELinux attributes, in selinux::ATTRS order (extra = tid, or 0 for the main thread)
+    AttrCurrent,
+    AttrPrev,
+    AttrExec,
+    AttrFscreate,
+    AttrKeycreate,
+    AttrSockcreate,
 }
 
-const ALL: [K; 40] = [
+const ALL: [K; 45] = [
     K::Root, K::Self_, K::ThreadSelf, K::Meminfo, K::Cpuinfo, K::Stat, K::Uptime, K::Loadavg, K::Version, K::Filesystems,
     K::Cmdline, K::Mounts, K::Sysctl, K::Pid, K::PCmdline, K::PComm, K::PExe, K::PCwd, K::PFd, K::PFdLink,
-    K::PMaps, K::PStatus, K::PStat, K::PStatm, K::PTask, K::PAttr, K::PAttrCurrent, K::PMounts, K::POom, K::PEnviron,
+    K::PMaps, K::PStatus, K::PStat, K::PStatm, K::PTask, K::PAttr, K::PMounts, K::POom, K::PEnviron,
     K::Task, K::PMountinfo, K::POomAdj, K::POomScore, K::PTimerslack, K::PNs, K::PNsLink, K::NsFile,
     K::Cgroups, K::PCgroup,
+    K::AttrCurrent, K::AttrPrev, K::AttrExec, K::AttrFscreate, K::AttrKeycreate, K::AttrSockcreate,
 ];
+const ATTR_K: [K; 6] = [K::AttrCurrent, K::AttrPrev, K::AttrExec, K::AttrFscreate, K::AttrKeycreate, K::AttrSockcreate];
+
+/// (pid, tid, index into selinux::ATTRS) of an attr file.
+pub(super) fn attr_node(ino: u64) -> Option<(i32, i32, usize)> {
+    let (k, pid, extra) = decode(ino)?;
+    let which = ATTR_K.iter().position(|&x| x == k)?;
+    Some((pid, if extra == 0 { pid } else { extra as i32 }, which))
+}
 
 /// One namespace of each kind, shared by every process: (name, kind, the inode
 /// number Linux gives the initial one). The *_for_children links name the
@@ -147,7 +162,7 @@ impl ProcFs {
         let (k, pid, extra) = decode(ino).ok_or_else(|| err(ENOENT))?;
         let kernel = self.kernel()?;
         let text = |s: String| Ok(Content::File(s.into_bytes()));
-        let d = |items: &[(&str, K)]| Ok(Content::Dir(items.iter().map(|(n, k)| (n.to_string(), mk(*k, pid, 0))).collect()));
+        let d = |items: &[(&str, K)]| Ok(Content::Dir(items.iter().map(|(n, k)| (n.to_string(), mk(*k, pid, extra))).collect()));
         match k {
             K::Root => {
                 let mut v: Vec<(String, u64)> = [
@@ -320,8 +335,11 @@ impl ProcFs {
             }
             // A thread directory: the process's view, with the thread's comm and attributes.
             K::Task => Ok(Content::Dir([("comm", K::PComm), ("stat", K::PStat), ("status", K::PStatus), ("attr", K::PAttr), ("cgroup", K::PCgroup), ("ns", K::PNs)].iter().map(|(n, k)| (n.to_string(), mk(*k, pid, extra))).collect())),
-            K::PAttr => d(&[("current", K::PAttrCurrent)]),
-            K::PAttrCurrent => Ok(Content::File(b"u:r:su:s0\0".to_vec())),
+            K::PAttr => Ok(Content::Dir(super::selinux::ATTRS.iter().zip(ATTR_K).map(|(n, k)| (n.to_string(), mk(k, pid, extra))).collect())),
+            K::AttrCurrent | K::AttrPrev | K::AttrExec | K::AttrFscreate | K::AttrKeycreate | K::AttrSockcreate => {
+                let (_, tid, which) = attr_node(ino).ok_or_else(|| err(ENOENT))?;
+                Ok(Content::File(super::selinux::attr(&*self.proc(pid)?, tid, which)))
+            }
             K::POom => text(format!("{}\n", self.proc(pid)?.knobs.lock().unwrap().oom_score_adj)),
             K::POomAdj => {
                 // Linux's legacy scale: -17 (OOM_DISABLE) ..= 15.
@@ -494,6 +512,7 @@ impl FileSystem for ProcFs {
         }
         if name == ".." {
             return Ok(Some(match decode(dir) {
+                Some((K::PAttr, pid, tid)) if tid != 0 => mk(K::Task, pid, tid),
                 Some((K::PAttr | K::PFd | K::PTask, pid, _)) => mk(K::Pid, pid, 0),
                 Some((K::Task, pid, _)) => mk(K::PTask, pid, 0),
                 Some((K::PNs, pid, _)) => mk(K::Pid, pid, 0),

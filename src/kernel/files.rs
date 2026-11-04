@@ -92,6 +92,24 @@ pub enum Kind {
     Block(BlockOpen),
     LoopControl,
     DmControl,
+    Special(SpecialOpen),
+}
+
+/// A file whose contents a kernel subsystem computes (selinuxfs,
+/// /proc/<pid>/attr). Reads see `contents` from the file position; writes
+/// leave the position alone, so a selinuxfs transaction (write a request,
+/// read the answer on the same fd) reads from offset 0.
+pub trait SpecialFile: Send + Sync {
+    fn contents(&self, t: &Thread) -> Result<Vec<u8>, i64>;
+    fn write(&self, t: &Thread, data: &[u8]) -> Result<usize, i64>;
+}
+
+pub struct SpecialOpen {
+    node: Node,
+    file: Box<dyn SpecialFile>,
+    pos: Mutex<u64>,
+    readable: bool,
+    writable: bool,
 }
 
 pub struct BlockOpen {
@@ -349,7 +367,7 @@ pub(super) fn poll_ready(f: &File, t: &Thread, depth: u32) -> u16 {
             }
             None => POLLIN | POLLOUT,
         },
-        Kind::Null | Kind::Zero | Kind::Random | Kind::Mem(_) | Kind::Block(_) | Kind::LoopControl | Kind::DmControl => POLLIN | POLLOUT,
+        Kind::Null | Kind::Zero | Kind::Random | Kind::Mem(_) | Kind::Block(_) | Kind::LoopControl | Kind::DmControl | Kind::Special(_) => POLLIN | POLLOUT,
         Kind::Kmsg => POLLOUT,
         Kind::Pipe(end) => {
             let st = end.pipe.st.lock().unwrap();
@@ -601,6 +619,7 @@ impl Kernel {
                 let node = match &f.kind {
                     Kind::Node(nf) => Some(nf.lock().unwrap().node.clone()),
                     Kind::Mem(m) => m.node.clone(),
+                    Kind::Special(s) => Some(s.node.clone()),
                     _ => None,
                 };
                 let bytes = match node {
@@ -801,6 +820,13 @@ impl Kernel {
             unix::S_IFSOCK if flags & O_PATH == 0 => return Err(ENXIO),
             S_IFDIR if access != 0 => return Err(EISDIR),
             _ if flags & of.directory != 0 && stat.mode & S_IFMT != S_IFDIR => return Err(ENOTDIR),
+            S_IFREG if super::selinux::is_special(vfs, &node) => Kind::Special(SpecialOpen {
+                file: super::selinux::open(self, vfs, &node)?,
+                node,
+                pos: Mutex::new(0),
+                readable: access != O_WRONLY,
+                writable: access == O_WRONLY || access == O_RDWR,
+            }),
             // Kernel files take each write as a value, so they keep no open contents.
             S_IFREG if vfs.write_ok(&node) => Kind::Node(NodeFile::open(vfs, node, stat, access != 0)),
             S_IFREG if vfs.writable(&node) => {
@@ -1118,6 +1144,16 @@ impl Kernel {
                 }
                 data[pos.min(data.len())..pos.min(data.len()) + n].to_vec()
             }
+            Kind::Special(s) if s.readable => {
+                let data = s.file.contents(t)?;
+                let mut pos = s.pos.lock().unwrap();
+                let off = (at.unwrap_or(*pos) as usize).min(data.len());
+                let n = (data.len() - off).min(count);
+                if at.is_none() {
+                    *pos += n as u64;
+                }
+                data[off..off + n].to_vec()
+            }
             _ => return Err(EBADF),
         };
         Ok(data)
@@ -1198,6 +1234,7 @@ impl Kernel {
                 nf.data = None;
                 self.vfs()?.write(&nf.node, &data)?
             }
+            Kind::Special(s) if s.writable => s.file.write(t, &data)?,
             _ => return Err(EBADF),
         };
         Ok(n as i64)
@@ -1220,6 +1257,7 @@ impl Kernel {
             Kind::LoopControl => chr(block::makedev(block::MISC_MAJOR, block::LOOP_CONTROL_MINOR)),
             Kind::DmControl => chr(block::makedev(block::MISC_MAJOR, block::DM_CONTROL_MINOR)),
             Kind::Node(nf) => nf.lock().unwrap().stat.clone(),
+            Kind::Special(s) => self.vfs()?.stat(&s.node)?,
             Kind::Mem(m) => match &m.node {
                 Some(n) => self.vfs()?.stat(n)?,
                 None => Stat { mode: S_IFREG | 0o600, nlink: 1, size: m.file.size(), ..Default::default() },
@@ -1437,6 +1475,7 @@ pub(super) fn file_name(f: &File) -> String {
     match &f.kind {
         Kind::Node(nf) => nf.lock().unwrap().node.path.clone(),
         Kind::Mem(m) => m.name.clone(),
+        Kind::Special(s) => s.node.path.clone(),
         Kind::Null => "/dev/null".into(),
         Kind::Zero => "/dev/zero".into(),
         Kind::Random => "/dev/urandom".into(),

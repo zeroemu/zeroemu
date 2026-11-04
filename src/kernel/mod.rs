@@ -24,6 +24,7 @@ mod process;
 mod procfs;
 mod properties;
 mod sched;
+mod selinux;
 mod signal;
 mod specialfd;
 mod sysctl;
@@ -88,6 +89,8 @@ pub struct Kernel {
     blocks: Arc<block::Blocks>,
     /// /proc/sys values.
     sysctl: sysctl::Sysctl,
+    /// SELinux state and selinuxfs.
+    selinux: Arc<selinux::Selinux>,
     /// Kernel-side socket services (kept alive here; looked up by name).
     _services: Vec<Arc<unix::Socket>>,
     /// The root process's wait status once it exits; droidrt then exits.
@@ -136,8 +139,8 @@ fn mount_tmpfs(vfs: &mut Vfs, phys: &Arc<PhysMem>) -> Arc<crate::tmpfs::Tmpfs> {
     vfs.mount("/tmp", Tmpfs::new(phys.clone(), 0o1777));
     vfs.mount("/mnt", Tmpfs::new(phys.clone(), 0o755));
     vfs.mount("/cache", Tmpfs::new(phys.clone(), 0o770));
-    // sysfs: what bionic's sysconf and friends read. No /sys/fs/selinux, so
-    // libselinux sees SELinux as disabled.
+    // sysfs: what bionic's sysconf and friends read. (selinuxfs is mounted
+    // over /sys/fs/selinux once the kernel exists: it reads the policy lazily.)
     let sys = Tmpfs::with_type(phys.clone(), 0o755, "sysfs");
     let n = std::thread::available_parallelism().map_or(1, |n| n.get()).min(64);
     for f in ["online", "possible", "present"] {
@@ -148,16 +151,6 @@ fn mount_tmpfs(vfs: &mut Vfs, phys: &Arc<PhysMem>) -> Arc<crate::tmpfs::Tmpfs> {
         sys.mkdir_p(d, 0o755);
     }
     vfs.mount("/sys", sys);
-    // selinuxfs, permissive and policy-less: libselinux finds it (statfs
-    // says SELINUX_MAGIC), maps its status page, and with deny_unknown=0
-    // every access check on an unknown class is allowed.
-    let selinux = Tmpfs::with_type(phys.clone(), 0o755, "selinuxfs");
-    for (name, content) in [("enforce", "0"), ("deny_unknown", "0"), ("reject_unknown", "0"), ("policyvers", "33"), ("mls", "1"), ("checkreqprot", "0")] {
-        selinux.write_file(name, 0o644, content);
-    }
-    // struct selinux_kernel_status: version 1, sequence 0, enforcing 0, policyload 0, deny_unknown 0.
-    selinux.write_file("status", 0o444, "\u{1}\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0");
-    vfs.mount("/sys/fs/selinux", selinux);
     dev_handle
 }
 
@@ -184,6 +177,8 @@ pub struct Process {
     pub creds: Mutex<creds::Creds>,
     /// Process group, session, limits, and other process-wide control state.
     pub attrs: Mutex<control::ProcAttrs>,
+    /// SELinux context (and the one before the last execve).
+    pub sec: selinux::ProcSec,
 }
 
 pub struct Thread {
@@ -199,6 +194,8 @@ pub struct Thread {
     dying: AtomicBool,
     /// comm, prctl state, scheduling attributes.
     pub attrs: Mutex<control::ThreadAttrs>,
+    /// SELinux exec/fscreate/keycreate/sockcreate contexts.
+    pub sec: selinux::ThreadSec,
 }
 
 /// Locked access to a live process's address space.
@@ -235,6 +232,7 @@ impl Thread {
             kick: Mutex::new(None),
             dying: AtomicBool::new(false),
             attrs: Mutex::new(control::ThreadAttrs::default()),
+            sec: Default::default(),
         })
     }
 
@@ -282,6 +280,8 @@ impl Kernel {
         // /proc reads kernel state, so the kernel is built around it.
         Ok(Arc::new_cyclic(|me| {
             v.mount("/proc", procfs::ProcFs::new(me.clone()));
+            let selinux = selinux::Selinux::new(me.clone(), phys.clone(), boot);
+            v.mount("/sys/fs/selinux", selinux.clone());
             let svc: Arc<dyn unix::Service> = Arc::new(PropertyService { kernel: me.clone() });
             // Socket nodes in /dev/socket, with init's modes and owners.
             let mut services = Vec::new();
@@ -309,6 +309,7 @@ impl Kernel {
             props,
             blocks,
             sysctl: sysctl::Sysctl::new(),
+            selinux,
             _services: services,
             exit: (Mutex::new(None), Condvar::new()),
             }
@@ -353,6 +354,7 @@ impl Kernel {
             knobs: Mutex::default(),
             creds: Mutex::new(creds::Creds::root()),
             attrs: Mutex::new(control::ProcAttrs::first()),
+            sec: self.selinux.initial_sec(),
         });
         self.root_pid.store(pid, Ordering::Relaxed);
         self.procs.lock().unwrap().insert(pid, proc.clone());

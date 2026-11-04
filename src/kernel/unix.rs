@@ -70,12 +70,14 @@ struct Cred {
     pid: i32,
     uid: u32,
     gid: u32,
+    /// SELinux label (selinux::sid); 0 for kernel-side services.
+    sid: u32,
 }
 
 impl Cred {
     fn of(t: &Thread) -> Cred {
         let c = t.proc.creds.lock().unwrap();
-        Cred { pid: t.proc.pid, uid: c.euid, gid: c.egid }
+        Cred { pid: t.proc.pid, uid: c.euid, gid: c.egid, sid: super::selinux::socket_sid(t) }
     }
     fn bytes(&self) -> [u8; 12] {
         let mut b = [0u8; 12];
@@ -126,7 +128,10 @@ struct State {
 
 pub struct Socket {
     ty: u32,
-    /// Credentials of the process that created the socket (SO_PEERCRED).
+    /// The creator's credentials, taken at socket() (SO_PEERCRED for
+    /// datagrams). Its sid is the socket's label (selinux_socket_post_create):
+    /// init's CreateSocket clears setsockcreatecon before listen/connect, so
+    /// later calls must not sample the task's label again. 0 for a kernel service.
     cred: Cred,
     rx: Mutex<Queue>,
     st: Mutex<State>,
@@ -149,14 +154,14 @@ pub trait Service: Send + Sync {
 }
 
 fn service_socket(vfs: &Vfs, path: &str, ty: u32, perm: u32, owner: (u32, u32), service: Arc<dyn Service>, listening: bool) -> Arc<Socket> {
-    let sock = Arc::new(Socket { ty, cred: Cred { pid: 1, uid: 0, gid: 0 }, rx: Mutex::new(Queue::default()), st: Mutex::new(State::default()), service: Some(service), svc_buf: Mutex::new(Vec::new()) });
+    let sock = Arc::new(Socket { ty, cred: Cred { pid: 1, uid: 0, gid: 0, sid: 0 }, rx: Mutex::new(Queue::default()), st: Mutex::new(State::default()), service: Some(service), svc_buf: Mutex::new(Vec::new()) });
     {
         let mut st = sock.st.lock().unwrap();
         st.name = Some(path.as_bytes().to_vec());
         if listening {
             st.backlog = Some(VecDeque::new());
         }
-        st.listen_cred = Cred { pid: 1, uid: 0, gid: 0 };
+        st.listen_cred = Cred { pid: 1, uid: 0, gid: 0, sid: 0 };
         match bind_node(vfs, "/", path, perm, &sock) {
             Ok(node) => {
                 let _ = vfs.set_attr(&node, None, Some(owner), None);
@@ -254,7 +259,7 @@ impl Socket {
             return true; // a reader that stopped reading: drop rather than grow
         }
         q.bytes += data.len();
-        q.msgs.push_back(Msg { data, off: 0, fds: Vec::new(), from: Vec::new(), cred: Cred { pid: 1, uid: 0, gid: 0 } });
+        q.msgs.push_back(Msg { data, off: 0, fds: Vec::new(), from: Vec::new(), cred: Cred { pid: 1, uid: 0, gid: 0, sid: 0 } });
         drop(q);
         EVENTS.bump();
         true
@@ -300,7 +305,7 @@ impl Socket {
             if !reply.is_empty() {
                 let mut q = client.rx.lock().unwrap();
                 q.bytes += reply.len();
-                q.msgs.push_back(Msg { data: reply, off: 0, fds: Vec::new(), from: Vec::new(), cred: Cred { pid: 1, uid: 0, gid: 0 } });
+                q.msgs.push_back(Msg { data: reply, off: 0, fds: Vec::new(), from: Vec::new(), cred: Cred { pid: 1, uid: 0, gid: 0, sid: 0 } });
             }
         }
         EVENTS.bump();
@@ -616,7 +621,9 @@ impl Kernel {
                     return Err(EINVAL);
                 }
                 st.backlog.get_or_insert_with(VecDeque::new);
-                st.listen_cred = Cred::of(t);
+                let mut cred = Cred::of(t);
+                cred.sid = sock.cred.sid;
+                st.listen_cred = cred;
                 Ok(0)
             }
             accept | accept4 => {
@@ -674,9 +681,11 @@ impl Kernel {
                 let listener = target;
                 if let Some(svc) = &listener.service {
                     // A kernel-side service answers on its own; nothing to accept.
-                    let server = Arc::new(Socket { ty: sock.ty, cred: Cred { pid: 1, uid: 0, gid: 0 }, rx: Mutex::new(Queue::default()), st: Mutex::new(State::default()), service: Some(svc.clone()), svc_buf: Mutex::new(Vec::new()) });
+                    let server = Arc::new(Socket { ty: sock.ty, cred: Cred { pid: 1, uid: 0, gid: 0, sid: 0 }, rx: Mutex::new(Queue::default()), st: Mutex::new(State::default()), service: Some(svc.clone()), svc_buf: Mutex::new(Vec::new()) });
                     server.st.lock().unwrap().name = listener.st.lock().unwrap().name.clone();
-                    Socket::connect_pair(&sock, &server, Cred::of(t), Cred { pid: 1, uid: 0, gid: 0 });
+                    let mut client = Cred::of(t);
+                    client.sid = sock.cred.sid;
+                    Socket::connect_pair(&sock, &server, client, Cred { pid: 1, uid: 0, gid: 0, sid: 0 });
                     sock.st.lock().unwrap().peer_server = Some(server);
                     return Ok(0);
                 }
@@ -688,7 +697,9 @@ impl Kernel {
                     return Err(EAGAIN);
                 }
                 server.st.lock().unwrap().name = listen_name;
-                Socket::connect_pair(&sock, &server, Cred::of(t), listen_cred);
+                let mut client = Cred::of(t);
+                client.sid = sock.cred.sid;
+                Socket::connect_pair(&sock, &server, client, listen_cred);
                 backlog.push_back(server);
                 drop(lst);
                 EVENTS.bump();
@@ -760,6 +771,19 @@ impl Kernel {
                 let (sock, _) = self.sock(t, int(a[0]))?;
                 if a[1] != SOL_SOCKET {
                     return Err(ENOPROTOOPT);
+                }
+                if a[2] == SO_PEERSEC {
+                    // The peer socket's label from its socket(); ERANGE says how much room it needs.
+                    let sid = if sock.ty == SOCK_DGRAM { 0 } else { sock.st.lock().unwrap().peer_cred.sid };
+                    let ctx = super::selinux::context_bytes(sid).ok_or(ENOPROTOOPT)?;
+                    let mut mm = t.proc.mm();
+                    let cap = mm.read_u32(a[4])? as usize;
+                    mm.write_u32(a[4], ctx.len() as u32)?;
+                    if cap < ctx.len() {
+                        return Err(ERANGE);
+                    }
+                    mm.write(a[3], &ctx)?;
+                    return Ok(0);
                 }
                 let st = sock.st.lock().unwrap();
                 let val: Vec<u8> = match a[2] {

@@ -124,6 +124,14 @@ check "unlinked socket"     "connect: No such file or directory" /system/bin/sh 
 check "logd takeover tap"   "I taptest: printed by the tap" /system/bin/sh -c '(sleep 0.6; echo "printed by the tap") | log -t taptest & sleep 0.2; rm /dev/socket/logdw; nc -U -u -l -s /dev/socket/logdw 2>/dev/null & sleep 0.8'
 check "logd takeover"       "kernel logd got 0"   /system/bin/sh -c '(sleep 0.6; echo "printed by the tap") | log -t taptest & sleep 0.2; rm /dev/socket/logdw; nc -U -u -l -s /dev/socket/logdw 2>/dev/null & sleep 0.8; echo "kernel logd got $(logcat -d -s taptest | grep -c tap)"'
 check "netlink dumps"       "link=0 addr=0 route=0 ss=0" /system/bin/sh -c 'ip link; l=$?; ip addr; a=$?; ip route; r=$?; ss -a >/dev/null; echo "link=$l addr=$a route=$r ss=$?"'
+# SELinux: selinuxfs from the image's CIL policy, process contexts
+check "selinuxfs class"     "index=99 set=1"      /system/bin/sh -c 'cd /sys/fs/selinux/class/property_service; echo "index=$(cat index) set=$(cat perms/set)"'
+check "attr/current"        "u:r:shell:s0"        /system/bin/toybox cat /proc/self/attr/current
+check "id -Z"               "u:r:shell:s0"        /system/bin/toybox id -Z
+check "compute_create"      "u:r:logd:s0"         /system/bin/sh -c 'i=$(cat /sys/fs/selinux/class/process/index); exec 3<>/sys/fs/selinux/create; echo -n "u:r:init:s0 u:object_r:logd_exec:s0 $i" >&3; cat <&3'
+check "runcon"              "now u:r:logd:s0 was u:r:shell:s0" /system/bin/runcon u:r:logd:s0 /system/bin/sh -c 'echo "now $(id -Z) was $(cat /proc/$$/attr/prev)"'
+check "ps -Z"               "u:r:shell:s0  "      /system/bin/toybox ps -Z
+check "setenforce"          "Permissive Enforcing" /system/bin/sh -c 'a=$(getenforce); setenforce 1; echo "$a $(getenforce)"'
 
 # Exit status needs its own path: the program's code must become droidrt's.
 perl -e 'alarm 60; exec @ARGV' "$BIN" --system "$IMG" /system/bin/sh -c 'exit 3' >/dev/null 2>&1

@@ -173,7 +173,7 @@ static void unix_paths(void) {
     i64 small = sys(NR_getsockopt, c, 1, 31 /* SO_PEERSEC */, con, &clen);
     u32 need = clen;
     clen = sizeof con;
-    check(small == -34 /* ERANGE */ && need == 10 && sys(NR_getsockopt, c, 1, 31, con, &clen) == 0 && clen == 10 && seq(con, "u:r:su:s0", 10), "SO_PEERSEC (getpeercon): the peer's context");
+    check(small == -34 /* ERANGE */ && need == 13 && sys(NR_getsockopt, c, 1, 31, con, &clen) == 0 && clen == 13 && seq(con, "u:r:shell:s0", 13), "SO_PEERSEC (getpeercon): the peer's context");
     glen = sizeof got;
     int conn = (int)sys(NR_accept, srv, &got, &glen);
     check(conn >= 0 && glen == 2, "accept: an unbound client has no name");

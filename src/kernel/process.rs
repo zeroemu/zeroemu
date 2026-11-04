@@ -81,6 +81,7 @@ impl Kernel {
         }
         let th = Thread::new(tid, t.proc.clone(), t.mask.load(Ordering::Relaxed));
         *th.attrs.lock().unwrap() = t.attrs.lock().unwrap().fork();
+        th.sec.inherit(&t.sec);
         {
             let mut mm = t.proc.mm();
             if flags & CLONE_PARENT_SETTID != 0 {
@@ -128,8 +129,10 @@ impl Kernel {
             knobs: Mutex::new(parent.knobs.lock().unwrap().clone()),
             creds: Mutex::new(parent.creds.lock().unwrap().clone()),
             attrs: Mutex::new(parent.attrs.lock().unwrap().fork(t.tid)),
+            sec: parent.sec.clone(),
         });
         let th = Thread::new(pid, child.clone(), t.mask.load(Ordering::Relaxed));
+        th.sec.inherit(&t.sec);
         *th.altstack.lock().unwrap() = *t.altstack.lock().unwrap();
         *th.attrs.lock().unwrap() = t.attrs.lock().unwrap().fork();
         if flags & CLONE_CHILD_CLEARTID != 0 {
@@ -176,6 +179,9 @@ impl Kernel {
         *t.proc.exe.lock().unwrap() = exe;
         *t.proc.cmdline.lock().unwrap() = cmdline;
         self.exec_attrs(t, &comm_path);
+        if let Some(vfs) = self.vfs.as_deref() {
+            self.selinux.exec(t, vfs, &cwd, &path);
+        }
         vcpu.set_page_tables(mm.root);
         vcpu.set_state(&state);
         let old = t.proc.mm.lock().unwrap().replace(mm);

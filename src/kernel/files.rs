@@ -4,6 +4,7 @@
 use super::binder::{self, BinderFile};
 use super::block;
 use super::epoll::Epoll;
+use super::netlink::{self, Netlink};
 use super::specialfd::{EventFd, SignalFd, TimerFd};
 use super::unix::{self, Socket};
 use super::wait::EVENTS;
@@ -30,6 +31,7 @@ const O_CREAT: u64 = 0o100;
 const O_EXCL: u64 = 0o200;
 const O_TRUNC: u64 = 0o1000;
 const O_TMPFILE: u64 = 0o20000000;
+const O_PATH: u64 = 0o10000000;
 const AT_REMOVEDIR: u64 = 0x200;
 const S_IFCHR: u32 = 0o020000;
 const S_IFBLK: u32 = 0o060000;
@@ -82,6 +84,7 @@ pub enum Kind {
     Signal(SignalFd),
     Epoll(Epoll),
     Socket(Arc<Socket>),
+    Netlink(Arc<Netlink>),
     Binder(BinderFile),
     /// A loop or device-mapper device (block.rs).
     Block(BlockOpen),
@@ -295,6 +298,7 @@ pub(super) fn poll_ready(f: &File, t: &Thread, depth: u32) -> u16 {
         Kind::Signal(sf) => if sf.ready_in(t) { POLLIN } else { 0 },
         Kind::Epoll(ep) => if ep.is_ready(t, depth) { POLLIN } else { 0 },
         Kind::Socket(s) => s.poll(),
+        Kind::Netlink(n) => n.poll(),
         Kind::Binder(b) => {
             (if binder::readable(b, t.tid) { POLLIN } else { 0 }) | POLLOUT
         }
@@ -718,6 +722,7 @@ impl Kernel {
             },
             S_IFBLK if self.blocks.device(stat.rdev).is_some() => Kind::Block(BlockOpen { devt: stat.rdev, pos: Mutex::new(0) }),
             S_IFBLK => return Err(ENXIO),
+            unix::S_IFSOCK if flags & O_PATH == 0 => return Err(ENXIO),
             S_IFDIR if access != 0 => return Err(EISDIR),
             _ if flags & of.directory != 0 && stat.mode & S_IFMT != S_IFDIR => return Err(ENOTDIR),
             S_IFREG if vfs.writable(&node) => {
@@ -787,7 +792,11 @@ impl Kernel {
             unlinkat => {
                 let path = t.proc.mm().read_cstr(a[1])?;
                 let (dir, name) = self.parent(t, int(a[0]), &path)?;
+                let victim = vfs.resolve(&dir.path, &name, false);
                 vfs.unlink(&dir, &name, a[2] & AT_REMOVEDIR != 0)?;
+                if let Ok(v) = victim {
+                    unix::unlinked(vfs, &v);
+                }
                 Ok(0)
             }
             symlinkat => {
@@ -816,7 +825,11 @@ impl Kernel {
                 };
                 let (odir, oname) = self.parent(t, int(a[0]), &op)?;
                 let (ndir, nname) = self.parent(t, int(a[2]), &np)?;
+                let victim = vfs.resolve(&ndir.path, &nname, false);
                 vfs.rename(&odir, &oname, &ndir, &nname, flags & RENAME_NOREPLACE != 0)?;
+                if let Ok(v) = victim {
+                    unix::unlinked(vfs, &v);
+                }
                 Ok(0)
             }
             truncate => {
@@ -984,6 +997,7 @@ impl Kernel {
                 data
             }
             Kind::Socket(sock) => unix::read(sock, t, count, f.nonblock())?,
+            Kind::Netlink(nl) => netlink::read(nl, t, count, f.nonblock())?,
             Kind::Block(b) => {
                 let dev = self.blocks.device(b.devt).ok_or(ENXIO)?;
                 let mut pos = b.pos.lock().unwrap();
@@ -1053,6 +1067,7 @@ impl Kernel {
                 }
                 r => r?,
             },
+            Kind::Netlink(nl) => netlink::write(nl, t, data, f.nonblock())?,
             Kind::Mem(m) => {
                 if !m.writable {
                     return Err(EBADF);
@@ -1086,7 +1101,7 @@ impl Kernel {
             Kind::Random => chr(0x0109),
             Kind::Kmsg => chr(0x010b),
             Kind::Pipe(_) => Stat { mode: 0o010600, nlink: 1, ..Default::default() },
-            Kind::Socket(_) => Stat { mode: 0o140777, nlink: 1, ..Default::default() },
+            Kind::Socket(_) | Kind::Netlink(_) => Stat { mode: 0o140777, nlink: 1, ..Default::default() },
             Kind::Event(_) | Kind::Timer(_) | Kind::Signal(_) | Kind::Epoll(_) => Stat { mode: 0o600, nlink: 1, ..Default::default() }, // anon_inode
             Kind::Binder(_) => Stat { mode: 0o020666, nlink: 1, rdev: 0xa36, ..Default::default() },
             Kind::Block(b) => Stat { mode: S_IFBLK | 0o600, nlink: 1, rdev: b.devt, ..Default::default() },
@@ -1307,6 +1322,7 @@ pub(super) fn file_name(f: &File) -> String {
         Kind::Kmsg => "/dev/kmsg".into(),
         Kind::Pipe(p) => format!("pipe:[{}]", Arc::as_ptr(&p.pipe) as usize % 100_000),
         Kind::Socket(s) => format!("socket:[{}]", Arc::as_ptr(s) as usize % 100_000),
+        Kind::Netlink(s) => format!("socket:[{}]", Arc::as_ptr(s) as usize % 100_000),
         Kind::Event(_) => "anon_inode:[eventfd]".into(),
         Kind::Timer(_) => "anon_inode:[timerfd]".into(),
         Kind::Signal(_) => "anon_inode:[signalfd]".into(),

@@ -1,18 +1,26 @@
-//! AF_UNIX sockets: socketpair and named (filesystem-path or abstract)
-//! stream, datagram, and seqpacket sockets, with SCM_RIGHTS fd passing and
-//! SCM_CREDENTIALS. Names live in a kernel-wide table rather than as inodes
-//! (the image filesystems are read-only).
+//! AF_UNIX sockets: socketpair and named stream, datagram, and seqpacket
+//! sockets, with SCM_RIGHTS fd passing and SCM_CREDENTIALS. A path binding is
+//! an S_IFSOCK node in the filesystem, as on Linux: connect finds the socket
+//! through the node it resolves to, whatever name reached it. Abstract names
+//! ("\0name") live in a kernel table.
 
 use super::files::{File, Kind};
+use super::{logd, netlink};
 use super::signal::{SIGPIPE, SigInfo};
 use super::wait::EVENTS;
 use super::{ERESTARTSYS, Kernel, POLL, Thread, int};
 use crate::arch::Sysno;
 use crate::errno::*;
+use crate::vfs::{FileSystem, Node, S_IFMT, Vfs};
 use std::collections::{BTreeMap, VecDeque};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 const AF_UNIX: u64 = 1;
+pub const S_IFSOCK: u32 = 0o140000;
+const AT_FDCWD: i64 = -100;
+/// What sockets are created with before the umask (Linux: S_IFSOCK | 0777).
+const UMASK: u32 = 0o022;
 pub const SOCK_STREAM: u32 = 1;
 pub const SOCK_DGRAM: u32 = 2;
 pub const SOCK_SEQPACKET: u32 = 5;
@@ -96,12 +104,16 @@ struct Queue {
 
 #[derive(Default)]
 struct State {
+    /// The address as bound: sun_path bytes, a path or "\0name".
     name: Option<Vec<u8>>,
+    /// The filesystem node of a path binding (only on the bound socket itself).
+    node: Option<NodeKey>,
+    /// A process's socket at /dev/socket/logdw (the real logd): what it
+    /// receives is printed too, so logs stay on the terminal.
+    log_tap: bool,
     connected: bool,
     peer: Option<Weak<Socket>>,
     peer_cred: Cred,
-    /// Default destination of a connected datagram socket.
-    dest: Option<Vec<u8>>,
     backlog: Option<VecDeque<Arc<Socket>>>,
     listen_cred: Cred,
     passcred: bool,
@@ -133,33 +145,75 @@ pub trait Service: Send + Sync {
     fn packet(&self, _conn: &Arc<Socket>, _data: &[u8]) {}
 }
 
-fn service_socket(name: &str, ty: u32, service: Arc<dyn Service>, listening: bool) -> Arc<Socket> {
+fn service_socket(vfs: &Vfs, path: &str, ty: u32, perm: u32, owner: (u32, u32), service: Arc<dyn Service>, listening: bool) -> Arc<Socket> {
     let sock = Arc::new(Socket { ty, rx: Mutex::new(Queue::default()), st: Mutex::new(State::default()), service: Some(service), svc_buf: Mutex::new(Vec::new()) });
     {
         let mut st = sock.st.lock().unwrap();
-        st.name = Some(name.as_bytes().to_vec());
+        st.name = Some(path.as_bytes().to_vec());
         if listening {
             st.backlog = Some(VecDeque::new());
         }
         st.listen_cred = Cred { pid: 1, uid: 0, gid: 0 };
+        match bind_node(vfs, "/", path, perm, &sock) {
+            Ok(node) => {
+                let _ = vfs.set_attr(&node, None, Some(owner), None);
+                st.node = Some(node_key(&vfs.fs_arc(&node), node.ino));
+            }
+            Err(e) => eprintln!("[droidrt] {path}: cannot create the socket (errno {e})"),
+        }
     }
-    NAMES.lock().unwrap().insert(name.as_bytes().to_vec(), Arc::downgrade(&sock));
     sock
 }
 
-/// Registers a kernel-side stream or seqpacket service under `name` (a
-/// path); the returned socket must be kept alive.
-pub fn listen_service(name: &str, ty: u32, service: Arc<dyn Service>) -> Arc<Socket> {
-    service_socket(name, ty, service, true)
+/// Creates a kernel-side stream or seqpacket service as a socket node at
+/// `path`, the way init would; the returned socket must be kept alive.
+pub fn listen_service(vfs: &Vfs, path: &str, ty: u32, perm: u32, owner: (u32, u32), service: Arc<dyn Service>) -> Arc<Socket> {
+    service_socket(vfs, path, ty, perm, owner, service, true)
 }
 
-/// Registers a kernel-side datagram sink under `name`.
-pub fn bind_service(name: &str, service: Arc<dyn Service>) -> Arc<Socket> {
-    service_socket(name, SOCK_DGRAM, service, false)
+/// A kernel-side datagram sink at `path`.
+pub fn bind_service(vfs: &Vfs, path: &str, perm: u32, owner: (u32, u32), service: Arc<dyn Service>) -> Arc<Socket> {
+    service_socket(vfs, path, SOCK_DGRAM, perm, owner, service, false)
 }
 
-/// Bound names (path or "\0abstract") -> sockets.
-static NAMES: Mutex<BTreeMap<Vec<u8>, Weak<Socket>>> = Mutex::new(BTreeMap::new());
+/// A filesystem node: (the filesystem's address, inode).
+type NodeKey = (usize, u64);
+
+fn node_key(fs: &Arc<dyn FileSystem>, ino: u64) -> NodeKey {
+    (Arc::as_ptr(fs) as *const () as usize, ino)
+}
+
+/// Path bindings by node. The weak filesystem reference keeps its address
+/// from being reused by a later mount while the entry exists.
+type Bound = BTreeMap<NodeKey, (Weak<dyn FileSystem>, Weak<Socket>)>;
+static BOUND: Mutex<Bound> = Mutex::new(BTreeMap::new());
+
+/// Abstract names: (type, "\0name") -> socket. Linux hashes the type in, so
+/// each socket type has its own namespace.
+static ABSTRACT: Mutex<BTreeMap<(u32, Vec<u8>), Weak<Socket>>> = Mutex::new(BTreeMap::new());
+
+/// Creates the S_IFSOCK node for binding `sock` to `path` and records the
+/// binding. EADDRINUSE if anything exists there (even a dangling symlink).
+fn bind_node(vfs: &Vfs, cwd: &str, path: &str, perm: u32, sock: &Arc<Socket>) -> Result<Node, i64> {
+    let (dir, name) = vfs.resolve_parent(cwd, path).map_err(|e| if e == EBUSY { EADDRINUSE } else { e })?;
+    if vfs.resolve(&dir.path, &name, false).is_ok() {
+        return Err(EADDRINUSE);
+    }
+    let node = vfs.create(&dir, &name, S_IFSOCK | perm, 0).map_err(|e| if e == EEXIST { EADDRINUSE } else { e })?;
+    let fs = vfs.fs_arc(&node);
+    BOUND.lock().unwrap().insert(node_key(&fs, node.ino), (Arc::downgrade(&fs), Arc::downgrade(sock)));
+    Ok(node)
+}
+
+/// Called after `node` lost a name (unlink, rename over it): once its last
+/// link is gone the socket bound there is unreachable, and a later node that
+/// reuses the inode number must not lead back to it.
+pub fn unlinked(vfs: &Vfs, node: &Node) {
+    let key = node_key(&vfs.fs_arc(node), node.ino);
+    if BOUND.lock().unwrap().contains_key(&key) && vfs.stat(node).is_err() {
+        BOUND.lock().unwrap().remove(&key);
+    }
+}
 
 impl Drop for Socket {
     fn drop(&mut self) {
@@ -167,10 +221,16 @@ impl Drop for Socket {
         if let Some(peer) = st.peer.as_ref().and_then(Weak::upgrade) {
             peer.rx.lock().unwrap().write_closed = true;
         }
-        if let Some(name) = &st.name {
-            let mut names = NAMES.lock().unwrap();
-            if names.get(name).is_some_and(|w| w.strong_count() == 0) {
-                names.remove(name);
+        if let Some(key) = st.node {
+            let mut bound = BOUND.lock().unwrap();
+            if bound.get(&key).is_some_and(|(_, s)| s.strong_count() == 0) {
+                bound.remove(&key);
+            }
+        } else if let Some(name) = st.name.take().filter(|n| n.first() == Some(&0)) {
+            let mut names = ABSTRACT.lock().unwrap();
+            let key = (self.ty, name);
+            if names.get(&key).is_some_and(|w| w.strong_count() == 0) {
+                names.remove(&key);
             }
         }
         EVENTS.bump();
@@ -314,32 +374,49 @@ impl Socket {
         }
     }
 
-    fn send(&self, t: &Thread, data: Vec<u8>, fds: Vec<Arc<File>>, dest: Option<Vec<u8>>, nonblock: bool) -> Result<usize, i64> {
-        let (name, connected, shut_wr, default_dest) = {
+    /// Sends on a connection, or for datagrams to `dest` (already looked up)
+    /// or the connected peer.
+    fn send(self: &Arc<Self>, t: &Thread, data: Vec<u8>, fds: Vec<Arc<File>>, dest: Option<Arc<Socket>>, nonblock: bool) -> Result<usize, i64> {
+        let (name, connected, shut_wr, peer) = {
             let st = self.st.lock().unwrap();
-            (st.name.clone().unwrap_or_default(), st.connected, st.shut_wr, st.dest.clone())
+            (st.name.clone().unwrap_or_default(), st.connected, st.shut_wr, st.peer.clone())
         };
         if shut_wr {
             return Err(EPIPE);
         }
         let len = data.len();
-        let msg = Msg { data, off: 0, fds, from: name, cred: Cred::of(t) };
         if self.ty == SOCK_DGRAM {
-            let target = match dest.or(default_dest) {
-                Some(d) => lookup(&d).ok_or(ECONNREFUSED)?,
-                None => self.peer().ok_or(ENOTCONN)?,
+            let target = match dest {
+                Some(d) => d,
+                None if !connected => return Err(ENOTCONN),
+                None => match peer.as_ref().and_then(Weak::upgrade) {
+                    Some(p) => p,
+                    None => {
+                        // The peer is gone: report it once, then act unconnected.
+                        let mut st = self.st.lock().unwrap();
+                        st.connected = false;
+                        st.peer = None;
+                        return Err(ECONNREFUSED);
+                    }
+                },
             };
-            if target.ty != SOCK_DGRAM {
-                return Err(EPROTOTYPE);
+            let tap = {
+                let ts = target.st.lock().unwrap();
+                // A datagram socket connected elsewhere only takes from its peer.
+                if ts.peer.as_ref().is_some_and(|p| !std::ptr::eq(p.as_ptr(), Arc::as_ptr(self))) {
+                    return Err(EPERM);
+                }
+                ts.log_tap
+            };
+            let copy = tap.then(|| data.clone());
+            self.deliver(t, &target, Msg { data, off: 0, fds, from: name, cred: Cred::of(t) }, nonblock)?;
+            if let Some(d) = copy {
+                logd::tap(&d, t.proc.pid);
             }
-            self.deliver(t, &target, msg, nonblock)?;
             return Ok(len);
         }
-        if dest.is_some() && connected {
-            return Err(EISCONN);
-        }
         let peer = self.peer().ok_or(if connected { EPIPE } else { ENOTCONN })?;
-        self.deliver(t, &peer, msg, nonblock)?;
+        self.deliver(t, &peer, Msg { data, off: 0, fds, from: name, cred: Cred::of(t) }, nonblock)?;
         Ok(len)
     }
 
@@ -437,26 +514,29 @@ impl Socket {
 /// (data, passed files, sender address, sender credentials, truncated).
 type Received = (Vec<u8>, Vec<Arc<File>>, Vec<u8>, Cred, bool);
 
-fn lookup(name: &[u8]) -> Option<Arc<Socket>> {
-    NAMES.lock().unwrap().get(name).and_then(Weak::upgrade)
-}
-
 /// Reads plain bytes and fds out of a socket file's read/write path.
 pub fn read(sock: &Socket, t: &Thread, max: usize, nonblock: bool) -> Result<Vec<u8>, i64> {
     sock.recv(t, max, 0, nonblock).map(|r| r.0) // passed files are dropped by read(2), as on Linux
 }
 
-pub fn write(sock: &Socket, t: &Thread, data: Vec<u8>, nonblock: bool) -> Result<usize, i64> {
+pub fn write(sock: &Arc<Socket>, t: &Thread, data: Vec<u8>, nonblock: bool) -> Result<usize, i64> {
     sock.send(t, data, Vec::new(), None, nonblock)
 }
 
 impl Kernel {
     pub(super) fn socket_syscall(&self, no: Sysno, t: &Arc<Thread>, a: [u64; 6]) -> Result<i64, i64> {
         use Sysno::*;
+        if no != socket && no != socketpair {
+            let f = t.proc.files.lock().unwrap().get(int(a[0]))?;
+            if let Kind::Netlink(nl) = &f.kind {
+                return self.netlink_syscall(no, t, nl, &f, a);
+            }
+        }
         match no {
+            socket if a[0] == netlink::AF_NETLINK => self.netlink_socket(t, a),
             socket => {
                 if a[0] != AF_UNIX {
-                    return Err(EAFNOSUPPORT); // inet and netlink sockets: not yet
+                    return Err(EAFNOSUPPORT); // inet sockets: not yet
                 }
                 let ty = sock_type(a[1])?;
                 let file = File::new(Kind::Socket(Socket::new(ty)), (a[1] & SOCK_NONBLOCK) as u32);
@@ -464,7 +544,7 @@ impl Kernel {
             }
             socketpair => {
                 if a[0] != AF_UNIX {
-                    return Err(EAFNOSUPPORT);
+                    return Err(if a[0] == netlink::AF_NETLINK { EOPNOTSUPP } else { EAFNOSUPPORT });
                 }
                 let ty = sock_type(a[1])?;
                 let (x, y) = (Socket::new(ty), Socket::new(ty));
@@ -490,16 +570,29 @@ impl Kernel {
             }
             bind => {
                 let (sock, _) = self.sock(t, int(a[0]))?;
-                let name = self.read_addr(t, a[1], a[2])?.ok_or(EINVAL)?;
-                let mut names = NAMES.lock().unwrap();
-                if names.get(&name).is_some_and(|w| w.strong_count() > 0) {
-                    return Err(EADDRINUSE);
-                }
+                let name = match self.read_addr(t, a[1], a[2])? {
+                    Some(n) => n,
+                    None => return autobind(&sock).map(|_| 0),
+                };
                 let mut st = sock.st.lock().unwrap();
                 if st.name.is_some() {
                     return Err(EINVAL);
                 }
-                names.insert(name.clone(), Arc::downgrade(&sock));
+                if name[0] == 0 {
+                    let mut names = ABSTRACT.lock().unwrap();
+                    let key = (sock.ty, name.clone());
+                    if names.get(&key).is_some_and(|w| w.strong_count() > 0) {
+                        return Err(EADDRINUSE);
+                    }
+                    names.insert(key, Arc::downgrade(&sock));
+                } else {
+                    let vfs = self.vfs.as_deref().ok_or(ENOENT)?;
+                    let path = String::from_utf8_lossy(&name).into_owned();
+                    let cwd = t.proc.cwd.lock().unwrap().clone();
+                    let node = bind_node(vfs, &cwd, &path, 0o777 & !UMASK, &sock)?;
+                    st.node = Some(node_key(&vfs.fs_arc(&node), node.ino));
+                    st.log_tap = node.path == "/dev/socket/logdw";
+                }
                 st.name = Some(name);
                 Ok(0)
             }
@@ -509,7 +602,7 @@ impl Kernel {
                     return Err(EOPNOTSUPP);
                 }
                 let mut st = sock.st.lock().unwrap();
-                if st.connected {
+                if st.connected || st.name.is_none() {
                     return Err(EINVAL);
                 }
                 st.backlog.get_or_insert_with(VecDeque::new);
@@ -547,15 +640,17 @@ impl Kernel {
             }
             connect => {
                 let (sock, _) = self.sock(t, int(a[0]))?;
-                let name = self.read_addr(t, a[1], a[2])?.ok_or(EINVAL)?;
-                let target = lookup(&name);
-                if sock.ty == SOCK_DGRAM {
-                    let target = target.ok_or(ENOENT)?;
-                    if target.ty != SOCK_DGRAM {
-                        return Err(EPROTOTYPE);
-                    }
+                if sock.ty == SOCK_DGRAM && a[2] >= 2 && t.proc.mm().read_vec(a[1], 2)? == [0, 0] {
+                    // AF_UNSPEC dissolves a datagram association.
                     let mut st = sock.st.lock().unwrap();
-                    st.dest = Some(name);
+                    st.connected = false;
+                    st.peer = None;
+                    return Ok(0);
+                }
+                let name = self.read_addr(t, a[1], a[2])?.ok_or(EINVAL)?;
+                let target = self.find(t, &name, sock.ty)?;
+                if sock.ty == SOCK_DGRAM {
+                    let mut st = sock.st.lock().unwrap();
                     st.peer = Some(Arc::downgrade(&target));
                     st.connected = true;
                     return Ok(0);
@@ -563,13 +658,11 @@ impl Kernel {
                 if sock.st.lock().unwrap().connected {
                     return Err(EISCONN);
                 }
-                let listener = target.ok_or(ENOENT)?;
-                if listener.ty != sock.ty {
-                    return Err(EPROTOTYPE);
-                }
+                let listener = target;
                 if let Some(svc) = &listener.service {
                     // A kernel-side service answers on its own; nothing to accept.
                     let server = Arc::new(Socket { ty: sock.ty, rx: Mutex::new(Queue::default()), st: Mutex::new(State::default()), service: Some(svc.clone()), svc_buf: Mutex::new(Vec::new()) });
+                    server.st.lock().unwrap().name = listener.st.lock().unwrap().name.clone();
                     Socket::connect_pair(&sock, &server, Cred::of(t), Cred { pid: 1, uid: 0, gid: 0 });
                     sock.st.lock().unwrap().peer_server = Some(server);
                     return Ok(0);
@@ -606,7 +699,7 @@ impl Kernel {
             sendto => {
                 let (sock, file) = self.sock(t, int(a[0]))?;
                 let data = t.proc.mm().read_vec(a[1], a[2].min(IO_MAX) as usize)?;
-                let dest = if a[4] != 0 { self.read_addr(t, a[4], a[5])? } else { None };
+                let dest = self.send_dest(t, &sock, a[4], a[5])?;
                 let nonblock = file.nonblock() || a[3] & MSG_DONTWAIT != 0;
                 self.finish_send(t, sock.send(t, data, Vec::new(), dest, nonblock), a[3])
             }
@@ -697,26 +790,58 @@ impl Kernel {
         }
     }
 
-    /// A `sockaddr_un` as a table key: an absolute path, or "\0name" for the
-    /// abstract namespace. `None` for an unnamed address.
+    /// A `sockaddr_un`'s name: a path (up to its NUL, as given), or "\0name"
+    /// for the abstract namespace. `None` for an unnamed address.
     fn read_addr(&self, t: &Thread, addr: u64, len: u64) -> Result<Option<Vec<u8>>, i64> {
         if !(2..=110).contains(&len) {
             return Err(EINVAL);
         }
         let b = t.proc.mm().read_vec(addr, len as usize)?;
         if u16::from_le_bytes([b[0], b[1]]) as u64 != AF_UNIX {
-            return Err(EAFNOSUPPORT);
+            return Err(EINVAL);
         }
         let path = &b[2..];
-        if path.is_empty() {
+        match path.first() {
+            None => Ok(None),
+            Some(0) => Ok(Some(path.to_vec())),
+            Some(_) => Ok(Some(path.split(|&c| c == 0).next().unwrap_or(path).to_vec())),
+        }
+    }
+
+    /// The socket bound at a name (connect, sendto): the socket node a path
+    /// resolves to (symlinks followed), or an abstract name.
+    fn find(&self, t: &Thread, name: &[u8], ty: u32) -> Result<Arc<Socket>, i64> {
+        let sock = if name[0] == 0 {
+            ABSTRACT.lock().unwrap().get(&(ty, name.to_vec())).and_then(Weak::upgrade).ok_or(ECONNREFUSED)?
+        } else {
+            let vfs = self.vfs.as_deref().ok_or(ENOENT)?;
+            let node = self.resolve(t, AT_FDCWD, &String::from_utf8_lossy(name), true)?;
+            if vfs.stat(&node)?.mode & S_IFMT != S_IFSOCK {
+                return Err(ECONNREFUSED);
+            }
+            let key = node_key(&vfs.fs_arc(&node), node.ino);
+            BOUND.lock().unwrap().get(&key).and_then(|(_, s)| s.upgrade()).ok_or(ECONNREFUSED)?
+        };
+        if sock.ty != ty {
+            return Err(EPROTOTYPE);
+        }
+        Ok(sock)
+    }
+
+    /// Where a sendto/sendmsg address sends to: datagram sockets look it up;
+    /// stream sockets refuse one and seqpacket ignores it, as on Linux.
+    fn send_dest(&self, t: &Thread, sock: &Socket, addr: u64, len: u64) -> Result<Option<Arc<Socket>>, i64> {
+        if addr == 0 || len == 0 {
             return Ok(None);
         }
-        if path[0] == 0 {
-            return Ok(Some(path.to_vec()));
+        match sock.ty {
+            SOCK_DGRAM => {
+                let name = self.read_addr(t, addr, len)?.ok_or(EINVAL)?;
+                self.find(t, &name, SOCK_DGRAM).map(Some)
+            }
+            SOCK_STREAM => Err(if sock.st.lock().unwrap().connected { EISCONN } else { EOPNOTSUPP }),
+            _ => Ok(None),
         }
-        let p = String::from_utf8_lossy(path.split(|&c| c == 0).next().unwrap_or(path)).into_owned();
-        let abs = if p.starts_with('/') { p } else { format!("{}/{p}", t.proc.cwd.lock().unwrap().trim_end_matches('/')) };
-        Ok(Some(abs.into_bytes()))
     }
 
     fn write_addr(&self, t: &Thread, addr: u64, len_p: u64, name: Option<&[u8]>) -> Result<(), i64> {
@@ -767,7 +892,7 @@ impl Kernel {
                 off += len.next_multiple_of(8);
             }
         }
-        let dest = if name != 0 { self.read_addr(t, name, namelen)? } else { None };
+        let dest = self.send_dest(t, &sock, name, namelen)?;
         let nonblock = file.nonblock() || flags & MSG_DONTWAIT != 0;
         self.finish_send(t, sock.send(t, data, fds, dest, nonblock), flags)
     }
@@ -839,6 +964,26 @@ impl Kernel {
         }
         Ok(data.len() as i64)
     }
+}
+
+/// Binds to a fresh abstract name, "\0" and five hex digits (Linux's autobind).
+fn autobind(sock: &Arc<Socket>) -> Result<(), i64> {
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+    let mut st = sock.st.lock().unwrap();
+    if st.name.is_some() {
+        return Ok(());
+    }
+    let mut names = ABSTRACT.lock().unwrap();
+    for _ in 0..0x100000 {
+        let name = format!("\0{:05x}", NEXT.fetch_add(1, Ordering::Relaxed) & 0xfffff).into_bytes();
+        let key = (sock.ty, name.clone());
+        if names.get(&key).is_none_or(|w| w.strong_count() == 0) {
+            names.insert(key, Arc::downgrade(sock));
+            st.name = Some(name);
+            return Ok(());
+        }
+    }
+    Err(ENOSPC)
 }
 
 fn sock_type(ty: u64) -> Result<u32, i64> {

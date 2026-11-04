@@ -12,10 +12,13 @@
 //!   `getLogSize 0`, each answered with a NUL-terminated string.
 //!
 //! `DROIDRT_LOG=<V|D|I|W|E|F|S>` sets the lowest priority printed (default I).
+//! Once init starts the real logd on sockets of its own, the kernel still
+//! prints what that logd receives (`tap`), so logs stay on the terminal.
 
 use super::unix::{self, Service, Socket};
+use crate::vfs::Vfs;
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Instant;
 
 const LOG_ID_MAX: u8 = 8;
@@ -41,6 +44,45 @@ struct Entry {
 }
 
 impl Entry {
+    /// A datagram written to logdw by process `pid`.
+    fn parse(data: &[u8], pid: i32) -> Option<Entry> {
+        if data.len() <= HEADER || data[0] >= LOG_ID_MAX {
+            return None;
+        }
+        Some(Entry {
+            lid: data[0],
+            pid,
+            tid: u16::from_le_bytes([data[1], data[2]]) as u32,
+            sec: le32(&data[3..]),
+            nsec: le32(&data[7..]),
+            payload: data[HEADER..data.len().min(HEADER + PAYLOAD_MAX)].to_vec(),
+        })
+    }
+
+    /// Prints a text record the way `logcat -v threadtime` does, with time
+    /// since boot in place of the date.
+    fn print(&self) {
+        let (level, boot) = printer();
+        if BINARY & 1 << self.lid != 0 {
+            return;
+        }
+        let Some((&prio, rest)) = self.payload.split_first() else { return };
+        if prio < level {
+            return;
+        }
+        let (tag, rest) = cstr(rest);
+        let (msg, _) = cstr(rest);
+        let p = b"??VDIWEFS".get(prio as usize).copied().unwrap_or(b'?') as char;
+        let tag = String::from_utf8_lossy(tag);
+        let msg = String::from_utf8_lossy(msg);
+        let t = boot.elapsed();
+        let mut out = String::new();
+        for line in msg.trim_end_matches('\n').split('\n') {
+            out += &format!("{:5}.{:03} {:5} {:5} {p} {tag}: {line}\n", t.as_secs(), t.subsec_millis(), self.pid, self.tid);
+        }
+        eprint!("{out}");
+    }
+
     fn packet(&self) -> Vec<u8> {
         let mut p = Vec::with_capacity(ENTRY_HEADER + self.payload.len());
         p.extend_from_slice(&(self.payload.len() as u16).to_le_bytes());
@@ -80,30 +122,48 @@ struct Logs {
 
 struct Logd {
     logs: Mutex<Logs>,
-    /// Lowest priority printed to stderr.
-    level: u8,
-    boot: Instant,
 }
 
-/// Registers logd's sockets (and a sink for statsd's); the returned sockets
-/// must be kept alive.
-pub fn start() -> Vec<Arc<Socket>> {
-    let level = match std::env::var("DROIDRT_LOG").ok().and_then(|v| v.bytes().next()) {
-        Some(b'V' | b'v') => 2,
-        Some(b'D' | b'd') => 3,
-        Some(b'W' | b'w') => 5,
-        Some(b'E' | b'e') => 6,
-        Some(b'F' | b'f') => 7,
-        Some(b'S' | b's') => u8::MAX,
-        _ => 4,
-    };
-    let logd: Arc<dyn Service> = Arc::new(Logd { logs: Mutex::default(), level, boot: Instant::now() });
+/// (lowest priority printed to stderr, time zero), fixed at first use.
+fn printer() -> (u8, Instant) {
+    static PRINTER: OnceLock<(u8, Instant)> = OnceLock::new();
+    *PRINTER.get_or_init(|| {
+        let level = match std::env::var("DROIDRT_LOG").ok().and_then(|v| v.bytes().next()) {
+            Some(b'V' | b'v') => 2,
+            Some(b'D' | b'd') => 3,
+            Some(b'W' | b'w') => 5,
+            Some(b'E' | b'e') => 6,
+            Some(b'F' | b'f') => 7,
+            Some(b'S' | b's') => u8::MAX,
+            _ => 4,
+        };
+        (level, Instant::now())
+    })
+}
+
+/// AID_LOGD and AID_STATSD, which own these sockets on a device.
+const LOGD: (u32, u32) = (1036, 1036);
+const STATSD: (u32, u32) = (1066, 1066);
+
+/// Creates logd's sockets in /dev/socket (and a sink for statsd's), with
+/// logd.rc's modes; the returned sockets must be kept alive.
+pub fn start(vfs: &Vfs) -> Vec<Arc<Socket>> {
+    printer();
+    let logd: Arc<dyn Service> = Arc::new(Logd { logs: Mutex::default() });
     vec![
-        unix::bind_service("/dev/socket/logdw", logd.clone()),
-        unix::listen_service("/dev/socket/logdr", unix::SOCK_SEQPACKET, logd.clone()),
-        unix::listen_service("/dev/socket/logd", unix::SOCK_STREAM, logd),
-        unix::bind_service("/dev/socket/statsdw", Arc::new(Discard)),
+        unix::bind_service(vfs, "/dev/socket/logdw", 0o222, LOGD, logd.clone()),
+        unix::listen_service(vfs, "/dev/socket/logdr", unix::SOCK_SEQPACKET, 0o666, LOGD, logd.clone()),
+        unix::listen_service(vfs, "/dev/socket/logd", unix::SOCK_STREAM, 0o666, LOGD, logd),
+        unix::bind_service(vfs, "/dev/socket/statsdw", 0o222, STATSD, Arc::new(Discard)),
     ]
+}
+
+/// A datagram delivered to a process's /dev/socket/logdw (the real logd):
+/// printed exactly as the kernel's logd prints its own records.
+pub fn tap(data: &[u8], pid: i32) {
+    if let Some(e) = Entry::parse(data, pid) {
+        e.print();
+    }
 }
 
 /// Accepts datagrams and drops them.
@@ -122,26 +182,6 @@ fn le32(b: &[u8]) -> u32 {
 }
 
 impl Logd {
-    /// Prints a text record the way `logcat -v threadtime` does, with time
-    /// since boot in place of the date.
-    fn print(&self, e: &Entry) {
-        let Some((&prio, rest)) = e.payload.split_first() else { return };
-        if prio < self.level {
-            return;
-        }
-        let (tag, rest) = cstr(rest);
-        let (msg, _) = cstr(rest);
-        let p = b"??VDIWEFS".get(prio as usize).copied().unwrap_or(b'?') as char;
-        let tag = String::from_utf8_lossy(tag);
-        let msg = String::from_utf8_lossy(msg);
-        let t = self.boot.elapsed();
-        let mut out = String::new();
-        for line in msg.trim_end_matches('\n').split('\n') {
-            out += &format!("{:5}.{:03} {:5} {:5} {p} {tag}: {line}\n", t.as_secs(), t.subsec_millis(), e.pid, e.tid);
-        }
-        eprint!("{out}");
-    }
-
     fn clear(&self, lids: u32) {
         let mut logs = self.logs.lock().unwrap();
         logs.entries.retain(|e| lids & 1 << e.lid == 0);
@@ -180,20 +220,8 @@ impl Logd {
 impl Service for Logd {
     /// logdw: one record from process `pid`.
     fn datagram(&self, data: &[u8], pid: i32) {
-        if data.len() <= HEADER || data[0] >= LOG_ID_MAX {
-            return;
-        }
-        let e = Entry {
-            lid: data[0],
-            pid,
-            tid: u16::from_le_bytes([data[1], data[2]]) as u32,
-            sec: le32(&data[3..]),
-            nsec: le32(&data[7..]),
-            payload: data[HEADER..data.len().min(HEADER + PAYLOAD_MAX)].to_vec(),
-        };
-        if BINARY & 1 << e.lid == 0 {
-            self.print(&e);
-        }
+        let Some(e) = Entry::parse(data, pid) else { return };
+        e.print();
         let mut logs = self.logs.lock().unwrap();
         if !logs.readers.is_empty() {
             let packet = e.packet();

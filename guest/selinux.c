@@ -15,7 +15,12 @@ typedef unsigned int u32;
 #define NR_write 64
 #define NR_exit_group 94
 #define NR_getpid 172
+#define NR_socket 198
 #define NR_socketpair 199
+#define NR_bind 200
+#define NR_listen 201
+#define NR_accept 202
+#define NR_connect 203
 #define NR_getsockopt 209
 #define NR_clone 220
 #define NR_mmap 222
@@ -226,6 +231,22 @@ int cmain(void) {
     sys(NR_socketpair, 1, 2 /* SOCK_DGRAM */, 0, dg);
     len = sizeof buf;
     check(sys(NR_getsockopt, dg[0], 1, 31, buf, &len) == -ENOPROTOOPT, "SO_PEERSEC on a datagram socket: ENOPROTOOPT");
+    // A named server (as init's property service): each end sees the other's label.
+    struct { unsigned short family; char path[14]; } addr = { 1, "\0selinux-test" };
+    int srv = (int)sys(NR_socket, 1, 1, 0);
+    sys(NR_bind, srv, &addr, sizeof addr);
+    sys(NR_listen, srv, 4);
+    put("/proc/thread-self/attr/sockcreate", "u:r:logd:s0", 1);
+    int cli = (int)sys(NR_socket, 1, 1, 0);
+    i64 conn = sys(NR_connect, cli, &addr, sizeof addr);
+    put("/proc/thread-self/attr/sockcreate", "", 0);
+    int acc = (int)sys(NR_accept, srv, 0, 0);
+    len = sizeof buf;
+    r = sys(NR_getsockopt, acc, 1, 31, buf, &len);
+    check(conn == 0 && r == 0 && is(buf, len, "u:r:logd:s0", 12), "SO_PEERSEC: a server sees its client's label");
+    len = sizeof buf;
+    r = sys(NR_getsockopt, cli, 1, 31, buf, &len);
+    check(r == 0 && is(buf, len, "u:r:shell:s0", 13), "SO_PEERSEC: a client sees the server's label");
 
     // ---- setcon ----
     check(put("/proc/self/attr/current", "u:r:logd:s0", 1) == 12, "setcon: write current");

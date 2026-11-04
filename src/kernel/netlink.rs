@@ -1,6 +1,6 @@
-//! AF_NETLINK sockets. The kernel end answers the way an idle Linux with no
-//! network interfaces would: dumps (RTM_GETLINK, sock_diag, …) come back as
-//! a bare NLMSG_DONE, requests asking for an ack get NLMSG_ERROR 0, audit
+//! AF_NETLINK sockets. The kernel end answers the way an idle Linux with only
+//! loopback would: rtnetlink shows `lo` (net.rs), other dumps (sock_diag, …)
+//! come back as a bare NLMSG_DONE, requests asking for an ack get NLMSG_ERROR 0, audit
 //! keeps its status (logd registers as auditd), and uevents arrive only when
 //! someone broadcasts one (`uevent`). Sockets of one protocol reach each
 //! other by port id (unicast) and by group (multicast).
@@ -54,6 +54,7 @@ const IO_MAX: u64 = 16 << 20;
 
 pub const NETLINK_ROUTE: u32 = 0;
 const NETLINK_SOCK_DIAG: u32 = 4;
+const NETLINK_XFRM: u32 = 6;
 const NETLINK_SELINUX: u32 = 7;
 const NETLINK_AUDIT: u32 = 9;
 const NETLINK_NETFILTER: u32 = 12;
@@ -68,7 +69,10 @@ const NLM_F_DUMP: u16 = 0x300;
 const NLMSG_ERROR: u16 = 2;
 const NLMSG_DONE: u16 = 3;
 const NLMSG_MIN_TYPE: u16 = 0x10;
+const RTM_NEWLINK: u16 = 16;
 const RTM_GETLINK: u16 = 18;
+const RTM_NEWADDR: u16 = 20;
+const RTM_GETADDR: u16 = 22;
 const RTM_GETROUTE: u16 = 26;
 const RTM_MAX: u16 = 127;
 const AUDIT_GET: u16 = 1000;
@@ -85,7 +89,7 @@ fn ngroups(proto: u32) -> Option<u32> {
     match proto {
         NETLINK_ROUTE => Some(36),
         NETLINK_GENERIC => Some(64),
-        NETLINK_SOCK_DIAG | NETLINK_SELINUX | NETLINK_AUDIT | NETLINK_NETFILTER | NETLINK_KOBJECT_UEVENT => Some(32),
+        NETLINK_SOCK_DIAG | NETLINK_XFRM | NETLINK_SELINUX | NETLINK_AUDIT | NETLINK_NETFILTER | NETLINK_KOBJECT_UEVENT => Some(32),
         _ => None,
     }
 }
@@ -290,7 +294,7 @@ impl Netlink {
                 break;
             }
             let (ty, flags, seq) = (u16::from_le_bytes([m[4], m[5]]), u16::from_le_bytes([m[6], m[7]]), u32::from_le_bytes(m[8..12].try_into().unwrap()));
-            let reply = if flags & NLM_F_REQUEST == 0 || ty < NLMSG_MIN_TYPE { Reply::Ok(Vec::new()) } else { self.request(ty, flags, seq, &m[16..len]) };
+            let reply = if flags & NLM_F_REQUEST == 0 || ty < NLMSG_MIN_TYPE { Reply::Ok(Vec::new()) } else { self.request(ty, flags, seq, port, &m[16..len]) };
             let (msgs, err, ack) = match reply {
                 Reply::Ok(msgs) => (msgs, 0, flags & NLM_F_ACK != 0),
                 Reply::Dump(mut msgs) => {
@@ -314,7 +318,7 @@ impl Netlink {
         Ok(())
     }
 
-    fn request(&self, ty: u16, flags: u16, seq: u32, body: &[u8]) -> Reply {
+    fn request(&self, ty: u16, flags: u16, seq: u32, port: u32, body: &[u8]) -> Reply {
         let dump = flags & NLM_F_DUMP != 0;
         match self.proto {
             NETLINK_ROUTE => {
@@ -324,15 +328,20 @@ impl Netlink {
                 if body.is_empty() {
                     return Reply::Ok(Vec::new());
                 }
-                // rtnetlink kinds: NEW, DEL, GET, SET. No interfaces, routes, or
-                // addresses exist; changes are accepted as if applied.
+                // rtnetlink kinds: NEW, DEL, GET, SET. Only `lo` and its
+                // addresses exist, no routes; changes are accepted as if applied.
                 match ((ty - 16) & 3, dump) {
-                    (2, true) => Reply::Dump(Vec::new()),
-                    (2, false) => Reply::Err(match ty {
-                        RTM_GETLINK => ENODEV,
-                        RTM_GETROUTE => ENETUNREACH,
-                        _ => EOPNOTSUPP,
+                    (2, true) => Reply::Dump(match ty {
+                        RTM_GETLINK => vec![nlmsg(RTM_NEWLINK, NLM_F_MULTI, seq, port, &super::net::link_payload())],
+                        RTM_GETADDR => super::net::addr_payloads(body[0]).iter().map(|p| nlmsg(RTM_NEWADDR, NLM_F_MULTI, seq, port, p)).collect(),
+                        _ => Vec::new(),
                     }),
+                    (2, false) => match ty {
+                        RTM_GETLINK if super::net::link_requested(body) => Reply::Ok(vec![nlmsg(RTM_NEWLINK, 0, seq, port, &super::net::link_payload())]),
+                        RTM_GETLINK => Reply::Err(ENODEV),
+                        RTM_GETROUTE => Reply::Err(ENETUNREACH),
+                        _ => Reply::Err(EOPNOTSUPP),
+                    },
                     _ => Reply::Ok(Vec::new()),
                 }
             }

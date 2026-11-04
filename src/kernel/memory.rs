@@ -60,6 +60,7 @@ impl Kernel {
             let mapped = match &f.kind {
                 super::files::Kind::Drm(d) => Some(d.mmap(offset, len)),
                 super::files::Kind::DmaBuf(b) => Some(b.mmap(offset, len)),
+                super::files::Kind::Ashmem(a) => Some(a.mmap(&self.phys, offset, len, prot, flags & MAP_SHARED != 0)),
                 _ => None,
             };
             if let Some(mapped) = mapped {

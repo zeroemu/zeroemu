@@ -15,6 +15,7 @@ typedef unsigned int u32;
 #define NR_pipe2 59
 #define NR_read 63
 #define NR_write 64
+#define NR_mmap 222
 #define NR_ppoll 73
 #define NR_signalfd4 74
 #define NR_timerfd_create 85
@@ -238,6 +239,12 @@ int cmain(void) {
     sys(NR_write, pq[0], "z", 1);
     i64 one = sys(NR_ppoll, &pfd, 1, tmo, 0, 8);
     check(none == 0 && one == 1 && (pfd.revents & 1), "ppoll: timeout, then readable");
+
+    // ART flushes caches over its read-only JIT code view: cache
+    // maintenance on a page never touched faults as a read, not a write.
+    char *code = (char *)sys(NR_mmap, 0, 4096, 5 /* PROT_READ|PROT_EXEC */, 0x22, -1, 0);
+    __asm__ volatile("dc cvau, %0\n dsb ish\n ic ivau, %0\n dsb ish\n isb" : : "r"(code + 0x3c0) : "memory");
+    check((i64)code > 0, "cache maintenance on read-only code does not fault");
 
     puts_(failures ? "SOME CHECKS FAILED\n" : "all checks passed\n");
     return failures;

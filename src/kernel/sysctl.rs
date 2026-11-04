@@ -5,6 +5,7 @@
 use crate::errno::*;
 use std::sync::{Mutex, OnceLock};
 
+#[derive(Clone, Copy)]
 enum Kind {
     /// A string of at most this many bytes.
     Str(usize),
@@ -27,7 +28,7 @@ const RND_BITS: (&str, i64, i64, &str, i64, i64) = ("18", 18, 24, "11", 11, 16);
 const RND_BITS: (&str, i64, i64, &str, i64, i64) = ("28", 28, 32, "8", 8, 16);
 
 /// (path under /proc/sys, default, kind). Sorted, so directories group.
-const TABLE: &[(&str, &str, Kind)] = &[
+const BASE: &[(&str, &str, Kind)] = &[
     ("abi/swp", "0", Int(0, 2)),
     ("fs/aio-max-nr", "65536", Int(0, MAX)),
     ("fs/aio-nr", "0", Ro),
@@ -169,8 +170,90 @@ const TABLE: &[(&str, &str, Kind)] = &[
     ("vm/watermark_scale_factor", "10", Int(1, 3000)),
 ];
 
-/// A node of the /proc/sys tree: an entry of TABLE, or a directory (an
-/// index past TABLE into `dirs()`; the first is /proc/sys itself).
+/// Per-interface IPv4 knobs (net/ipv4/conf/<iface>/), with Linux's defaults.
+const IPV4_CONF: &[(&str, &str)] = &[
+    ("accept_local", "0"), ("accept_redirects", "1"), ("accept_source_route", "0"), ("arp_accept", "0"),
+    ("arp_announce", "0"), ("arp_filter", "0"), ("arp_ignore", "0"), ("arp_notify", "0"), ("bc_forwarding", "0"),
+    ("bootp_relay", "0"), ("disable_policy", "0"), ("disable_xfrm", "0"), ("drop_gratuitous_arp", "0"),
+    ("drop_unicast_in_l2_multicast", "0"), ("force_igmp_version", "0"), ("forwarding", "0"),
+    ("igmpv2_unsolicited_report_interval", "10000"), ("igmpv3_unsolicited_report_interval", "1000"),
+    ("ignore_routes_with_linkdown", "0"), ("log_martians", "0"), ("medium_id", "0"), ("promote_secondaries", "0"),
+    ("proxy_arp", "0"), ("proxy_arp_pvlan", "0"), ("route_localnet", "0"), ("rp_filter", "0"),
+    ("secure_redirects", "1"), ("send_redirects", "1"), ("shared_media", "1"), ("src_valid_mark", "0"), ("tag", "0"),
+];
+
+/// Per-interface IPv6 knobs (net/ipv6/conf/<iface>/), with Linux's defaults
+/// and Android's accept_ra_rt_table.
+const IPV6_CONF: &[(&str, &str)] = &[
+    ("accept_dad", "1"), ("accept_ra", "1"), ("accept_ra_defrtr", "1"), ("accept_ra_from_local", "0"),
+    ("accept_ra_min_hop_limit", "1"), ("accept_ra_min_lft", "0"), ("accept_ra_mtu", "1"), ("accept_ra_pinfo", "1"),
+    ("accept_ra_rt_info_max_plen", "0"), ("accept_ra_rt_info_min_plen", "0"), ("accept_ra_rt_table", "0"),
+    ("accept_ra_rtr_pref", "1"), ("accept_redirects", "1"), ("accept_source_route", "0"), ("accept_untracked_na", "0"),
+    ("addr_gen_mode", "0"), ("autoconf", "1"), ("dad_transmits", "1"), ("disable_ipv6", "0"), ("disable_policy", "0"),
+    ("drop_unicast_in_l2_multicast", "0"), ("drop_unsolicited_na", "0"), ("enhanced_dad", "1"),
+    ("force_mld_version", "0"), ("force_tllao", "0"), ("forwarding", "0"), ("hop_limit", "64"),
+    ("ignore_routes_with_linkdown", "0"), ("keep_addr_on_down", "0"), ("max_addresses", "16"),
+    ("max_desync_factor", "600"), ("mldv1_unsolicited_report_interval", "10000"),
+    ("mldv2_unsolicited_report_interval", "1000"), ("mtu", "1280"), ("ndisc_notify", "0"), ("ndisc_tclass", "0"),
+    ("optimistic_dad", "0"), ("proxy_ndp", "0"), ("ra_defrtr_metric", "1024"), ("regen_max_retry", "3"),
+    ("router_probe_interval", "60"), ("router_solicitation_delay", "1"), ("router_solicitation_interval", "4"),
+    ("router_solicitation_max_interval", "3600"), ("router_solicitations", "-1"), ("rpl_seg_enabled", "0"),
+    ("seg6_enabled", "0"), ("suppress_frag_ndisc", "1"), ("temp_prefered_lft", "86400"), ("temp_valid_lft", "604800"),
+    ("use_oif_addrs_only", "0"), ("use_optimistic", "0"), ("use_tempaddr", "0"),
+];
+
+/// Neighbour-table knobs (net/ipv{4,6}/neigh/<iface>/).
+const NEIGH: &[(&str, &str)] = &[
+    ("anycast_delay", "100"), ("app_solicit", "0"), ("base_reachable_time", "30"), ("base_reachable_time_ms", "30000"),
+    ("delay_first_probe_time", "5"), ("gc_stale_time", "60"), ("interval_probe_time_ms", "5000"), ("locktime", "100"),
+    ("mcast_resolicit", "0"), ("mcast_solicit", "3"), ("proxy_delay", "80"), ("proxy_qlen", "64"),
+    ("retrans_time", "100"), ("retrans_time_ms", "1000"), ("ucast_solicit", "3"), ("unres_qlen", "101"),
+    ("unres_qlen_bytes", "212992"),
+];
+
+/// BASE and, for each interface (net.rs: lo) plus "all" and "default", its
+/// conf and neigh knobs.
+fn table() -> &'static [(&'static str, &'static str, Kind)] {
+    static T: OnceLock<Vec<(&'static str, &'static str, Kind)>> = OnceLock::new();
+    T.get_or_init(|| {
+        let mut v = BASE.to_vec();
+        let mut add = |path: String, def: &'static str, kind: Kind| {
+            if !v.iter().any(|(p, _, _)| *p == path) {
+                v.push((Box::leak(path.into_boxed_str()), def, kind));
+            }
+        };
+        for iface in ["all", "default", "lo"] {
+            for (key, def) in IPV4_CONF {
+                add(format!("net/ipv4/conf/{iface}/{key}"), def, Int(MIN, MAX));
+            }
+            add(format!("net/ipv4/conf/{iface}/mc_forwarding"), "0", Ro);
+            for (key, def) in IPV6_CONF {
+                let def = match (iface, *key) {
+                    ("lo", "mtu") => "65536",
+                    ("lo", "use_tempaddr") => "-1",
+                    _ => def,
+                };
+                add(format!("net/ipv6/conf/{iface}/{key}"), def, Int(MIN, MAX));
+            }
+            add(format!("net/ipv6/conf/{iface}/mc_forwarding"), "0", Ro);
+            add(format!("net/ipv6/conf/{iface}/stable_secret"), "", Str(64));
+        }
+        for proto in ["ipv4", "ipv6"] {
+            for iface in ["default", "lo"] {
+                for (key, def) in NEIGH {
+                    add(format!("net/{proto}/neigh/{iface}/{key}"), def, Int(MIN, MAX));
+                }
+            }
+            for (key, def) in [("gc_interval", "30"), ("gc_thresh1", "128"), ("gc_thresh2", "512"), ("gc_thresh3", "1024")] {
+                add(format!("net/{proto}/neigh/default/{key}"), def, Int(MIN, MAX));
+            }
+        }
+        v
+    })
+}
+
+/// A node of the /proc/sys tree: an entry of table(), or a directory (an
+/// index past table() into `dirs()`; the first is /proc/sys itself).
 pub enum Entry {
     Dir(Vec<(String, u16)>),
     File(String),
@@ -181,7 +264,7 @@ fn dirs() -> &'static [String] {
     static DIRS: OnceLock<Vec<String>> = OnceLock::new();
     DIRS.get_or_init(|| {
         let mut v = vec![String::new()];
-        for (path, _, _) in TABLE {
+        for (path, _, _) in table() {
             let mut p = *path;
             while let Some((d, _)) = p.rsplit_once('/') {
                 if !v.iter().any(|x| x == d) {
@@ -210,27 +293,27 @@ pub struct Sysctl {
 impl Sysctl {
     pub fn new() -> Sysctl {
         let boot_id = uuid();
-        let values = TABLE.iter().map(|(p, d, _)| if *p == "kernel/random/boot_id" { boot_id.clone() } else { d.to_string() }).collect();
+        let values = table().iter().map(|(p, d, _)| if *p == "kernel/random/boot_id" { boot_id.clone() } else { d.to_string() }).collect();
         Sysctl { values: Mutex::new(values) }
     }
 
     /// The root directory's index (/proc/sys).
     pub fn root() -> u16 {
-        TABLE.len() as u16
+        table().len() as u16
     }
 
     pub fn entry(&self, idx: u16) -> Option<Entry> {
         let i = idx as usize;
-        if let Some((path, _, _)) = TABLE.get(i) {
+        if let Some((path, _, _)) = table().get(i) {
             return Some(Entry::File(match *path {
                 "kernel/random/uuid" => uuid(),
                 _ => self.values.lock().unwrap()[i].clone(),
             }));
         }
-        let dir = dirs().get(i - TABLE.len())?;
+        let dir = dirs().get(i - table().len())?;
         let prefix = if dir.is_empty() { String::new() } else { format!("{dir}/") };
         let mut out: Vec<(String, u16)> = Vec::new();
-        let names = TABLE.iter().map(|(p, _, _)| p.to_string()).enumerate().chain(dirs().iter().cloned().enumerate().map(|(j, d)| (j + TABLE.len(), d)));
+        let names = table().iter().map(|(p, _, _)| p.to_string()).enumerate().chain(dirs().iter().cloned().enumerate().map(|(j, d)| (j + table().len(), d)));
         for (j, p) in names {
             if let Some(name) = p.strip_prefix(&prefix).filter(|n| !n.is_empty() && !n.contains('/')) {
                 out.push((name.to_string(), j as u16));
@@ -241,21 +324,21 @@ impl Sysctl {
     }
 
     pub fn parent(idx: u16) -> u16 {
-        let path = match TABLE.get(idx as usize) {
+        let path = match table().get(idx as usize) {
             Some((p, _, _)) => p.to_string(),
-            None => dirs().get(idx as usize - TABLE.len()).cloned().unwrap_or_default(),
+            None => dirs().get(idx as usize - table().len()).cloned().unwrap_or_default(),
         };
         let parent = path.rsplit_once('/').map_or("", |(d, _)| d);
-        (dirs().iter().position(|d| d == parent).unwrap_or(0) + TABLE.len()) as u16
+        (dirs().iter().position(|d| d == parent).unwrap_or(0) + table().len()) as u16
     }
 
     pub fn writable(idx: u16) -> bool {
-        TABLE.get(idx as usize).is_some_and(|(_, _, k)| !matches!(k, Ro))
+        table().get(idx as usize).is_some_and(|(_, _, k)| !matches!(k, Ro))
     }
 
     /// One write(2): the new value, validated like the kernel's handlers.
     pub fn write(&self, idx: u16, data: &[u8]) -> Result<usize, i64> {
-        let (_, _, kind) = TABLE.get(idx as usize).ok_or(EINVAL)?;
+        let (_, _, kind) = table().get(idx as usize).ok_or(EINVAL)?;
         let text = String::from_utf8_lossy(data);
         let value = match kind {
             Ro => return Err(EINVAL),
@@ -282,7 +365,7 @@ impl Sysctl {
                 v.iter().map(|n| n.to_string()).collect::<Vec<_>>().join("\t")
             }
         };
-        let value = match TABLE[idx as usize].0 {
+        let value = match table()[idx as usize].0 {
             // Rounded up to a power-of-two number of pages, as pipes are sized.
             "fs/pipe-max-size" => (value.parse::<u64>().unwrap_or(4096).max(4096).next_power_of_two()).to_string(),
             _ => value,
@@ -292,12 +375,12 @@ impl Sysctl {
     }
 
     pub fn get(&self, path: &str) -> String {
-        TABLE.iter().position(|(p, _, _)| *p == path).map(|i| self.values.lock().unwrap()[i].clone()).unwrap_or_default()
+        table().iter().position(|(p, _, _)| *p == path).map(|i| self.values.lock().unwrap()[i].clone()).unwrap_or_default()
     }
 
     /// Stores a value the kernel itself sets (sethostname, setdomainname), unvalidated.
     pub fn set(&self, path: &str, value: String) {
-        if let Some(i) = TABLE.iter().position(|(p, _, _)| *p == path) {
+        if let Some(i) = table().iter().position(|(p, _, _)| *p == path) {
             self.values.lock().unwrap()[i] = value;
         }
     }

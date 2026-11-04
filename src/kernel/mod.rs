@@ -7,6 +7,7 @@
 //! vCPU (Hypervisor.framework binds a vCPU to its creating thread). Blocking
 //! syscalls simply block that host thread.
 
+mod ashmem;
 mod binder;
 mod block;
 mod bpf;
@@ -18,8 +19,10 @@ mod epoll;
 mod files;
 mod futex;
 mod inet;
+mod inotify;
 mod locks;
 mod logd;
+mod net;
 mod memory;
 mod misc;
 mod mount;
@@ -413,6 +416,17 @@ impl Kernel {
         if let Some(d) = &drm {
             d.publish(dev.as_ref(), sys.as_ref());
         }
+        net::publish(sys.as_ref());
+        let sysctl = sysctl::Sysctl::new();
+        // libcutils opens /dev/ashmem<boot id> (init names the node so).
+        {
+            use crate::vfs::FileSystem;
+            if let Ok(root) = dev.root() {
+                for name in ["ashmem".to_string(), format!("ashmem{}", sysctl.get("kernel/random/boot_id"))] {
+                    let _ = dev.create(root, &name, 0o020666, ashmem::rdev());
+                }
+            }
+        }
         let names: Vec<String> = partitions.iter().map(|(n, _)| n.clone()).collect();
         for (name, dev) in partitions {
             blocks.add_static(&name, dev);
@@ -462,7 +476,7 @@ impl Kernel {
             root_pid: AtomicI32::new(0),
             props,
             blocks,
-            sysctl: sysctl::Sysctl::new(),
+            sysctl,
             selinux,
             _services: services,
             exit: (Mutex::new(None), Condvar::new()),
@@ -764,6 +778,8 @@ impl Kernel {
             rt_sigaction => self.sys_rt_sigaction(t, a[0] as u32, a[1], a[2]),
             rt_sigprocmask => self.sys_rt_sigprocmask(t, a[0], a[1], a[2]),
             rt_sigsuspend => self.sys_rt_sigsuspend(t, a[0]),
+            rt_sigtimedwait => self.sys_rt_sigtimedwait(t, a[0], a[1], a[2]),
+            rt_sigpending => self.sys_rt_sigpending(t, a[0]),
             rt_sigreturn => return self.sys_rt_sigreturn(t, vcpu),
             sigaltstack => self.sys_sigaltstack(t, a[0], a[1]),
 
@@ -827,6 +843,7 @@ impl Kernel {
             if write { "writing" } else { "reading" },
             mm.symbolize(pc)
         );
+        eprintln!("[droidrt]   in {}", mm.describe(addr));
         if let CpuState::Aarch64(s) = vcpu.state() {
             eprintln!("[droidrt]   lr {}", mm.symbolize(s.x[30]));
             let mut fp = s.x[29];

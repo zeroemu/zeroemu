@@ -301,7 +301,7 @@ fn walk(fs: &dyn FileSystem, path: &str) -> Option<u64> {
 }
 
 /// Creates or replaces a small attribute file.
-fn put_file(fs: &dyn FileSystem, path: &str, content: &str) {
+pub(super) fn put_file(fs: &dyn FileSystem, path: &str, content: &str) {
     let (dir, name) = path.rsplit_once('/').unwrap_or(("", path));
     let d = mkdir_p(fs, dir);
     let ino = match fs.lookup(d, name).ok().flatten() {

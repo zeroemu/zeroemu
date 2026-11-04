@@ -207,6 +207,17 @@ impl Thread {
         sigs.into_iter().any(|s| !ignored(&actions.get(s), s, self.proc.pid == 1))
     }
 
+    /// The lowest pending signal in `set` (this thread's first), dequeued.
+    fn take_from(&self, set: u64) -> Option<(u32, SigInfo)> {
+        for pending in [&self.pending, &self.proc.pending] {
+            let mut p = pending.lock().unwrap();
+            if let Some(&sig) = p.keys().filter(|&&s| bit(s) & set != 0).min() {
+                return p.remove(&sig).map(|i| (sig, i));
+            }
+        }
+        None
+    }
+
     fn take_signal(&self) -> Option<(u32, SigInfo)> {
         let mask = self.mask.load(Ordering::Relaxed) & !UNBLOCKABLE;
         for pending in [&self.pending, &self.proc.pending] {
@@ -456,6 +467,56 @@ impl Kernel {
             std::thread::sleep(POLL.min(std::time::Duration::from_millis(2)));
         }
         -EINTR
+    }
+
+    /// sigwaitinfo / sigtimedwait: takes a signal of `set` (normally blocked)
+    /// without running its handler. ART's Signal Catcher sits in this.
+    pub(super) fn sys_rt_sigtimedwait(&self, t: &Thread, set: u64, info: u64, timeout: u64) -> i64 {
+        let (want, deadline) = {
+            let mut mm = t.proc.mm();
+            let want = match mm.read_u64(set) {
+                Ok(m) => m & !UNBLOCKABLE,
+                Err(e) => return -e,
+            };
+            let deadline = if timeout == 0 {
+                None
+            } else {
+                match (mm.read_u64(timeout), mm.read_u64(timeout + 8)) {
+                    (Ok(s), Ok(ns)) if ns < 1_000_000_000 => Some(std::time::Instant::now() + std::time::Duration::new(s, ns as u32)),
+                    (Ok(_), Ok(_)) => return -EINVAL,
+                    (Err(e), _) | (_, Err(e)) => return -e,
+                }
+            };
+            (want, deadline)
+        };
+        loop {
+            if let Some((sig, si)) = t.take_from(want) {
+                if info != 0
+                    && let Err(e) = t.proc.mm().write(info, &si.0)
+                {
+                    return -e;
+                }
+                return sig as i64;
+            }
+            if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+                return -EAGAIN;
+            }
+            if t.interrupted() {
+                return -EINTR; // a signal outside the set, to be handled
+            }
+            let nap = deadline.map_or(POLL, |d| d.saturating_duration_since(std::time::Instant::now()).min(POLL));
+            super::vcpus::blocking();
+            std::thread::sleep(nap.min(std::time::Duration::from_millis(5)));
+        }
+    }
+
+    /// The signals pending for the thread or its process.
+    pub(super) fn sys_rt_sigpending(&self, t: &Thread, set: u64) -> i64 {
+        let bits = [&t.pending, &t.proc.pending].iter().flat_map(|p| p.lock().unwrap().keys().copied().collect::<Vec<u32>>()).fold(0u64, |acc, s| acc | bit(s));
+        match t.proc.mm().write_u64(set, bits) {
+            Ok(()) => 0,
+            Err(e) => -e,
+        }
     }
 
     pub(super) fn sys_sigaltstack(&self, t: &Thread, ss: u64, old: u64) -> i64 {

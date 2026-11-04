@@ -24,6 +24,10 @@ const EC_DATA_ABORT_LOWER: u64 = 0x24;
 const EC_SVC64: u64 = 0x15;
 const EC_HVC64: u64 = 0x16;
 const ESR_WNR: u64 = 1 << 6;
+/// The abort came from a cache maintenance instruction (DC CVAU, IC IVAU...),
+/// which reports WnR = 1; Linux counts it as a read (is_write_abort), so
+/// cleaning the cache over read-only code works.
+const ESR_CM: u64 = 1 << 8;
 
 const CPSR_EL1H_MASKED: u64 = 0x3c5;
 const CPSR_MODE_MASK: u64 = 0xf;
@@ -242,7 +246,7 @@ impl Vcpu for HvfVcpu {
             let addr = || crate::arch::untag(self.sys(HV_SYS_REG_FAR_EL1));
             return match esr >> 26 {
                 EC_SVC64 => Exit::Syscall,
-                EC_DATA_ABORT_LOWER => Exit::PageFault { pc: elr, addr: addr(), write: esr & ESR_WNR != 0, exec: false },
+                EC_DATA_ABORT_LOWER => Exit::PageFault { pc: elr, addr: addr(), write: esr & ESR_WNR != 0 && esr & ESR_CM == 0, exec: false },
                 EC_INSTR_ABORT_LOWER => Exit::PageFault { pc: elr, addr: addr(), write: false, exec: true },
                 ec => Exit::Fault { pc: elr, addr: addr(), detail: format!("ESR_EL1={esr:#x} (EC {ec:#x})") },
             };

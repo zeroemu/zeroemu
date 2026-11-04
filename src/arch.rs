@@ -83,6 +83,9 @@ syscalls! {
     fcntl = 25, 72;
     ioctl = 29, 16;
     flock = 32, 73;
+    inotify_init1 = 26, 294;
+    inotify_add_watch = 27, 254;
+    inotify_rm_watch = 28, 255;
     mknodat = 33, 259;
     mkdirat = 34, 258;
     unlinkat = 35, 263;
@@ -147,6 +150,8 @@ syscalls! {
     sigaltstack = 132, 131;
     rt_sigaction = 134, 13;
     rt_sigprocmask = 135, 14;
+    rt_sigpending = 136, 127;
+    rt_sigtimedwait = 137, 128;
     rt_sigsuspend = 133, 130;
     rt_sigreturn = 139, 15;
     rt_sigqueueinfo = 138, 129;

@@ -275,6 +275,20 @@ impl AddressSpace {
 
     // ---- VMAs ----
 
+    /// The mapping at `addr`, as a crash report shows it.
+    pub fn describe(&self, addr: u64) -> String {
+        let addr = crate::arch::untag(addr);
+        let Some((start, v)) = self.find(addr) else { return "no mapping".into() };
+        let kind = match &v.backing {
+            Backing::Anon => "anon",
+            Backing::File { .. } => "file copy",
+            Backing::Shared { .. } => "shared",
+            Backing::Dev { .. } => "device",
+        };
+        let p = |bit: u32, c: char| if v.prot & bit != 0 { c } else { '-' };
+        format!("{start:#x}-{:#x} {}{}{} {kind} {}", v.end, p(PROT_READ, 'r'), p(PROT_WRITE, 'w'), p(PROT_EXEC, 'x'), v.name.as_deref().unwrap_or(""))
+    }
+
     fn find(&self, addr: u64) -> Option<(u64, &Vma)> {
         let (&start, vma) = self.vmas.range(..=addr).next_back()?;
         (addr < vma.end).then_some((start, vma))

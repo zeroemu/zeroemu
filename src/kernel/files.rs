@@ -8,6 +8,7 @@ use super::netlink::{self, Netlink};
 use super::specialfd::{EventFd, SignalFd, TimerFd};
 use super::unix::{self, Socket};
 use super::wait::EVENTS;
+use super::inotify;
 use super::{ERESTARTSYS, Kernel, POLL, Thread, int};
 use crate::arch::Sysno;
 use crate::errno::*;
@@ -70,7 +71,7 @@ pub fn handles(no: Sysno) -> bool {
             | fstatfs | umask | pipe2 | ppoll | eventfd2 | epoll_create1 | epoll_ctl | epoll_pwait | epoll_pwait2 | timerfd_create
             | timerfd_settime | timerfd_gettime | signalfd4 | mknodat | mkdirat | unlinkat | symlinkat | linkat | renameat
             | renameat2 | truncate | ftruncate | fallocate | fchmod | fchmodat | fchown | fchownat | sync | fsync | fdatasync
-            | utimensat | memfd_create | flock
+            | utimensat | memfd_create | flock | inotify_init1 | inotify_add_watch | inotify_rm_watch
     )
 }
 
@@ -95,6 +96,9 @@ pub enum Kind {
     Netlink(Arc<Netlink>),
     /// AF_INET / AF_INET6 (inet.rs): no network yet.
     Inet(Arc<super::inet::Inet>),
+    /// An /dev/ashmem region (ashmem.rs).
+    Ashmem(super::ashmem::Ashmem),
+    Inotify(Arc<super::inotify::Inotify>),
     Binder(BinderFile),
     /// A loop or device-mapper device (block.rs).
     Block(BlockOpen),
@@ -215,10 +219,17 @@ struct Entry {
     cloexec: bool,
 }
 
-/// The open file description is gone: so are its OFD and flock locks.
+/// The open file description is gone: so are its OFD and flock locks, and
+/// a written file's watchers hear IN_CLOSE_WRITE.
 impl Drop for File {
     fn drop(&mut self) {
         super::locks::LOCKS.release(super::locks::Owner::File(self as *const File as usize));
+        if let Kind::Mem(m) = &self.kind
+            && m.writable
+            && let Some(n) = &m.node
+        {
+            inotify::notify(&n.path, inotify::IN_CLOSE_WRITE, 0);
+        }
     }
 }
 
@@ -401,6 +412,7 @@ pub(super) fn poll_ready(f: &File, t: &Thread, depth: u32) -> u16 {
         Kind::Bpf(_) => 0,
         Kind::Netlink(n) => n.poll(),
         Kind::Inet(_) => POLLOUT,
+        Kind::Inotify(i) => if i.pending() > 0 { POLLIN } else { 0 },
         Kind::Binder(b) => {
             (if binder::readable(b, t.tid) { POLLIN } else { 0 }) | POLLOUT
         }
@@ -419,7 +431,7 @@ pub(super) fn poll_ready(f: &File, t: &Thread, depth: u32) -> u16 {
             }
             None => POLLIN | POLLOUT,
         },
-        Kind::Null | Kind::Zero | Kind::Random | Kind::Mem(_) | Kind::Block(_) | Kind::LoopControl | Kind::DmControl | Kind::Special(_) | Kind::DmaBuf(_) => POLLIN | POLLOUT,
+        Kind::Null | Kind::Zero | Kind::Random | Kind::Mem(_) | Kind::Block(_) | Kind::LoopControl | Kind::DmControl | Kind::Special(_) | Kind::DmaBuf(_) | Kind::Ashmem(_) => POLLIN | POLLOUT,
         Kind::Drm(d) => d.poll_bits(),
         Kind::Sync(s) => s.poll(),
         Kind::Kmsg => POLLOUT,
@@ -738,6 +750,11 @@ impl Kernel {
                     Kind::DmaBuf(_) => return super::drm::dma_ioctl(cmd, a[2], &mut DrmIo { t }),
                     Kind::Sync(s) => return super::drm::sync_ioctl(s, cmd, a[2], &mut DrmIo { t }),
                     Kind::Binder(b) => return self.binder_ioctl(t, &f, b, cmd, a[2]),
+                    Kind::Ashmem(m) => return m.ioctl(cmd, a[2], &mut AshmemIo { t }),
+                    Kind::Inotify(i) if cmd == 0x541b => {
+                        t.proc.mm().write_u32(a[2], i.pending() as u32)?; // FIONREAD
+                        return Ok(0);
+                    }
                     Kind::Block(b) => return self.blocks.ioctl(b.devt, cmd, a[2], &mut BlockCaller { k: self, t }),
                     Kind::LoopControl => return self.blocks.loop_control(cmd, a[2]),
                     Kind::DmControl => return self.blocks.dm_ioctl(cmd, a[2], &mut BlockCaller { k: self, t }),
@@ -746,6 +763,8 @@ impl Kernel {
                         return t.proc.files.lock().unwrap().alloc(file, a[2] & O_CLOEXEC != 0, 0);
                     }
                     Kind::Pty(p) if !matches!(a[1], 0x5450 | 0x5451 | 0x5421) => return p.ioctl(t, cmd, a[2]),
+                    // Socket ioctls (SIOC*): the interfaces.
+                    Kind::Inet(_) if (0x8900..0x89ff).contains(&cmd) => return self.inet_ioctl(t, cmd, a[2]),
                     _ => {}
                 }
                 const FIONCLEX: u64 = 0x5450;
@@ -820,6 +839,27 @@ impl Kernel {
             ppoll => self.ppoll(t, a[0], a[1], a[2], a[3]),
             mknodat | mkdirat | unlinkat | symlinkat | linkat | renameat | renameat2 | truncate | ftruncate | fallocate | fchmod
             | fchmodat | fchown | fchownat | sync | fsync | fdatasync | utimensat | memfd_create => self.change_syscall(no, t, a),
+            inotify_init1 => {
+                const IN_NONBLOCK: u64 = 0o4000;
+                const IN_CLOEXEC: u64 = 0o2000000;
+                if a[0] & !(IN_NONBLOCK | IN_CLOEXEC) != 0 {
+                    return Err(EINVAL);
+                }
+                let f = File::new(Kind::Inotify(super::inotify::Inotify::new()), (a[0] & IN_NONBLOCK) as u32);
+                t.proc.files.lock().unwrap().alloc(f, a[0] & IN_CLOEXEC != 0, 0)
+            }
+            inotify_add_watch | inotify_rm_watch => {
+                let f = t.proc.files.lock().unwrap().get(int(a[0]))?;
+                let Kind::Inotify(i) = &f.kind else { return Err(EINVAL) };
+                if no == inotify_rm_watch {
+                    return i.rm_watch(a[1] as i32);
+                }
+                let mask = a[2] as u32;
+                let path = t.proc.mm().read_cstr(a[1])?;
+                let node = self.resolve(t, AT_FDCWD, &path, super::inotify::follow(mask))?;
+                let is_dir = self.vfs()?.stat(&node)?.mode & S_IFMT == S_IFDIR;
+                i.add_watch(&node.path, is_dir, mask)
+            }
             eventfd2 => {
                 let f = File::new(Kind::Event(EventFd::new(a[0] as u32 as u64, a[1])), a[1] as u32 & O_NONBLOCK);
                 t.proc.files.lock().unwrap().alloc(f, a[1] & O_CLOEXEC != 0, 0)
@@ -956,7 +996,9 @@ impl Kernel {
             Ok(n) => n,
             Err(ENOENT) if flags & O_CREAT != 0 => {
                 let (dir, name) = self.parent(t, dirfd, &path)?;
-                self.vfs()?.create(&dir, &name, S_IFREG | (mode as u32 & 0o7777 & !0o022), 0)?
+                let node = self.vfs()?.create(&dir, &name, S_IFREG | (mode as u32 & 0o7777 & !0o022), 0)?;
+                inotify::notify(&inotify::join(&dir.path, &name), inotify::IN_CREATE, 0);
+                node
             }
             Err(e) => return Err(e),
         };
@@ -975,6 +1017,7 @@ impl Kernel {
                 r if r == block::makedev(block::MISC_MAJOR, block::LOOP_CONTROL_MINOR) => Kind::LoopControl,
                 r if r == block::makedev(block::MISC_MAJOR, block::DM_CONTROL_MINOR) => Kind::DmControl,
                 r if super::drm::is_node(r) => Kind::Drm(self.drm.as_ref().ok_or(ENXIO)?.open(r)),
+                r if r == super::ashmem::rdev() => Kind::Ashmem(super::ashmem::Ashmem::new()),
                 rdev => binder::file_for(t, rdev).ok_or(ENXIO)?,
             },
             S_IFBLK if self.blocks.device(stat.rdev).is_some() => Kind::Block(BlockOpen { devt: stat.rdev, pos: Mutex::new(0) }),
@@ -1053,6 +1096,8 @@ impl Kernel {
                 } else {
                     vfs.create(&dir, &name, a[2] as u32 & !0o022, a[3])?; // umask
                 }
+                let isdir = if no == mkdirat { inotify::IN_ISDIR } else { 0 };
+                inotify::notify(&inotify::join(&dir.path, &name), inotify::IN_CREATE | isdir, 0);
                 Ok(0)
             }
             unlinkat => {
@@ -1063,6 +1108,8 @@ impl Kernel {
                 if let Ok(v) = victim {
                     unix::unlinked(vfs, &v);
                 }
+                let isdir = if a[2] & AT_REMOVEDIR != 0 { inotify::IN_ISDIR } else { 0 };
+                inotify::notify(&inotify::join(&dir.path, &name), inotify::IN_DELETE | isdir, 0);
                 Ok(0)
             }
             symlinkat => {
@@ -1070,6 +1117,7 @@ impl Kernel {
                 let path = t.proc.mm().read_cstr(a[2])?;
                 let (dir, name) = self.parent(t, int(a[1]), &path)?;
                 vfs.symlink(&dir, &name, &target)?;
+                inotify::notify(&inotify::join(&dir.path, &name), inotify::IN_CREATE, 0);
                 Ok(0)
             }
             linkat => {
@@ -1077,6 +1125,7 @@ impl Kernel {
                 let path = t.proc.mm().read_cstr(a[3])?;
                 let (dir, name) = self.parent(t, int(a[2]), &path)?;
                 vfs.link(&old, &dir, &name)?;
+                inotify::notify(&inotify::join(&dir.path, &name), inotify::IN_CREATE, 0);
                 Ok(0)
             }
             renameat | renameat2 => {
@@ -1096,6 +1145,9 @@ impl Kernel {
                 if let Ok(v) = victim {
                     unix::unlinked(vfs, &v);
                 }
+                let cookie = inotify::cookie();
+                inotify::notify(&inotify::join(&odir.path, &oname), inotify::IN_MOVED_FROM, cookie);
+                inotify::notify(&inotify::join(&ndir.path, &nname), inotify::IN_MOVED_TO, cookie);
                 Ok(0)
             }
             truncate => {
@@ -1108,6 +1160,7 @@ impl Kernel {
                     return Err(EROFS);
                 }
                 vfs.mem_file(&node).ok_or(EISDIR)?.truncate(a[1]);
+                inotify::notify(&node.path, inotify::IN_MODIFY, 0);
                 Ok(0)
             }
             ftruncate | fallocate => {
@@ -1126,6 +1179,9 @@ impl Kernel {
                 } else if a[2] + a[3] > m.file.size() && a[1] & 1 == 0 {
                     m.file.truncate(a[2] + a[3]); // FALLOC_FL_KEEP_SIZE (1) unset: extend
                 }
+                if let Some(n) = &m.node {
+                    inotify::notify(&n.path, inotify::IN_MODIFY, 0);
+                }
                 Ok(0)
             }
             fchmod | fchown => {
@@ -1135,16 +1191,19 @@ impl Kernel {
                 } else {
                     vfs.set_attr(&node, None, Some((a[1] as u32, a[2] as u32)), None)?;
                 }
+                inotify::notify(&node.path, inotify::IN_ATTRIB, 0);
                 Ok(0)
             }
             fchmodat => {
                 let node = self.target(t, int(a[0]), a[1], 0)?;
                 vfs.set_attr(&node, Some(a[2] as u32), None, None)?;
+                inotify::notify(&node.path, inotify::IN_ATTRIB, 0);
                 Ok(0)
             }
             fchownat => {
                 let node = self.target(t, int(a[0]), a[1], a[4])?;
                 vfs.set_attr(&node, None, Some((a[2] as u32, a[3] as u32)), None)?;
+                inotify::notify(&node.path, inotify::IN_ATTRIB, 0);
                 Ok(0)
             }
             utimensat => {
@@ -1288,6 +1347,7 @@ impl Kernel {
             Kind::Socket(sock) => unix::read(sock, t, count, f.nonblock())?,
             Kind::Netlink(nl) => netlink::read(nl, t, count, f.nonblock())?,
             Kind::Inet(_) => return Err(ENOTCONN),
+            Kind::Inotify(i) => i.read(t, count, f.nonblock())?,
             Kind::Block(b) => {
                 let dev = self.blocks.device(b.devt).ok_or(ENXIO)?;
                 let mut pos = b.pos.lock().unwrap();
@@ -1395,6 +1455,9 @@ impl Kernel {
                 if at.is_none() {
                     *pos = off + n as u64;
                 }
+                if let Some(node) = &m.node {
+                    inotify::notify(&node.path, inotify::IN_MODIFY, 0);
+                }
                 n
             }
             Kind::Node(nf) => {
@@ -1422,8 +1485,9 @@ impl Kernel {
             Kind::Kmsg => chr(0x010b),
             Kind::Pipe(_) => Stat { mode: 0o010600, nlink: 1, ..Default::default() },
             Kind::Socket(_) | Kind::Netlink(_) | Kind::Inet(_) => Stat { mode: 0o140777, nlink: 1, ..Default::default() },
-            Kind::Event(_) | Kind::Timer(_) | Kind::Signal(_) | Kind::Epoll(_) | Kind::Bpf(_) | Kind::Sync(_) => Stat { mode: 0o600, nlink: 1, ..Default::default() }, // anon_inode
+            Kind::Event(_) | Kind::Timer(_) | Kind::Signal(_) | Kind::Epoll(_) | Kind::Bpf(_) | Kind::Sync(_) | Kind::Inotify(_) => Stat { mode: 0o600, nlink: 1, ..Default::default() }, // anon_inode
             Kind::Drm(d) => Stat { mode: 0o020666, rdev: d.rdev(), nlink: 1, ..Default::default() },
+            Kind::Ashmem(a) => Stat { mode: 0o020666, rdev: super::ashmem::rdev(), nlink: 1, size: a.size(), ..Default::default() },
             Kind::DmaBuf(b) => Stat { mode: 0o600, nlink: 1, size: b.size(), ..Default::default() },
             Kind::Binder(_) => Stat { mode: 0o020666, nlink: 1, rdev: 0xa36, ..Default::default() },
             Kind::Block(b) => Stat { mode: S_IFBLK | 0o600, nlink: 1, rdev: b.devt, ..Default::default() },
@@ -1673,6 +1737,8 @@ pub(super) fn file_name(f: &File) -> String {
         Kind::Socket(s) => format!("socket:[{}]", Arc::as_ptr(s) as usize % 100_000),
         Kind::Netlink(s) => format!("socket:[{}]", Arc::as_ptr(s) as usize % 100_000),
         Kind::Inet(s) => format!("socket:[{}]", Arc::as_ptr(s) as usize % 100_000),
+        Kind::Ashmem(a) => a.map_name(),
+        Kind::Inotify(_) => "anon_inode:inotify".into(),
         Kind::Event(_) => "anon_inode:[eventfd]".into(),
         Kind::Timer(_) => "anon_inode:[timerfd]".into(),
         Kind::Signal(_) => "anon_inode:[signalfd]".into(),
@@ -1791,4 +1857,17 @@ fn statx_bytes(st: &Stat) -> [u8; 256] {
     put(136, &block::major(st.dev).to_le_bytes()); // stx_dev_major
     put(140, &block::minor(st.dev).to_le_bytes());
     b
+}
+
+struct AshmemIo<'a> {
+    t: &'a Thread,
+}
+
+impl super::ashmem::Io for AshmemIo<'_> {
+    fn read(&mut self, addr: u64, buf: &mut [u8]) -> Result<(), i64> {
+        self.t.proc.mm().read(addr, buf)
+    }
+    fn write(&mut self, addr: u64, data: &[u8]) -> Result<(), i64> {
+        self.t.proc.mm().write(addr, data)
+    }
 }

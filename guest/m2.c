@@ -22,6 +22,10 @@ typedef long i64;
 #define NR_pipe2 59
 #define NR_read 63
 #define NR_close 57
+#define NR_rt_sigprocmask 135
+#define NR_rt_sigtimedwait 137
+#define NR_getpid 172
+#define NR_kill 129
 
 static i64 sys6(i64 n, i64 a, i64 b, i64 c, i64 d, i64 e, i64 f) {
     register i64 x8 __asm__("x8") = n;
@@ -49,6 +53,10 @@ static i64 sys6(i64 n, i64 a, i64 b, i64 c, i64 d, i64 e, i64 f) {
 #define NR_futex 202
 #define NR_exit_group 231
 #define NR_pipe2 293
+#define NR_rt_sigprocmask 14
+#define NR_rt_sigtimedwait 128
+#define NR_getpid 39
+#define NR_kill 62
 
 static i64 sys6(i64 n, i64 a, i64 b, i64 c, i64 d, i64 e, i64 f) {
     register i64 r10 __asm__("r10") = d;
@@ -256,6 +264,17 @@ int cmain(i64 *sp) {
     sys(NR_mprotect, ax, 8192, PROT_RW);
     char *ax2 = (char *)sys(NR_mremap, ax, 8192, 16384, 1 /* MREMAP_MAYMOVE */, 0);
     check((i64)ax2 > 0 && ax2[0] == 5, "mremap after mprotect splits and rejoins");
+
+    // sigwaitinfo: a blocked signal is taken without its handler running.
+    u64 usr1 = 1ul << (10 - 1), old = 0;
+    sys(NR_rt_sigprocmask, 0 /* SIG_BLOCK */, &usr1, &old, 8);
+    sys(NR_kill, sys(NR_getpid, 0), 10);
+    int info[32];
+    i64 got = sys(NR_rt_sigtimedwait, &usr1, info, 0, 8);
+    check(got == 10 && info[0] == 10, "sigtimedwait takes a blocked signal with its siginfo");
+    i64 ts[2] = {0, 10 * 1000 * 1000};
+    check(sys(NR_rt_sigtimedwait, &usr1, 0, ts, 8) == -11, "sigtimedwait times out with EAGAIN");
+    sys(NR_rt_sigprocmask, 2 /* SIG_SETMASK */, &old, 0, 8);
 
     // Linux lays the argv then envp strings out contiguously, ascending.
     i64 argc = sp[0];

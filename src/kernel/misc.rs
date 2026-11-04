@@ -114,7 +114,38 @@ impl Kernel {
                 vcpu.set_state(&st);
                 Ok(0)
             }
-            rseq | membarrier | clone3 => Err(ENOSYS), // bionic falls back cleanly
+            // Every other thread of the process (or every process) passes a
+            // full barrier: each is forced out of the guest, and leaving and
+            // re-entering it is context-synchronizing (the SYNC_CORE flavour
+            // ART's JIT needs after writing code through its writable view).
+            membarrier => {
+                const QUERY: u64 = 0;
+                const GLOBAL: u64 = 1;
+                const GLOBAL_EXPEDITED: u64 = 2;
+                const PRIVATE_EXPEDITED: u64 = 8;
+                const PRIVATE_EXPEDITED_SYNC_CORE: u64 = 32;
+                const SUPPORTED: u64 = 0x7f; // all but the rseq commands
+                match a[0] {
+                    QUERY => Ok(SUPPORTED as i64),
+                    GLOBAL | GLOBAL_EXPEDITED | PRIVATE_EXPEDITED | PRIVATE_EXPEDITED_SYNC_CORE => {
+                        std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+                        let procs: Vec<std::sync::Arc<super::Process>> = if a[0] & (GLOBAL | GLOBAL_EXPEDITED) != 0 {
+                            self.procs.lock().unwrap().values().cloned().collect()
+                        } else {
+                            vec![t.proc.clone()]
+                        };
+                        for p in procs {
+                            for th in p.threads.lock().unwrap().iter().filter(|th| th.tid != t.tid) {
+                                th.kick();
+                            }
+                        }
+                        Ok(0)
+                    }
+                    c if c.is_power_of_two() && c & SUPPORTED != 0 => Ok(0), // the REGISTER_* commands
+                    _ => Err(EINVAL),
+                }
+            }
+            rseq | clone3 => Err(ENOSYS), // bionic falls back cleanly
             _ => Err(ENOSYS),
         }
     }

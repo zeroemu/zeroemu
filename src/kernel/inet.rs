@@ -149,6 +149,30 @@ impl Kernel {
         }
     }
 
+    pub(super) fn inet_ioctl(&self, t: &Arc<Thread>, cmd: u64, arg: u64) -> Result<i64, i64> {
+        const SIOCGIFCONF: u64 = 0x8912;
+        if cmd == SIOCGIFCONF {
+            // struct ifconf: a length, then a buffer of ifreqs (none: the size wanted).
+            let mut mm = t.proc.mm();
+            let room = mm.read_u32(arg)? as usize;
+            let buf = mm.read_u64(arg + 8)?;
+            if buf != 0 && room >= 40 {
+                let mut req = [0u8; 40];
+                req[..2].copy_from_slice(b"lo");
+                req[16..18].copy_from_slice(&2u16.to_le_bytes()); // AF_INET
+                req[20..24].copy_from_slice(&[127, 0, 0, 1]);
+                mm.write(buf, &req)?;
+            }
+            mm.write_u32(arg, 40)?;
+            return Ok(0);
+        }
+        let mut req = [0u8; 40];
+        t.proc.mm().read(arg, &mut req)?;
+        super::net::ifreq_ioctl(cmd, &mut req)?;
+        t.proc.mm().write(arg, &req)?;
+        Ok(0)
+    }
+
     fn inet_getsockopt(&self, t: &Arc<Thread>, s: &Inet, a: [u64; 6]) -> Result<i64, i64> {
         let (level, name, val, lenp) = (a[1], a[2], a[3], a[4]);
         let len = t.proc.mm().read_u32(lenp)? as usize;

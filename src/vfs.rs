@@ -619,6 +619,56 @@ impl Vfs {
         })
     }
 
+    /// Linux's propagate_mnt: `tree` (its first mount just attached on
+    /// `dest`, the rest beneath it) is copied onto every other mount that
+    /// receives events from `dest`'s peer group (its peers and slaves) where
+    /// the mount point is visible. Copies are peers of what they copy, so
+    /// later mounts on them propagate too.
+    fn propagate(&self, mounts: &mut Vec<Arc<Mount>>, dest: &Mount, tree: &[Arc<Mount>]) {
+        let group = dest.propagation.lock().unwrap().shared;
+        let Some(top) = tree.first() else { return };
+        if group == 0 {
+            return;
+        }
+        let inner = rebase(&top.path, &dest.path, &dest.root_path);
+        let receivers: Vec<(Arc<Mount>, bool)> = mounts
+            .iter()
+            .filter(|r| r.id != dest.id && !tree.iter().any(|t| t.id == r.id) && Arc::ptr_eq(&r.sb, &dest.sb))
+            .filter_map(|r| {
+                let p = *r.propagation.lock().unwrap();
+                (p.shared == group || p.master == group).then(|| (r.clone(), p.shared != group))
+            })
+            .collect();
+        for (r, slave) in receivers {
+            if !under(&inner, &r.root_path) {
+                continue;
+            }
+            let at = rebase(&inner, &r.root_path, &r.path);
+            let mut copies: HashMap<u32, u32> = HashMap::new();
+            for (i, m) in tree.iter().enumerate() {
+                let (parent, path) = match (i, copies.get(&m.parent)) {
+                    (0, _) => (r.id, at.clone()),
+                    (_, Some(&p)) => (p, rebase(&m.path, &top.path, &at)),
+                    _ => continue,
+                };
+                let shared = m.propagation.lock().unwrap().shared;
+                let propagation = if slave { Propagation { master: shared, ..Default::default() } } else { Propagation { shared, ..Default::default() } };
+                let c = Arc::new(Mount {
+                    id: self.ids.fetch_add(1, Ordering::Relaxed) + ROOT_PARENT + 1,
+                    parent,
+                    path,
+                    sb: m.sb.clone(),
+                    root: m.root,
+                    root_path: m.root_path.clone(),
+                    flags: AtomicU64::new(m.flags.load(Ordering::Relaxed)),
+                    propagation: Mutex::new(propagation),
+                });
+                copies.insert(m.id, c.id);
+                mounts.push(c);
+            }
+        }
+    }
+
     /// Mounts `fs` at `path` while assembling the namespace (the mount point
     /// need not exist); the first mount must be "/".
     pub fn mount(&self, path: &str, fs: Arc<dyn FileSystem>) {
@@ -676,10 +726,10 @@ impl Vfs {
             return Err(ENOTDIR);
         }
         self.edit(|tab, mounts| {
-            if !tab.mounts.iter().any(|m| m.id == target.mnt.id) {
-                return Err(ENOENT); // its mount went away meanwhile
-            }
-            mounts.push(self.new_mount(&target.mnt, target.path.clone(), sb, Some(root), "/".into(), flags, 0));
+            let dest = tab.mounts.iter().find(|m| m.id == target.mnt.id).cloned().ok_or(ENOENT)?; // ENOENT: its mount went away meanwhile
+            let m = self.new_mount(&dest, target.path.clone(), sb, Some(root), "/".into(), flags, 0);
+            mounts.push(m.clone());
+            self.propagate(mounts, &dest, &[m]);
             Ok(())
         })
     }
@@ -697,11 +747,10 @@ impl Vfs {
         }
         let root_path = rebase(&src.path, &src.mnt.path, &src.mnt.root_path);
         self.edit(|tab, mounts| {
-            if !tab.mounts.iter().any(|m| m.id == target.mnt.id) {
-                return Err(ENOENT);
-            }
+            let dest = tab.mounts.iter().find(|m| m.id == target.mnt.id).cloned().ok_or(ENOENT)?;
             let flags = src.mnt.flags.load(Ordering::Relaxed);
-            let top = self.new_mount(&target.mnt, target.path.clone(), src.mnt.sb.clone(), Some(src.ino), root_path, flags, sp.shared);
+            let top = self.new_mount(&dest, target.path.clone(), src.mnt.sb.clone(), Some(src.ino), root_path, flags, sp.shared);
+            let first = mounts.len();
             mounts.push(top.clone());
             if recursive {
                 // Copies of the mounts under `src`, in mount order so parents come first.
@@ -718,6 +767,8 @@ impl Vfs {
                     copies.insert(m.id, c);
                 }
             }
+            let tree = mounts[first..].to_vec();
+            self.propagate(mounts, &dest, &tree);
             Ok(())
         })
     }
@@ -739,9 +790,27 @@ impl Vfs {
             return Err(EBUSY);
         }
         self.edit(|tab, mounts| {
-            let gone = tab.subtree(&m);
+            let mut gone = tab.subtree(&m);
             if gone.len() > 1 && !detach {
                 return Err(EBUSY);
+            }
+            // propagate_umount: the copies on the parent's peers and slaves go too (busy ones stay).
+            if let Some(dest) = tab.mounts.iter().find(|x| x.id == m.parent) {
+                let group = dest.propagation.lock().unwrap().shared;
+                let inner = rebase(&m.path, &dest.path, &dest.root_path);
+                for r in tab.mounts.iter().filter(|r| r.id != dest.id && group != 0 && Arc::ptr_eq(&r.sb, &dest.sb)) {
+                    let p = *r.propagation.lock().unwrap();
+                    if (p.shared != group && p.master != group) || !under(&inner, &r.root_path) {
+                        continue;
+                    }
+                    let at = rebase(&inner, &r.root_path, &r.path);
+                    for c in tab.mounts.iter().filter(|c| c.parent == r.id && c.path == at && Arc::ptr_eq(&c.sb, &m.sb) && c.root == m.root) {
+                        let sub = tab.subtree(c);
+                        if sub.len() == 1 || detach {
+                            gone.extend(sub);
+                        }
+                    }
+                }
             }
             let removed = mounts.iter().filter(|x| gone.contains(&x.id)).cloned().collect();
             mounts.retain(|x| !gone.contains(&x.id));

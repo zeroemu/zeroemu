@@ -695,6 +695,42 @@ mod tests {
         assert_eq!(proc_mounts(&vfs).lines().count(), 2);
     }
 
+    /// init's bootstrap namespace: /apex is a bind of the shared
+    /// /bootstrap-apex, so what apexd mounts under one shows under the other.
+    #[test]
+    fn shared_subtrees_propagate() {
+        let phys = crate::phys::PhysMem::new(Arc::new(NoHv));
+        let tmpfs = || Tmpfs::new(phys.clone(), 0o755);
+        let vfs = Vfs::default();
+        vfs.mount("/", tmpfs());
+        let root = vfs.resolve("/", "/", true).unwrap();
+        for d in ["apex", "bootstrap-apex", "img"] {
+            vfs.mkdir(&root, d, 0o755).unwrap();
+        }
+        let at = |p: &str| vfs.resolve("/", p, true);
+        let sb = |fs: Arc<Tmpfs>| vfs.new_super(fs, "tmpfs", None, 0, "");
+        vfs.mount_at(&at("/bootstrap-apex").unwrap(), sb(tmpfs()), 0).unwrap();
+        vfs.set_propagation(&at("/bootstrap-apex").unwrap(), PropagationChange::Shared, false).unwrap();
+        vfs.bind(&at("/bootstrap-apex").unwrap(), &at("/apex").unwrap(), false).unwrap();
+        let img = tmpfs();
+        img.mkdir_p("etc/vintf", 0o755);
+        vfs.mkdir(&at("/apex").unwrap(), "m@1", 0o755).unwrap();
+        vfs.mount_at(&at("/apex/m@1").unwrap(), sb(img), 0).unwrap();
+        assert!(at("/bootstrap-apex/m@1/etc/vintf").is_ok());
+        // A bind of the new mount propagates too, then both go on umount.
+        vfs.mkdir(&at("/apex").unwrap(), "m", 0o755).unwrap();
+        vfs.bind(&at("/apex/m@1").unwrap(), &at("/apex/m").unwrap(), false).unwrap();
+        assert!(at("/bootstrap-apex/m/etc/vintf").is_ok());
+        vfs.umount(&at("/apex/m").unwrap(), false).unwrap();
+        assert!(at("/bootstrap-apex/m/etc").is_err() && at("/bootstrap-apex/m@1/etc").is_ok());
+        // A private mount receives nothing.
+        vfs.mount_at(&at("/img").unwrap(), sb(tmpfs()), 0).unwrap();
+        vfs.bind(&at("/img").unwrap(), &at("/apex/m").unwrap(), false).unwrap();
+        vfs.mkdir(&at("/img").unwrap(), "x", 0o755).unwrap();
+        vfs.mount_at(&at("/img/x").unwrap(), sb(tmpfs()), 0).unwrap();
+        assert!(!at("/apex/m/x").unwrap().is_mount_root());
+    }
+
     #[test]
     fn statfs_flags() {
         let b = statfs_bytes("tmpfs", MS_RDONLY | MS_NOSUID | MS_RELATIME);

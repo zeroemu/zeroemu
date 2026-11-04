@@ -907,10 +907,10 @@ impl Kernel {
                 if !m.writable {
                     return Err(EINVAL);
                 }
-                if let Some(n) = &m.node {
-                    if vfs.readonly(n) {
-                        return Err(EROFS);
-                    }
+                if let Some(n) = &m.node
+                    && vfs.readonly(n)
+                {
+                    return Err(EROFS);
                 }
                 if no == ftruncate {
                     m.file.truncate(a[1]);
@@ -1149,10 +1149,10 @@ impl Kernel {
                     return Err(EBADF);
                 }
                 // Remount,ro applies to descriptors already open, as mnt_want_write does.
-                if let Some(n) = &m.node {
-                    if self.vfs()?.readonly(n) {
-                        return Err(EROFS);
-                    }
+                if let Some(n) = &m.node
+                    && self.vfs()?.readonly(n)
+                {
+                    return Err(EROFS);
                 }
                 let mut pos = m.pos.lock().unwrap();
                 let append = f.flags.load(Ordering::Relaxed) & O_APPEND != 0;

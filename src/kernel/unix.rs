@@ -43,6 +43,7 @@ const SO_RCVBUF: u64 = 8;
 const SO_PASSCRED: u64 = 16;
 const SO_PEERCRED: u64 = 17;
 const SO_ACCEPTCONN: u64 = 30;
+const SO_PEERSEC: u64 = 31;
 const SO_PROTOCOL: u64 = 38;
 const SO_DOMAIN: u64 = 39;
 const SHUT_RD: u64 = 0;
@@ -341,7 +342,7 @@ impl Socket {
         }
         let writable = match &peer {
             Some(p) => !shut_wr && p.rx.lock().unwrap().bytes < QUEUE_LIMIT,
-            None => self.ty == SOCK_DGRAM && !connected,
+            None => self.ty == SOCK_DGRAM, // a dead peer: the send reports ECONNREFUSED
         };
         if writable {
             r |= POLLOUT;
@@ -756,11 +757,19 @@ impl Kernel {
                     SO_SNDBUF | SO_RCVBUF => (QUEUE_LIMIT as u32).to_le_bytes().to_vec(),
                     SO_PASSCRED => (st.passcred as u32).to_le_bytes().to_vec(),
                     SO_ACCEPTCONN => (st.backlog.is_some() as u32).to_le_bytes().to_vec(),
+                    // The peer's SELinux context (libselinux's getpeercon; init's
+                    // property service checks it). Every process runs in one
+                    // domain, as /proc/<pid>/attr/current says.
+                    SO_PEERSEC if st.connected => b"u:r:su:s0\0".to_vec(),
                     _ => return Err(ENOPROTOOPT),
                 };
                 drop(st);
                 let mut mm = t.proc.mm();
                 let cap = mm.read_u32(a[4])? as usize;
+                if a[2] == SO_PEERSEC && cap < val.len() {
+                    mm.write_u32(a[4], val.len() as u32)?;
+                    return Err(ERANGE);
+                }
                 let n = cap.min(val.len());
                 mm.write(a[3], &val[..n])?;
                 mm.write_u32(a[4], n as u32)?;

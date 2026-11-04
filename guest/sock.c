@@ -167,6 +167,12 @@ static void unix_paths(void) {
     u32 glen = sizeof got;
     sys(NR_getpeername, c, &got, &glen);
     check(glen == 2 + 10 && seq(got.path, "/tmp/u/s1", 10), "getpeername: the listener's path");
+    char con[32];
+    u32 clen = 4;
+    i64 small = sys(NR_getsockopt, c, 1, 31 /* SO_PEERSEC */, con, &clen);
+    u32 need = clen;
+    clen = sizeof con;
+    check(small == -34 /* ERANGE */ && need == 10 && sys(NR_getsockopt, c, 1, 31, con, &clen) == 0 && clen == 10 && seq(con, "u:r:su:s0", 10), "SO_PEERSEC (getpeercon): the peer's context");
     glen = sizeof got;
     int conn = (int)sys(NR_accept, srv, &got, &glen);
     check(conn >= 0 && glen == 2, "accept: an unbound client has no name");
@@ -242,6 +248,8 @@ static void unix_paths(void) {
     sys(NR_unlinkat, AT_FDCWD, "/tmp/u/dg", 0);
     check(sys(NR_write, dc, "still", 5) == 5 && sys(NR_read, d, b, 8) == 5, "a connected datagram socket outlives the unlink");
     check(sys(NR_sendto, dc, "x", 1, 0, &to, tlen) == -ENOENT, "sendto the unlinked path: ENOENT");
+    sys(NR_close, d);
+    check(sys(NR_write, dc, "x", 1) == -ECONNREFUSED && sys(NR_write, dc, "x", 1) == -107 /* ENOTCONN */, "the peer closed: ECONNREFUSED once, then unconnected");
     check(sys(NR_sendto, srv2, "x", 1, 0, &to, tlen) == -95 /* EOPNOTSUPP */ && sys(NR_sendto, c, "x", 1, 0, &to, tlen) == -EISCONN, "a stream socket refuses a destination");
 
     // Autobind: an empty address picks an abstract name.

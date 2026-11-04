@@ -3,9 +3,11 @@
 //! resolution, so this filesystem never needs to know who is asking.
 //!
 //! Inode numbers encode what a node is: kind (low 16 bits), pid (bits
-//! 16..48), and an extra field (bits 48..64: an fd or a tid).
+//! 16..48), and an extra field (bits 48..64: an fd, a tid, or a table index).
 
 use super::files::file_name;
+use super::mount;
+use super::sysctl::{self, Sysctl};
 use super::{Kernel, Process};
 use crate::errno::*;
 use crate::paging::{PROT_EXEC, PROT_READ, PROT_WRITE};
@@ -32,18 +34,8 @@ enum K {
     Filesystems,
     Cmdline,
     Mounts,
-    Sys,
-    SysKernel,
-    SysVm,
-    SysRandom,
-    Osrelease,
-    Ostype,
-    Hostname,
-    PidMax,
-    BootId,
-    Uuid,
-    Entropy,
-    Overcommit,
+    /// /proc/sys and everything in it (extra: the sysctl.rs index).
+    Sysctl,
     // per process (pid in the inode)
     Pid,
     PCmdline,
@@ -64,15 +56,64 @@ enum K {
     PEnviron,
     // per thread (pid = tgid, extra = tid)
     Task,
+    PMountinfo,
+    POomAdj,
+    POomScore,
+    PTimerslack,
+    /// /proc/<pid>/ns, its magic links, and the nsfs inodes they lead to (extra: index into NAMESPACES).
+    PNs,
+    PNsLink,
+    NsFile,
+    Cgroups,
+    PCgroup,
 }
 
-const ALL: [K; 42] = [
+const ALL: [K; 40] = [
     K::Root, K::Self_, K::ThreadSelf, K::Meminfo, K::Cpuinfo, K::Stat, K::Uptime, K::Loadavg, K::Version, K::Filesystems,
-    K::Cmdline, K::Mounts, K::Sys, K::SysKernel, K::SysVm, K::SysRandom, K::Osrelease, K::Ostype, K::Hostname, K::PidMax,
-    K::BootId, K::Uuid, K::Entropy, K::Overcommit, K::Pid, K::PCmdline, K::PComm, K::PExe, K::PCwd, K::PFd, K::PFdLink,
+    K::Cmdline, K::Mounts, K::Sysctl, K::Pid, K::PCmdline, K::PComm, K::PExe, K::PCwd, K::PFd, K::PFdLink,
     K::PMaps, K::PStatus, K::PStat, K::PStatm, K::PTask, K::PAttr, K::PAttrCurrent, K::PMounts, K::POom, K::PEnviron,
-    K::Task,
+    K::Task, K::PMountinfo, K::POomAdj, K::POomScore, K::PTimerslack, K::PNs, K::PNsLink, K::NsFile,
+    K::Cgroups, K::PCgroup,
 ];
+
+/// One namespace of each kind, shared by every process: (name, kind, the inode
+/// number Linux gives the initial one). The *_for_children links name the
+/// same namespaces.
+const NAMESPACES: [(&str, &str, u64); 10] = [
+    ("cgroup", "cgroup", 4026531835),
+    ("ipc", "ipc", 4026531839),
+    ("mnt", "mnt", 4026531841),
+    ("net", "net", 4026531840),
+    ("pid", "pid", 4026531836),
+    ("pid_for_children", "pid", 4026531836),
+    ("time", "time", 4026531834),
+    ("time_for_children", "time", 4026531834),
+    ("user", "user", 4026531837),
+    ("uts", "uts", 4026531838),
+];
+
+/// The kind ("mnt", "net", ...) of a namespace file opened through /proc/<pid>/ns.
+pub(super) fn ns_kind(ino: u64) -> Option<&'static str> {
+    match decode(ino)? {
+        (K::NsFile, _, i) => NAMESPACES.get(i as usize).map(|n| n.1),
+        _ => None,
+    }
+}
+
+/// Per-process values behind /proc/<pid>/{oom_score_adj,comm,timerslack_ns}.
+#[derive(Clone)]
+pub struct Knobs {
+    pub oom_score_adj: i32,
+    /// Set by writing /proc/<pid>/comm; exec clears it.
+    pub comm: Option<String>,
+    pub timerslack_ns: u64,
+}
+
+impl Default for Knobs {
+    fn default() -> Knobs {
+        Knobs { oom_score_adj: 0, comm: None, timerslack_ns: 50_000 }
+    }
+}
 
 fn mk(k: K, pid: i32, extra: u64) -> u64 {
     (ALL.iter().position(|&x| x == k).unwrap() as u64 + 1) | (pid as u64) << 16 | extra << 48
@@ -91,7 +132,6 @@ enum Content {
 
 pub struct ProcFs {
     kernel: Weak<Kernel>,
-    boot_id: String,
 }
 
 fn err(e: i64) -> io::Error {
@@ -100,11 +140,7 @@ fn err(e: i64) -> io::Error {
 
 impl ProcFs {
     pub fn new(kernel: Weak<Kernel>) -> Arc<ProcFs> {
-        let mut r = [0u8; 16];
-        crate::phys::random_bytes(&mut r);
-        let h: String = r.iter().map(|b| format!("{b:02x}")).collect();
-        let boot_id = format!("{}-{}-{}-{}-{}", &h[0..8], &h[8..12], &h[12..16], &h[16..20], &h[20..32]);
-        Arc::new(ProcFs { kernel, boot_id })
+        Arc::new(ProcFs { kernel })
     }
 
     fn kernel(&self) -> io::Result<Arc<Kernel>> {
@@ -134,11 +170,12 @@ impl ProcFs {
                     ("filesystems", K::Filesystems),
                     ("cmdline", K::Cmdline),
                     ("mounts", K::Mounts),
-                    ("sys", K::Sys),
+                    ("cgroups", K::Cgroups),
                 ]
                 .iter()
                 .map(|(n, k)| (n.to_string(), mk(*k, 0, 0)))
                 .collect();
+                v.push(("sys".into(), mk(K::Sysctl, 0, Sysctl::root() as u64)));
                 let mut pids: Vec<i32> = kernel.procs.lock().unwrap().values().filter(|p| p.status.lock().unwrap().is_none()).map(|p| p.pid).collect();
                 pids.sort();
                 v.extend(pids.into_iter().map(|p| (p.to_string(), mk(K::Pid, p, 0))));
@@ -172,36 +209,19 @@ impl ProcFs {
             }
             K::Loadavg => text(format!("0.00 0.00 0.00 1/{} {}\n", kernel.procs.lock().unwrap().len(), kernel.next_id.load(Ordering::Relaxed) - 1)),
             K::Version => text("Linux version 6.6.0-droidrt (droidrt) #1 SMP PREEMPT\n".into()),
-            K::Filesystems => text("nodev\tproc\nnodev\ttmpfs\nnodev\tsysfs\nnodev\tselinuxfs\n\terofs\n\text4\n".into()),
+            K::Filesystems => text(mount::filesystems()),
             K::Cmdline => text("androidboot.hardware=droidrt androidboot.selinux=permissive\n".into()),
-            K::Mounts | K::PMounts => {
-                let vfs = kernel.vfs.as_deref().ok_or_else(|| err(ENOENT))?;
-                let mut s = String::new();
-                for (path, ty) in vfs.mounts() {
-                    let virtual_fs = matches!(ty, "tmpfs" | "proc" | "sysfs" | "selinuxfs");
-                    let src = if virtual_fs { ty } else { "/dev/block/droidrt" };
-                    let opts = if matches!(ty, "tmpfs" | "selinuxfs" | "sysfs") { "rw" } else { "ro" };
-                    s += &format!("{src} {path} {ty} {opts},relatime 0 0\n");
+            K::Mounts | K::PMounts | K::PMountinfo => {
+                if pid != 0 {
+                    self.proc(pid)?;
                 }
-                text(s)
+                let vfs = kernel.vfs.as_deref().ok_or_else(|| err(ENOENT))?;
+                text(if k == K::PMountinfo { mount::mountinfo(vfs) } else { mount::proc_mounts(vfs) })
             }
-            K::Sys => d(&[("kernel", K::SysKernel), ("vm", K::SysVm)]),
-            K::SysKernel => d(&[("osrelease", K::Osrelease), ("ostype", K::Ostype), ("hostname", K::Hostname), ("pid_max", K::PidMax), ("random", K::SysRandom)]),
-            K::SysVm => d(&[("overcommit_memory", K::Overcommit)]),
-            K::SysRandom => d(&[("boot_id", K::BootId), ("uuid", K::Uuid), ("entropy_avail", K::Entropy)]),
-            K::Osrelease => text("6.6.0-droidrt\n".into()),
-            K::Ostype => text("Linux\n".into()),
-            K::Hostname => text("localhost\n".into()),
-            K::PidMax => text("32768\n".into()),
-            K::BootId => text(format!("{}\n", self.boot_id)),
-            K::Uuid => {
-                let mut r = [0u8; 16];
-                crate::phys::random_bytes(&mut r);
-                let h: String = r.iter().map(|b| format!("{b:02x}")).collect();
-                text(format!("{}-{}-4{}-{}-{}\n", &h[0..8], &h[8..12], &h[13..16], &h[16..20], &h[20..32]))
-            }
-            K::Entropy => text("256\n".into()),
-            K::Overcommit => text("1\n".into()),
+            K::Sysctl => match kernel.sysctl.entry(extra as u16).ok_or_else(|| err(ENOENT))? {
+                sysctl::Entry::Dir(v) => Ok(Content::Dir(v.into_iter().map(|(n, i)| (n, mk(K::Sysctl, 0, i as u64))).collect())),
+                sysctl::Entry::File(v) => text(format!("{v}\n")),
+            },
 
             K::Pid => {
                 self.proc(pid)?;
@@ -218,7 +238,13 @@ impl ProcFs {
                     ("task", K::PTask),
                     ("attr", K::PAttr),
                     ("mounts", K::PMounts),
+                    ("mountinfo", K::PMountinfo),
                     ("oom_score_adj", K::POom),
+                    ("oom_adj", K::POomAdj),
+                    ("oom_score", K::POomScore),
+                    ("timerslack_ns", K::PTimerslack),
+                    ("ns", K::PNs),
+                    ("cgroup", K::PCgroup),
                     ("environ", K::PEnviron),
                 ])
             }
@@ -284,18 +310,61 @@ impl ProcFs {
                 Ok(Content::Dir(tids.into_iter().map(|t| (t.to_string(), mk(K::Task, pid, t as u64))).collect()))
             }
             // A thread directory: the process's view (good enough for comm/stat/status).
-            K::Task => d(&[("comm", K::PComm), ("stat", K::PStat), ("status", K::PStatus), ("attr", K::PAttr)]),
+            K::Task => d(&[("comm", K::PComm), ("stat", K::PStat), ("status", K::PStatus), ("attr", K::PAttr), ("cgroup", K::PCgroup), ("ns", K::PNs)]),
             K::PAttr => d(&[("current", K::PAttrCurrent)]),
             K::PAttrCurrent => Ok(Content::File(b"u:r:su:s0\0".to_vec())),
-            K::POom => text("0\n".into()),
+            K::POom => text(format!("{}\n", self.proc(pid)?.knobs.lock().unwrap().oom_score_adj)),
+            K::POomAdj => {
+                // Linux's legacy scale: -17 (OOM_DISABLE) ..= 15.
+                let adj = self.proc(pid)?.knobs.lock().unwrap().oom_score_adj;
+                text(format!("{}\n", if adj == 1000 { 15 } else { adj * 17 / 1000 }))
+            }
+            K::POomScore => {
+                let p = self.proc(pid)?;
+                let rss = p.mm.lock().unwrap().as_ref().map_or(0, |m| m.usage().1);
+                let adj = p.knobs.lock().unwrap().oom_score_adj as i64;
+                text(format!("{}\n", ((rss as u128 * 1000 / PHYS_MAX as u128) as i64 + adj).clamp(0, 2000)))
+            }
+            K::PTimerslack => text(format!("{}\n", self.proc(pid)?.knobs.lock().unwrap().timerslack_ns)),
+            K::PNs => {
+                self.proc(pid)?;
+                Ok(Content::Dir(NAMESPACES.iter().enumerate().map(|(i, n)| (n.0.to_string(), mk(K::PNsLink, pid, i as u64))).collect()))
+            }
+            K::PNsLink => {
+                self.proc(pid)?;
+                let (_, kind, inum) = NAMESPACES[extra as usize % NAMESPACES.len()];
+                Ok(Content::Link(format!("{kind}:[{inum}]")))
+            }
+            K::NsFile => Ok(Content::File(Vec::new())),
+            K::Cgroups => text(super::cgroup::proc_cgroups(&kernel)),
+            K::PCgroup => {
+                self.proc(pid)?;
+                text(super::cgroup::proc_pid_cgroup(&kernel, pid))
+            }
             K::PEnviron => Ok(Content::File(Vec::new())),
         }
     }
 }
 
 fn comm(p: &Process) -> String {
+    if let Some(c) = p.knobs.lock().unwrap().comm.clone() {
+        return c;
+    }
     let exe = p.exe.lock().unwrap();
     exe.rsplit('/').next().unwrap_or("").chars().take(15).collect()
+}
+
+/// An integer written to a /proc file (kstrtoint after strstrip; base 0).
+fn parse_int(data: &[u8]) -> Result<i64, i64> {
+    let s = std::str::from_utf8(data).map_err(|_| EINVAL)?.trim();
+    let (neg, s) = s.strip_prefix('-').map_or((false, s), |r| (true, r));
+    let v = match s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        Some(h) => i64::from_str_radix(h, 16),
+        None if s.len() > 1 && s.starts_with('0') => i64::from_str_radix(&s[1..], 8),
+        None => s.parse(),
+    }
+    .map_err(|_| EINVAL)?;
+    Ok(if neg { -v } else { v })
 }
 
 fn cpus() -> usize {
@@ -327,12 +396,73 @@ impl FileSystem for ProcFs {
 
     fn stat(&self, ino: u64) -> io::Result<Stat> {
         let (mode, size) = match self.content(ino)? {
+            Content::Dir(_) if matches!(decode(ino), Some((K::PNs, _, _))) => (S_IFDIR | 0o511, 0),
             Content::Dir(_) => (S_IFDIR | 0o555, 0),
             Content::Link(t) => (S_IFLNK | 0o777, t.len() as u64),
+            Content::File(_) if matches!(decode(ino), Some((K::PTimerslack, _, _))) => (S_IFREG | 0o666, 0),
+            Content::File(_) if self.write_ok(ino) => (S_IFREG | 0o644, 0),
             Content::File(_) => (S_IFREG | 0o444, 0), // like Linux, procfs files report size 0
         };
         let mtime = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
-        Ok(Stat { dev: 0, ino, mode, nlink: 1, uid: 0, gid: 0, rdev: 0, size, mtime })
+        // An nsfs inode's number is the namespace's id.
+        let st_ino = match decode(ino) {
+            Some((K::NsFile, _, i)) => NAMESPACES[i as usize % NAMESPACES.len()].2,
+            _ => ino,
+        };
+        Ok(Stat { dev: 0, ino: st_ino, mode, nlink: 1, uid: 0, gid: 0, rdev: 0, size, mtime })
+    }
+
+    fn write_ok(&self, ino: u64) -> bool {
+        match decode(ino) {
+            Some((K::Sysctl, _, i)) => Sysctl::writable(i as u16),
+            Some((K::POom | K::POomAdj | K::PComm | K::PTimerslack, _, _)) => true,
+            _ => false,
+        }
+    }
+
+    fn write(&self, ino: u64, data: &[u8]) -> Result<usize, i64> {
+        let (k, pid, extra) = decode(ino).ok_or(ENOENT)?;
+        let kernel = self.kernel().map_err(|_| ENOENT)?;
+        if k == K::Sysctl {
+            return kernel.sysctl.write(extra as u16, data);
+        }
+        let p = self.proc(pid).map_err(|_| ESRCH)?;
+        let mut knobs = p.knobs.lock().unwrap();
+        match k {
+            K::POom => {
+                let v = parse_int(&data[..data.len().min(23)])?;
+                knobs.oom_score_adj = i32::try_from(v).ok().filter(|v| (-1000..=1000).contains(v)).ok_or(EINVAL)?;
+            }
+            K::POomAdj => {
+                let v = parse_int(&data[..data.len().min(23)])?;
+                if !(-17..=15).contains(&v) {
+                    return Err(EINVAL);
+                }
+                knobs.oom_score_adj = if v == 15 { 1000 } else { (v * 1000 / 17) as i32 };
+            }
+            // Like Linux: the first 15 bytes, newline and all.
+            K::PComm => knobs.comm = Some(String::from_utf8_lossy(&data[..data.len().min(15)]).into_owned()),
+            K::PTimerslack => {
+                let v = parse_int(data).ok().and_then(|v| u64::try_from(v).ok()).ok_or(EINVAL)?;
+                knobs.timerslack_ns = if v == 0 { 50_000 } else { v };
+            }
+            _ => return Err(EINVAL),
+        }
+        Ok(data.len())
+    }
+
+    fn changes(&self, ino: u64) -> Option<Arc<std::sync::atomic::AtomicU64>> {
+        match decode(ino)? {
+            (K::Mounts | K::PMounts | K::PMountinfo, _, _) => Some(self.kernel.upgrade()?.vfs.as_ref()?.events()),
+            _ => None,
+        }
+    }
+
+    fn magic_link(&self, ino: u64) -> Option<u64> {
+        match decode(ino)? {
+            (K::PNsLink, pid, i) => Some(mk(K::NsFile, pid, i)),
+            _ => None,
+        }
     }
 
     fn lookup(&self, dir: u64, name: &str) -> io::Result<Option<u64>> {
@@ -343,8 +473,8 @@ impl FileSystem for ProcFs {
             return Ok(Some(match decode(dir) {
                 Some((K::PAttr | K::PFd | K::PTask, pid, _)) => mk(K::Pid, pid, 0),
                 Some((K::Task, pid, _)) => mk(K::PTask, pid, 0),
-                Some((K::SysKernel | K::SysVm, _, _)) => mk(K::Sys, 0, 0),
-                Some((K::SysRandom, _, _)) => mk(K::SysKernel, 0, 0),
+                Some((K::PNs, pid, _)) => mk(K::Pid, pid, 0),
+                Some((K::Sysctl, _, i)) if i as u16 != Sysctl::root() => mk(K::Sysctl, 0, Sysctl::parent(i as u16) as u64),
                 _ => ROOT,
             }));
         }
@@ -370,9 +500,10 @@ impl FileSystem for ProcFs {
 
     fn read_all(&self, ino: u64) -> io::Result<Arc<[u8]>> {
         match self.content(ino)? {
-            Content::File(b) => Ok(b.into()),
             Content::Link(t) => Ok(t.into_bytes().into()),
             Content::Dir(_) => Err(err(EISDIR)),
+            Content::File(_) if matches!(decode(ino), Some((K::NsFile, _, _))) => Err(err(EINVAL)),
+            Content::File(b) => Ok(b.into()),
         }
     }
 }

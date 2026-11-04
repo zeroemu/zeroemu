@@ -9,17 +9,20 @@
 
 mod binder;
 mod block;
+mod cgroup;
 mod epoll;
 mod files;
 mod futex;
 mod logd;
 mod memory;
 mod misc;
+mod mount;
 mod process;
 mod procfs;
 mod properties;
 mod signal;
 mod specialfd;
+mod sysctl;
 mod unix;
 mod wait;
 
@@ -78,6 +81,8 @@ pub struct Kernel {
     pub props: Arc<properties::Properties>,
     /// Loop and device-mapper devices.
     blocks: Arc<block::Blocks>,
+    /// /proc/sys values.
+    sysctl: sysctl::Sysctl,
     /// Kernel-side socket services (kept alive here; looked up by name).
     _services: Vec<Arc<unix::Socket>>,
     /// The root process's wait status once it exits; droidrt then exits.
@@ -116,6 +121,9 @@ fn mount_tmpfs(vfs: &mut Vfs, phys: &Arc<PhysMem>) -> Arc<crate::tmpfs::Tmpfs> {
     dev.mkdir_p("socket", 0o755);
     dev.mkdir_p("pts", 0o755);
     vfs.mount("/dev", dev);
+    let pts = Tmpfs::with_type(phys.clone(), 0o755, "devpts");
+    pts.create(1, "ptmx", 0o020000, 0x502).expect("devpts");
+    vfs.mount("/dev/pts", pts);
     let data = Tmpfs::new(phys.clone(), 0o771);
     data.mkdir_p("local/tmp", 0o771);
     data.mkdir_p("system", 0o775);
@@ -131,7 +139,7 @@ fn mount_tmpfs(vfs: &mut Vfs, phys: &Arc<PhysMem>) -> Arc<crate::tmpfs::Tmpfs> {
         sys.write_file(&format!("devices/system/cpu/{f}"), 0o444, &format!("0-{}\n", n - 1));
     }
     sys.write_file("devices/system/cpu/kernel_max", 0o444, "63\n");
-    for d in ["fs", "kernel", "class", "bus", "block", "dev/char", "dev/block", "module"] {
+    for d in ["fs/cgroup", "fs/bpf", "fs/pstore", "fs/fuse/connections", "kernel/tracing", "kernel/debug", "kernel/config", "class", "bus", "block", "dev/char", "dev/block", "module"] {
         sys.mkdir_p(d, 0o755);
     }
     vfs.mount("/sys", sys);
@@ -167,6 +175,7 @@ pub struct Process {
     exiting: Mutex<Option<i32>>,
     /// Process-directed pending signals.
     pending: Mutex<HashMap<u32, SigInfo>>,
+    knobs: Mutex<procfs::Knobs>,
 }
 
 pub struct Thread {
@@ -243,7 +252,7 @@ impl Kernel {
         let kwin = KernelWindow::new(&phys, &pages).map_err(|e| format!("kernel window: errno {e}"))?;
         // Without an image the root itself is a tmpfs (for freestanding guests).
         let mut v = vfs.unwrap_or_else(|| {
-            let mut v = Vfs::default();
+            let v = Vfs::default();
             v.mount("/", crate::tmpfs::Tmpfs::new(phys.clone(), 0o755));
             v
         });
@@ -286,6 +295,7 @@ impl Kernel {
             root_pid: AtomicI32::new(0),
             props,
             blocks,
+            sysctl: sysctl::Sysctl::new(),
             _services: services,
             exit: (Mutex::new(None), Condvar::new()),
             }
@@ -327,6 +337,7 @@ impl Kernel {
             status: Mutex::new(None),
             exiting: Mutex::new(None),
             pending: Mutex::new(HashMap::new()),
+            knobs: Mutex::default(),
         });
         self.root_pid.store(pid, Ordering::Relaxed);
         self.procs.lock().unwrap().insert(pid, proc.clone());
@@ -511,6 +522,12 @@ impl Kernel {
             // futexes
             futex => self.sys_futex(t, a[0], a[1] as u32, a[2] as u32, a[3], a[4], a[5] as u32),
             set_robust_list => 0,
+
+            // mounts and namespaces
+            n if self::mount::handles(n) => match self.mount_syscall(n, t, a) {
+                Ok(v) => v,
+                Err(e) => -e,
+            },
 
             // sockets
             n if unix::handles(n) => match self.socket_syscall(n, t, a) {

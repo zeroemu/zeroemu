@@ -31,7 +31,8 @@ pub struct Epoll {
 
 impl Epoll {
     pub fn ctl(&self, op: u64, fd: i32, file: &Arc<File>, events: u32, data: u64) -> Result<(), i64> {
-        if matches!(file.kind, Kind::Node(_) | Kind::Mem(_)) {
+        let pollable = matches!(&file.kind, Kind::Node(nf) if nf.lock().unwrap().pollable());
+        if matches!(file.kind, Kind::Node(_) | Kind::Mem(_)) && !pollable {
             return Err(EPERM); // regular files are always ready; Linux refuses them
         }
         let mut list = self.interest.lock().unwrap();

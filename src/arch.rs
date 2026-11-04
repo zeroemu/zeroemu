@@ -75,6 +75,8 @@ syscalls! {
     symlinkat = 36, 266;
     linkat = 37, 265;
     renameat = 38, 264;
+    umount2 = 39, 166;
+    mount = 40, 165;
     statfs = 43, 137;
     fstatfs = 44, 138;
     truncate = 45, 76;
@@ -113,6 +115,7 @@ syscalls! {
     exit = 93, 60;
     exit_group = 94, 231;
     set_tid_address = 96, 218;
+    unshare = 97, 272;
     futex = 98, 202;
     set_robust_list = 99, 273;
     nanosleep = 101, 35;
@@ -178,6 +181,7 @@ syscalls! {
     madvise = 233, 28;
     wait4 = 260, 61;
     prlimit64 = 261, 302;
+    setns = 268, 308;
     renameat2 = 276, 316;
     getrandom = 278, 318;
     memfd_create = 279, 319;

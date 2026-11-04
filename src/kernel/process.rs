@@ -92,6 +92,7 @@ impl Kernel {
             status: Mutex::new(None),
             exiting: Mutex::new(None),
             pending: Mutex::new(HashMap::new()),
+            knobs: Mutex::new(parent.knobs.lock().unwrap().clone()),
         });
         let th = Thread::new(pid, child.clone(), t.mask.load(Ordering::Relaxed));
         *th.altstack.lock().unwrap() = *t.altstack.lock().unwrap();
@@ -137,6 +138,7 @@ impl Kernel {
         *t.altstack.lock().unwrap() = (0, 0, super::signal::SS_DISABLE);
         *t.proc.exe.lock().unwrap() = exe;
         *t.proc.cmdline.lock().unwrap() = cmdline;
+        t.proc.knobs.lock().unwrap().comm = None; // comm follows the new executable
         vcpu.set_page_tables(mm.root);
         vcpu.set_state(&state);
         let old = t.proc.mm.lock().unwrap().replace(mm);

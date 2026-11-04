@@ -1,6 +1,7 @@
 //! Assembles an Android root filesystem from an SDK system image, the way
 //! first-stage init and apexd would on a device: the logical partitions from
-//! `super`, plus every APEX payload under /apex.
+//! `super`, plus every APEX payload under /apex (unless Android's own init
+//! and apexd are to mount them).
 
 use crate::image::{Dev, FileDev, MemDev, erofs::Erofs, gpt, lp, zip};
 use crate::vfs::{FileSystem, LazyFs, Vfs, open_fs};
@@ -17,7 +18,9 @@ const PARTITIONS: [(&str, &str); 5] = [
     ("system_dlkm", "/system_dlkm"),
 ];
 
-pub fn open_system_image(path: &Path) -> io::Result<Vfs> {
+/// `apexes`: pre-mount every APEX at /apex/<name>. Without, /apex is the
+/// image's empty directory, for init to mount a tmpfs over and apexd to fill.
+pub fn open_system_image(path: &Path, apexes: bool) -> io::Result<Vfs> {
     let disk = FileDev::open(path)?;
     let sup = gpt::partitions(&disk)?
         .into_iter()
@@ -36,7 +39,9 @@ pub fn open_system_image(path: &Path) -> io::Result<Vfs> {
             return Err(io::Error::other("super has no `system` partition"));
         }
     }
-    mount_apexes(&mut vfs, "/system/apex")?;
+    if apexes {
+        mount_apexes(&mut vfs, "/system/apex")?;
+    }
     Ok(vfs)
 }
 

@@ -1,12 +1,19 @@
-//! The guest's file namespace: a mount table over read-only filesystems, with
-//! Linux path resolution (symlinks, "..", mount crossings).
+//! The guest's file namespace: a mount table over filesystems, with Linux
+//! path resolution (symlinks, "..", mount crossings).
+//!
+//! The table is an immutable snapshot behind an `RwLock<Arc<_>>`: resolution
+//! clones the `Arc` and never holds a lock while it calls into filesystems,
+//! and mount/umount build a new snapshot and publish it. There is one mount
+//! namespace, shared by every process.
 
 use crate::errno::*;
 use crate::image::erofs::Erofs;
 use crate::image::ext4::Ext4;
 use crate::tmpfs::MemFile;
+use std::collections::{HashMap, HashSet};
 use std::io;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 pub const S_IFMT: u32 = 0o170000;
 pub const S_IFDIR: u32 = 0o040000;
@@ -74,6 +81,31 @@ pub trait FileSystem: Send + Sync {
     }
     fn set_attr(&self, _ino: u64, _mode: Option<u32>, _owner: Option<(u32, u32)>, _mtime: Option<u64>) -> Result<(), i64> {
         Err(EROFS)
+    }
+
+    /// Kernel files that take each write(2) as a value (sysctls, cgroup
+    /// control files) instead of storing bytes; reads regenerate them.
+    fn write_ok(&self, _ino: u64) -> bool {
+        false
+    }
+    fn write(&self, _ino: u64, _data: &[u8]) -> Result<usize, i64> {
+        Err(EINVAL)
+    }
+    /// A magic symlink (/proc/<pid>/ns/*): following it lands on this inode
+    /// of the same filesystem rather than on its text.
+    fn magic_link(&self, _ino: u64) -> Option<u64> {
+        None
+    }
+    /// (total, free) bytes, for statfs.
+    fn space(&self) -> Option<(u64, u64)> {
+        None
+    }
+    /// tmpfs's size= (at mount and remount); 0 is no limit.
+    fn set_size_limit(&self, _bytes: u64) {}
+    /// A counter bumped whenever this file's contents change, for poll's
+    /// POLLPRI (/proc/mounts reports mount table changes so).
+    fn changes(&self, _ino: u64) -> Option<Arc<AtomicU64>> {
+        None
     }
 }
 
@@ -173,6 +205,14 @@ pub fn open_fs(dev: crate::image::Dev) -> io::Result<Arc<dyn FileSystem>> {
     }
 }
 
+/// Opens `dev` as `fstype` ("ext4" or "erofs"), for mount(2).
+pub fn open_fs_as(dev: crate::image::Dev, fstype: &str) -> io::Result<Arc<dyn FileSystem>> {
+    match fstype {
+        "erofs" => Ok(Erofs::open(dev)?),
+        _ => Ok(Ext4::open(dev)?),
+    }
+}
+
 /// A filesystem that is only opened on first use (APEX payloads are big).
 type Opener = Box<dyn FnOnce() -> io::Result<Arc<dyn FileSystem>> + Send>;
 
@@ -205,43 +245,228 @@ impl LazyFs {
     }
 }
 
+/// The root of a LazyFs: stat-able without opening the filesystem (tools
+/// that stat every mount point, like `mount -o remount`, would otherwise
+/// open every APEX).
+const LAZY_ROOT: u64 = u64::MAX;
+
+impl LazyFs {
+    fn real(&self, ino: u64) -> io::Result<(&Arc<dyn FileSystem>, u64)> {
+        let fs = self.get()?;
+        Ok((fs, if ino == LAZY_ROOT { fs.root()? } else { ino }))
+    }
+}
+
 impl FileSystem for LazyFs {
     fn fs_type(&self) -> &'static str {
         self.fs.get().and_then(|r| r.as_ref().ok()).map_or("ext4", |f| f.fs_type())
     }
     fn root(&self) -> io::Result<u64> {
-        self.get()?.root()
+        Ok(LAZY_ROOT)
     }
     fn stat(&self, ino: u64) -> io::Result<Stat> {
-        self.get()?.stat(ino)
+        if ino == LAZY_ROOT && self.fs.get().is_none() {
+            return Ok(Stat { ino: 2, mode: S_IFDIR | 0o755, nlink: 2, size: 4096, ..Default::default() });
+        }
+        let (fs, ino) = self.real(ino)?;
+        fs.stat(ino)
     }
     fn lookup(&self, dir: u64, name: &str) -> io::Result<Option<u64>> {
-        self.get()?.lookup(dir, name)
+        let (fs, dir) = self.real(dir)?;
+        fs.lookup(dir, name)
     }
     fn readdir(&self, dir: u64) -> io::Result<Vec<Dirent>> {
-        self.get()?.readdir(dir)
+        let (fs, dir) = self.real(dir)?;
+        fs.readdir(dir)
     }
     fn read_all(&self, ino: u64) -> io::Result<Arc<[u8]>> {
-        self.get()?.read_all(ino)
+        let (fs, ino) = self.real(ino)?;
+        fs.read_all(ino)
     }
 }
 
-struct Mount {
-    path: String,
-    fs: Arc<dyn FileSystem>,
+// Mount flags (mount(2)'s MS_*) that a mount or a superblock keeps.
+pub const MS_RDONLY: u64 = 1;
+pub const MS_NOSUID: u64 = 2;
+pub const MS_NODEV: u64 = 4;
+pub const MS_NOEXEC: u64 = 8;
+pub const MS_SYNCHRONOUS: u64 = 16;
+pub const MS_MANDLOCK: u64 = 64;
+pub const MS_DIRSYNC: u64 = 128;
+pub const MS_NOSYMFOLLOW: u64 = 256;
+pub const MS_NOATIME: u64 = 1024;
+pub const MS_NODIRATIME: u64 = 2048;
+pub const MS_RELATIME: u64 = 1 << 21;
+pub const MS_LAZYTIME: u64 = 1 << 25;
+
+/// The parent id shown for the root mount (Linux's hidden rootfs).
+const ROOT_PARENT: u32 = 1;
+
+/// A filesystem instance (Linux's superblock), shared by its bind mounts.
+pub struct Super {
+    pub fs: Arc<dyn FileSystem>,
+    /// st_dev of its files.
+    pub dev: u64,
+    /// The mount(2) source, as /proc/mounts shows it.
+    pub source: String,
+    /// MS_RDONLY, MS_SYNCHRONOUS, MS_MANDLOCK, MS_DIRSYNC, MS_LAZYTIME.
+    pub flags: AtomicU64,
+    /// Filesystem-specific options for /proc/mounts ("mode=755").
+    pub options: Mutex<String>,
 }
 
-#[derive(Clone, Debug)]
+/// Mount propagation as /proc/<pid>/mountinfo shows it: peer group ids, 0 for none.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct Propagation {
+    pub shared: u32,
+    pub master: u32,
+    pub unbindable: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PropagationChange {
+    Shared,
+    Private,
+    Slave,
+    Unbindable,
+}
+
+pub struct Mount {
+    pub id: u32,
+    pub parent: u32,
+    /// Where it is attached: a canonical absolute path.
+    pub path: String,
+    pub sb: Arc<Super>,
+    /// The mount's root in `sb.fs` (None: the filesystem's own root, looked
+    /// up on first use so lazily opened APEXes stay unopened), and its path
+    /// there ("/" unless this is a bind mount of a subtree).
+    root: Option<u64>,
+    pub root_path: String,
+    /// MS_RDONLY, MS_NOSUID, MS_NODEV, MS_NOEXEC, MS_NOATIME, MS_NODIRATIME,
+    /// MS_RELATIME, MS_NOSYMFOLLOW.
+    pub flags: AtomicU64,
+    pub propagation: Mutex<Propagation>,
+}
+
+impl Mount {
+    pub fn readonly(&self) -> bool {
+        (self.flags.load(Ordering::Relaxed) | self.sb.flags.load(Ordering::Relaxed)) & MS_RDONLY != 0
+    }
+
+    fn root_ino(&self) -> Result<u64, i64> {
+        match self.root {
+            Some(i) => Ok(i),
+            None => self.sb.fs.root().map_err(io_errno),
+        }
+    }
+
+    /// A copy at another place (MS_MOVE keeps the id, so children still find it).
+    fn moved(&self, parent: u32, path: String) -> Arc<Mount> {
+        Arc::new(Mount {
+            id: self.id,
+            parent,
+            path,
+            sb: self.sb.clone(),
+            root: self.root,
+            root_path: self.root_path.clone(),
+            flags: AtomicU64::new(self.flags.load(Ordering::Relaxed)),
+            propagation: Mutex::new(*self.propagation.lock().unwrap()),
+        })
+    }
+}
+
+#[derive(Clone)]
 pub struct Node {
-    mount: usize,
+    mnt: Arc<Mount>,
     pub ino: u64,
     /// Canonical absolute path (no symlinks, "." or "..").
     pub path: String,
 }
 
+impl std::fmt::Debug for Node {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Node({} ino {} on mount {})", self.path, self.ino, self.mnt.id)
+    }
+}
+
+impl Node {
+    pub fn mount(&self) -> &Arc<Mount> {
+        &self.mnt
+    }
+    /// Whether this is the root of its mount (a mount point).
+    pub fn is_mount_root(&self) -> bool {
+        self.path == self.mnt.path
+    }
+}
+
+/// An immutable snapshot of the mount table.
+#[derive(Default)]
+struct Table {
+    /// In mount order.
+    mounts: Vec<Arc<Mount>>,
+    /// Mount point → indices of the mounts attached there.
+    at: HashMap<String, Vec<usize>>,
+}
+
+impl Table {
+    fn new(mounts: Vec<Arc<Mount>>) -> Table {
+        let mut at: HashMap<String, Vec<usize>> = HashMap::new();
+        for (i, m) in mounts.iter().enumerate() {
+            at.entry(m.path.clone()).or_default().push(i);
+        }
+        Table { mounts, at }
+    }
+
+    /// What `path`, reached on mount `parent`, shows: the mount attached
+    /// there and then whatever is stacked on top of it.
+    fn covering(&self, parent: &Mount, path: &str) -> Option<&Arc<Mount>> {
+        let at = self.at.get(path)?;
+        let (mut top, mut id) = (None, parent.id);
+        for _ in 0..at.len() {
+            let Some(&i) = at.iter().find(|&&i| self.mounts[i].parent == id) else { break };
+            top = Some(&self.mounts[i]);
+            id = self.mounts[i].id;
+        }
+        top
+    }
+
+    fn root(&self) -> Result<Node, i64> {
+        let first = self.mounts.first().ok_or(ENOENT)?;
+        let m = self.covering(first, "/").unwrap_or(first);
+        Ok(Node { mnt: m.clone(), ino: m.root_ino()?, path: "/".into() })
+    }
+
+    /// `m` and every mount beneath it.
+    fn subtree(&self, m: &Mount) -> HashSet<u32> {
+        let mut set = HashSet::from([m.id]);
+        // A fixpoint: MS_MOVE can leave a child before its new parent in mount order.
+        loop {
+            let n = set.len();
+            for x in &self.mounts {
+                if set.contains(&x.parent) {
+                    set.insert(x.id);
+                }
+            }
+            if set.len() == n {
+                return set;
+            }
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct Vfs {
-    mounts: Vec<Mount>,
+    table: RwLock<Arc<Table>>,
+    /// Serializes changes: copy the table, edit it, publish it.
+    edit: Mutex<()>,
+    ids: AtomicU32,
+    anon: AtomicU32,
+    groups: AtomicU32,
+    /// Single-instance filesystems (proc, sysfs, cgroup hierarchies) that
+    /// mount(2) reuses, also once unmounted.
+    kept: Mutex<Vec<Arc<Super>>>,
+    /// Bumped on every change to the table (Linux's mnt_namespace event).
+    events: Arc<AtomicU64>,
 }
 
 fn io_errno(e: io::Error) -> i64 {
@@ -260,36 +485,282 @@ fn join(dir: &str, name: &str) -> String {
     }
 }
 
+/// `path` (at or under `from`) moved to under `to`.
+fn rebase(path: &str, from: &str, to: &str) -> String {
+    let rest = if from == "/" { path } else { &path[from.len()..] };
+    match (to, rest) {
+        (_, "" | "/") => to.to_string(),
+        ("/", r) => r.to_string(),
+        (t, r) => format!("{t}{r}"),
+    }
+}
+
+fn under(path: &str, dir: &str) -> bool {
+    dir == "/" || path == dir || path.strip_prefix(dir).is_some_and(|r| r.starts_with('/'))
+}
+
 impl Vfs {
-    /// Mounts `fs` at `path`; the first mount must be "/".
-    pub fn mount(&mut self, path: &str, fs: Arc<dyn FileSystem>) {
-        assert!(!self.mounts.is_empty() || path == "/", "mount / first");
-        self.mounts.push(Mount {
-            path: path.to_string(),
-            fs,
-        });
+    fn table(&self) -> Arc<Table> {
+        self.table.read().unwrap().clone()
     }
 
-    fn mount_at(&self, path: &str) -> Option<usize> {
-        // Later mounts shadow earlier ones, as in Linux.
-        self.mounts.iter().rposition(|m| m.path == path)
+    /// Applies `f` to a copy of the mount list and publishes the result.
+    fn edit<R>(&self, f: impl FnOnce(&Table, &mut Vec<Arc<Mount>>) -> Result<R, i64>) -> Result<R, i64> {
+        let _g = self.edit.lock().unwrap();
+        let tab = self.table();
+        let mut mounts = tab.mounts.clone();
+        let r = f(&tab, &mut mounts)?;
+        *self.table.write().unwrap() = Arc::new(Table::new(mounts));
+        self.touch();
+        Ok(r)
     }
 
-    fn fs(&self, node: &Node) -> &dyn FileSystem {
-        &*self.mounts[node.mount].fs
+    /// Notes a change to the mount table (or a mount's flags) for pollers of /proc/mounts.
+    pub fn touch(&self) {
+        self.events.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn events(&self) -> Arc<AtomicU64> {
+        self.events.clone()
+    }
+
+    fn new_group(&self) -> u32 {
+        self.groups.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    /// An anonymous device number (major 0), as Linux gives virtual filesystems.
+    pub fn anon_dev(&self) -> u64 {
+        let n = self.anon.fetch_add(1, Ordering::Relaxed) as u64 + 1;
+        (n & 0xff) | (n & !0xff) << 12
+    }
+
+    pub fn new_super(&self, fs: Arc<dyn FileSystem>, source: &str, dev: Option<u64>, flags: u64, options: &str) -> Arc<Super> {
+        let dev = dev.unwrap_or_else(|| self.anon_dev());
+        Arc::new(Super { fs, dev, source: source.to_string(), flags: AtomicU64::new(flags), options: Mutex::new(options.to_string()) })
+    }
+
+    /// A mount of `sb` (its subtree at `root`) attached on `parent` at `path`.
+    /// Under a shared mount it is shared too: in the bind source's peer group
+    /// (`peer`) or a new one, as in Linux.
+    #[allow(clippy::too_many_arguments)]
+    fn new_mount(&self, parent: &Mount, path: String, sb: Arc<Super>, root: Option<u64>, root_path: String, flags: u64, peer: u32) -> Arc<Mount> {
+        let shared = if peer != 0 {
+            peer
+        } else if parent.propagation.lock().unwrap().shared != 0 {
+            self.new_group()
+        } else {
+            0
+        };
+        Arc::new(Mount {
+            id: self.ids.fetch_add(1, Ordering::Relaxed) + ROOT_PARENT + 1,
+            parent: parent.id,
+            path,
+            sb,
+            root,
+            root_path,
+            flags: AtomicU64::new(flags),
+            propagation: Mutex::new(Propagation { shared, ..Default::default() }),
+        })
+    }
+
+    /// Mounts `fs` at `path` while assembling the namespace (the mount point
+    /// need not exist); the first mount must be "/".
+    pub fn mount(&self, path: &str, fs: Arc<dyn FileSystem>) {
+        let image = matches!(fs.fs_type(), "erofs" | "ext4");
+        let source = if image { "/dev/block/droidrt" } else { fs.fs_type() };
+        let ro = if image { MS_RDONLY } else { 0 };
+        // What Linux would show for these mounts' options.
+        let options = match fs.fs_type() {
+            "tmpfs" => fs.root().and_then(|r| fs.stat(r)).map(|st| st.mode & 0o7777).ok().filter(|&m| m != 0o1777).map(|m| format!("mode={m:03o}")).unwrap_or_default(),
+            "devpts" => "mode=600,ptmxmode=000".into(),
+            _ => String::new(),
+        };
+        let sb = self.new_super(fs, source, None, ro, &options);
+        if self.table().mounts.is_empty() {
+            assert!(path == "/", "mount / first");
+            let root = Arc::new(Mount {
+                id: self.ids.fetch_add(1, Ordering::Relaxed) + ROOT_PARENT + 1,
+                parent: ROOT_PARENT,
+                path: "/".into(),
+                sb,
+                root: None,
+                root_path: "/".into(),
+                flags: AtomicU64::new(ro | MS_RELATIME),
+                propagation: Mutex::default(),
+            });
+            self.edit(|_, mounts| {
+                mounts.push(root);
+                Ok(())
+            })
+            .unwrap();
+            return;
+        }
+        // On what the path shows now; a missing mount point hangs off its parent directory.
+        let (parent, path) = match self.resolve("/", path, true) {
+            Ok(n) => (n.mnt, n.path),
+            Err(_) => {
+                let (dir, name) = path.trim_end_matches('/').rsplit_once('/').unwrap_or(("", path));
+                let d = self.resolve("/", if dir.is_empty() { "/" } else { dir }, true).expect("mount point's parent directory");
+                let p = join(&d.path, name);
+                (d.mnt, p)
+            }
+        };
+        let m = self.new_mount(&parent, path, sb, None, "/".into(), ro | MS_RELATIME, 0);
+        self.edit(|_, mounts| {
+            mounts.push(m);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    /// Mounts a new filesystem instance on `target` (mount(2) without MS_BIND).
+    pub fn mount_at(&self, target: &Node, sb: Arc<Super>, flags: u64) -> Result<(), i64> {
+        let root = sb.fs.root().map_err(io_errno)?;
+        if sb.fs.stat(root).map_err(io_errno)?.mode & S_IFMT == S_IFDIR && self.stat(target)?.mode & S_IFMT != S_IFDIR {
+            return Err(ENOTDIR);
+        }
+        self.edit(|tab, mounts| {
+            if !tab.mounts.iter().any(|m| m.id == target.mnt.id) {
+                return Err(ENOENT); // its mount went away meanwhile
+            }
+            mounts.push(self.new_mount(&target.mnt, target.path.clone(), sb, Some(root), "/".into(), flags, 0));
+            Ok(())
+        })
+    }
+
+    /// Bind-mounts `src` (a directory subtree or one file) on `target`;
+    /// `recursive` (MS_REC) brings along the mounts beneath `src`.
+    pub fn bind(&self, src: &Node, target: &Node, recursive: bool) -> Result<(), i64> {
+        let sp = *src.mnt.propagation.lock().unwrap();
+        if sp.unbindable {
+            return Err(EINVAL);
+        }
+        let is_dir = |n: &Node| self.stat(n).map(|s| s.mode & S_IFMT == S_IFDIR);
+        if is_dir(src)? != is_dir(target)? {
+            return Err(ENOTDIR);
+        }
+        let root_path = rebase(&src.path, &src.mnt.path, &src.mnt.root_path);
+        self.edit(|tab, mounts| {
+            if !tab.mounts.iter().any(|m| m.id == target.mnt.id) {
+                return Err(ENOENT);
+            }
+            let flags = src.mnt.flags.load(Ordering::Relaxed);
+            let top = self.new_mount(&target.mnt, target.path.clone(), src.mnt.sb.clone(), Some(src.ino), root_path, flags, sp.shared);
+            mounts.push(top.clone());
+            if recursive {
+                // Copies of the mounts under `src`, in mount order so parents come first.
+                let mut copies = HashMap::from([(src.mnt.id, top)]);
+                let inside = tab.subtree(&src.mnt);
+                for m in &tab.mounts {
+                    if m.id == src.mnt.id || !inside.contains(&m.id) || !under(&m.path, &src.path) || m.path == src.path {
+                        continue;
+                    }
+                    let Some(parent) = copies.get(&m.parent).cloned() else { continue };
+                    let peer = m.propagation.lock().unwrap().shared;
+                    let c = self.new_mount(&parent, rebase(&m.path, &src.path, &target.path), m.sb.clone(), m.root, m.root_path.clone(), m.flags.load(Ordering::Relaxed), peer);
+                    mounts.push(c.clone());
+                    copies.insert(m.id, c);
+                }
+            }
+            Ok(())
+        })
+    }
+
+    /// The live mount `node` is the root of: EINVAL if it is not a mount point.
+    pub fn mount_root(&self, node: &Node) -> Result<Arc<Mount>, i64> {
+        if !node.is_mount_root() {
+            return Err(EINVAL);
+        }
+        self.table().mounts.iter().find(|m| m.id == node.mnt.id).cloned().ok_or(EINVAL)
+    }
+
+    /// Unmounts the mount whose root is `node`; returns what was removed.
+    /// `detach` (MNT_DETACH) takes the mounts beneath it too, which otherwise
+    /// make it EBUSY. Open files keep their filesystems alive.
+    pub fn umount(&self, node: &Node, detach: bool) -> Result<Vec<Arc<Mount>>, i64> {
+        let m = self.mount_root(node)?;
+        if m.parent == ROOT_PARENT {
+            return Err(EBUSY);
+        }
+        self.edit(|tab, mounts| {
+            let gone = tab.subtree(&m);
+            if gone.len() > 1 && !detach {
+                return Err(EBUSY);
+            }
+            let removed = mounts.iter().filter(|x| gone.contains(&x.id)).cloned().collect();
+            mounts.retain(|x| !gone.contains(&x.id));
+            Ok(removed)
+        })
+    }
+
+    /// MS_MOVE: re-attaches the mount at `src`, and everything beneath it, on `target`.
+    pub fn move_mount(&self, src: &Node, target: &Node) -> Result<(), i64> {
+        let m = self.mount_root(src)?;
+        if m.parent == ROOT_PARENT {
+            return Err(EINVAL);
+        }
+        if under(&target.path, &m.path) {
+            return Err(ELOOP);
+        }
+        let is_dir = |n: &Node| self.stat(n).map(|s| s.mode & S_IFMT == S_IFDIR);
+        if is_dir(src)? != is_dir(target)? {
+            return Err(ENOTDIR);
+        }
+        self.edit(|tab, mounts| {
+            let moving = tab.subtree(&m);
+            for slot in mounts.iter_mut().filter(|x| moving.contains(&x.id)) {
+                let parent = if slot.id == m.id { target.mnt.id } else { slot.parent };
+                *slot = slot.moved(parent, rebase(&slot.path, &m.path, &target.path));
+            }
+            Ok(())
+        })
+    }
+
+    /// MS_SHARED / MS_PRIVATE / MS_SLAVE / MS_UNBINDABLE on the mount at
+    /// `node`; `recursive` (MS_REC) also on every mount beneath it.
+    pub fn set_propagation(&self, node: &Node, change: PropagationChange, recursive: bool) -> Result<(), i64> {
+        let m = self.mount_root(node)?;
+        let tab = self.table();
+        let ids = if recursive { tab.subtree(&m) } else { HashSet::from([m.id]) };
+        for x in tab.mounts.iter().filter(|x| ids.contains(&x.id)) {
+            let mut p = x.propagation.lock().unwrap();
+            match change {
+                PropagationChange::Shared if p.shared == 0 => p.shared = self.new_group(),
+                PropagationChange::Shared => {}
+                PropagationChange::Private => *p = Propagation::default(),
+                PropagationChange::Slave if p.shared != 0 => *p = Propagation { master: p.shared, ..Default::default() },
+                PropagationChange::Slave => p.unbindable = false,
+                PropagationChange::Unbindable => *p = Propagation { unbindable: true, ..Default::default() },
+            }
+        }
+        Ok(())
+    }
+
+    /// Every mount, in mount order (for /proc/mounts).
+    pub fn mount_list(&self) -> Vec<Arc<Mount>> {
+        self.table().mounts.clone()
+    }
+
+    /// An existing instance of a single-instance filesystem, mounted or kept.
+    pub fn find_super(&self, pred: impl Fn(&Super) -> bool) -> Option<Arc<Super>> {
+        let mounted = self.table().mounts.iter().map(|m| m.sb.clone()).find(|sb| pred(sb));
+        mounted.or_else(|| self.kept.lock().unwrap().iter().find(|sb| pred(sb)).cloned())
+    }
+
+    /// Remembers `sb` for find_super after it is unmounted.
+    pub fn keep(&self, sb: &Arc<Super>) {
+        let mut kept = self.kept.lock().unwrap();
+        if !kept.iter().any(|k| Arc::ptr_eq(k, sb)) {
+            kept.push(sb.clone());
+        }
+    }
+
+    fn fs<'a>(&self, node: &'a Node) -> &'a dyn FileSystem {
+        &*node.mnt.sb.fs
     }
 
     pub fn fs_arc(&self, node: &Node) -> Arc<dyn FileSystem> {
-        self.mounts[node.mount].fs.clone()
-    }
-
-    fn root_node(&self) -> Result<Node, i64> {
-        let ino = self.mounts[0].fs.root().map_err(io_errno)?;
-        Ok(Node {
-            mount: 0,
-            ino,
-            path: "/".into(),
-        })
+        node.mnt.sb.fs.clone()
     }
 
     pub fn resolve(&self, cwd: &str, path: &str, follow_last: bool) -> Result<Node, i64> {
@@ -307,7 +778,8 @@ impl Vfs {
             .filter(|c| !c.is_empty())
             .map(String::from)
             .collect();
-        let mut stack = vec![self.root_node()?];
+        let tab = self.table();
+        let mut stack = vec![tab.root()?];
         let mut links = 0;
 
         while let Some(c) = todo.pop() {
@@ -325,15 +797,15 @@ impl Vfs {
                 return Err(ENOTDIR);
             }
             let child_path = join(&cur.path, &c);
-            let node = match self.mount_at(&child_path) {
+            let node = match tab.covering(&cur.mnt, &child_path) {
                 Some(m) => Node {
-                    mount: m,
-                    ino: self.mounts[m].fs.root().map_err(io_errno)?,
+                    mnt: m.clone(),
+                    ino: m.root_ino()?,
                     path: child_path,
                 },
                 None => match self.fs(cur).lookup(cur.ino, &c).map_err(io_errno)? {
                     Some(ino) => Node {
-                        mount: cur.mount,
+                        mnt: cur.mnt.clone(),
                         ino,
                         path: child_path,
                     },
@@ -342,8 +814,12 @@ impl Vfs {
             };
             let st = self.stat(&node)?;
             if st.mode & S_IFMT == S_IFLNK && (follow_last || !todo.is_empty()) {
+                if let Some(ino) = self.fs(&node).magic_link(node.ino) {
+                    stack.push(Node { ino, ..node });
+                    continue;
+                }
                 links += 1;
-                if links > 40 {
+                if links > 40 || node.mnt.flags.load(Ordering::Relaxed) & MS_NOSYMFOLLOW != 0 {
                     return Err(ELOOP);
                 }
                 let target = self.read_all(&node)?;
@@ -367,7 +843,7 @@ impl Vfs {
 
     pub fn stat(&self, node: &Node) -> Result<Stat, i64> {
         let mut st = self.fs(node).stat(node.ino).map_err(io_errno)?;
-        st.dev = node.mount as u64 + 1;
+        st.dev = node.mnt.sb.dev;
         Ok(st)
     }
 
@@ -375,21 +851,37 @@ impl Vfs {
         self.fs(node).read_all(node.ino).map_err(io_errno)
     }
 
-    /// (mount point, filesystem type) in mount order.
-    pub fn mounts(&self) -> Vec<(String, &'static str)> {
-        self.mounts.iter().map(|m| (m.path.clone(), m.fs.fs_type())).collect()
-    }
-
     pub fn fs_type(&self, node: &Node) -> &'static str {
         self.fs(node).fs_type()
     }
 
+    /// Whether writes can land: a writable filesystem or kernel file, on a read-write mount.
     pub fn writable(&self, node: &Node) -> bool {
-        self.fs(node).writable()
+        !node.mnt.readonly() && (self.fs(node).writable() || self.fs(node).write_ok(node.ino))
+    }
+
+    /// A kernel file that interprets writes (see FileSystem::write_ok).
+    pub fn write_ok(&self, node: &Node) -> bool {
+        !node.mnt.readonly() && self.fs(node).write_ok(node.ino)
+    }
+
+    pub fn write(&self, node: &Node, data: &[u8]) -> Result<usize, i64> {
+        if node.mnt.readonly() {
+            return Err(EROFS);
+        }
+        self.fs(node).write(node.ino, data)
     }
 
     pub fn mem_file(&self, node: &Node) -> Option<Arc<MemFile>> {
         self.fs(node).mem_file(node.ino)
+    }
+
+    pub fn space(&self, node: &Node) -> Option<(u64, u64)> {
+        self.fs(node).space()
+    }
+
+    pub fn changes(&self, node: &Node) -> Option<Arc<AtomicU64>> {
+        self.fs(node).changes(node.ino)
     }
 
     /// Resolves everything but the last component: (directory, name).
@@ -408,59 +900,93 @@ impl Vfs {
         if self.stat(&dir_node)?.mode & S_IFMT != S_IFDIR {
             return Err(ENOTDIR);
         }
-        if self.mount_at(&join(&dir_node.path, name)).is_some() {
+        Ok((dir_node, name.to_string()))
+    }
+
+    fn is_mount_point(&self, dir: &Node, name: &str) -> bool {
+        self.table().covering(&dir.mnt, &join(&dir.path, name)).is_some()
+    }
+
+    /// Linux's order for creating `name`: EEXIST if it is taken (a mount
+    /// point counts), then EROFS.
+    fn creatable(&self, dir: &Node, name: &str) -> Result<(), i64> {
+        if self.is_mount_point(dir, name) || self.fs(dir).lookup(dir.ino, name).map_err(io_errno)?.is_some() {
+            return Err(EEXIST);
+        }
+        if dir.mnt.readonly() {
+            return Err(EROFS);
+        }
+        Ok(())
+    }
+
+    /// For unlink, rmdir and rename: mount points are EBUSY.
+    fn removable(&self, dir: &Node, name: &str) -> Result<(), i64> {
+        if dir.mnt.readonly() {
+            return Err(EROFS);
+        }
+        if self.is_mount_point(dir, name) {
             return Err(EBUSY);
         }
-        Ok((dir_node, name.to_string()))
+        Ok(())
     }
 
     /// A child of `dir`, looked up afresh (after creating it).
     pub fn child(&self, dir: &Node, name: &str, ino: u64) -> Node {
-        Node { mount: dir.mount, ino, path: join(&dir.path, name) }
+        Node { mnt: dir.mnt.clone(), ino, path: join(&dir.path, name) }
     }
 
     pub fn create(&self, dir: &Node, name: &str, mode: u32, rdev: u64) -> Result<Node, i64> {
+        self.creatable(dir, name)?;
         let ino = self.fs(dir).create(dir.ino, name, mode, rdev)?;
         Ok(self.child(dir, name, ino))
     }
 
     pub fn mkdir(&self, dir: &Node, name: &str, mode: u32) -> Result<(), i64> {
+        self.creatable(dir, name)?;
         self.fs(dir).mkdir(dir.ino, name, mode).map(|_| ())
     }
 
     pub fn symlink(&self, dir: &Node, name: &str, target: &str) -> Result<(), i64> {
+        self.creatable(dir, name)?;
         self.fs(dir).symlink(dir.ino, name, target).map(|_| ())
     }
 
     pub fn link(&self, node: &Node, dir: &Node, name: &str) -> Result<(), i64> {
-        if node.mount != dir.mount {
+        self.creatable(dir, name)?;
+        if node.mnt.id != dir.mnt.id {
             return Err(EXDEV);
         }
         self.fs(dir).link(node.ino, dir.ino, name)
     }
 
     pub fn unlink(&self, dir: &Node, name: &str, rmdir: bool) -> Result<(), i64> {
+        self.removable(dir, name)?;
         self.fs(dir).unlink(dir.ino, name, rmdir)
     }
 
     pub fn rename(&self, odir: &Node, oname: &str, ndir: &Node, nname: &str, noreplace: bool) -> Result<(), i64> {
-        if odir.mount != ndir.mount {
+        if odir.mnt.id != ndir.mnt.id {
             return Err(EXDEV);
         }
+        self.removable(odir, oname)?;
+        self.removable(ndir, nname)?;
         self.fs(odir).rename(odir.ino, oname, ndir.ino, nname, noreplace)
     }
 
     pub fn set_attr(&self, node: &Node, mode: Option<u32>, owner: Option<(u32, u32)>, mtime: Option<u64>) -> Result<(), i64> {
+        if node.mnt.readonly() {
+            return Err(EROFS);
+        }
         self.fs(node).set_attr(node.ino, mode, owner, mtime)
     }
 
     pub fn readdir(&self, node: &Node) -> Result<Vec<Dirent>, i64> {
         let mut out = self.fs(node).readdir(node.ino).map_err(io_errno)?;
-        // Mount points directly under this directory, even if not in the parent fs.
-        for m in &self.mounts[1..] {
+        // Mount points directly under this directory, even if not in its filesystem.
+        for m in self.table().mounts.iter().filter(|m| m.parent == node.mnt.id) {
             if let Some((parent, name)) = m.path.rsplit_once('/') {
                 let parent = if parent.is_empty() { "/" } else { parent };
-                if parent == node.path && !out.iter().any(|d| d.name == name) {
+                if parent == node.path && !name.is_empty() && !out.iter().any(|d| d.name == name) {
                     out.push(Dirent {
                         name: name.to_string(),
                         ino: 0,

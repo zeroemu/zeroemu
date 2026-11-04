@@ -14,15 +14,58 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const ROOT: u64 = 1;
 
+/// A tmpfs's size= limit: pages its files' contents may use.
+#[derive(Default)]
+pub struct Quota {
+    /// In pages; 0 is unlimited.
+    limit: AtomicU64,
+    used: AtomicU64,
+}
+
+impl Quota {
+    fn charge(&self, pages: u64) -> Result<(), i64> {
+        let limit = self.limit.load(Ordering::Relaxed);
+        self.used.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |u| (limit == 0 || u + pages <= limit).then_some(u + pages)).map(|_| ()).map_err(|_| ENOSPC)
+    }
+    /// Pages still free.
+    fn room(&self) -> u64 {
+        match self.limit.load(Ordering::Relaxed) {
+            0 => u64::MAX,
+            l => l.saturating_sub(self.used.load(Ordering::Relaxed)),
+        }
+    }
+    fn release(&self, pages: u64) {
+        self.used.fetch_sub(pages, Ordering::Relaxed);
+    }
+}
+
+fn pages(bytes: u64) -> u64 {
+    bytes.div_ceil(4096)
+}
+
 /// A regular file's contents: shared pages plus a length.
 pub struct MemFile {
     pub obj: Arc<SharedObject>,
     size: Mutex<u64>,
+    /// The filesystem's limit, and the pages charged to it (up to the furthest write).
+    quota: Option<(Arc<Quota>, AtomicU64)>,
+}
+
+impl Drop for MemFile {
+    fn drop(&mut self) {
+        if let Some((q, charged)) = &self.quota {
+            q.release(charged.load(Ordering::Relaxed));
+        }
+    }
 }
 
 impl MemFile {
     pub fn new(phys: Arc<PhysMem>) -> Arc<MemFile> {
-        Arc::new(MemFile { obj: SharedObject::new(phys), size: Mutex::new(0) })
+        Arc::new(MemFile { obj: SharedObject::new(phys), size: Mutex::new(0), quota: None })
+    }
+
+    fn with_quota(phys: Arc<PhysMem>, quota: Arc<Quota>) -> Arc<MemFile> {
+        Arc::new(MemFile { obj: SharedObject::new(phys), size: Mutex::new(0), quota: Some((quota, AtomicU64::new(0))) })
     }
 
     pub fn size(&self) -> u64 {
@@ -37,21 +80,44 @@ impl MemFile {
         buf
     }
 
-    pub fn write_at(&self, off: u64, data: &[u8]) -> Result<(), i64> {
+    /// Writes `data` at `off`. Under a size= limit only the pages that fit
+    /// are written, as Linux's tmpfs does: a short count, or ENOSPC for none.
+    pub fn write_at(&self, off: u64, data: &[u8]) -> Result<usize, i64> {
         let end = off.checked_add(data.len() as u64).ok_or(EFBIG)?;
         if end > 1 << 40 {
             return Err(EFBIG);
         }
         let mut size = self.size.lock().unwrap();
+        let mut data = data;
+        if let Some((q, charged)) = &self.quota {
+            let had = charged.load(Ordering::Relaxed);
+            if pages(end) > had {
+                let grant = (pages(end) - had).min(q.room());
+                let fit = ((had + grant) * 4096).min(end);
+                if fit <= off {
+                    return Err(ENOSPC);
+                }
+                q.charge(grant)?;
+                charged.store(had + grant, Ordering::Relaxed);
+                data = &data[..(fit - off) as usize];
+            }
+        }
         self.obj.write(off, data)?;
-        *size = (*size).max(end);
-        Ok(())
+        *size = (*size).max(off + data.len() as u64);
+        Ok(data.len())
     }
 
     pub fn truncate(&self, len: u64) {
         let mut size = self.size.lock().unwrap();
         if len < *size {
             self.obj.zero_from(len);
+        }
+        if let Some((q, charged)) = &self.quota {
+            let had = charged.load(Ordering::Relaxed);
+            if pages(len) < had {
+                q.release(had - pages(len));
+                charged.store(pages(len), Ordering::Relaxed);
+            }
         }
         *size = len;
     }
@@ -80,6 +146,7 @@ pub struct Tmpfs {
     type_name: &'static str,
     nodes: Mutex<HashMap<u64, Node>>,
     next: AtomicU64,
+    quota: Arc<Quota>,
 }
 
 fn now() -> u64 {
@@ -109,8 +176,9 @@ impl Tmpfs {
     pub fn with_type(phys: Arc<PhysMem>, mode: u32, type_name: &'static str) -> Arc<Tmpfs> {
         let mut nodes = HashMap::new();
         nodes.insert(ROOT, Node { mode: S_IFDIR | mode, uid: 0, gid: 0, nlink: 2, mtime: now(), kind: Kind::Dir { entries: BTreeMap::new(), parent: ROOT } });
-        Arc::new(Tmpfs { phys, type_name, nodes: Mutex::new(nodes), next: AtomicU64::new(ROOT + 1) })
+        Arc::new(Tmpfs { phys, type_name, nodes: Mutex::new(nodes), next: AtomicU64::new(ROOT + 1), quota: Arc::default() })
     }
+
 
     fn add(&self, dir: u64, name: &str, mode: u32, kind: Kind) -> Result<u64, i64> {
         valid_name(name)?;
@@ -157,7 +225,7 @@ impl Tmpfs {
     pub fn write_file(&self, path: &str, mode: u32, content: &str) {
         let (dir, name) = path.rsplit_once('/').unwrap_or(("", path));
         let d = self.mkdir_p(dir, 0o755);
-        let ino = self.add(d, name, S_IFREG | mode, Kind::File(MemFile::new(self.phys.clone()))).expect("tmpfs write_file");
+        let ino = self.add(d, name, S_IFREG | mode, Kind::File(MemFile::with_quota(self.phys.clone(), self.quota.clone()))).expect("tmpfs write_file");
         if let Some(Kind::File(f)) = self.nodes.lock().unwrap().get(&ino).map(|n| &n.kind) {
             f.write_at(0, content.as_bytes()).expect("tmpfs write_file");
         }
@@ -234,6 +302,19 @@ impl FileSystem for Tmpfs {
         true
     }
 
+    fn set_size_limit(&self, bytes: u64) {
+        self.quota.limit.store(pages(bytes), Ordering::Relaxed);
+    }
+
+    fn space(&self) -> Option<(u64, u64)> {
+        // Unlimited tmpfs reports half of RAM, Linux's default size.
+        let total = match self.quota.limit.load(Ordering::Relaxed) {
+            0 => crate::phys::PHYS_MAX / 2,
+            l => l * 4096,
+        };
+        Some((total, total.saturating_sub(self.quota.used.load(Ordering::Relaxed) * 4096)))
+    }
+
     fn mem_file(&self, ino: u64) -> Option<Arc<MemFile>> {
         match &self.nodes.lock().unwrap().get(&ino)?.kind {
             Kind::File(f) => Some(f.clone()),
@@ -243,7 +324,7 @@ impl FileSystem for Tmpfs {
 
     fn create(&self, dir: u64, name: &str, mode: u32, rdev: u64) -> Result<u64, i64> {
         let kind = match mode & S_IFMT {
-            0 | S_IFREG => Kind::File(MemFile::new(self.phys.clone())),
+            0 | S_IFREG => Kind::File(MemFile::with_quota(self.phys.clone(), self.quota.clone())),
             S_IFDIR => return Err(EINVAL),
             _ => Kind::Special { rdev },
         };

@@ -54,7 +54,7 @@ fn run() -> Result<i32, String> {
         }
     }
     let vfs = match &system {
-        Some(img) => Some(android::open_system_image(img).map_err(|e| format!("{}: {e}", img.display()))?),
+        Some(img) => Some(android::open_system_image(img, !boot).map_err(|e| format!("{}: {e}", img.display()))?),
         None => None,
     };
     if let Some((cmd, path)) = inspect {

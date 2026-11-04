@@ -45,8 +45,11 @@ const F_GETLK: u64 = 5;
 const F_SETLK: u64 = 6;
 const F_SETLKW: u64 = 7;
 const F_DUPFD_CLOEXEC: u64 = 1030;
+const F_SETPIPE_SZ: u64 = 1031;
 const F_GETPIPE_SZ: u64 = 1032;
+const O_PATH: u64 = 0o10000000;
 const FD_CLOEXEC: u64 = 1;
+/// A new pipe's capacity (F_SETPIPE_SZ changes it).
 const PIPE_CAP: usize = 64 << 10;
 /// Largest single read/write we copy at once (Linux caps at ~2 GiB).
 const IO_MAX: u64 = 16 << 20;
@@ -125,6 +128,25 @@ pub struct NodeFile {
     pos: u64,
     data: Option<Arc<[u8]>>,
     dents: Option<Vec<Dirent>>,
+    /// A kernel file (sysctl, cgroup control file) opened for writing.
+    writable: bool,
+    /// For files that report changes (/proc/mounts): the counter and the value last seen.
+    event: Option<(Arc<std::sync::atomic::AtomicU64>, u64)>,
+}
+
+impl NodeFile {
+    fn open(vfs: &crate::vfs::Vfs, node: Node, stat: Stat, writable: bool) -> Mutex<NodeFile> {
+        let event = vfs.changes(&node).map(|c| {
+            let seen = c.load(Ordering::Relaxed);
+            (c, seen)
+        });
+        Mutex::new(NodeFile { node, stat, pos: 0, data: None, dents: None, writable, event })
+    }
+
+    /// Whether epoll may watch it (Linux refuses regular files).
+    pub(super) fn pollable(&self) -> bool {
+        self.event.is_some()
+    }
 }
 
 #[derive(Clone)]
@@ -206,6 +228,7 @@ struct PipeState {
     buf: VecDeque<u8>,
     readers: usize,
     writers: usize,
+    cap: usize,
 }
 
 pub struct PipeEnd {
@@ -259,7 +282,7 @@ impl Pipe {
             if st.readers == 0 {
                 return Err(EPIPE);
             }
-            let room = PIPE_CAP.saturating_sub(st.buf.len());
+            let room = st.cap.saturating_sub(st.buf.len());
             if room > 0 {
                 let n = room.min(data.len() - done);
                 st.buf.extend(&data[done..done + n]);
@@ -282,6 +305,7 @@ impl Pipe {
 }
 
 const POLLIN: u16 = 0x1;
+const POLLPRI: u16 = 0x2;
 const POLLOUT: u16 = 0x4;
 const POLLERR: u16 = 0x8;
 const POLLHUP: u16 = 0x10;
@@ -300,12 +324,25 @@ pub(super) fn poll_ready(f: &File, t: &Thread, depth: u32) -> u16 {
         }
         Kind::Stdin => POLLIN,
         Kind::Stdout | Kind::Stderr => POLLOUT,
-        Kind::Null | Kind::Zero | Kind::Random | Kind::Node(_) | Kind::Mem(_) | Kind::Block(_) | Kind::LoopControl | Kind::DmControl => POLLIN | POLLOUT,
+        // /proc/mounts: POLLERR | POLLPRI once per change of the mount table.
+        Kind::Node(nf) => match &mut nf.lock().unwrap().event {
+            Some((counter, seen)) => {
+                let now = counter.load(Ordering::Relaxed);
+                if now == *seen {
+                    POLLIN
+                } else {
+                    *seen = now;
+                    POLLIN | POLLERR | POLLPRI
+                }
+            }
+            None => POLLIN | POLLOUT,
+        },
+        Kind::Null | Kind::Zero | Kind::Random | Kind::Mem(_) | Kind::Block(_) | Kind::LoopControl | Kind::DmControl => POLLIN | POLLOUT,
         Kind::Kmsg => POLLOUT,
         Kind::Pipe(end) => {
             let st = end.pipe.st.lock().unwrap();
             if end.write {
-                if st.readers == 0 { POLLERR } else if st.buf.len() < PIPE_CAP { POLLOUT } else { 0 }
+                if st.readers == 0 { POLLERR } else if st.buf.len() < st.cap { POLLOUT } else { 0 }
             } else {
                 let mut r = if st.buf.is_empty() { 0 } else { POLLIN };
                 if st.writers == 0 {
@@ -390,6 +427,14 @@ impl Kernel {
                 };
                 let new = base.checked_add(a[1] as i64).filter(|&n| n >= 0).ok_or(EINVAL)?;
                 nf.pos = new as u64;
+                // A rewind re-lists a directory, and regenerates a generated
+                // file (/proc, cgroups: size 0) like seq_file does.
+                if new == 0 {
+                    nf.dents = None;
+                    if nf.stat.size == 0 {
+                        nf.data = None;
+                    }
+                }
                 Ok(new)
             }
             fstat => {
@@ -484,7 +529,29 @@ impl Kernel {
                         Ok(0)
                     }
                     F_GETLK | F_SETLK | F_SETLKW => files.get(fd).map(|_| 0), // no locking: one writer can't exist on a read-only image
-                    F_GETPIPE_SZ => files.get(fd).map(|_| PIPE_CAP as i64),
+                    F_GETPIPE_SZ | F_SETPIPE_SZ => {
+                        let f = files.get(fd)?;
+                        drop(files);
+                        let Kind::Pipe(end) = &f.kind else { return Err(EBADF) };
+                        let mut st = end.pipe.st.lock().unwrap();
+                        if a[1] == F_SETPIPE_SZ {
+                            // A power-of-two number of pages, at least one.
+                            let want = a[2] as u32 as usize;
+                            if want > 1 << 31 {
+                                return Err(EINVAL);
+                            }
+                            let size = want.max(phys::PAGE as usize).next_power_of_two();
+                            if size > st.cap && size > self.sysctl.pipe_max_size() && !self.capable(t) {
+                                return Err(EPERM);
+                            }
+                            if size < st.buf.len() {
+                                return Err(EBUSY);
+                            }
+                            st.cap = size;
+                            end.pipe.cv.notify_all();
+                        }
+                        Ok(st.cap as i64)
+                    }
                     _ => Err(EINVAL),
                 }
             }
@@ -525,8 +592,8 @@ impl Kernel {
                     _ => None,
                 };
                 let bytes = match node {
-                    Some(n) => statfs_bytes(self.vfs()?.fs_type(&n), self.vfs()?.writable(&n)),
-                    None => statfs_bytes(if matches!(f.kind, Kind::Mem(_)) { "tmpfs" } else { "pipefs" }, true),
+                    Some(n) => super::mount::statfs_node(self.vfs()?, &n),
+                    None => super::mount::statfs_bytes(if matches!(f.kind, Kind::Mem(_)) { "tmpfs" } else { "pipefs" }, 0),
                 };
                 t.proc.mm().write(a[1], &bytes)?;
                 Ok(0)
@@ -534,13 +601,12 @@ impl Kernel {
             statfs => {
                 let path = t.proc.mm().read_cstr(a[0])?;
                 let node = self.resolve(t, AT_FDCWD, &path, true)?;
-                let vfs = self.vfs()?;
-                t.proc.mm().write(a[1], &statfs_bytes(vfs.fs_type(&node), vfs.writable(&node)))?;
+                t.proc.mm().write(a[1], &super::mount::statfs_node(self.vfs()?, &node))?;
                 Ok(0)
             }
             umask => Ok(0o022),
             pipe2 => {
-                let shared = Arc::new(Pipe { st: Mutex::new(PipeState { buf: VecDeque::new(), readers: 1, writers: 1 }), cv: Condvar::new() });
+                let shared = Arc::new(Pipe { st: Mutex::new(PipeState { buf: VecDeque::new(), readers: 1, writers: 1, cap: PIPE_CAP }), cv: Condvar::new() });
                 let flags = a[1] as u32 & O_NONBLOCK;
                 let cloexec = a[1] & O_CLOEXEC != 0;
                 let r = File::new(Kind::Pipe(PipeEnd { pipe: shared.clone(), write: false }), flags);
@@ -707,6 +773,8 @@ impl Kernel {
         let vfs = self.vfs()?;
         let stat = vfs.stat(&node)?;
         let kind = match stat.mode & S_IFMT {
+            // A path-only descriptor: nothing behind it is opened.
+            _ if flags & O_PATH != 0 => Kind::Node(NodeFile::open(vfs, node, stat, false)),
             S_IFCHR => match stat.rdev {
                 0x103 => Kind::Null,
                 0x105 => Kind::Zero,
@@ -720,6 +788,8 @@ impl Kernel {
             S_IFBLK => return Err(ENXIO),
             S_IFDIR if access != 0 => return Err(EISDIR),
             _ if flags & of.directory != 0 && stat.mode & S_IFMT != S_IFDIR => return Err(ENOTDIR),
+            // Kernel files take each write as a value, so they keep no open contents.
+            S_IFREG if vfs.write_ok(&node) => Kind::Node(NodeFile::open(vfs, node, stat, access != 0)),
             S_IFREG if vfs.writable(&node) => {
                 let file = vfs.mem_file(&node).ok_or(EIO)?;
                 if flags & O_TRUNC != 0 && access != 0 {
@@ -735,7 +805,7 @@ impl Kernel {
                 })
             }
             _ if access != 0 => return Err(EROFS),
-            _ => Kind::Node(Mutex::new(NodeFile { node, stat, pos: 0, data: None, dents: None })),
+            _ => Kind::Node(NodeFile::open(vfs, node, stat, false)),
         };
         t.proc.files.lock().unwrap().alloc(File::new(kind, status), cloexec, 0)
     }
@@ -747,7 +817,7 @@ impl Kernel {
     }
 
     /// The node a path-or-fd syscall (fchmodat, utimensat…) refers to.
-    fn target(&self, t: &Thread, dirfd: i64, path: u64, flags: u64) -> Result<Node, i64> {
+    pub(super) fn target(&self, t: &Thread, dirfd: i64, path: u64, flags: u64) -> Result<Node, i64> {
         let p = if path == 0 { String::new() } else { t.proc.mm().read_cstr(path)? };
         if p.is_empty() && (path == 0 || flags & AT_EMPTY_PATH != 0) {
             let f = t.proc.files.lock().unwrap().get(dirfd)?;
@@ -780,7 +850,7 @@ impl Kernel {
                 if no == mkdirat {
                     vfs.mkdir(&dir, &name, a[2] as u32 & !0o022)?;
                 } else {
-                    vfs.create(&dir, &name, a[2] as u32, a[3])?;
+                    vfs.create(&dir, &name, a[2] as u32 & !0o022, a[3])?; // umask
                 }
                 Ok(0)
             }
@@ -822,6 +892,9 @@ impl Kernel {
             truncate => {
                 let path = t.proc.mm().read_cstr(a[0])?;
                 let node = self.resolve(t, AT_FDCWD, &path, true)?;
+                if vfs.write_ok(&node) {
+                    return Ok(0); // kernel files have no length to change
+                }
                 vfs.mem_file(&node).ok_or(if vfs.writable(&node) { EISDIR } else { EROFS })?.truncate(a[1]);
                 Ok(0)
             }
@@ -858,11 +931,20 @@ impl Kernel {
                 Ok(0)
             }
             utimensat => {
+                const UTIME_NOW: u64 = (1 << 30) - 1;
+                const UTIME_OMIT: u64 = (1 << 30) - 2;
                 let node = self.target(t, int(a[0]), a[1], a[3])?;
+                let now = || std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+                // Only mtime is kept: times[1], unless it says UTIME_OMIT.
                 let mtime = if a[2] == 0 {
-                    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
+                    now()
                 } else {
-                    t.proc.mm().read_u64(a[2] + 16)? // times[1].tv_sec
+                    let mut mm = t.proc.mm();
+                    match mm.read_u64(a[2] + 24)? {
+                        UTIME_OMIT => return Ok(0),
+                        UTIME_NOW => now(),
+                        _ => mm.read_u64(a[2] + 16)?,
+                    }
                 };
                 match vfs.set_attr(&node, None, None, Some(mtime)) {
                     Err(EROFS) => Ok(0), // touching image files: accepted, not recorded
@@ -1064,13 +1146,20 @@ impl Kernel {
                     None if append => m.file.size(),
                     None => *pos,
                 };
-                m.file.write_at(off, &data)?;
+                let n = m.file.write_at(off, &data)?;
                 if at.is_none() {
-                    *pos = off + data.len() as u64;
+                    *pos = off + n as u64;
                 }
-                data.len()
+                n
             }
-            Kind::Node(_) => return Err(EBADF), // opened read-only
+            Kind::Node(nf) => {
+                let mut nf = nf.lock().unwrap();
+                if !nf.writable {
+                    return Err(EBADF); // opened read-only
+                }
+                nf.data = None;
+                self.vfs()?.write(&nf.node, &data)?
+            }
             _ => return Err(EBADF),
         };
         Ok(n as i64)
@@ -1352,27 +1441,6 @@ impl block::Caller for BlockCaller<'_> {
     }
 }
 
-/// `struct statfs` (same 120-byte layout on arm64 and x86_64) for a mount.
-/// libselinux finds selinuxfs by its magic number.
-fn statfs_bytes(fs_type: &str, writable: bool) -> [u8; 120] {
-    let magic: u64 = match fs_type {
-        "erofs" => 0xe0f5_e1e2,
-        "ext4" => 0xef53,
-        "tmpfs" => 0x0102_1994,
-        "proc" => 0x9fa0,
-        "sysfs" => 0x6265_6572,
-        "selinuxfs" => 0xf97c_ff8c,
-        _ => 0x5049_5045, // pipefs
-    };
-    let mut b = [0u8; 120];
-    b[0..8].copy_from_slice(&magic.to_le_bytes()); // f_type
-    b[8..16].copy_from_slice(&4096u64.to_le_bytes()); // f_bsize
-    b[64..72].copy_from_slice(&255u64.to_le_bytes()); // f_namelen
-    b[72..80].copy_from_slice(&4096u64.to_le_bytes()); // f_frsize
-    b[80..88].copy_from_slice(&(if writable { 0u64 } else { 1 }).to_le_bytes()); // f_flags: ST_RDONLY
-    b
-}
-
 fn statx_bytes(st: &Stat) -> [u8; 256] {
     let mut b = [0u8; 256];
     let mut put = |off: usize, v: &[u8]| b[off..off + v.len()].copy_from_slice(v);
@@ -1388,8 +1456,9 @@ fn statx_bytes(st: &Stat) -> [u8; 256] {
     for t in [64, 80, 96, 112] {
         put(t, &st.mtime.to_le_bytes()); // atime, btime, ctime, mtime
     }
-    put(128, &((st.rdev >> 8) as u32 & 0xfff).to_le_bytes());
-    put(132, &(st.rdev as u32 & 0xff).to_le_bytes());
-    put(140, &(st.dev as u32).to_le_bytes());
+    put(128, &block::major(st.rdev).to_le_bytes());
+    put(132, &block::minor(st.rdev).to_le_bytes());
+    put(136, &block::major(st.dev).to_le_bytes()); // stx_dev_major
+    put(140, &block::minor(st.dev).to_le_bytes());
     b
 }

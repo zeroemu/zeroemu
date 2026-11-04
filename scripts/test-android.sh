@@ -66,6 +66,22 @@ check "/proc/self/maps"     "/system/bin/toybox"  /system/bin/toybox cat /proc/s
 check "/proc/self/fd"       "/dev/pts/0"          /system/bin/toybox ls -l /proc/self/fd
 check "mount"               "on /data type tmpfs" /system/bin/toybox mount
 check "nproc via /sys"      "0-"                  /system/bin/toybox cat /sys/devices/system/cpu/possible
+# mount(2), namespaces, kernel tunables
+check "mount tmpfs + umount" "in=x after=."       /system/bin/sh -c 'mount -t tmpfs -o size=1m tmpfs /mnt && touch /mnt/x && echo "in=$(ls /mnt) after=$(umount /mnt; ls /mnt)."'
+check "bind mount a dir"    "bound:hi"            /system/bin/sh -c 'cd /data/local/tmp && mkdir a b && echo hi > a/f && mount --bind /data/local/tmp/a /data/local/tmp/b && echo "bound:$(cat b/f)"'
+check "bind mount a file"   "file:one"            /system/bin/sh -c 'cd /data/local/tmp && echo one > f1 && touch f2 && mount --bind /data/local/tmp/f1 /data/local/tmp/f2 && echo "file:$(cat f2)"'
+check "remount ro: EROFS"   "/mnt/x': Read-only file system" /system/bin/sh -c 'mount -t tmpfs tmpfs /mnt && mount -o remount,ro /mnt && touch /mnt/x'
+check "mountinfo"           " / /data/local/tmp rw,nosuid,relatime - tmpfs tmpfs rw,seclabel,mode=700" /system/bin/sh -c 'mount -t tmpfs -o nosuid,mode=0700 tmpfs /data/local/tmp && cat /proc/self/mountinfo'
+check "mkdir -p over mounts" "made"               /system/bin/sh -c 'mkdir -p /data/local/tmp/x/y && echo made'
+check "sysctl write"        "panic=7 host=droid"  /system/bin/sh -c 'echo 7 > /proc/sys/kernel/panic; echo droid > /proc/sys/kernel/hostname; echo "panic=$(cat /proc/sys/kernel/panic) host=$(uname -n)"'
+check "oom_score_adj"       "adj=-500 legacy=-8"  /system/bin/sh -c 'echo -500 > /proc/self/oom_score_adj; echo "adj=$(cat /proc/$$/oom_score_adj) legacy=$(cat /proc/$$/oom_adj)"'
+check "cgroup v1"           "1:cpu:/fg"           /system/bin/sh -c 'mkdir /dev/cpuctl && mount -t cgroup -o cpu none /dev/cpuctl && mkdir /dev/cpuctl/fg && echo $$ > /dev/cpuctl/fg/cgroup.procs && cat /proc/self/cgroup'
+check "unshare + nsenter"   "mnt:[4026531841]"    /system/bin/sh -c 'unshare -m nsenter -t 1 -m readlink /proc/self/ns/mnt'
+# A loop device over an APEX's ext4 payload (a stored zip entry), mounted like apexd does.
+SHIM=/system/apex/com.android.apex.cts.shim.apex
+OFF=$("$BIN" --system "$IMG" --cat $SHIM | perl -0777 -ne '$h = index($_, "apex_payload.img") - 30; ($n, $e) = unpack("v v", substr($_, $h + 26, 4)); print $h + 30 + $n + $e')
+check "block device mount"  "mounted apex_manifest.pb, detached" /system/bin/sh -c "losetup -r -o $OFF /dev/block/loop0 $SHIM && mkdir /data/local/tmp/m && mount -t ext4 -o ro /dev/block/loop0 /data/local/tmp/m && l=\$(ls /data/local/tmp/m | head -1) && umount -D /data/local/tmp/m && losetup -d /dev/block/loop0 && echo \"mounted \$l, detached\""
+check "apexd --bootstrap"   "/apex/com.android.runtime/bin/linker64" /system/bin/sh -c 'mount -t tmpfs tmpfs /apex && apexd --bootstrap 2>/dev/null && ls /apex/com.android.runtime/bin/linker64'
 # properties and binder
 check "getprop"             "16"                  /system/bin/getprop ro.build.version.release
 check "derived fingerprint" "release-keys"        /system/bin/getprop ro.build.fingerprint

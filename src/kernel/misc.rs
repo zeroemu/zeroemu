@@ -23,8 +23,10 @@ impl Kernel {
                     Arch::X86_64 => "x86_64",
                 };
                 let mut out = [0u8; 65 * 6];
-                for (i, f) in ["Linux", "localhost", "6.6.0-droidrt", "#1 SMP PREEMPT droidrt", machine, "(none)"].iter().enumerate() {
-                    out[i * 65..i * 65 + f.len()].copy_from_slice(f.as_bytes());
+                let (host, domain) = (self.sysctl.get("kernel/hostname"), self.sysctl.get("kernel/domainname"));
+                for (i, f) in ["Linux", &host, "6.6.0-droidrt", "#1 SMP PREEMPT droidrt", machine, &domain].iter().enumerate() {
+                    let n = f.len().min(64);
+                    out[i * 65..i * 65 + n].copy_from_slice(&f.as_bytes()[..n]);
                 }
                 t.proc.mm().write(a[0], &out)?;
                 Ok(0)

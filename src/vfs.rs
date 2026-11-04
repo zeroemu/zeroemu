@@ -76,8 +76,9 @@ pub trait FileSystem: Send + Sync {
         Err(EROFS)
     }
 
-    // Extended attributes, by full name ("security.selinux"). `flags` takes
-    // XATTR_CREATE / XATTR_REPLACE; namespace policy is the caller's.
+    // Extended attributes, by full name ("security.selinux"); `flags` takes
+    // XATTR_CREATE / XATTR_REPLACE. Name syntax and per-namespace rules are
+    // checked by the syscall layer; a filesystem refuses what it can't store.
     fn getxattr(&self, _ino: u64, _name: &str) -> Result<Vec<u8>, i64> {
         Err(ENODATA)
     }
@@ -94,6 +95,7 @@ pub trait FileSystem: Send + Sync {
 
 pub const XATTR_CREATE: u32 = 1;
 pub const XATTR_REPLACE: u32 = 2;
+pub const XATTR_SELINUX: &str = "security.selinux";
 
 /// getxattr over a parsed attribute list (the read-only images).
 fn find_xattr(attrs: io::Result<Vec<(String, Vec<u8>)>>, name: &str) -> Result<Vec<u8>, i64> {

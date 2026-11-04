@@ -7,8 +7,8 @@ use super::{Kernel, Thread, int};
 use crate::arch::Sysno;
 use crate::errno::*;
 use crate::phys::PAGE;
-use crate::tmpfs::{MemFile, XATTR_SELINUX};
-use crate::vfs::{Node, S_IFDIR, S_IFMT, S_IFREG, Vfs, XATTR_CREATE, XATTR_REPLACE};
+use crate::tmpfs::MemFile;
+use crate::vfs::{Node, S_IFDIR, S_IFMT, S_IFREG, Vfs, XATTR_CREATE, XATTR_REPLACE, XATTR_SELINUX};
 use std::sync::Arc;
 
 const AT_FDCWD: i64 = -100;

@@ -5,7 +5,7 @@
 use crate::errno::*;
 use crate::mm::SharedObject;
 use crate::phys::PhysMem;
-use crate::vfs::{Dirent, FileSystem, S_IFDIR, S_IFLNK, S_IFMT, S_IFREG, Stat, XATTR_CREATE, XATTR_REPLACE};
+use crate::vfs::{Dirent, FileSystem, S_IFDIR, S_IFLNK, S_IFMT, S_IFREG, Stat, XATTR_CREATE, XATTR_REPLACE, XATTR_SELINUX};
 use std::collections::{BTreeMap, HashMap};
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -76,8 +76,6 @@ struct Node {
     kind: Kind,
     xattrs: Xattrs,
 }
-
-pub const XATTR_SELINUX: &str = "security.selinux";
 
 /// An inode's extended attributes, by full name. Like Linux's tmpfs, only
 /// the security.*, trusted.* and user.* namespaces are stored.

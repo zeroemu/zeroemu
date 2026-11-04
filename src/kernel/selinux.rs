@@ -304,17 +304,23 @@ impl Selinux {
         loaded
     }
 
-    /// Rewrites the status page around `f`, with an odd sequence number
-    /// while it changes (libselinux retries reads until the number is even
-    /// and unchanged).
+    /// Rewrites the status page around `f`. The sequence is odd while the
+    /// other fields change and the even value is stored last: libselinux
+    /// accepts a read only when the sequence is even and unchanged, and the
+    /// page is mapped MAP_SHARED, so an even sequence in the middle of the
+    /// record would publish a stale enforcing or policyload.
     fn update_status(&self, f: impl FnOnce(&mut (u32, u32))) {
         let mut seq = self.seq.lock().unwrap();
-        seq.0 += 1;
+        seq.0 = seq.0.wrapping_add(1);
         let _ = self.status.write_at(4, &seq.0.to_le_bytes());
+        std::sync::atomic::fence(Ordering::SeqCst);
         f(&mut seq);
-        seq.0 += 1;
-        let fields = [1, seq.0, self.enforcing.load(Ordering::Relaxed) as u32, seq.1, 0]; // version .. deny_unknown
-        let _ = self.status.write_at(0, &fields.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>());
+        let tail = [self.enforcing.load(Ordering::Relaxed) as u32, seq.1, 0]; // enforcing, policyload, deny_unknown
+        let _ = self.status.write_at(8, &tail.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>());
+        let _ = self.status.write_at(0, &1u32.to_le_bytes());
+        std::sync::atomic::fence(Ordering::SeqCst);
+        seq.0 = seq.0.wrapping_add(1);
+        let _ = self.status.write_at(4, &seq.0.to_le_bytes());
     }
 
     pub fn initial_sec(&self) -> ProcSec {
@@ -741,5 +747,79 @@ mod tests {
         assert_eq!(p.transition("init", "system_file", process, None), None);
         assert!(p.valid("u", "r", "untrusted_app"));
         assert_eq!(compute_create(&p, "u:r:init:s0", "u:object_r:apexd_exec:s0", process, None), Ok("u:r:apexd:s0".into()));
+    }
+
+    /// libselinux reads the mapped status page as a seqlock: an even sequence
+    /// that is unchanged across the read must already show that update's
+    /// enforcing and policyload. A guest maps the page and does not take the
+    /// file lock, so this reads the same bytes it would.
+    #[test]
+    fn status_page_seqlock() {
+        use crate::hv::{CpuState, Hypervisor, KernelPage, PageTableRoot, Vcpu};
+        use std::sync::atomic::{fence, AtomicBool, AtomicUsize, Ordering as O};
+        use std::sync::Arc;
+        use std::thread;
+
+        struct NoHv;
+        impl Hypervisor for NoHv {
+            fn map_ram(&self, _: *mut u8, _: u64, _: u64) -> Result<(), String> {
+                Ok(())
+            }
+            fn kernel_pages(&self, _: &mut dyn FnMut() -> (u64, *mut u8)) -> Vec<KernelPage> {
+                Vec::new()
+            }
+            fn create_vcpu(&self, _: PageTableRoot, _: &CpuState) -> Result<Box<dyn Vcpu>, String> {
+                Err("no vcpu".into())
+            }
+            fn max_vcpus(&self) -> usize {
+                0
+            }
+        }
+
+        let phys = crate::phys::PhysMem::new(Arc::new(NoHv));
+        let se = Selinux::new(std::sync::Weak::new(), phys.clone(), false);
+        let gpa = se.status.obj.frame(0).unwrap();
+        let addr = phys.host(gpa) as usize;
+        // After the initial publish, sequence 2 means enforcing 0. Each later
+        // toggle publishes sequence 4, 6, 8, … with enforcing 1, 0, 1, ….
+        fn expect(seq: u32) -> u32 {
+            if seq < 4 { 0 } else { u32::from(((seq - 4) / 2) % 2 == 0) }
+        }
+        let word = |off: usize| unsafe { std::ptr::read_volatile((addr + off) as *const u32) };
+
+        let bad = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let reader = thread::spawn({
+            let (bad, stop) = (bad.clone(), stop.clone());
+            move || {
+                let word = |off: usize| unsafe { std::ptr::read_volatile((addr + off) as *const u32) };
+                while !stop.load(O::Acquire) {
+                    let seq = word(4);
+                    if seq & 1 != 0 {
+                        continue;
+                    }
+                    fence(O::Acquire);
+                    let (enf, pol) = (word(8), word(12));
+                    fence(O::Acquire);
+                    if word(4) != seq {
+                        continue;
+                    }
+                    if enf != expect(seq) || pol != 0 {
+                        bad.fetch_add(1, O::Relaxed);
+                        break;
+                    }
+                }
+            }
+        });
+        for i in 0..200_000 {
+            se.enforcing.store(i % 2 == 0, O::Relaxed);
+            se.update_status(|_| {});
+        }
+        stop.store(true, O::Release);
+        reader.join().unwrap();
+        let seq = word(4);
+        assert_eq!(seq & 1, 0, "sequence left odd");
+        assert_eq!(word(8), expect(seq), "final enforcing does not match sequence {seq}");
+        assert_eq!(bad.load(O::Relaxed), 0, "stable even sequence with a stale enforcing/policyload");
     }
 }

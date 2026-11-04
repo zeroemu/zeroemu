@@ -8,23 +8,27 @@ mod hvf;
 #[cfg(target_os = "macos")]
 mod hvf_sys;
 #[cfg(windows)]
-mod whp_pending;
-// Built for its tests until whp.rs is ported onto it again.
+mod whp;
 #[cfg(any(windows, test))]
-#[cfg_attr(windows, allow(dead_code))]
 mod x86;
 
 use crate::arch::Arch;
 use std::sync::Arc;
 
 #[derive(Debug)]
-#[cfg_attr(windows, allow(dead_code))] // no Windows backend until whp.rs is ported
+// The arm64 Windows build has no vCPU, so nothing constructs these variants there.
+#[cfg_attr(all(windows, target_arch = "aarch64"), allow(dead_code))]
 pub enum Exit {
     /// The guest executed its syscall instruction. Arguments: `syscall_regs`.
     Syscall,
     /// A user access the page tables did not allow (not present, or protected).
     /// Resuming re-executes the faulting instruction.
-    PageFault { pc: u64, addr: u64, write: bool, exec: bool },
+    PageFault {
+        pc: u64,
+        addr: u64,
+        write: bool,
+        exec: bool,
+    },
     /// Anything else the guest cannot continue from (undefined instruction…).
     Fault { pc: u64, addr: u64, detail: String },
     /// `Kick::kick` was called from another thread.
@@ -76,9 +80,17 @@ impl CpuState {
     /// A fresh user thread about to start at `entry` with stack `sp`.
     pub fn new_user(entry: u64, sp: u64) -> CpuState {
         match Arch::HOST {
-            Arch::Aarch64 => CpuState::Aarch64(Box::new(Aarch64State { sp, pc: entry, ..Default::default() })),
+            Arch::Aarch64 => CpuState::Aarch64(Box::new(Aarch64State {
+                sp,
+                pc: entry,
+                ..Default::default()
+            })),
             Arch::X86_64 => {
-                let mut s = X86_64State { rip: entry, rflags: 0x202, ..Default::default() };
+                let mut s = X86_64State {
+                    rip: entry,
+                    rflags: 0x202,
+                    ..Default::default()
+                };
                 s.gpr[4] = sp;
                 CpuState::X86_64(Box::new(s))
             }
@@ -162,7 +174,7 @@ pub fn create() -> Result<Arc<dyn Hypervisor>, String> {
     #[cfg(target_os = "macos")]
     return hvf::Hvf::new().map(|h| Arc::new(h) as Arc<dyn Hypervisor>);
     #[cfg(windows)]
-    return whp_pending::create();
+    return whp::Whp::new().map(|h| Arc::new(h) as Arc<dyn Hypervisor>);
     #[cfg(not(any(target_os = "macos", windows)))]
     Err("no hypervisor backend for this OS yet (KVM is planned)".into())
 }

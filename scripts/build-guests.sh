@@ -15,11 +15,11 @@ for arch in aarch64 x86_64; do
     clang -target "$triple" -O2 -ffreestanding -fno-stack-protector -fno-pic \
         -fno-builtin -nostdlib -c guest/smoke.c -o "$OUT/smoke_$arch.o"
     "$LLD" -flavor gnu -static -o "$OUT/smoke_$arch" "$OUT/smoke_$arch.o"
-done
 
-clang -target aarch64-linux-gnu -O2 -ffreestanding -fno-stack-protector -fno-pic \
-    -fno-builtin -nostdlib -c guest/m2.c -o "$OUT/m2_aarch64.o"
-"$LLD" -flavor gnu -static -o "$OUT/m2_aarch64" "$OUT/m2_aarch64.o"
+    clang -target "$triple" -O2 -ffreestanding -fno-stack-protector -fno-pic \
+        -fno-builtin -nostdlib -c guest/m2.c -o "$OUT/m2_$arch.o"
+    "$LLD" -flavor gnu -static -o "$OUT/m2_$arch" "$OUT/m2_$arch.o"
+done
 
 for t in fault bench; do
     clang -target aarch64-linux-gnu -c "guest/${t}_aarch64.S" -o "$OUT/${t}_aarch64.o"

@@ -1,11 +1,13 @@
-// Freestanding arm64 test of droidrt's M2 kernel (no libc): threads via raw
-// clone + futex, fork/pipe/wait4, mprotect faults delivered to a SIGSEGV
-// handler (which fixes the page and returns through rt_sigreturn), munmap,
-// mremap, and a huge PROT_NONE reservation. Exits with the failure count.
+// Freestanding test of droidrt's M2 kernel (no libc), built for arm64 and
+// x86_64: threads via raw clone + futex, fork/pipe/wait4, mprotect faults
+// delivered to a SIGSEGV handler (which fixes the page and returns through
+// rt_sigreturn), munmap, mremap, and a huge PROT_NONE reservation. Exits
+// with the failure count.
 
 typedef unsigned long u64;
 typedef long i64;
 
+#if defined(__aarch64__)
 #define NR_futex 98
 #define NR_write 64
 #define NR_exit 93
@@ -32,6 +34,32 @@ static i64 sys6(i64 n, i64 a, i64 b, i64 c, i64 d, i64 e, i64 f) {
     __asm__ volatile("svc #0" : "+r"(x0) : "r"(x8), "r"(x1), "r"(x2), "r"(x3), "r"(x4), "r"(x5) : "memory");
     return x0;
 }
+#elif defined(__x86_64__)
+#define NR_read 0
+#define NR_write 1
+#define NR_close 3
+#define NR_mmap 9
+#define NR_mprotect 10
+#define NR_munmap 11
+#define NR_rt_sigaction 13
+#define NR_mremap 25
+#define NR_clone 56
+#define NR_exit 60
+#define NR_wait4 61
+#define NR_futex 202
+#define NR_exit_group 231
+#define NR_pipe2 293
+
+static i64 sys6(i64 n, i64 a, i64 b, i64 c, i64 d, i64 e, i64 f) {
+    register i64 r10 __asm__("r10") = d;
+    register i64 r8 __asm__("r8") = e;
+    register i64 r9 __asm__("r9") = f;
+    __asm__ volatile("syscall" : "+a"(n) : "D"(a), "S"(b), "d"(c), "r"(r10), "r"(r8), "r"(r9) : "rcx", "r11", "memory");
+    return n;
+}
+#else
+#error unsupported guest arch
+#endif
 #define sys(n, ...) sys6_(n, __VA_ARGS__, 0, 0, 0, 0, 0, 0)
 #define sys6_(n, a, b, c, d, e, f, ...) sys6(n, (i64)(a), (i64)(b), (i64)(c), (i64)(d), (i64)(e), (i64)(f))
 
@@ -59,10 +87,11 @@ static void *map(u64 len, int prot) { return (void *)sys(NR_mmap, 0, len, prot, 
 // Starts fn(arg) on a new thread with its own stack; the child exits the
 // thread when fn returns. *ctid is cleared and futex-woken at thread exit.
 static i64 spawn(void *stack_top, void (*fn)(void *), void *arg, int *ctid) {
+#if defined(__aarch64__)
     register i64 x0 __asm__("x0") = CLONE_THREAD_FLAGS;
     register i64 x1 __asm__("x1") = (i64)stack_top;
     register i64 x2 __asm__("x2") = 0;
-    register i64 x3 __asm__("x3") = 0;
+    register i64 x3 __asm__("x3") = 0; // tls
     register i64 x4 __asm__("x4") = (i64)ctid;
     register i64 x8 __asm__("x8") = NR_clone;
     register void *x19 __asm__("x19") = (void *)fn;
@@ -80,6 +109,31 @@ static i64 spawn(void *stack_top, void (*fn)(void *), void *arg, int *ctid) {
         : "r"(x1), "r"(x2), "r"(x3), "r"(x4), "r"(x8), "r"(x19), "r"(x20)
         : "memory", "x30");
     return x0;
+#elif defined(__x86_64__)
+    // x86_64 clone args: flags, stack, parent_tid, child_tid, tls.
+    register i64 rax __asm__("rax") = NR_clone;
+    register i64 rdi __asm__("rdi") = CLONE_THREAD_FLAGS;
+    register i64 rsi __asm__("rsi") = (i64)stack_top;
+    register i64 rdx __asm__("rdx") = 0;
+    register i64 r10 __asm__("r10") = (i64)ctid;
+    register i64 r8 __asm__("r8") = 0;
+    register void *rbx __asm__("rbx") = (void *)fn;
+    register void *r12 __asm__("r12") = arg;
+    __asm__ volatile(
+        "syscall\n"
+        "test %%rax, %%rax\n"
+        "jnz 1f\n"
+        "movq %%r12, %%rdi\n"
+        "call *%%rbx\n"
+        "xorl %%edi, %%edi\n"
+        "movl $60, %%eax\n" // exit: just this thread
+        "syscall\n"
+        "1:\n"
+        : "+r"(rax)
+        : "r"(rdi), "r"(rsi), "r"(rdx), "r"(r10), "r"(r8), "r"(rbx), "r"(r12)
+        : "memory", "rcx", "r11", "cc");
+    return rax;
+#endif
 }
 
 static volatile u64 counter;
@@ -202,4 +256,8 @@ void __attribute__((noreturn)) cstart(void) {
     __builtin_unreachable();
 }
 
+#if defined(__aarch64__)
 __asm__(".global _start\n_start:\n bl cstart\n");
+#elif defined(__x86_64__)
+__asm__(".global _start\n_start:\n call cstart\n");
+#endif

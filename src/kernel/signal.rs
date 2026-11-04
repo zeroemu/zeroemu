@@ -1,6 +1,9 @@
 //! Signals: dispositions, pending sets, delivery through Linux-compatible
-//! signal frames, and rt_sigreturn. Frames are built for arm64 (the layout of
-//! arch/arm64/kernel/signal.c); x86_64 frames are not written yet.
+//! signal frames, and rt_sigreturn. arm64 frames follow
+//! arch/arm64/kernel/signal.c. x86_64 frames follow
+//! arch/x86/kernel/signal_64.c and uapi `struct sigcontext_64`: `pretcode`,
+//! `ucontext` (sigcontext + 8-byte `uc_sigmask`), `siginfo`, and a
+//! 64-byte-aligned FXSAVE/XSAVE image above the frame.
 
 use super::{Kernel, POLL, Process, Ret, Thread};
 use crate::errno::*;
@@ -132,18 +135,51 @@ impl SigInfo {
 
 fn sig_name(sig: u32) -> String {
     const NAMES: [&str; 32] = [
-        "", "SIGHUP", "SIGINT", "SIGQUIT", "SIGILL", "SIGTRAP", "SIGABRT", "SIGBUS", "SIGFPE", "SIGKILL", "SIGUSR1", "SIGSEGV",
-        "SIGUSR2", "SIGPIPE", "SIGALRM", "SIGTERM", "SIGSTKFLT", "SIGCHLD", "SIGCONT", "SIGSTOP", "SIGTSTP", "SIGTTIN",
-        "SIGTTOU", "SIGURG", "SIGXCPU", "SIGXFSZ", "SIGVTALRM", "SIGPROF", "SIGWINCH", "SIGIO", "SIGPWR", "SIGSYS",
+        "",
+        "SIGHUP",
+        "SIGINT",
+        "SIGQUIT",
+        "SIGILL",
+        "SIGTRAP",
+        "SIGABRT",
+        "SIGBUS",
+        "SIGFPE",
+        "SIGKILL",
+        "SIGUSR1",
+        "SIGSEGV",
+        "SIGUSR2",
+        "SIGPIPE",
+        "SIGALRM",
+        "SIGTERM",
+        "SIGSTKFLT",
+        "SIGCHLD",
+        "SIGCONT",
+        "SIGSTOP",
+        "SIGTSTP",
+        "SIGTTIN",
+        "SIGTTOU",
+        "SIGURG",
+        "SIGXCPU",
+        "SIGXFSZ",
+        "SIGVTALRM",
+        "SIGPROF",
+        "SIGWINCH",
+        "SIGIO",
+        "SIGPWR",
+        "SIGSYS",
     ];
-    NAMES.get(sig as usize).map_or_else(|| format!("signal {sig}"), |s| s.to_string())
+    NAMES
+        .get(sig as usize)
+        .map_or_else(|| format!("signal {sig}"), |s| s.to_string())
 }
 
 impl Thread {
     pub(super) fn has_deliverable_signal(&self) -> bool {
         let mask = self.mask.load(Ordering::Relaxed) & !UNBLOCKABLE;
-        let deliverable = |p: &std::collections::HashMap<u32, SigInfo>| p.keys().any(|&s| bit(s) & mask == 0);
-        deliverable(&self.pending.lock().unwrap()) || deliverable(&self.proc.pending.lock().unwrap())
+        let deliverable =
+            |p: &std::collections::HashMap<u32, SigInfo>| p.keys().any(|&s| bit(s) & mask == 0);
+        deliverable(&self.pending.lock().unwrap())
+            || deliverable(&self.proc.pending.lock().unwrap())
     }
 
     fn take_signal(&self) -> Option<(u32, SigInfo)> {
@@ -161,7 +197,9 @@ impl Thread {
 impl Kernel {
     fn discarded(&self, proc: &Process, sig: u32) -> bool {
         let act = proc.sig.lock().unwrap().get(sig);
-        sig != SIGKILL && (act.handler == SIG_IGN || (act.handler == SIG_DFL && default_action(sig) == Default_::Ignore))
+        sig != SIGKILL
+            && (act.handler == SIG_IGN
+                || (act.handler == SIG_DFL && default_action(sig) == Default_::Ignore))
     }
 
     pub(super) fn send_process_signal(&self, proc: &Arc<Process>, sig: u32, info: SigInfo) {
@@ -175,7 +213,10 @@ impl Kernel {
         proc.pending.lock().unwrap().insert(sig, info);
         // Wake a thread that can take it.
         let threads = proc.threads.lock().unwrap();
-        if let Some(th) = threads.iter().find(|t| t.mask.load(Ordering::Relaxed) & bit(sig) == 0) {
+        if let Some(th) = threads
+            .iter()
+            .find(|t| t.mask.load(Ordering::Relaxed) & bit(sig) == 0)
+        {
             th.kick();
         }
     }
@@ -213,7 +254,12 @@ impl Kernel {
 
     /// Runs before re-entering the guest. `restart` is a syscall that returned
     /// ERESTARTSYS: restarted unless a handler without SA_RESTART runs.
-    pub(super) fn deliver_signals(&self, t: &Arc<Thread>, vcpu: &mut dyn Vcpu, mut restart: Option<SyscallRegs>) {
+    pub(super) fn deliver_signals(
+        &self,
+        t: &Arc<Thread>,
+        vcpu: &mut dyn Vcpu,
+        mut restart: Option<SyscallRegs>,
+    ) {
         while let Some((sig, info)) = t.take_signal() {
             let act = t.proc.sig.lock().unwrap().get(sig);
             if act.handler == SIG_IGN {
@@ -224,7 +270,12 @@ impl Kernel {
                     Default_::Ignore => continue,
                     d => {
                         if d == Default_::Core || self.strace {
-                            eprintln!("[droidrt] pid {} ({}) killed by {}", t.proc.pid, t.proc.exe.lock().unwrap(), sig_name(sig));
+                            eprintln!(
+                                "[droidrt] pid {} ({}) killed by {}",
+                                t.proc.pid,
+                                t.proc.exe.lock().unwrap(),
+                                sig_name(sig)
+                            );
                         }
                         let core = if d == Default_::Core { 0x80 } else { 0 };
                         self.exit_group(&t.proc, sig as i32 | core, None);
@@ -241,7 +292,12 @@ impl Kernel {
                     state.set_return(-EINTR as u64);
                 }
             }
-            let old_mask = t.saved_mask.lock().unwrap().take().unwrap_or(t.mask.load(Ordering::Relaxed));
+            let old_mask = t
+                .saved_mask
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap_or(t.mask.load(Ordering::Relaxed));
             match self.setup_frame(t, &mut state, sig, &info, &act, old_mask) {
                 Ok(()) => {
                     vcpu.set_state(&state);
@@ -255,7 +311,11 @@ impl Kernel {
                     }
                 }
                 Err(e) => {
-                    eprintln!("[droidrt] pid {}: cannot deliver {} (errno {e}); killing it", t.proc.pid, sig_name(sig));
+                    eprintln!(
+                        "[droidrt] pid {}: cannot deliver {} (errno {e}); killing it",
+                        t.proc.pid,
+                        sig_name(sig)
+                    );
                     self.exit_group(&t.proc, SIGSEGV as i32 | 0x80, None);
                     t.dying.store(true, Ordering::Release);
                     return;
@@ -295,8 +355,14 @@ impl Kernel {
                 Err(e) => return -e,
             };
             let w = |i: usize| u64::from_le_bytes(b[i * 8..i * 8 + 8].try_into().unwrap());
-            actions.0[sig as usize] = SigAction { handler: w(0), flags: w(1), restorer: w(2), mask: w(3) & !UNBLOCKABLE };
-            let ignore = w(0) == SIG_IGN || (w(0) == SIG_DFL && default_action(sig) == Default_::Ignore);
+            actions.0[sig as usize] = SigAction {
+                handler: w(0),
+                flags: w(1),
+                restorer: w(2),
+                mask: w(3) & !UNBLOCKABLE,
+            };
+            let ignore =
+                w(0) == SIG_IGN || (w(0) == SIG_DFL && default_action(sig) == Default_::Ignore);
             drop(actions);
             drop(mm);
             if ignore {
@@ -317,9 +383,10 @@ impl Kernel {
         let cur = t.mask.load(Ordering::Relaxed);
         let mut mm = t.proc.mm();
         if old != 0
-            && let Err(e) = mm.write_u64(old, cur) {
-                return -e;
-            }
+            && let Err(e) = mm.write_u64(old, cur)
+        {
+            return -e;
+        }
         if set == 0 {
             return 0;
         }
@@ -370,32 +437,63 @@ impl Kernel {
             let sp = u64::from_le_bytes(b[0..8].try_into().unwrap());
             let flags = i32::from_le_bytes(b[8..12].try_into().unwrap());
             let size = u64::from_le_bytes(b[16..24].try_into().unwrap());
-            *alt = if flags & SS_DISABLE != 0 { (0, 0, SS_DISABLE) } else { (sp, size, 0) };
+            *alt = if flags & SS_DISABLE != 0 {
+                (0, 0, SS_DISABLE)
+            } else {
+                (sp, size, 0)
+            };
         }
         0
     }
 
     // ---- arm64 frames ----
 
-    fn setup_frame(&self, t: &Thread, state: &mut CpuState, sig: u32, info: &SigInfo, act: &SigAction, mask: u64) -> Result<(), i64> {
+    fn setup_frame(
+        &self,
+        t: &Thread,
+        state: &mut CpuState,
+        sig: u32,
+        info: &SigInfo,
+        act: &SigAction,
+        mask: u64,
+    ) -> Result<(), i64> {
+        if let CpuState::X86_64(_) = state {
+            return self.setup_frame_x64(t, state, sig, info, act, mask);
+        }
         let CpuState::Aarch64(s) = state else {
-            return Err(EOPNOTSUPP); // x86_64 frames: not written yet
+            unreachable!();
         };
         let (alt_sp, alt_size, alt_flags) = *t.altstack.lock().unwrap();
         let on_alt = alt_flags != SS_DISABLE && s.sp > alt_sp && s.sp <= alt_sp + alt_size;
-        let top = if act.flags & SA_ONSTACK != 0 && alt_flags != SS_DISABLE && !on_alt { alt_sp + alt_size } else { s.sp };
+        let top = if act.flags & SA_ONSTACK != 0 && alt_flags != SS_DISABLE && !on_alt {
+            alt_sp + alt_size
+        } else {
+            s.sp
+        };
 
         let frame = (top - FRAME_SIZE - 16) & !15;
         let mut b = vec![0u8; (FRAME_SIZE + 16) as usize];
-        let mut put = |off: u64, v: &[u8]| b[off as usize..off as usize + v.len()].copy_from_slice(v);
+        let mut put =
+            |off: u64, v: &[u8]| b[off as usize..off as usize + v.len()].copy_from_slice(v);
         put(0, &info.0);
         // ucontext: uc_flags, uc_link, uc_stack, uc_sigmask.
         put(UC + 16, &alt_sp.to_le_bytes());
-        put(UC + 24, &(if on_alt { SS_ONSTACK } else { alt_flags }).to_le_bytes());
+        put(
+            UC + 24,
+            &(if on_alt { SS_ONSTACK } else { alt_flags }).to_le_bytes(),
+        );
         put(UC + 32, &alt_size.to_le_bytes());
         put(UC + 40, &mask.to_le_bytes());
         // sigcontext.
-        put(MC, &(if matches!(sig, 4 | 7 | 8 | 11) { info.addr() } else { 0 }).to_le_bytes());
+        put(
+            MC,
+            &(if matches!(sig, 4 | 7 | 8 | 11) {
+                info.addr()
+            } else {
+                0
+            })
+            .to_le_bytes(),
+        );
         for (i, x) in s.x.iter().enumerate() {
             put(MC + 8 + i as u64 * 8, &x.to_le_bytes());
         }
@@ -419,7 +517,11 @@ impl Kernel {
         s.x[1] = frame;
         s.x[2] = frame + UC;
         s.x[29] = frame + FRAME_SIZE;
-        s.x[30] = if act.restorer != 0 { act.restorer } else { SIGRETURN_TRAMPOLINE };
+        s.x[30] = if act.restorer != 0 {
+            act.restorer
+        } else {
+            SIGRETURN_TRAMPOLINE
+        };
         s.sp = frame;
         s.pc = act.handler;
         Ok(())
@@ -428,27 +530,41 @@ impl Kernel {
     pub(super) fn sys_rt_sigreturn(&self, t: &Thread, vcpu: &mut dyn Vcpu) -> Ret {
         let mut state = vcpu.state();
         let CpuState::Aarch64(s) = &mut state else {
-            return Ret::Value(-ENOSYS);
+            return self.rt_sigreturn_x64(t, vcpu, &mut state);
         };
         let frame = s.sp;
         let b = match t.proc.mm().read_vec(frame, FRAME_SIZE as usize) {
             Ok(b) => b,
             Err(_) => {
-                eprintln!("[droidrt] pid {}: bad signal frame at {frame:#x}", t.proc.pid);
+                eprintln!(
+                    "[droidrt] pid {}: bad signal frame at {frame:#x}",
+                    t.proc.pid
+                );
                 self.exit_group(&t.proc, SIGSEGV as i32 | 0x80, None);
                 return Ret::ExitThread;
             }
         };
-        let r = |off: u64| u64::from_le_bytes(b[off as usize..off as usize + 8].try_into().unwrap());
+        let r =
+            |off: u64| u64::from_le_bytes(b[off as usize..off as usize + 8].try_into().unwrap());
         for i in 0..31 {
             s.x[i] = r(MC + 8 + i as u64 * 8);
         }
         s.sp = r(MC + 256);
         s.pc = r(MC + 264);
         s.pstate = r(MC + 272);
-        if u32::from_le_bytes(b[FPSIMD as usize..FPSIMD as usize + 4].try_into().unwrap()) == FPSIMD_MAGIC {
-            s.fpsr = u32::from_le_bytes(b[FPSIMD as usize + 8..FPSIMD as usize + 12].try_into().unwrap()) as u64;
-            s.fpcr = u32::from_le_bytes(b[FPSIMD as usize + 12..FPSIMD as usize + 16].try_into().unwrap()) as u64;
+        if u32::from_le_bytes(b[FPSIMD as usize..FPSIMD as usize + 4].try_into().unwrap())
+            == FPSIMD_MAGIC
+        {
+            s.fpsr = u32::from_le_bytes(
+                b[FPSIMD as usize + 8..FPSIMD as usize + 12]
+                    .try_into()
+                    .unwrap(),
+            ) as u64;
+            s.fpcr = u32::from_le_bytes(
+                b[FPSIMD as usize + 12..FPSIMD as usize + 16]
+                    .try_into()
+                    .unwrap(),
+            ) as u64;
             for i in 0..32 {
                 let o = (FPSIMD + 16 + i * 16) as usize;
                 s.v[i as usize] = u128::from_le_bytes(b[o..o + 16].try_into().unwrap());
@@ -457,6 +573,125 @@ impl Kernel {
         t.mask.store(r(UC + 40) & !UNBLOCKABLE, Ordering::Relaxed);
         vcpu.set_state(&state);
         Ret::NoReturn
+    }
+
+    /// Linux x86_64 `rt_sigframe` (arch/x86/kernel/signal_64.c). The handler is
+    /// entered with RSP pointing at `pretcode` (so `ret` jumps to the restorer)
+    /// and `(RSP + 8)` 16-byte aligned. `fpu` is copied to a 64-byte-aligned
+    /// FXSAVE/XSAVE image above the frame; `sigcontext.fpstate` points at it.
+    fn setup_frame_x64(
+        &self,
+        t: &Thread,
+        state: &mut CpuState,
+        sig: u32,
+        info: &SigInfo,
+        act: &SigAction,
+        mask: u64,
+    ) -> Result<(), i64> {
+        let CpuState::X86_64(s) = state else {
+            unreachable!()
+        };
+        let (alt_sp, alt_size, alt_flags) = *t.altstack.lock().unwrap();
+        let sp0 = s.gpr[4];
+        let on_alt = alt_flags != SS_DISABLE && sp0 > alt_sp && sp0 <= alt_sp + alt_size;
+        let mut sp = sp0.saturating_sub(128); // SysV red zone
+        if act.flags & SA_ONSTACK != 0 && alt_flags != SS_DISABLE && !on_alt {
+            sp = alt_sp.saturating_add(alt_size);
+        }
+        let fpu = x64_fpstate(&s.fpu);
+        let (frame, fp_addr) = x64_frame_layout(sp, fpu.len() as u64);
+        if frame.saturating_add(X64_FRAME_SIZE) > fp_addr {
+            return Err(EFAULT);
+        }
+        let mut b = vec![0u8; (fp_addr + fpu.len() as u64 - frame) as usize];
+        let put = |b: &mut [u8], off: u64, v: &[u8]| {
+            let o = off as usize;
+            b[o..o + v.len()].copy_from_slice(v);
+        };
+        let restorer = if act.restorer != 0 {
+            act.restorer
+        } else {
+            SIGRETURN_TRAMPOLINE
+        };
+        put(&mut b, 0, &restorer.to_le_bytes());
+        let uc_flags = UC_SIGCONTEXT_SS
+            | UC_STRICT_RESTORE_SS
+            | if fpu.len() > 512 { UC_FP_XSTATE } else { 0 };
+        put(&mut b, X64_UC, &uc_flags.to_le_bytes());
+        put(&mut b, X64_UC + 16, &alt_sp.to_le_bytes());
+        put(
+            &mut b,
+            X64_UC + 24,
+            &(if on_alt { SS_ONSTACK } else { alt_flags }).to_le_bytes(),
+        );
+        put(&mut b, X64_UC + 32, &alt_size.to_le_bytes());
+        store_x64_gprs(&mut b, X64_SC, &s.gpr);
+        put(&mut b, X64_SC + 128, &s.rip.to_le_bytes());
+        put(&mut b, X64_SC + 136, &s.rflags.to_le_bytes());
+        put(&mut b, X64_SC + 144, &X64_USER_CS.to_le_bytes());
+        put(&mut b, X64_SC + 150, &X64_USER_SS.to_le_bytes());
+        put(&mut b, X64_SC + 168, &mask.to_le_bytes());
+        let cr2 = if matches!(sig, 4 | 7 | 8 | 11) {
+            info.addr()
+        } else {
+            0
+        };
+        put(&mut b, X64_SC + 176, &cr2.to_le_bytes());
+        put(&mut b, X64_SC + 184, &fp_addr.to_le_bytes());
+        put(&mut b, X64_SIGMASK, &mask.to_le_bytes());
+        put(&mut b, X64_INFO, &info.0);
+        let fp_off = (fp_addr - frame) as usize;
+        b[fp_off..fp_off + fpu.len()].copy_from_slice(&fpu);
+        t.proc.mm().write(frame, &b)?;
+
+        s.gpr[7] = sig as u64; // rdi
+        s.gpr[6] = frame + X64_INFO; // rsi = siginfo
+        s.gpr[2] = frame + X64_UC; // rdx = ucontext
+        s.gpr[0] = 0; // rax, as Linux does for an unprototyped handler
+        s.gpr[4] = frame;
+        s.rip = act.handler;
+        Ok(())
+    }
+
+    /// `rt_sigreturn`: the restorer's `ret` already popped `pretcode`, so the
+    /// frame starts at `RSP - 8` (arch/x86/kernel/signal_64.c).
+    fn rt_sigreturn_x64(&self, t: &Thread, vcpu: &mut dyn Vcpu, state: &mut CpuState) -> Ret {
+        let CpuState::X86_64(s) = state else {
+            unreachable!()
+        };
+        let frame = s.gpr[4].wrapping_sub(8);
+        let b = match t.proc.mm().read_vec(frame, X64_FRAME_SIZE as usize) {
+            Ok(b) => b,
+            Err(_) => return self.bad_sigframe(t, frame),
+        };
+        let r =
+            |off: u64| u64::from_le_bytes(b[off as usize..off as usize + 8].try_into().unwrap());
+        load_x64_gprs(&b, X64_SC, &mut s.gpr);
+        s.rip = r(X64_SC + 128);
+        // Same mask as Linux `FIX_EFLAGS`: condition codes, DF, TF, RF, AC.
+        // IF and the reserved bit stay as they were (CPL 3 cannot clear IF).
+        s.rflags = (s.rflags & !X64_FIX_EFLAGS) | (r(X64_SC + 136) & X64_FIX_EFLAGS) | 2;
+        let fp = r(X64_SC + 184);
+        if fp != 0 {
+            let mut mm = t.proc.mm();
+            match read_x64_fpstate(&mut mm, fp) {
+                Ok(image) => s.fpu = image,
+                Err(_) => return self.bad_sigframe(t, frame),
+            }
+        }
+        t.mask
+            .store(r(X64_SIGMASK) & !UNBLOCKABLE, Ordering::Relaxed);
+        vcpu.set_state(state);
+        Ret::NoReturn
+    }
+
+    fn bad_sigframe(&self, t: &Thread, frame: u64) -> Ret {
+        eprintln!(
+            "[droidrt] pid {}: bad signal frame at {frame:#x}",
+            t.proc.pid
+        );
+        self.exit_group(&t.proc, SIGSEGV as i32 | 0x80, None);
+        Ret::ExitThread
     }
 }
 
@@ -467,6 +702,105 @@ const FPSIMD: u64 = MC + 288;
 const FPSIMD_MAGIC: u32 = 0x4650_8001;
 const FPSIMD_SIZE: u32 = 528;
 const FRAME_SIZE: u64 = UC + 4560;
+
+/// Offsets in Linux's x86_64 `struct rt_sigframe` (pretcode, ucontext, siginfo).
+/// `ucontext` is 304 bytes: flags, link, 24-byte `stack_t`, 256-byte
+/// `sigcontext`, 8-byte kernel `sigset_t`. User CS/SS are droidrt's GDT slots
+/// (`hv::x86::SEL_UCODE` / `SEL_UDATA`), not Linux's 0x33/0x2b.
+const X64_UC: u64 = 8;
+const X64_SC: u64 = 48;
+const X64_SIGMASK: u64 = 304;
+const X64_INFO: u64 = 312;
+const X64_FRAME_SIZE: u64 = 440;
+const X64_USER_CS: u16 = 0x23;
+const X64_USER_SS: u16 = 0x1b;
+const UC_FP_XSTATE: u64 = 1;
+const UC_SIGCONTEXT_SS: u64 = 2;
+const UC_STRICT_RESTORE_SS: u64 = 4;
+/// `FP_XSTATE_MAGIC1` (`_fpx_sw_bytes` at FXSAVE offset 464).
+const FP_XSTATE_MAGIC1: u32 = 0x4650_5853;
+/// AC|OF|DF|TF|SF|ZF|AF|PF|CF|RF.
+const X64_FIX_EFLAGS: u64 = (1 << 18)
+    | (1 << 11)
+    | (1 << 10)
+    | (1 << 8)
+    | (1 << 7)
+    | (1 << 6)
+    | (1 << 4)
+    | (1 << 2)
+    | 1
+    | (1 << 16);
+// Both frame ABIs are implemented, so nothing returns this anymore. Keeping
+// the reference leaves the errno available without a dead-code warning.
+const _: i64 = EOPNOTSUPP;
+/// sigcontext GPR order: r8–r15, rdi, rsi, rbp, rbx, rdx, rax, rcx, rsp.
+const X64_GPR_ORDER: [usize; 16] = [8, 9, 10, 11, 12, 13, 14, 15, 7, 6, 5, 3, 2, 0, 1, 4];
+
+fn store_x64_gprs(b: &mut [u8], base: u64, gpr: &[u64; 16]) {
+    for (i, &src) in X64_GPR_ORDER.iter().enumerate() {
+        let off = (base + i as u64 * 8) as usize;
+        b[off..off + 8].copy_from_slice(&gpr[src].to_le_bytes());
+    }
+}
+
+fn load_x64_gprs(b: &[u8], base: u64, gpr: &mut [u64; 16]) {
+    for (i, &dst) in X64_GPR_ORDER.iter().enumerate() {
+        let off = (base + i as u64 * 8) as usize;
+        gpr[dst] = u64::from_le_bytes(b[off..off + 8].try_into().unwrap());
+    }
+}
+
+/// `get_sigframe`: FXSAVE/XSAVE at a 64-byte boundary, then
+/// `round_down(fp - frame_size, 16) - 8` so the handler's entry RSP is 8 mod 16.
+fn x64_frame_layout(sp: u64, fp_len: u64) -> (u64, u64) {
+    let fp_addr = sp.saturating_sub(fp_len) & !63;
+    let frame = (fp_addr.saturating_sub(X64_FRAME_SIZE) & !15).saturating_sub(8);
+    (frame, fp_addr)
+}
+
+/// FXSAVE (512 bytes) or the backend XSAVE image, with Linux's software
+/// reserved header stamped when the image carries state past the legacy region.
+fn x64_fpstate(fpu: &[u8]) -> Vec<u8> {
+    let mut image = if fpu.len() >= 512 {
+        fpu.to_vec()
+    } else {
+        let mut image = vec![0u8; 512];
+        image[..fpu.len()].copy_from_slice(fpu);
+        if fpu.is_empty() {
+            image[0..2].copy_from_slice(&0x037fu16.to_le_bytes());
+            image[24..28].copy_from_slice(&0x1f80u32.to_le_bytes());
+            image[28..32].copy_from_slice(&0xffffu32.to_le_bytes());
+        }
+        image
+    };
+    if image.len() > 512 {
+        image[464..468].copy_from_slice(&FP_XSTATE_MAGIC1.to_le_bytes());
+        let xstate = image.len() as u32;
+        image[468..472].copy_from_slice(&xstate.saturating_add(4).to_le_bytes());
+        if image.len() >= 520 {
+            let xfeatures = image[512..520].to_vec();
+            image[472..480].copy_from_slice(&xfeatures);
+        }
+        image[480..484].copy_from_slice(&xstate.to_le_bytes());
+    }
+    image
+}
+
+fn read_x64_fpstate(mm: &mut crate::mm::AddressSpace, fp: u64) -> Result<Vec<u8>, i64> {
+    let head = mm.read_vec(fp, 512)?;
+    if u32::from_le_bytes(head[464..468].try_into().unwrap()) != FP_XSTATE_MAGIC1 {
+        return Ok(head);
+    }
+    let n = u32::from_le_bytes(head[480..484].try_into().unwrap()) as usize;
+    if !(512..=8192).contains(&n) {
+        return Err(EFAULT);
+    }
+    if n == 512 {
+        Ok(head)
+    } else {
+        mm.read_vec(fp, n)
+    }
+}
 
 /// Re-arms an interrupted syscall: back up over the trap instruction and
 /// restore the register the return value overwrote.
@@ -480,5 +814,82 @@ fn rewind(state: &mut CpuState, regs: &SyscallRegs) {
             s.rip -= 2;
             s.gpr[0] = regs.nr;
         }
+    }
+}
+
+#[cfg(test)]
+mod x64_frame_tests {
+    use super::*;
+
+    #[test]
+    fn x64_frame_matches_the_linux_layout() {
+        // pretcode + 304-byte ucontext + 128-byte siginfo.
+        assert_eq!(X64_FRAME_SIZE, 8 + 304 + 128);
+        assert_eq!(X64_SC, 48);
+        assert_eq!(X64_SIGMASK, 304);
+        assert_eq!(X64_INFO, 312);
+        // fpstate pointer is 184 bytes into sigcontext.
+        assert_eq!(X64_SC + 184, 232);
+        let (frame, fp) = x64_frame_layout(0x7f00_0000, 512);
+        assert_eq!(frame & 15, 8, "handler entry RSP is 8 mod 16");
+        assert_eq!(fp & 63, 0);
+        assert!(frame + X64_FRAME_SIZE <= fp);
+        let (frame, fp) = x64_frame_layout(0x7f00_0000, 832);
+        assert_eq!(frame & 15, 8);
+        assert_eq!(fp & 63, 0);
+        assert!(frame + X64_FRAME_SIZE <= fp);
+    }
+
+    #[test]
+    fn x64_sigcontext_gprs_round_trip() {
+        let mut gpr = [0u64; 16];
+        for (i, g) in gpr.iter_mut().enumerate() {
+            *g = 0x1000 + i as u64;
+        }
+        let mut b = vec![0u8; X64_FRAME_SIZE as usize];
+        store_x64_gprs(&mut b, X64_SC, &gpr);
+        let mut out = [0u64; 16];
+        load_x64_gprs(&b, X64_SC, &mut out);
+        assert_eq!(gpr, out);
+        // rdi is the 9th sigcontext slot (after r8–r15).
+        assert_eq!(
+            u64::from_le_bytes(
+                b[X64_SC as usize + 64..X64_SC as usize + 72]
+                    .try_into()
+                    .unwrap()
+            ),
+            gpr[7]
+        );
+        assert_eq!(
+            u64::from_le_bytes(
+                b[X64_SC as usize + 120..X64_SC as usize + 128]
+                    .try_into()
+                    .unwrap()
+            ),
+            gpr[4]
+        );
+    }
+
+    #[test]
+    fn x64_fpstate_stamps_the_xsave_header() {
+        let legacy = x64_fpstate(&[]);
+        assert_eq!(legacy.len(), 512);
+        assert_eq!(u16::from_le_bytes(legacy[0..2].try_into().unwrap()), 0x037f);
+        assert_eq!(u32::from_le_bytes(legacy[464..468].try_into().unwrap()), 0);
+        let mut xsave = vec![0u8; 832];
+        xsave[512..520].copy_from_slice(&0x7u64.to_le_bytes());
+        let stamped = x64_fpstate(&xsave);
+        assert_eq!(
+            u32::from_le_bytes(stamped[464..468].try_into().unwrap()),
+            FP_XSTATE_MAGIC1
+        );
+        assert_eq!(
+            u32::from_le_bytes(stamped[480..484].try_into().unwrap()),
+            832
+        );
+        assert_eq!(
+            u64::from_le_bytes(stamped[472..480].try_into().unwrap()),
+            0x7
+        );
     }
 }

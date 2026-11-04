@@ -1,23 +1,12 @@
 //! x86_64 tables shared by the Windows backend and the host-side unit tests.
 //!
-//! Long mode, identity-mapped with 2 MiB pages. The encodings are the on-wire
-//! descriptor and page-table values; nothing here talks to a hypervisor.
+//! Long mode. Page tables are built by `mm` / `paging`; this module only
+//! builds the descriptors and the kernel-window pages (GDT, IDT, TSS, the
+//! ring-0 stack, and the `hlt` stub) that every address space maps.
 
 #![cfg_attr(not(all(windows, target_arch = "x86_64")), allow(dead_code))]
 
-// The identity-mapped 1 GiB layout this backend was written against. Kept
-// local until the backend is ported to paged memory (crate::mm / paging).
-const MEM_SIZE: u64 = 1 << 30;
-const BLOCK: u64 = 2 << 20;
-const KERNEL_BASE: u64 = MEM_SIZE - 32 * BLOCK;
-
-pub const PTE_PRESENT: u64 = 1 << 0;
-pub const PTE_WRITE: u64 = 1 << 1;
-pub const PTE_USER: u64 = 1 << 2;
-pub const PTE_ACCESSED: u64 = 1 << 5;
-pub const PTE_DIRTY: u64 = 1 << 6;
-pub const PTE_LARGE: u64 = 1 << 7;
-pub const PTE_NX: u64 = 1 << 63;
+use crate::paging::KERNEL_WINDOW;
 
 pub const CR0_PE: u64 = 1 << 0;
 pub const CR0_MP: u64 = 1 << 1;
@@ -81,15 +70,16 @@ pub const SEL_UDATA: u16 = 0x1B;
 pub const SEL_UCODE: u16 = 0x23;
 pub const SEL_TSS: u16 = 0x28;
 
-pub const PML4: u64 = KERNEL_BASE;
-pub const PDPT: u64 = KERNEL_BASE + 0x1000;
-pub const PD: u64 = KERNEL_BASE + 0x2000;
-pub const GDT_BASE: u64 = KERNEL_BASE + 0x3000;
-pub const IDT_BASE: u64 = KERNEL_BASE + 0x4000;
-pub const TSS_BASE: u64 = KERNEL_BASE + 0x5000;
-pub const STUB: u64 = KERNEL_BASE + 0x6000;
-/// Ring-0 stack for the `hlt` stubs. Grows down, still inside the first kernel page.
-pub const RSP0: u64 = KERNEL_BASE + 0x8000;
+const PAGE: u64 = 0x1000;
+/// GDT, IDT, TSS, ring-0 stack, and the `hlt` stub. All inside the 1 GiB
+/// kernel window, one page each. `RSP0` is the top of the stack page, which
+/// is also the first byte of the stub page: pushes land below it.
+pub const GDT_VA: u64 = KERNEL_WINDOW;
+pub const IDT_VA: u64 = KERNEL_WINDOW + PAGE;
+pub const TSS_VA: u64 = KERNEL_WINDOW + 2 * PAGE;
+pub const STACK_VA: u64 = KERNEL_WINDOW + 3 * PAGE;
+pub const STUB_VA: u64 = KERNEL_WINDOW + 4 * PAGE;
+pub const RSP0: u64 = STACK_VA + PAGE;
 
 pub const GDT_ENTRIES: u64 = 7;
 pub const GDT_LIMIT: u16 = (GDT_ENTRIES * 8 - 1) as u16;
@@ -100,9 +90,6 @@ pub const TSS_ACCESS: u8 = 0x8B;
 
 pub const HLT: u8 = 0xF4;
 pub const SYSCALL: [u8; 2] = [0x0F, 0x05];
-
-const TABLE_FLAGS: u64 = PTE_PRESENT | PTE_WRITE | PTE_USER | PTE_ACCESSED;
-const LEAF_FLAGS: u64 = PTE_PRESENT | PTE_WRITE | PTE_ACCESSED | PTE_DIRTY | PTE_LARGE;
 
 /// Vectors intercepted before they reach the IDT.
 ///
@@ -153,35 +140,32 @@ pub fn xcr0_from_xsave(property: u64) -> u64 {
     xcr0
 }
 
-/// `Some(rip)` when `len` bytes at `rip` lie entirely inside a guest of
-/// `mem_size` bytes. Overflow and a range that runs off the end are `None`.
-pub fn checked_range(mem_size: u64, rip: u64, len: u64) -> Option<u64> {
-    let end = rip.checked_add(len)?;
-    if end > mem_size { None } else { Some(rip) }
-}
-
 pub fn is_syscall(bytes: &[u8]) -> bool {
     bytes.len() >= 2 && bytes[0] == SYSCALL[0] && bytes[1] == SYSCALL[1]
 }
 
-/// Next-level table pointer. U/S is set so a user leaf under it stays reachable.
-pub fn table_entry(next: u64) -> u64 {
-    next | TABLE_FLAGS
+/// `#PF` error code: bit 2 is the user/supervisor flag.
+pub fn pf_user(error: u32) -> bool {
+    error & 4 != 0
 }
 
-/// Identity 2 MiB translation for page-directory index `index`.
-pub fn pde_for_block(index: u64) -> u64 {
-    let pa = index * BLOCK;
-    if !(BLOCK..MEM_SIZE).contains(&pa) {
-        return 0;
-    }
-    if pa >= KERNEL_BASE {
-        // The stub shares the first kernel 2 MiB with the tables, so that
-        // page stays executable. Every later kernel page is NX.
-        let nx = if pa == KERNEL_BASE { 0 } else { PTE_NX };
-        return pa | LEAF_FLAGS | nx;
-    }
-    pa | LEAF_FLAGS | PTE_USER
+pub fn pf_write(error: u32) -> bool {
+    error & 2 != 0
+}
+
+pub fn pf_exec(error: u32) -> bool {
+    error & 0x10 != 0
+}
+
+/// `(va, executable)` for each kernel-window page, in window order.
+pub fn kernel_slots() -> [(u64, bool); 5] {
+    [
+        (GDT_VA, false),
+        (IDT_VA, false),
+        (TSS_VA, false),
+        (STACK_VA, false),
+        (STUB_VA, true),
+    ]
 }
 
 /// 8-byte code/data descriptor. `flags` is the high nibble (G D/B L AVL).
@@ -225,6 +209,31 @@ pub fn interrupt_gate(target: u64, selector: u16) -> [u64; 2] {
         | (0x8Eu64 << 40)
         | (((target >> 16) & 0xFFFF) << 48);
     [low, target >> 32]
+}
+
+/// The GDT installed in every vCPU: ring 0/3 flat segments and a busy TSS
+/// whose base is the kernel-window VA, not a guest-physical address.
+pub fn gdt() -> [u64; GDT_ENTRIES as usize] {
+    let mut gdt = [0u64; GDT_ENTRIES as usize];
+    gdt[sel_index(SEL_KCODE)] = code64_descriptor(0);
+    gdt[sel_index(SEL_KDATA)] = data_descriptor(0);
+    gdt[sel_index(SEL_UDATA)] = data_descriptor(3);
+    gdt[sel_index(SEL_UCODE)] = code64_descriptor(3);
+    let tss = system_descriptor(TSS_VA, TSS_LIMIT, TSS_ACCESS);
+    let tss_index = sel_index(SEL_TSS);
+    gdt[tss_index] = tss[0];
+    gdt[tss_index + 1] = tss[1];
+    gdt
+}
+
+pub fn sel_index(selector: u16) -> usize {
+    (selector as usize & !3) / 8
+}
+
+/// Every IDT vector points at the `hlt` stub. Exceptions the bitmap misses
+/// become halt exits instead of triple faults.
+pub fn idt_gate() -> [u64; 2] {
+    interrupt_gate(STUB_VA, SEL_KCODE)
 }
 
 /// Loaded code-segment attributes. Type is 0xB (accessed); the WHP long-mode
@@ -295,11 +304,12 @@ mod tests {
             interrupt_gate(0x1000, SEL_KCODE),
             [0x0000_8E00_0008_1000, 0]
         );
-        let gate = interrupt_gate(STUB, SEL_KCODE);
-        assert_eq!(gate[0] & 0xFFFF, STUB & 0xFFFF);
+        let gate = interrupt_gate(STUB_VA, SEL_KCODE);
+        assert_eq!(gate[0] & 0xFFFF, STUB_VA & 0xFFFF);
         assert_eq!((gate[0] >> 16) & 0xFFFF, SEL_KCODE as u64);
         assert_eq!((gate[0] >> 40) & 0xFF, 0x8E);
-        assert_eq!(gate[1], STUB >> 32);
+        assert_eq!(gate[1], STUB_VA >> 32);
+        assert_eq!(idt_gate(), gate);
     }
 
     #[test]
@@ -346,77 +356,34 @@ mod tests {
     }
 
     #[test]
-    fn syscall_fetch_is_bounds_checked() {
-        assert_eq!(checked_range(MEM_SIZE, 0, 2), Some(0));
-        assert_eq!(checked_range(MEM_SIZE, MEM_SIZE - 2, 2), Some(MEM_SIZE - 2));
-        assert_eq!(checked_range(MEM_SIZE, MEM_SIZE - 1, 2), None);
-        assert_eq!(checked_range(MEM_SIZE, MEM_SIZE, 2), None);
-        assert_eq!(checked_range(MEM_SIZE, u64::MAX, 2), None);
-        assert_eq!(checked_range(MEM_SIZE, u64::MAX - 1, 2), None);
-    }
-
-    #[test]
-    fn page_tables_split_user_kernel_and_the_null_page() {
-        assert_eq!(pde_for_block(0), 0);
-        let user = pde_for_block(1);
-        assert_eq!(user & 0xFF, 0xE7);
-        assert_eq!(user & !0xFFF, BLOCK);
-        assert_eq!(user & PTE_NX, 0);
-
-        let kernel = KERNEL_BASE / BLOCK;
-        let exec = pde_for_block(kernel);
-        assert_eq!(exec & PTE_USER, 0);
-        assert_eq!(exec & PTE_NX, 0);
-        assert_eq!(exec & !0xFFF, KERNEL_BASE);
-        assert_ne!(exec & PTE_PRESENT, 0);
-
-        let nx = pde_for_block(kernel + 1);
-        assert_eq!(nx & PTE_USER, 0);
-        assert_ne!(nx & PTE_NX, 0);
-        assert_eq!(nx & !PTE_NX & !0xFFF, KERNEL_BASE + BLOCK);
-
-        let table = table_entry(PD);
-        assert_eq!(
-            table & (PTE_PRESENT | PTE_WRITE | PTE_USER),
-            PTE_PRESENT | PTE_WRITE | PTE_USER
-        );
-        assert_eq!(table & (PTE_LARGE | PTE_NX), 0);
-        assert_eq!(table & !0xFFF, PD);
-    }
-
-    #[test]
-    fn every_block_is_identity_mapped_once() {
-        let mut present = 0;
-        for i in 0..(MEM_SIZE / BLOCK) {
-            let pte = pde_for_block(i);
-            let pa = i * BLOCK;
-            if pa < BLOCK {
-                assert_eq!(pte, 0);
-                continue;
-            }
-            present += 1;
-            assert_eq!(pte & PTE_NX & !PTE_NX, 0);
-            assert_eq!(pte & !PTE_NX & !0xFFF, pa);
-            if pa >= KERNEL_BASE {
-                assert_eq!(pte & PTE_USER, 0);
-            } else {
-                assert_ne!(pte & PTE_USER, 0);
-                assert_eq!(pte & PTE_NX, 0);
-            }
-        }
-        assert_eq!(present, MEM_SIZE / BLOCK - 1);
+    fn page_fault_error_code_bits() {
+        let err = 1 | 2 | 4 | 0x10;
+        assert!(pf_user(err) && pf_write(err) && pf_exec(err));
+        assert!(!pf_user(1 | 2 | 0x10));
+        assert!(!pf_write(4));
+        assert!(!pf_exec(4 | 2));
     }
 
     #[test]
     fn kernel_window_holds_the_stub_and_the_ring0_stack() {
-        for addr in [PML4, PDPT, PD, GDT_BASE, IDT_BASE, TSS_BASE, STUB, RSP0] {
-            assert!(addr >= KERNEL_BASE && addr < MEM_SIZE, "{addr:#x}");
-            assert_eq!(addr & 0xF, 0);
+        let window = KERNEL_WINDOW..KERNEL_WINDOW + (1 << 30);
+        for (addr, _) in kernel_slots() {
+            assert!(window.contains(&addr), "{addr:#x}");
+            assert_eq!(addr & (PAGE - 1), 0, "{addr:#x}");
         }
-        assert!(STUB - KERNEL_BASE < BLOCK);
-        assert!(RSP0 - KERNEL_BASE < BLOCK);
-        assert!(RSP0 > STUB);
+        assert!(window.contains(&RSP0));
+        assert_eq!(RSP0, STUB_VA);
+        assert!(RSP0 > STACK_VA && RSP0 - STACK_VA == PAGE);
+        // Five distinct pages, stub last and the only executable one.
+        let slots = kernel_slots();
+        for i in 0..slots.len() {
+            for j in 0..i {
+                assert_ne!(slots[i].0, slots[j].0);
+            }
+        }
+        assert!(slots.iter().filter(|s| s.1).eq([(STUB_VA, true)].iter()));
         assert_eq!(GDT_LIMIT, 55);
+        assert_eq!(IDT_LIMIT as u64 + 1, PAGE);
         assert!(is_syscall(&[0x0F, 0x05, 0x90]));
         assert!(!is_syscall(&[0x0F, 0x0B]));
         assert!(!is_syscall(&[0x0F]));
@@ -432,5 +399,15 @@ mod tests {
         let tss = tss_bytes(RSP0);
         assert_eq!(u64::from_le_bytes(tss[4..12].try_into().unwrap()), RSP0);
         assert_eq!(u16::from_le_bytes(tss[0x66..0x68].try_into().unwrap()), 104);
+
+        let gdt = gdt();
+        assert_eq!(gdt[sel_index(SEL_UCODE)], code64_descriptor(3));
+        assert_eq!(gdt[sel_index(SEL_UDATA)], data_descriptor(3));
+        let tss_i = sel_index(SEL_TSS);
+        assert_eq!(gdt[tss_i + 1], TSS_VA >> 32);
+        assert_eq!((gdt[tss_i] >> 16) & 0xFFFF, TSS_VA & 0xFFFF);
+        // signal.rs hardcodes these selectors in the x86_64 sigcontext.
+        assert_eq!(SEL_UCODE, 0x23);
+        assert_eq!(SEL_UDATA, 0x1B);
     }
 }

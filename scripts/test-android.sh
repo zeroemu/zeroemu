@@ -78,6 +78,14 @@ check "log to stderr"       "I droidrt-test: hello log" /system/bin/log -t droid
 check "logcat -d"           "W/t2      (    3): two"  /system/bin/sh -c 'log -t t1 one; log -p w -t t2 two; logcat -d -v brief -s t2 2>&1'
 check "logcat stream"       "I/t3      (    4): live" /system/bin/sh -c 'logcat -v brief -s t3 > /data/local/tmp/o & sleep 0.3; log -t t3 live; sleep 0.3; kill %1; cat /data/local/tmp/o'
 check "logcat -c"           "one=0 two=1"         /system/bin/sh -c 'log -t t one; logcat -c; log -t t two; d=$(logcat -d -s t); echo "one=$(echo "$d" | grep -c one) two=$(echo "$d" | grep -c two)"'
+# SELinux: selinuxfs from the image's CIL policy, process contexts
+check "selinuxfs class"     "index=99 set=1"      /system/bin/sh -c 'cd /sys/fs/selinux/class/property_service; echo "index=$(cat index) set=$(cat perms/set)"'
+check "attr/current"        "u:r:shell:s0"        /system/bin/toybox cat /proc/self/attr/current
+check "id -Z"               "u:r:shell:s0"        /system/bin/toybox id -Z
+check "compute_create"      "u:r:logd:s0"         /system/bin/sh -c 'i=$(cat /sys/fs/selinux/class/process/index); exec 3<>/sys/fs/selinux/create; echo -n "u:r:init:s0 u:object_r:logd_exec:s0 $i" >&3; cat <&3'
+check "runcon"              "now u:r:logd:s0 was u:r:shell:s0" /system/bin/runcon u:r:logd:s0 /system/bin/sh -c 'echo "now $(id -Z) was $(cat /proc/$$/attr/prev)"'
+check "ps -Z"               "u:r:shell:s0  "      /system/bin/toybox ps -Z
+check "setenforce"          "Permissive Enforcing" /system/bin/sh -c 'a=$(getenforce); setenforce 1; echo "$a $(getenforce)"'
 
 # Exit status needs its own path: the program's code must become droidrt's.
 perl -e 'alarm 60; exec @ARGV' "$BIN" --system "$IMG" /system/bin/sh -c 'exit 3' >/dev/null 2>&1

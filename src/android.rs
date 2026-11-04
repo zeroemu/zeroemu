@@ -10,7 +10,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 /// Logical partitions and where they are mounted ("system" is the root).
-const PARTITIONS: [(&str, &str); 5] = [
+pub const PARTITIONS: [(&str, &str); 5] = [
     ("system", "/"),
     ("vendor", "/vendor"),
     ("system_ext", "/system_ext"),
@@ -20,13 +20,23 @@ const PARTITIONS: [(&str, &str); 5] = [
 
 /// `apexes`: pre-mount every APEX at /apex/<name>. Without, /apex is the
 /// image's empty directory, for init to mount a tmpfs over and apexd to fill.
-pub fn open_system_image(path: &Path, apexes: bool) -> io::Result<Vfs> {
+fn super_partitions(path: &Path) -> io::Result<Vec<lp::LogicalPartition>> {
     let disk = FileDev::open(path)?;
     let sup = gpt::partitions(&disk)?
         .into_iter()
         .find(|p| p.name == "super")
         .ok_or_else(|| io::Error::other(format!("{}: no `super` partition", path.display())))?;
-    let logical = lp::partitions(&sup.dev)?;
+    lp::partitions(&sup.dev)
+}
+
+/// The logical partitions in `super`, which first-stage init maps with
+/// device-mapper (vold looks them up by name): name and contents.
+pub fn logical_partitions(path: &Path) -> io::Result<Vec<(String, Dev)>> {
+    Ok(super_partitions(path)?.into_iter().map(|p| (p.name, p.dev)).collect())
+}
+
+pub fn open_system_image(path: &Path, apexes: bool) -> io::Result<Vfs> {
+    let logical = super_partitions(path)?;
 
     let mut vfs = Vfs::default();
     for (name, mountpoint) in PARTITIONS {

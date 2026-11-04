@@ -648,6 +648,29 @@ impl Blocks {
         }
     }
 
+    /// A read-only device-mapper device over `dev`, as first-stage init
+    /// creates for each logical partition in `super`.
+    pub fn add_static(&self, name: &str, dev: Dev) {
+        let sectors = dev.len() / SECTOR;
+        if sectors == 0 {
+            return;
+        }
+        let mut devs = self.devs.lock().unwrap();
+        if devs.dms.iter().any(|d| d.ids.lock().unwrap().0 == name) {
+            return;
+        }
+        let minor = (0..).find(|m| !devs.dms.iter().any(|d| d.minor == *m)).unwrap();
+        let table = vec![Target { start: 0, len: sectors, ty: "linear".into(), params: "super 0".into(), map: Map::Linear { dev, devt: 0, offset: 0 } }];
+        let st = DmState { active: Some(Arc::new(table)), readonly: true, ..Default::default() };
+        let d = Arc::new(DmDevice { minor, ids: Mutex::new((name.into(), String::new())), st: Mutex::new(st) });
+        devs.dms.push(d.clone());
+        drop(devs);
+        let block = mkdir_p(&*self.dev, "block");
+        let _ = self.dev.create(block, &format!("dm-{minor}"), S_IFBLK | 0o600, makedev(DM_MAJOR, minor));
+        self.dm_links(&d, true);
+        self.dm_sysfs(&d);
+    }
+
     fn dm_sysfs(&self, d: &DmDevice) {
         let base = format!("block/dm-{}", d.minor);
         let st = d.st.lock().unwrap();

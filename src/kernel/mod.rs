@@ -123,6 +123,29 @@ impl unix::Service for PropertyService {
 
 /// The writable filesystems a device has after first-stage init, empty
 /// apart from the basics (init itself is not run yet). Returns /dev.
+/// What first-stage init leaves for the second stage beyond the partitions
+/// droidrt already mounted: a writable /metadata, and an fstab describing the
+/// mounts that exist (bound over the vendor's, which names virtio disks
+/// droidrt has no reason to emulate), so `mount_all` has nothing to wait for.
+fn first_stage_mounts(v: &Vfs, phys: &Arc<PhysMem>, dev: &crate::tmpfs::Tmpfs, partitions: &[String]) {
+    if let Ok(node) = v.resolve("/", "/metadata", true) {
+        let sb = v.new_super(crate::tmpfs::Tmpfs::new(phys.clone(), 0o755), "tmpfs", None, 0, "mode=0755");
+        let _ = v.mount_at(&node, sb, 0);
+    }
+    let Ok(hw_fstab) = v.resolve("/", "/vendor/etc/fstab.ranchu", true) else { return };
+    let mut fstab = String::from("# Written by droidrt, which plays first-stage init.\n");
+    for (name, mountpoint) in crate::android::PARTITIONS {
+        if partitions.iter().any(|p| p == name) {
+            fstab += &format!("{name} {mountpoint} erofs ro wait,logical,first_stage_mount\n");
+        }
+    }
+    fstab += "tmpfs /metadata tmpfs nosuid,nodev,noatime,mode=0755 first_stage_mount\n";
+    dev.write_file(".droidrt/fstab.ranchu", 0o644, &fstab);
+    if let Ok(src) = v.resolve("/", "/dev/.droidrt/fstab.ranchu", true) {
+        let _ = v.bind(&src, &hw_fstab, false);
+    }
+}
+
 fn mount_tmpfs(vfs: &mut Vfs, phys: &Arc<PhysMem>) -> Arc<crate::tmpfs::Tmpfs> {
     use crate::tmpfs::Tmpfs;
     use crate::vfs::FileSystem;
@@ -262,7 +285,9 @@ impl Kernel {
     /// `boot`: Android's init runs as pid 1 and provides properties and
     /// daemons itself; otherwise the kernel stands in for what init would
     /// have set up (the property area and service, logd).
-    pub fn new(hv: Arc<dyn Hypervisor>, vfs: Option<Vfs>, strace: bool, boot: bool) -> Result<Arc<Kernel>, String> {
+    /// `partitions`: the image's logical partitions, mapped as device-mapper
+    /// devices as first-stage init would.
+    pub fn new(hv: Arc<dyn Hypervisor>, vfs: Option<Vfs>, partitions: Vec<(String, crate::image::Dev)>, strace: bool, boot: bool) -> Result<Arc<Kernel>, String> {
         let phys = PhysMem::new(hv.clone());
         let max_vcpus = hv.max_vcpus();
         let pages = hv.kernel_pages(&mut || {
@@ -279,6 +304,13 @@ impl Kernel {
         let dev = mount_tmpfs(&mut v, &phys);
         let sys = v.resolve("/", "/sys", true).map(|n| v.fs_arc(&n)).map_err(|e| format!("/sys: errno {e}"))?;
         let blocks = block::Blocks::new(dev.clone(), sys);
+        let names: Vec<String> = partitions.iter().map(|(n, _)| n.clone()).collect();
+        for (name, dev) in partitions {
+            blocks.add_static(&name, dev);
+        }
+        if boot {
+            first_stage_mounts(&v, &phys, &dev, &names);
+        }
         // Properties, as init would set them up: defaults from build.prop,
         // shared read-only with every process at /dev/__properties__.
         let props = properties::Properties::new(phys.clone());

@@ -169,6 +169,17 @@ fn err(e: i64) -> io::Error {
     io_err(e)
 }
 
+/// The androidboot.* parameters the Android Emulator passes, in its
+/// virtio-gpu mode: the image's own ranchu vendor init then sets up gfxstream
+/// over virtio-gpu (minigbm gralloc, emulation EGL, ranchu Vulkan), which
+/// droidrt's DRM device and the emulator's host renderer serve.
+const BOOT_ARGS: &str = "androidboot.hardware=ranchu androidboot.selinux=permissive androidboot.qemu=1 \
+androidboot.hardware.gralloc=minigbm androidboot.hardware.gltransport=virtio-gpu-asg \
+androidboot.qemu.gltransport.name=virtio-gpu-asg androidboot.qemu.gltransport.drawFlushInterval=800 \
+androidboot.hardware.vulkan=ranchu androidboot.opengles.version=196609 androidboot.qemu.vsync=60 \
+androidboot.debug.hwui.renderer=skiagl androidboot.debug.sf.nobootanimation=1 \
+androidboot.hardware.cpu.pagesize=4096 androidboot.qemu.avd_name=droidrt";
+
 impl ProcFs {
     pub fn new(kernel: Weak<Kernel>) -> Arc<ProcFs> {
         Arc::new(ProcFs { kernel })
@@ -241,7 +252,7 @@ impl ProcFs {
             K::Loadavg => text(format!("0.00 0.00 0.00 1/{} {}\n", kernel.procs.lock().unwrap().len(), kernel.next_id.load(Ordering::Relaxed) - 1)),
             K::Version => text("Linux version 6.6.0-droidrt (droidrt) #1 SMP PREEMPT\n".into()),
             K::Filesystems => text(mount::filesystems()),
-            K::Cmdline => text("androidboot.hardware=droidrt androidboot.selinux=permissive\n".into()),
+            K::Cmdline => text(format!("{BOOT_ARGS}\n")),
             K::Mounts | K::PMounts | K::PMountinfo => {
                 if pid != 0 {
                     self.proc(pid)?;

@@ -79,7 +79,11 @@ fn run() -> Result<i32, String> {
         "HOME=/".to_string(),
     ];
 
-    let kernel = Kernel::new(hv::create()?, vfs, strace, boot)?;
+    let partitions = match &system {
+        Some(img) => android::logical_partitions(img).map_err(|e| format!("{}: {e}", img.display()))?,
+        None => Vec::new(),
+    };
+    let kernel = Kernel::new(hv::create()?, vfs, partitions, strace, boot)?;
     let mut mm = kernel.new_address_space().map_err(|e| format!("address space: errno {e}"))?;
     let (state, exe) = if system.is_some() {
         kernel

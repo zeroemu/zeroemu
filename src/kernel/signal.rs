@@ -16,6 +16,7 @@ pub const SIGKILL: u32 = 9;
 pub const SIGSEGV: u32 = 11;
 pub const SIGPIPE: u32 = 13;
 pub const SIGCHLD: u32 = 17;
+pub const SIGCONT: u32 = 18;
 pub const SIGSTOP: u32 = 19;
 pub const SS_ONSTACK: i32 = 1;
 
@@ -71,6 +72,12 @@ impl Actions {
     pub fn get(&self, sig: u32) -> SigAction {
         self.0[sig as usize]
     }
+    /// (SIGCHLD is SIG_IGN, SA_NOCLDWAIT is set): either way children are
+    /// reaped as they exit instead of becoming zombies.
+    pub fn child_ignore(&self) -> (bool, bool) {
+        let a = self.get(SIGCHLD);
+        (a.handler == SIG_IGN, a.flags & SA_NOCLDWAIT != 0)
+    }
     /// execve keeps ignored signals ignored and resets handlers to default.
     pub fn reset_on_exec(&mut self) {
         for a in self.0.iter_mut() {
@@ -109,11 +116,16 @@ impl SigInfo {
         b[8..12].copy_from_slice(&code.to_le_bytes());
         SigInfo(b)
     }
-    /// Sent by kill/tgkill (SI_USER) from `pid`, uid 0.
+    /// Sent by kill/tgkill (SI_USER) from `pid`, uid 0 unless `with_uid`.
     pub fn user(sig: u32, pid: i32) -> SigInfo {
         let mut s = SigInfo::base(sig, 0);
         s.0[16..20].copy_from_slice(&pid.to_le_bytes());
         s
+    }
+    /// Sets si_uid (the sender's, or for SIGCHLD the child's, real uid).
+    pub fn with_uid(mut self, uid: u32) -> SigInfo {
+        self.0[20..24].copy_from_slice(&uid.to_le_bytes());
+        self
     }
     /// SIGCHLD: `code` is CLD_EXITED (1) or CLD_KILLED (2).
     pub fn child(code: i32, pid: i32, status: i32) -> SigInfo {
@@ -173,13 +185,26 @@ fn sig_name(sig: u32) -> String {
         .map_or_else(|| format!("signal {sig}"), |s| s.to_string())
 }
 
+/// Whether `act` makes `sig` a no-op (for init, any default action is).
+fn ignored(act: &SigAction, sig: u32, init: bool) -> bool {
+    sig != SIGKILL && (act.handler == SIG_IGN || (act.handler == SIG_DFL && (init || default_action(sig) == Default_::Ignore)))
+}
+
 impl Thread {
     pub(super) fn has_deliverable_signal(&self) -> bool {
         let mask = self.mask.load(Ordering::Relaxed) & !UNBLOCKABLE;
-        let deliverable =
-            |p: &std::collections::HashMap<u32, SigInfo>| p.keys().any(|&s| bit(s) & mask == 0);
-        deliverable(&self.pending.lock().unwrap())
-            || deliverable(&self.proc.pending.lock().unwrap())
+        let unmasked = |p: &std::collections::HashMap<u32, SigInfo>| {
+            p.keys().copied().filter(|&s| bit(s) & mask == 0).collect::<Vec<_>>()
+        };
+        let mut sigs = unmasked(&self.pending.lock().unwrap());
+        sigs.extend(unmasked(&self.proc.pending.lock().unwrap()));
+        if sigs.is_empty() {
+            return false;
+        }
+        // One queued while blocked may be ignored now: it interrupts nothing
+        // (deliver_signals drops it). The root process is always pid 1.
+        let actions = self.proc.sig.lock().unwrap();
+        sigs.into_iter().any(|s| !ignored(&actions.get(s), s, self.proc.pid == 1))
     }
 
     fn take_signal(&self) -> Option<(u32, SigInfo)> {
@@ -195,15 +220,29 @@ impl Thread {
 }
 
 impl Kernel {
-    fn discarded(&self, proc: &Process, sig: u32) -> bool {
+    /// sig_ignored: whether sending `sig` is a no-op. A blocked signal is
+    /// always queued (its disposition may change, or signalfd reads it).
+    /// The root process is pid 1: like Linux's init (SIGNAL_UNKILLABLE) it
+    /// gets only signals it handles, never SIGKILL; faults still kill it.
+    fn discarded(&self, proc: &Process, sig: u32, blocked: bool) -> bool {
+        let init = self.is_init(proc);
+        if init && (sig == SIGKILL || sig == SIGSTOP) {
+            return true;
+        }
+        if blocked {
+            return false;
+        }
         let act = proc.sig.lock().unwrap().get(sig);
-        sig != SIGKILL
-            && (act.handler == SIG_IGN
-                || (act.handler == SIG_DFL && default_action(sig) == Default_::Ignore))
+        ignored(&act, sig, init)
+    }
+
+    fn is_init(&self, proc: &Process) -> bool {
+        proc.pid == self.root_pid.load(Ordering::Relaxed)
     }
 
     pub(super) fn send_process_signal(&self, proc: &Arc<Process>, sig: u32, info: SigInfo) {
-        if proc.status.lock().unwrap().is_some() || self.discarded(proc, sig) {
+        let blocked = proc.threads.lock().unwrap().iter().any(|t| t.mask.load(Ordering::Relaxed) & bit(sig) != 0);
+        if proc.status.lock().unwrap().is_some() || self.discarded(proc, sig, blocked) {
             return;
         }
         if sig == SIGKILL {
@@ -211,6 +250,9 @@ impl Kernel {
             return;
         }
         proc.pending.lock().unwrap().insert(sig, info);
+        if blocked {
+            super::wait::EVENTS.bump(); // a signalfd reader may be polling for it
+        }
         // Wake a thread that can take it.
         let threads = proc.threads.lock().unwrap();
         if let Some(th) = threads
@@ -222,7 +264,7 @@ impl Kernel {
     }
 
     pub(super) fn send_thread_signal(&self, th: &Arc<Thread>, sig: u32, info: SigInfo) {
-        if self.discarded(&th.proc, sig) {
+        if self.discarded(&th.proc, sig, th.mask.load(Ordering::Relaxed) & bit(sig) != 0) {
             return;
         }
         if sig == SIGKILL {
@@ -268,6 +310,7 @@ impl Kernel {
             if act.handler == SIG_DFL {
                 match default_action(sig) {
                     Default_::Ignore => continue,
+                    _ if self.is_init(&t.proc) => continue, // queued while blocked
                     d => {
                         if d == Default_::Core || self.strace {
                             eprintln!(
@@ -371,9 +414,6 @@ impl Kernel {
                 for th in t.proc.threads.lock().unwrap().iter() {
                     th.pending.lock().unwrap().remove(&sig);
                 }
-            }
-            if sig == SIGCHLD && (w(0) == SIG_IGN || w(1) & SA_NOCLDWAIT != 0) && self.strace {
-                eprintln!("[droidrt] note: SIGCHLD auto-reaping is not implemented");
             }
         }
         0

@@ -295,6 +295,13 @@ impl Sysctl {
         TABLE.iter().position(|(p, _, _)| *p == path).map(|i| self.values.lock().unwrap()[i].clone()).unwrap_or_default()
     }
 
+    /// Stores a value the kernel itself sets (sethostname, setdomainname), unvalidated.
+    pub fn set(&self, path: &str, value: String) {
+        if let Some(i) = TABLE.iter().position(|(p, _, _)| *p == path) {
+            self.values.lock().unwrap()[i] = value;
+        }
+    }
+
     /// /proc/sys/fs/pipe-max-size: what an unprivileged F_SETPIPE_SZ may ask for.
     pub fn pipe_max_size(&self) -> usize {
         self.get("fs/pipe-max-size").parse().unwrap_or(1 << 20)

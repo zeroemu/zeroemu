@@ -105,6 +105,16 @@ check "chcon on tmpfs"      "u:object_r:system_file:s0 f" /system/bin/sh -c 'cd 
 check "setfattr/getfattr"   'user.droidrt="hello"' /system/bin/sh -c 'touch /tmp/f && setfattr -n user.droidrt -v hello /tmp/f && getfattr -d -n user.droidrt /tmp/f'
 check "image is read-only"  "Read-only file system" /system/bin/toybox chcon u:object_r:shell_exec:s0 /system/bin/sh
 check "restorecon relabels" "from u:object_r:system_file:s0 to u:object_r:shell_data_file:s0" /system/bin/sh -c 'touch /data/local/tmp/f && chcon u:object_r:system_file:s0 /data/local/tmp/f && restorecon -v /data/local/tmp/f 2>&1'
+# credentials, limits, scheduling, process tree
+check "CapEff in status"    "000001ffffffffff"    /system/bin/toybox grep CapEff /proc/self/status
+check "ulimit -n"           "soft=256 hard=4096"  /system/bin/sh -c 'ulimit -Sn 256; echo "soft=$(ulimit -Sn) hard=$(ulimit -Hn)"'
+check "renice"              "nice=4"              /system/bin/sh -c 'renice -n 4 -p $$ >/dev/null; echo "nice=$(cut -d" " -f19 /proc/$$/stat)"'
+check "nice"                " 26 6 1 "            /system/bin/toybox nice -n 6 cat /proc/self/stat
+check "chrt"                "policy: SCHED_FIFO"  /system/bin/sh -c 'chrt -f -p $$ 10; chrt -p $$'
+check "ionice"              "Best-effort: prio 3" /system/bin/sh -c 'ionice -c 2 -n 3 -p $$; ionice -p $$'
+check "hostname"            "droidrt-host"        /system/bin/sh -c 'hostname droidrt-host; uname -n'
+check "setsid"              "own session"         /system/bin/toybox setsid /system/bin/sh -c '[ "$(cut -d" " -f6 /proc/$$/stat)" = $$ ] && echo "own session"'
+check "orphan adopted by 1" "ppid=1 ok"           /system/bin/sh -c '(sh -c "sleep 0.3; echo ppid=\$(cut -d\" \" -f4 /proc/\$\$/stat) ok" &); sleep 0.6'
 
 # Exit status needs its own path: the program's code must become droidrt's.
 perl -e 'alarm 60; exec @ARGV' "$BIN" --system "$IMG" /system/bin/sh -c 'exit 3' >/dev/null 2>&1

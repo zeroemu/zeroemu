@@ -66,7 +66,8 @@ struct Cred {
 
 impl Cred {
     fn of(t: &Thread) -> Cred {
-        Cred { pid: t.proc.pid, uid: 0, gid: 0 }
+        let c = t.proc.creds.lock().unwrap();
+        Cred { pid: t.proc.pid, uid: c.euid, gid: c.egid }
     }
     fn bytes(&self) -> [u8; 12] {
         let mut b = [0u8; 12];

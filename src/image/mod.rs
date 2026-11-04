@@ -185,7 +185,7 @@ pub fn sdk_image() -> Option<crate::vfs::Vfs> {
         found.sort();
         found.pop().map(|(_, p)| p)
     })?;
-    match crate::android::open_system_image(&path) {
+    match crate::android::open_system_image(&path, true) {
         Ok(v) => Some(v),
         Err(e) => panic!("{}: {e}", path.display()),
     }

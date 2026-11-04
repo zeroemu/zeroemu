@@ -100,19 +100,11 @@ pub(super) fn ns_kind(ino: u64) -> Option<&'static str> {
     }
 }
 
-/// Per-process values behind /proc/<pid>/{oom_score_adj,comm,timerslack_ns}.
-#[derive(Clone)]
+/// Per-process values behind /proc/<pid>/{oom_score_adj,oom_adj}. comm and
+/// timerslack_ns are per thread (control::ThreadAttrs).
+#[derive(Clone, Default)]
 pub struct Knobs {
     pub oom_score_adj: i32,
-    /// Set by writing /proc/<pid>/comm; exec clears it.
-    pub comm: Option<String>,
-    pub timerslack_ns: u64,
-}
-
-impl Default for Knobs {
-    fn default() -> Knobs {
-        Knobs { oom_score_adj: 0, comm: None, timerslack_ns: 50_000 }
-    }
 }
 
 fn mk(k: K, pid: i32, extra: u64) -> u64 {
@@ -249,7 +241,7 @@ impl ProcFs {
                 ])
             }
             K::PCmdline => Ok(Content::File(self.proc(pid)?.cmdline.lock().unwrap().clone())),
-            K::PComm => text(format!("{}\n", comm(&*self.proc(pid)?))),
+            K::PComm => text(format!("{}\n", comm(&*self.proc(pid)?, extra as i32))),
             K::PExe => Ok(Content::Link(self.proc(pid)?.exe.lock().unwrap().clone())),
             K::PCwd => Ok(Content::Link(self.proc(pid)?.cwd.lock().unwrap().clone())),
             K::PFd => {
@@ -288,18 +280,35 @@ impl ProcFs {
                 let threads = p.threads.lock().unwrap().len().max(1);
                 let (virt, rss) = p.mm.lock().unwrap().as_ref().map_or((0, 0), |m| m.usage());
                 let ppid = p.ppid.load(Ordering::Relaxed);
-                let name = comm(&p);
+                let name = comm(&p, extra as i32);
+                let c = p.creds.lock().unwrap().clone();
+                let (pgid, sid) = {
+                    let a = p.attrs.lock().unwrap();
+                    (a.pgid, a.sid)
+                };
+                let ta = thread_of(&p, extra as i32).map(|t| t.attrs.lock().unwrap().clone()).unwrap_or_default();
                 match k {
-                    K::PStatus => text(format!(
-                        "Name:\t{name}\nUmask:\t0022\nState:\tR (running)\nTgid:\t{pid}\nNgid:\t0\nPid:\t{pid}\nPPid:\t{ppid}\nTracerPid:\t0\nUid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\nFDSize:\t64\nGroups:\t\nVmPeak:\t{} kB\nVmSize:\t{} kB\nVmRSS:\t{} kB\nThreads:\t{threads}\nSigQ:\t0/0\nSigPnd:\t0000000000000000\nShdPnd:\t0000000000000000\nCapInh:\t0000000000000000\nCapPrm:\t000001ffffffffff\nCapEff:\t000001ffffffffff\nCapBnd:\t000001ffffffffff\nSeccomp:\t0\nCpus_allowed_list:\t0-{}\n",
-                        virt / 1024,
-                        virt / 1024,
-                        rss / 1024,
-                        cpus() - 1
-                    )),
+                    K::PStatus => {
+                        let groups: Vec<String> = c.groups.iter().map(|g| g.to_string()).collect();
+                        text(format!(
+                            "Name:\t{name}\nUmask:\t0022\nState:\tR (running)\nTgid:\t{pid}\nNgid:\t0\nPid:\t{pid}\nPPid:\t{ppid}\nTracerPid:\t0\nUid:\t{}\t{}\t{}\t{}\nGid:\t{}\t{}\t{}\t{}\nFDSize:\t64\nGroups:\t{}\nVmPeak:\t{} kB\nVmSize:\t{} kB\nVmRSS:\t{} kB\nThreads:\t{threads}\nSigQ:\t0/0\nSigPnd:\t0000000000000000\nShdPnd:\t0000000000000000\nCapInh:\t{:016x}\nCapPrm:\t{:016x}\nCapEff:\t{:016x}\nCapBnd:\t{:016x}\nCapAmb:\t{:016x}\nNoNewPrivs:\t{}\nSeccomp:\t{}\nSeccomp_filters:\t{}\nCpus_allowed_list:\t0-{}\n",
+                            c.uid, c.euid, c.suid, c.fsuid, c.gid, c.egid, c.sgid, c.fsgid,
+                            groups.join(" "),
+                            virt / 1024,
+                            virt / 1024,
+                            rss / 1024,
+                            c.inh, c.prm, c.eff, c.bnd, c.amb,
+                            ta.no_new_privs as u32, ta.seccomp, ta.filters,
+                            cpus() - 1
+                        ))
+                    }
                     K::PStat => text(format!(
-                        "{pid} ({name}) R {ppid} {pid} {pid} 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 {threads} 0 0 {virt} {} 18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
-                        rss / PAGE
+                        "{pid} ({name}) R {ppid} {pgid} {sid} 0 -1 4194560 0 0 0 0 0 0 0 0 {} {} {threads} 0 0 {virt} {} 18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 17 0 {} {} 0 0 0 0 0 0 0 0 0 0 0\n",
+                        ta.sched.proc_priority(),
+                        ta.sched.nice,
+                        rss / PAGE,
+                        ta.sched.prio,
+                        ta.sched.policy
                     )),
                     _ => text(format!("{} {} 0 0 0 0 0\n", virt / PAGE, rss / PAGE)),
                 }
@@ -309,8 +318,8 @@ impl ProcFs {
                 let tids: Vec<i32> = p.threads.lock().unwrap().iter().map(|t| t.tid).collect();
                 Ok(Content::Dir(tids.into_iter().map(|t| (t.to_string(), mk(K::Task, pid, t as u64))).collect()))
             }
-            // A thread directory: the process's view (good enough for comm/stat/status).
-            K::Task => d(&[("comm", K::PComm), ("stat", K::PStat), ("status", K::PStatus), ("attr", K::PAttr), ("cgroup", K::PCgroup), ("ns", K::PNs)]),
+            // A thread directory: the process's view, with the thread's comm and attributes.
+            K::Task => Ok(Content::Dir([("comm", K::PComm), ("stat", K::PStat), ("status", K::PStatus), ("attr", K::PAttr), ("cgroup", K::PCgroup), ("ns", K::PNs)].iter().map(|(n, k)| (n.to_string(), mk(*k, pid, extra))).collect())),
             K::PAttr => d(&[("current", K::PAttrCurrent)]),
             K::PAttrCurrent => Ok(Content::File(b"u:r:su:s0\0".to_vec())),
             K::POom => text(format!("{}\n", self.proc(pid)?.knobs.lock().unwrap().oom_score_adj)),
@@ -325,7 +334,7 @@ impl ProcFs {
                 let adj = p.knobs.lock().unwrap().oom_score_adj as i64;
                 text(format!("{}\n", ((rss as u128 * 1000 / PHYS_MAX as u128) as i64 + adj).clamp(0, 2000)))
             }
-            K::PTimerslack => text(format!("{}\n", self.proc(pid)?.knobs.lock().unwrap().timerslack_ns)),
+            K::PTimerslack => text(format!("{}\n", thread_of(&*self.proc(pid)?, extra as i32).ok_or_else(|| err(ESRCH))?.attrs.lock().unwrap().timer_slack())),
             K::PNs => {
                 self.proc(pid)?;
                 Ok(Content::Dir(NAMESPACES.iter().enumerate().map(|(i, n)| (n.0.to_string(), mk(K::PNsLink, pid, i as u64))).collect()))
@@ -346,12 +355,18 @@ impl ProcFs {
     }
 }
 
-fn comm(p: &Process) -> String {
-    if let Some(c) = p.knobs.lock().unwrap().comm.clone() {
-        return c;
+/// Thread `tid` of `p`, or its main thread for 0 (any thread if that one is gone).
+fn thread_of(p: &Process, tid: i32) -> Option<Arc<super::Thread>> {
+    let threads = p.threads.lock().unwrap();
+    let want = if tid == 0 { p.pid } else { tid };
+    threads.iter().find(|t| t.tid == want).or(threads.first()).cloned()
+}
+
+fn comm(p: &Process, tid: i32) -> String {
+    match thread_of(p, tid).map(|t| t.attrs.lock().unwrap().comm.clone()) {
+        Some(c) if !c.is_empty() => c,
+        _ => super::control::comm_of(&p.exe.lock().unwrap()),
     }
-    let exe = p.exe.lock().unwrap();
-    exe.rsplit('/').next().unwrap_or("").chars().take(15).collect()
 }
 
 /// An integer written to a /proc file (kstrtoint after strstrip; base 0).
@@ -427,6 +442,20 @@ impl FileSystem for ProcFs {
             return kernel.sysctl.write(extra as u16, data);
         }
         let p = self.proc(pid).map_err(|_| ESRCH)?;
+        match k {
+            // Like Linux: the first 15 bytes, newline and all.
+            K::PComm => {
+                let t = thread_of(&p, extra as i32).ok_or(ESRCH)?;
+                t.attrs.lock().unwrap().comm = String::from_utf8_lossy(&data[..data.len().min(15)]).into_owned();
+                return Ok(data.len());
+            }
+            K::PTimerslack => {
+                let v = parse_int(data).ok().and_then(|v| u64::try_from(v).ok()).ok_or(EINVAL)?;
+                thread_of(&p, extra as i32).ok_or(ESRCH)?.attrs.lock().unwrap().set_timer_slack(v);
+                return Ok(data.len());
+            }
+            _ => {}
+        }
         let mut knobs = p.knobs.lock().unwrap();
         match k {
             K::POom => {
@@ -439,12 +468,6 @@ impl FileSystem for ProcFs {
                     return Err(EINVAL);
                 }
                 knobs.oom_score_adj = if v == 15 { 1000 } else { (v * 1000 / 17) as i32 };
-            }
-            // Like Linux: the first 15 bytes, newline and all.
-            K::PComm => knobs.comm = Some(String::from_utf8_lossy(&data[..data.len().min(15)]).into_owned()),
-            K::PTimerslack => {
-                let v = parse_int(data).ok().and_then(|v| u64::try_from(v).ok()).ok_or(EINVAL)?;
-                knobs.timerslack_ns = if v == 0 { 50_000 } else { v };
             }
             _ => return Err(EINVAL),
         }

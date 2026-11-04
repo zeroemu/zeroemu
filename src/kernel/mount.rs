@@ -291,12 +291,6 @@ pub fn statfs_node(vfs: &Vfs, node: &Node) -> [u8; 120] {
 }
 
 impl Kernel {
-    /// Whether `t` may do privileged things (mount, oversized pipes). Every
-    /// process runs as root with full capabilities today (getuid returns 0).
-    pub(super) fn capable(&self, _t: &Thread) -> bool {
-        true
-    }
-
     pub(super) fn mount_syscall(self: &Arc<Self>, no: Sysno, t: &Arc<Thread>, a: [u64; 6]) -> Result<i64, i64> {
         match no {
             Sysno::mount => self.sys_mount(t, a),
@@ -309,7 +303,7 @@ impl Kernel {
                 if flags & !ok != 0 {
                     return Err(EINVAL);
                 }
-                if flags & CLONE_NEWNS != 0 && !self.capable(t) {
+                if flags & CLONE_NEWNS != 0 && !self.creds(t).capable(super::creds::CAP_SYS_ADMIN) {
                     return Err(EPERM);
                 }
                 Ok(0)
@@ -333,7 +327,7 @@ impl Kernel {
                 if a[1] != 0 && a[1] != want {
                     return Err(EINVAL);
                 }
-                if !self.capable(t) {
+                if !self.creds(t).capable(super::creds::CAP_SYS_ADMIN) {
                     return Err(EPERM);
                 }
                 Ok(0) // already in it: there is one namespace of each kind
@@ -357,7 +351,7 @@ impl Kernel {
             flags &= !MS_MGC_MSK;
         }
         let target = self.resolve(t, AT_FDCWD, &target, true)?;
-        if !self.capable(t) {
+        if !self.creds(t).capable(super::creds::CAP_SYS_ADMIN) {
             return Err(EPERM);
         }
 
@@ -588,7 +582,7 @@ impl Kernel {
         }
         let path = t.proc.mm().read_cstr(path)?;
         let node = self.resolve(t, AT_FDCWD, &path, flags & UMOUNT_NOFOLLOW == 0)?;
-        if !self.capable(t) {
+        if !self.creds(t).capable(super::creds::CAP_SYS_ADMIN) {
             return Err(EPERM);
         }
         if flags & MNT_EXPIRE != 0 {

@@ -99,6 +99,8 @@ check "kmsg keeps digits"   "[kmsg] 12 apples"    /system/bin/sh -c 'echo "<6>12
 check "iptables tables keep rules" "-A oem_in -p tcp -m tcp --dport 22 -j DROP" /system/bin/sh -c 'printf "*filter\n:oem_in -\n-A INPUT -j oem_in\n-A oem_in -p tcp --dport 22 -j DROP\nCOMMIT\n" | iptables-restore && iptables -S'
 check "ip6tables has the mangle hooks" "-P POSTROUTING ACCEPT" /system/bin/ip6tables -t mangle -S
 check "loopback is up with its addresses" "inet 127.0.0.1/8 scope host lo" /system/bin/ip addr
+check "PSI triggers are accepted" "trigger-ok" /system/bin/sh -c 'echo "some 70000 1000000" > /proc/pressure/memory && echo trigger-ok'
+check "umask is per process" "drwxrwxrwx" /system/bin/sh -c 'umask 0 && mkdir /tmp/um && ls -ld /tmp/um'
 check "logcat -d"           "W/t2      (    3): two"  /system/bin/sh -c 'log -t t1 one; log -p w -t t2 two; logcat -d -v brief -s t2 2>&1'
 check "logcat stream"       "I/t3      (    4): live" /system/bin/sh -c 'logcat -v brief -s t3 > /data/local/tmp/o & sleep 0.3; log -t t3 live; sleep 0.3; kill %1; cat /data/local/tmp/o'
 check "logcat -c"           "one=0 two=1"         /system/bin/sh -c 'log -t t one; logcat -c; log -t t two; d=$(logcat -d -s t); echo "one=$(echo "$d" | grep -c one) two=$(echo "$d" | grep -c two)"'

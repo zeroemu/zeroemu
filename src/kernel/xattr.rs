@@ -132,7 +132,10 @@ impl Kernel {
                 if !user_allowed(vfs, &n, &name)? {
                     return Err(ENODATA);
                 }
-                let mut v = vfs.getxattr(&n, &name)?;
+                let mut v = match vfs.getxattr(&n, &name) {
+                    Err(ENODATA) if name == XATTR_SELINUX && vfs.fs_type(&n) == "bpf" => bpf_label(&n.path).into_bytes(),
+                    r => r?,
+                };
                 // SELinux reports a context NUL-terminated, however the filesystem stored it.
                 if name == XATTR_SELINUX && v.last().is_some_and(|&c| c != 0) {
                     v.push(0);
@@ -233,6 +236,29 @@ const LABELS: &[(&str, &str, bool)] = &[
     ("/sys/devices/system/cpu", "sysfs_devices_system_cpu", true),
     ("/sys/fs/selinux", "selinuxfs", true),
 ];
+
+/// genfscon bpf: Android's labels for bpffs (system/sepolicy genfs_contexts),
+/// by the longest directory prefix under the mount (/sys/fs/bpf).
+fn bpf_label(path: &str) -> String {
+    const GENFS: &[(&str, &str)] = &[
+        ("/loader", "fs_bpf_loader"),
+        ("/memevents", "fs_bpf_memevents"),
+        ("/net_private", "fs_bpf_net_private"),
+        ("/net_shared", "fs_bpf_net_shared"),
+        ("/netd_readonly", "fs_bpf_netd_readonly"),
+        ("/netd_shared", "fs_bpf_netd_shared"),
+        ("/tethering", "fs_bpf_tethering"),
+        ("/uprobestats", "fs_bpf_uprobestats"),
+        ("/vendor", "fs_bpf_vendor"),
+    ];
+    let rel = path.strip_prefix("/sys/fs/bpf").unwrap_or(path);
+    let ty = GENFS
+        .iter()
+        .filter(|(p, _)| rel == *p || rel.starts_with(&format!("{p}/")))
+        .max_by_key(|(p, _)| p.len())
+        .map_or("fs_bpf", |(_, t)| t);
+    format!("u:object_r:{ty}:s0")
+}
 
 pub fn label_mounts(vfs: &Vfs) {
     for &(path, ty, subtree) in LABELS {

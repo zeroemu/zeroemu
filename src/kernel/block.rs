@@ -324,7 +324,7 @@ fn remove(fs: &dyn FileSystem, path: &str) {
     }
 }
 
-fn remove_tree(fs: &dyn FileSystem, path: &str) {
+pub(super) fn remove_tree(fs: &dyn FileSystem, path: &str) {
     fn rm(fs: &dyn FileSystem, dir: u64) {
         for e in fs.readdir(dir).unwrap_or_default() {
             if e.name == "." || e.name == ".." {

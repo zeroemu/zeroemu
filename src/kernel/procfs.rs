@@ -65,6 +65,9 @@ enum K {
     NsFile,
     Cgroups,
     PCgroup,
+    /// /proc/pressure and its cpu, memory, io files (extra: which).
+    Pressure,
+    PressureFile,
     // SELinux attributes, in selinux::ATTRS order (extra = tid, or 0 for the main thread)
     AttrCurrent,
     AttrPrev,
@@ -74,12 +77,12 @@ enum K {
     AttrSockcreate,
 }
 
-const ALL: [K; 45] = [
+const ALL: [K; 47] = [
     K::Root, K::Self_, K::ThreadSelf, K::Meminfo, K::Cpuinfo, K::Stat, K::Uptime, K::Loadavg, K::Version, K::Filesystems,
     K::Cmdline, K::Mounts, K::Sysctl, K::Pid, K::PCmdline, K::PComm, K::PExe, K::PCwd, K::PFd, K::PFdLink,
     K::PMaps, K::PStatus, K::PStat, K::PStatm, K::PTask, K::PAttr, K::PMounts, K::POom, K::PEnviron,
     K::Task, K::PMountinfo, K::POomAdj, K::POomScore, K::PTimerslack, K::PNs, K::PNsLink, K::NsFile,
-    K::Cgroups, K::PCgroup,
+    K::Cgroups, K::PCgroup, K::Pressure, K::PressureFile,
     K::AttrCurrent, K::AttrPrev, K::AttrExec, K::AttrFscreate, K::AttrKeycreate, K::AttrSockcreate,
 ];
 const ATTR_K: [K; 6] = [K::AttrCurrent, K::AttrPrev, K::AttrExec, K::AttrFscreate, K::AttrKeycreate, K::AttrSockcreate];
@@ -144,6 +147,20 @@ pub(super) fn ns_mnt(ino: u64) -> Option<u32> {
 #[derive(Clone, Default)]
 pub struct Knobs {
     pub oom_score_adj: i32,
+}
+
+const PSI: [&str; 3] = ["cpu", "memory", "io"];
+
+/// A PSI trigger, "some|full <stall us> <window us>", checked as Linux's
+/// psi_trigger_create does (window 500 ms to 10 s, stall within it).
+fn psi_trigger(data: &[u8]) -> Result<usize, i64> {
+    let text = String::from_utf8_lossy(data);
+    let mut w = text.trim_end_matches('\0').split_whitespace();
+    let (kind, stall, window) = (w.next(), w.next().and_then(|v| v.parse::<u64>().ok()), w.next().and_then(|v| v.parse::<u64>().ok()));
+    match (kind, stall, window) {
+        (Some("some" | "full"), Some(s), Some(win)) if (500_000..=10_000_000).contains(&win) && s > 0 && s <= win => Ok(data.len()),
+        _ => Err(EINVAL),
+    }
 }
 
 fn mk(k: K, pid: i32, extra: u64) -> u64 {
@@ -218,6 +235,7 @@ impl ProcFs {
                 .map(|(n, k)| (n.to_string(), mk(*k, 0, 0)))
                 .collect();
                 v.push(("sys".into(), mk(K::Sysctl, 0, Sysctl::root() as u64)));
+                v.push(("pressure".into(), mk(K::Pressure, 0, 0)));
                 let mut pids: Vec<i32> = kernel.procs.lock().unwrap().values().filter(|p| p.status.lock().unwrap().is_none()).map(|p| p.pid).collect();
                 pids.sort();
                 v.extend(pids.into_iter().map(|p| (p.to_string(), mk(K::Pid, p, 0))));
@@ -251,6 +269,11 @@ impl ProcFs {
             }
             K::Loadavg => text(format!("0.00 0.00 0.00 1/{} {}\n", kernel.procs.lock().unwrap().len(), kernel.next_id.load(Ordering::Relaxed) - 1)),
             K::Version => text("Linux version 6.6.0-droidrt (droidrt) #1 SMP PREEMPT\n".into()),
+            // Pressure stall information: nothing ever stalls here. Triggers
+            // written to these files are accepted and never fire (lmkd and
+            // system_server's LowMemDetector need them to exist).
+            K::Pressure => Ok(Content::Dir(PSI.iter().enumerate().map(|(i, n)| (n.to_string(), mk(K::PressureFile, 0, i as u64))).collect())),
+            K::PressureFile => text("some avg10=0.00 avg60=0.00 avg300=0.00 total=0\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0\n".into()),
             K::Filesystems => text(mount::filesystems()),
             K::Cmdline => text(format!("{BOOT_ARGS}\n")),
             K::Mounts | K::PMounts | K::PMountinfo => {
@@ -344,7 +367,8 @@ impl ProcFs {
                     K::PStatus => {
                         let groups: Vec<String> = c.groups.iter().map(|g| g.to_string()).collect();
                         text(format!(
-                            "Name:\t{name}\nUmask:\t0022\nState:\tR (running)\nTgid:\t{pid}\nNgid:\t0\nPid:\t{pid}\nPPid:\t{ppid}\nTracerPid:\t0\nUid:\t{}\t{}\t{}\t{}\nGid:\t{}\t{}\t{}\t{}\nFDSize:\t64\nGroups:\t{}\nVmPeak:\t{} kB\nVmSize:\t{} kB\nVmRSS:\t{} kB\nThreads:\t{threads}\nSigQ:\t0/0\nSigPnd:\t0000000000000000\nShdPnd:\t0000000000000000\nCapInh:\t{:016x}\nCapPrm:\t{:016x}\nCapEff:\t{:016x}\nCapBnd:\t{:016x}\nCapAmb:\t{:016x}\nNoNewPrivs:\t{}\nSeccomp:\t{}\nSeccomp_filters:\t{}\nCpus_allowed_list:\t0-{}\n",
+                            "Name:\t{name}\nUmask:\t{:04o}\nState:\tR (running)\nTgid:\t{pid}\nNgid:\t0\nPid:\t{pid}\nPPid:\t{ppid}\nTracerPid:\t0\nUid:\t{}\t{}\t{}\t{}\nGid:\t{}\t{}\t{}\t{}\nFDSize:\t64\nGroups:\t{}\nVmPeak:\t{} kB\nVmSize:\t{} kB\nVmRSS:\t{} kB\nThreads:\t{threads}\nSigQ:\t0/0\nSigPnd:\t0000000000000000\nShdPnd:\t0000000000000000\nCapInh:\t{:016x}\nCapPrm:\t{:016x}\nCapEff:\t{:016x}\nCapBnd:\t{:016x}\nCapAmb:\t{:016x}\nNoNewPrivs:\t{}\nSeccomp:\t{}\nSeccomp_filters:\t{}\nCpus_allowed_list:\t0-{}\n",
+                            p.umask.load(Ordering::Relaxed),
                             c.uid, c.euid, c.suid, c.fsuid, c.gid, c.egid, c.sgid, c.fsgid,
                             groups.join(" "),
                             virt / 1024,
@@ -486,7 +510,7 @@ impl FileSystem for ProcFs {
     fn write_ok(&self, ino: u64) -> bool {
         match decode(ino) {
             Some((K::Sysctl, _, i)) => Sysctl::writable(i as u16),
-            Some((K::POom | K::POomAdj | K::PComm | K::PTimerslack, _, _)) => true,
+            Some((K::POom | K::POomAdj | K::PComm | K::PTimerslack | K::PressureFile, _, _)) => true,
             _ => false,
         }
     }
@@ -496,6 +520,9 @@ impl FileSystem for ProcFs {
         let kernel = self.kernel().map_err(|_| ENOENT)?;
         if k == K::Sysctl {
             return kernel.sysctl.write(extra as u16, data);
+        }
+        if k == K::PressureFile {
+            return psi_trigger(data);
         }
         let p = self.proc(pid).map_err(|_| ESRCH)?;
         match k {

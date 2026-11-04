@@ -35,7 +35,7 @@ arm64 Android on Apple Silicon and Windows on ARM, x86_64 Android on x86_64 PCs.
 | M2: demand paging, threads, futex, `fork`/`execve`/`wait4`, pipes, signals | done on macOS; x86_64 written (signal frames, TLB shootdown), untested |
 | M3: binder, `servicemanager`, property service, `logd` | binder, properties, `servicemanager`, logd done (macOS); `init` next |
 | M4: SurfaceFlinger with a composer HAL that renders to Metal / D3D12 | in progress: Android's graphics stack runs unmodified on a virtio-gpu device backed by the Android Emulator's gfxstream renderer; Android's boot animation plays in the window (macOS) |
-| M5: zygote, ART, `system_server`, launcher, apps | |
+| M5: zygote, ART, `system_server`, launcher, apps | in progress: Zygote preloads and forks `system_server`, which starts its services (macOS) |
 
 M1 reads the image directly; nothing is extracted to disk. The chain is
 `system.img` (GPT) → `super` (dynamic partitions) → EROFS with LZ4 → `.apex`
@@ -120,7 +120,10 @@ logs every binder transaction; `DROIDRT_WATCHDOG=<secs>` forces a stuck guest
 out of the VM and dumps its registers. Fatal faults print a backtrace as
 library+offset, and writes to `/dev/kmsg` (where `servicemanager` and `init`
 log) appear on stderr. `DROIDRT_DUMP=<secs>` prints, every that many seconds,
-each guest thread with the syscall it is in, for how long, and its backtrace.
+each guest thread with the syscall it is in, for how long, and its backtrace;
+`kill -USR1` on droidrt prints one such dump at any time (without backtraces
+unless `DROIDRT_DUMP` is set). `DROIDRT_FD_TRACE=<name>` logs every descriptor
+added to or removed from the tables of programs whose path contains it.
 `DROIDRT_DRM_TRACE=1` logs GPU ioctls, transfers and fences;
 `DROIDRT_GPU_LOG=<E|W|I|D>` shows the renderer's own log; `DROIDRT_SAVE_FRAMES=<dir>`
 and `DROIDRT_DUMP_RES=<dir>` save displayed frames and GPU buffers as raw pixels.

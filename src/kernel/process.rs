@@ -115,7 +115,7 @@ impl Kernel {
             pid,
             ppid: AtomicI32::new(parent.pid),
             mm: Mutex::new(Some(mm)),
-            files: Mutex::new(parent.files.lock().unwrap().clone()),
+            files: Mutex::new(parent.files.lock().unwrap().fork_copy(pid)),
             cwd: Mutex::new(parent.cwd.lock().unwrap().clone()),
             exe: Mutex::new(parent.exe.lock().unwrap().clone()),
             cmdline: Mutex::new(parent.cmdline.lock().unwrap().clone()),
@@ -131,6 +131,7 @@ impl Kernel {
             attrs: Mutex::new(parent.attrs.lock().unwrap().fork(t.tid)),
             sec: parent.sec.clone(),
             mnt_ns: AtomicU32::new(parent.mnt_ns.load(Ordering::Relaxed)),
+            umask: AtomicU32::new(parent.umask.load(Ordering::Relaxed)),
         });
         let th = Thread::new(pid, child.clone(), t.mask.load(Ordering::Relaxed));
         th.sec.inherit(&t.sec);
@@ -174,7 +175,11 @@ impl Kernel {
         // Point of no return: other threads go first, so nothing still runs on
         // the old page tables when they are freed.
         self.exit_group_others(t);
-        t.proc.files.lock().unwrap().close_on_exec();
+        {
+            let mut files = t.proc.files.lock().unwrap();
+            files.set_traced(super::files::fd_trace_wanted(&exe).then_some(t.proc.pid));
+            files.close_on_exec();
+        }
         t.proc.sig.lock().unwrap().reset_on_exec();
         *t.altstack.lock().unwrap() = (0, 0, super::signal::SS_DISABLE);
         *t.proc.exe.lock().unwrap() = exe;

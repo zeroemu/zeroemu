@@ -555,6 +555,12 @@ impl Kernel {
                 (CgroupFs::new(Arc::downgrade(self), true, Vec::new(), false) as Arc<dyn FileSystem>, o.join(","))
             }
             "sysfs" | "selinuxfs" => return Err(ENODEV), // single instances, always mounted at boot
+            // bpffs: a sticky, world-writable root unless mode= says otherwise (bpf_fill_super).
+            "bpf" => {
+                let mode = match opts.iter().find(|(k, _)| *k == "mode") { Some((_, v)) => octal(*v)?, None => 0o1777 };
+                let o: Vec<String> = opts.iter().map(|(k, v)| v.map_or(k.to_string(), |v| format!("{k}={v}"))).collect();
+                (tmpfs(mode) as Arc<dyn FileSystem>, o.join(","))
+            }
             // Stand-ins: empty directories of the right type (a fuse daemon is never asked anything).
             _ => {
                 let o: Vec<String> = opts.iter().filter(|(k, _)| !matches!(*k, "fd" | "rootmode" | "user_id" | "group_id")).map(|(k, v)| v.map_or(k.to_string(), |v| format!("{k}={v}"))).collect();

@@ -71,7 +71,7 @@ pub fn handles(no: Sysno) -> bool {
             | fstatfs | umask | pipe2 | ppoll | eventfd2 | epoll_create1 | epoll_ctl | epoll_pwait | epoll_pwait2 | timerfd_create
             | timerfd_settime | timerfd_gettime | signalfd4 | mknodat | mkdirat | unlinkat | symlinkat | linkat | renameat
             | renameat2 | truncate | ftruncate | fallocate | fchmod | fchmodat | fchown | fchownat | sync | fsync | fdatasync
-            | utimensat | memfd_create | flock | inotify_init1 | inotify_add_watch | inotify_rm_watch
+            | utimensat | memfd_create | flock | pselect6 | inotify_init1 | inotify_add_watch | inotify_rm_watch
     )
 }
 
@@ -99,6 +99,10 @@ pub enum Kind {
     /// An /dev/ashmem region (ashmem.rs).
     Ashmem(super::ashmem::Ashmem),
     Inotify(Arc<super::inotify::Inotify>),
+    /// AF_VSOCK to the emulator's host services (vsock.rs).
+    Vsock(Arc<super::vsock::Vsock>),
+    /// /dev/tun (net.rs).
+    Tun(super::net::Tun),
     Binder(BinderFile),
     /// A loop or device-mapper device (block.rs).
     Block(BlockOpen),
@@ -241,16 +245,48 @@ pub struct FdTable {
     fds: Vec<Option<Entry>>,
     /// The process's RLIMIT_NOFILE soft limit: fds must stay below it.
     limit: usize,
+    /// DROIDRT_FD_TRACE: the pid whose table this is, when traced.
+    traced: Option<i32>,
+}
+
+thread_local! {
+    /// (pid, tid, syscall number) of the syscall this host thread runs, for fd traces.
+    pub(super) static CURRENT: std::cell::Cell<(i32, i32, u64)> = const { std::cell::Cell::new((0, 0, 0)) };
+}
+
+/// DROIDRT_FD_TRACE=<name>: log every descriptor added to or removed from
+/// the tables of programs whose path contains it (with who did it).
+pub(super) fn fd_trace_wanted(exe: &str) -> bool {
+    static NAME: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    NAME.get_or_init(|| std::env::var("DROIDRT_FD_TRACE").ok().filter(|v| !v.is_empty())).as_deref().is_some_and(|n| exe.contains(n))
+}
+
+fn fd_log(owner: Option<i32>, what: &str, fd: usize, f: Option<&Arc<File>>) {
+    if let Some(pid) = owner {
+        let (by, tid, nr) = CURRENT.with(|c| c.get());
+        eprintln!("[fd] {pid}: {what}{fd} {} (by {by}/{tid} syscall {nr})", f.map(|f| file_name(f)).unwrap_or_default());
+    }
 }
 
 impl FdTable {
     pub fn stdio() -> FdTable {
         let e = |k| Some(Entry { file: File::new(k, 0), cloexec: false });
-        FdTable { fds: vec![e(Kind::Stdin), e(Kind::Stdout), e(Kind::Stderr)], limit: NOFILE_DEFAULT }
+        FdTable { fds: vec![e(Kind::Stdin), e(Kind::Stdout), e(Kind::Stderr)], limit: NOFILE_DEFAULT, traced: None }
     }
 
     pub fn empty() -> FdTable {
-        FdTable { fds: Vec::new(), limit: NOFILE_DEFAULT }
+        FdTable { fds: Vec::new(), limit: NOFILE_DEFAULT, traced: None }
+    }
+
+    pub(super) fn set_traced(&mut self, pid: Option<i32>) {
+        self.traced = pid;
+    }
+
+    /// A forked child's copy: traced as the child, if the parent was.
+    pub(super) fn fork_copy(&self, child: i32) -> FdTable {
+        let mut t = self.clone();
+        t.traced = self.traced.map(|_| child);
+        t
     }
 
     pub(super) fn set_limit(&mut self, limit: usize) {
@@ -273,12 +309,14 @@ impl FdTable {
         if self.fds.len() <= slot {
             self.fds.resize_with(slot + 1, || None);
         }
+        fd_log(self.traced, "+", slot, Some(&file));
         self.fds[slot] = Some(Entry { file, cloexec });
         Ok(slot as i64)
     }
 
     pub(super) fn close(&mut self, fd: i64) {
         if let Some(slot) = usize::try_from(fd).ok().and_then(|i| self.fds.get_mut(i)) {
+            fd_log(self.traced, "-", fd as usize, slot.as_ref().map(|e| &e.file));
             *slot = None;
         }
     }
@@ -287,6 +325,7 @@ impl FdTable {
         if self.fds.len() <= fd {
             self.fds.resize_with(fd + 1, || None);
         }
+        fd_log(self.traced, "=", fd, Some(&file));
         self.fds[fd] = Some(Entry { file, cloexec });
     }
 
@@ -296,8 +335,9 @@ impl FdTable {
     }
 
     pub fn close_on_exec(&mut self) {
-        for slot in &mut self.fds {
+        for (i, slot) in self.fds.iter_mut().enumerate() {
             if slot.as_ref().is_some_and(|e| e.cloexec) {
+                fd_log(self.traced, "-exec ", i, slot.as_ref().map(|e| &e.file));
                 *slot = None;
             }
         }
@@ -413,6 +453,8 @@ pub(super) fn poll_ready(f: &File, t: &Thread, depth: u32) -> u16 {
         Kind::Netlink(n) => n.poll(),
         Kind::Inet(_) => POLLOUT,
         Kind::Inotify(i) => if i.pending() > 0 { POLLIN } else { 0 },
+        Kind::Vsock(v) => POLLOUT | if v.readable() { POLLIN } else { 0 },
+        Kind::Tun(_) => POLLOUT,
         Kind::Binder(b) => {
             (if binder::readable(b, t.tid) { POLLIN } else { 0 }) | POLLOUT
         }
@@ -516,8 +558,18 @@ impl Kernel {
             close => {
                 let entry = {
                     let mut files = t.proc.files.lock().unwrap();
-                    let slot = usize::try_from(int(a[0])).ok().and_then(|i| files.fds.get_mut(i)).ok_or(EBADF)?;
-                    slot.take().ok_or(EBADF)?
+                    let traced = files.traced;
+                    let slot = usize::try_from(int(a[0])).ok().and_then(|i| files.fds.get_mut(i));
+                    match slot.and_then(|s| s.take()) {
+                        Some(e) => {
+                            fd_log(traced, "-", int(a[0]) as usize, Some(&e.file));
+                            e
+                        }
+                        None => {
+                            fd_log(traced, "EBADF close ", int(a[0]) as usize, None);
+                            return Err(EBADF);
+                        }
+                    }
                 };
                 // POSIX record locks go with any close of the file.
                 super::locks::LOCKS.release_on(entry.file.lock_key(), t.proc.pid);
@@ -751,6 +803,7 @@ impl Kernel {
                     Kind::Sync(s) => return super::drm::sync_ioctl(s, cmd, a[2], &mut DrmIo { t }),
                     Kind::Binder(b) => return self.binder_ioctl(t, &f, b, cmd, a[2]),
                     Kind::Ashmem(m) => return m.ioctl(cmd, a[2], &mut AshmemIo { t }),
+                    Kind::Tun(n) => return n.ioctl(cmd, a[2], &mut AshmemIo { t }),
                     Kind::Inotify(i) if cmd == 0x541b => {
                         t.proc.mm().write_u32(a[2], i.pending() as u32)?; // FIONREAD
                         return Ok(0);
@@ -807,7 +860,7 @@ impl Kernel {
                 t.proc.mm().write(a[1], &super::mount::statfs_node(self.vfs()?, &node))?;
                 Ok(0)
             }
-            umask => Ok(0o022),
+            umask => Ok(t.proc.umask.swap(a[0] as u32 & 0o777, Ordering::Relaxed) as i64),
             pipe2 => {
                 let shared = Arc::new(Pipe { st: Mutex::new(PipeState { buf: VecDeque::new(), readers: 1, writers: 1, cap: PIPE_CAP }), cv: Condvar::new() });
                 let flags = a[1] as u32 & O_NONBLOCK;
@@ -837,6 +890,7 @@ impl Kernel {
                 Ok(0)
             }
             ppoll => self.ppoll(t, a[0], a[1], a[2], a[3]),
+            pselect6 => self.pselect6(t, a),
             mknodat | mkdirat | unlinkat | symlinkat | linkat | renameat | renameat2 | truncate | ftruncate | fallocate | fchmod
             | fchmodat | fchown | fchownat | sync | fsync | fdatasync | utimensat | memfd_create => self.change_syscall(no, t, a),
             inotify_init1 => {
@@ -996,7 +1050,7 @@ impl Kernel {
             Ok(n) => n,
             Err(ENOENT) if flags & O_CREAT != 0 => {
                 let (dir, name) = self.parent(t, dirfd, &path)?;
-                let node = self.vfs()?.create(&dir, &name, S_IFREG | (mode as u32 & 0o7777 & !0o022), 0)?;
+                let node = self.vfs()?.create(&dir, &name, S_IFREG | (mode as u32 & 0o7777 & !t.proc.umask.load(Ordering::Relaxed)), 0)?;
                 inotify::notify(&inotify::join(&dir.path, &name), inotify::IN_CREATE, 0);
                 node
             }
@@ -1018,6 +1072,7 @@ impl Kernel {
                 r if r == block::makedev(block::MISC_MAJOR, block::DM_CONTROL_MINOR) => Kind::DmControl,
                 r if super::drm::is_node(r) => Kind::Drm(self.drm.as_ref().ok_or(ENXIO)?.open(r)),
                 r if r == super::ashmem::rdev() => Kind::Ashmem(super::ashmem::Ashmem::new()),
+                r if r == super::net::tun_rdev() => Kind::Tun(super::net::Tun::new()),
                 rdev => binder::file_for(t, rdev).ok_or(ENXIO)?,
             },
             S_IFBLK if self.blocks.device(stat.rdev).is_some() => Kind::Block(BlockOpen { devt: stat.rdev, pos: Mutex::new(0) }),
@@ -1091,10 +1146,11 @@ impl Kernel {
             mknodat | mkdirat => {
                 let path = t.proc.mm().read_cstr(a[1])?;
                 let (dir, name) = self.parent(t, int(a[0]), &path)?;
+                let mask = t.proc.umask.load(Ordering::Relaxed);
                 if no == mkdirat {
-                    vfs.mkdir(&dir, &name, a[2] as u32 & !0o022)?;
+                    vfs.mkdir(&dir, &name, a[2] as u32 & !mask)?;
                 } else {
-                    vfs.create(&dir, &name, a[2] as u32 & !0o022, a[3])?; // umask
+                    vfs.create(&dir, &name, a[2] as u32 & !mask, a[3])?;
                 }
                 let isdir = if no == mkdirat { inotify::IN_ISDIR } else { 0 };
                 inotify::notify(&inotify::join(&dir.path, &name), inotify::IN_CREATE | isdir, 0);
@@ -1348,6 +1404,16 @@ impl Kernel {
             Kind::Netlink(nl) => netlink::read(nl, t, count, f.nonblock())?,
             Kind::Inet(_) => return Err(ENOTCONN),
             Kind::Inotify(i) => i.read(t, count, f.nonblock())?,
+            Kind::Vsock(v) => v.read(t, count, f.nonblock())?,
+            // No packets ever come in.
+            Kind::Tun(_) if f.nonblock() => return Err(EAGAIN),
+            Kind::Tun(_) => loop {
+                if t.interrupted() {
+                    return Err(ERESTARTSYS);
+                }
+                super::vcpus::blocking();
+                std::thread::sleep(POLL);
+            },
             Kind::Block(b) => {
                 let dev = self.blocks.device(b.devt).ok_or(ENXIO)?;
                 let mut pos = b.pos.lock().unwrap();
@@ -1433,6 +1499,8 @@ impl Kernel {
             },
             Kind::Netlink(nl) => netlink::write(nl, t, data, f.nonblock())?,
             Kind::Inet(_) => return Err(ENETUNREACH),
+            Kind::Vsock(v) => v.write(&data)?,
+            Kind::Tun(_) => data.len(), // sent nowhere
             Kind::Pty(p) => p.write(t, &data, f.nonblock())?,
             Kind::Mem(m) => {
                 if !m.writable {
@@ -1484,10 +1552,11 @@ impl Kernel {
             Kind::Random => chr(0x0109),
             Kind::Kmsg => chr(0x010b),
             Kind::Pipe(_) => Stat { mode: 0o010600, nlink: 1, ..Default::default() },
-            Kind::Socket(_) | Kind::Netlink(_) | Kind::Inet(_) => Stat { mode: 0o140777, nlink: 1, ..Default::default() },
+            Kind::Socket(_) | Kind::Netlink(_) | Kind::Inet(_) | Kind::Vsock(_) => Stat { mode: 0o140777, nlink: 1, ..Default::default() },
             Kind::Event(_) | Kind::Timer(_) | Kind::Signal(_) | Kind::Epoll(_) | Kind::Bpf(_) | Kind::Sync(_) | Kind::Inotify(_) => Stat { mode: 0o600, nlink: 1, ..Default::default() }, // anon_inode
             Kind::Drm(d) => Stat { mode: 0o020666, rdev: d.rdev(), nlink: 1, ..Default::default() },
             Kind::Ashmem(a) => Stat { mode: 0o020666, rdev: super::ashmem::rdev(), nlink: 1, size: a.size(), ..Default::default() },
+            Kind::Tun(_) => Stat { mode: 0o020660, rdev: super::net::tun_rdev(), nlink: 1, ..Default::default() },
             Kind::DmaBuf(b) => Stat { mode: 0o600, nlink: 1, size: b.size(), ..Default::default() },
             Kind::Binder(_) => Stat { mode: 0o020666, nlink: 1, rdev: 0xa36, ..Default::default() },
             Kind::Block(b) => Stat { mode: S_IFBLK | 0o600, nlink: 1, rdev: b.devt, ..Default::default() },
@@ -1619,6 +1688,80 @@ impl Kernel {
         r
     }
 
+    /// select(2) over ppoll's readiness: fd_set bitmaps in, the ready bits out.
+    fn pselect6(&self, t: &Thread, a: [u64; 6]) -> Result<i64, i64> {
+        const POLLPRI: u16 = 0x2;
+        let nfds = a[0] as usize;
+        if nfds > 1024 {
+            return Err(EINVAL);
+        }
+        let words = nfds.div_ceil(64);
+        let (sets, deadline, sigmask) = {
+            let mut mm = t.proc.mm();
+            let mut sets = [Vec::new(), Vec::new(), Vec::new()];
+            for (i, &p) in [a[1], a[2], a[3]].iter().enumerate() {
+                if p != 0 {
+                    sets[i] = (0..words).map(|w| mm.read_u64(p + w as u64 * 8)).collect::<Result<_, _>>()?;
+                }
+            }
+            let deadline = if a[4] == 0 {
+                None
+            } else {
+                let (s, ns) = (mm.read_u64(a[4])?, mm.read_u64(a[4] + 8)?);
+                Some(Instant::now() + Duration::new(s, ns.min(999_999_999) as u32))
+            };
+            // The sixth argument points at { const sigset_t *ss; size_t ss_len }.
+            let sigmask = if a[5] == 0 { 0 } else { mm.read_u64(a[5])? };
+            (sets, deadline, sigmask)
+        };
+        let wanted = |fd: usize, s: &Vec<u64>| !s.is_empty() && s[fd / 64] & 1 << (fd % 64) != 0;
+        let old = self.swap_mask(t, sigmask)?;
+        let r = loop {
+            let seen = EVENTS.current();
+            let mut out = [vec![0u64; words], vec![0u64; words], vec![0u64; words]];
+            let mut count = 0;
+            let mut timer: Option<Instant> = None;
+            {
+                let files = t.proc.files.lock().unwrap();
+                for fd in 0..nfds {
+                    if !(0..3).any(|i| wanted(fd, &sets[i])) {
+                        continue;
+                    }
+                    let f = match files.get(fd as i64) {
+                        Ok(f) => f,
+                        Err(e) => break_with(e)?,
+                    };
+                    if let Kind::Timer(tf) = &f.kind {
+                        timer = timer.into_iter().chain(tf.deadline()).min();
+                    }
+                    let r = poll_ready(&f, t, 0);
+                    for (i, mask) in [POLLIN | POLLHUP | POLLERR, POLLOUT | POLLERR, POLLPRI].iter().enumerate() {
+                        if wanted(fd, &sets[i]) && r & mask != 0 {
+                            out[i][fd / 64] |= 1 << (fd % 64);
+                            count += 1;
+                        }
+                    }
+                }
+            }
+            if count > 0 || deadline.is_some_and(|d| Instant::now() >= d) {
+                let mut mm = t.proc.mm();
+                for (i, &p) in [a[1], a[2], a[3]].iter().enumerate() {
+                    if p != 0 {
+                        let bytes: Vec<u8> = out[i].iter().flat_map(|w| w.to_le_bytes()).collect();
+                        mm.write(p, &bytes[..nfds.div_ceil(8)])?;
+                    }
+                }
+                break Ok(count);
+            }
+            if t.interrupted() {
+                break Err(EINTR);
+            }
+            EVENTS.wait(seen, nap(deadline, timer));
+        };
+        self.restore_mask(t, old, &r);
+        r
+    }
+
     fn ppoll_wait(&self, t: &Thread, fds: u64, mut raw: Vec<u8>, deadline: Option<Instant>) -> Result<i64, i64> {
         loop {
             let seen = EVENTS.current();
@@ -1739,6 +1882,8 @@ pub(super) fn file_name(f: &File) -> String {
         Kind::Inet(s) => format!("socket:[{}]", Arc::as_ptr(s) as usize % 100_000),
         Kind::Ashmem(a) => a.map_name(),
         Kind::Inotify(_) => "anon_inode:inotify".into(),
+        Kind::Tun(_) => "/dev/tun".into(),
+        Kind::Vsock(v) => format!("socket:[{}]", Arc::as_ptr(v) as usize % 100_000),
         Kind::Event(_) => "anon_inode:[eventfd]".into(),
         Kind::Timer(_) => "anon_inode:[timerfd]".into(),
         Kind::Signal(_) => "anon_inode:[signalfd]".into(),
@@ -1870,4 +2015,9 @@ impl super::ashmem::Io for AshmemIo<'_> {
     fn write(&mut self, addr: u64, data: &[u8]) -> Result<(), i64> {
         self.t.proc.mm().write(addr, data)
     }
+}
+
+/// An error out of a loop body that returns Result.
+fn break_with<T>(e: i64) -> Result<T, i64> {
+    Err(e)
 }

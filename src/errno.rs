@@ -66,3 +66,5 @@ impl std::error::Error for Errno {}
 pub fn io_err(e: i64) -> std::io::Error {
     std::io::Error::other(Errno(e))
 }
+pub const EBADFD: i64 = 77;
+pub const EADDRNOTAVAIL: i64 = 99;

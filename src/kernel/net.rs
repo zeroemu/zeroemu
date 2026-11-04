@@ -1,34 +1,112 @@
-//! The network interfaces droidrt shows: loopback only, as a Linux with no
-//! network devices. One description of `lo` feeds /sys/class/net, rtnetlink
-//! (RTM_GETLINK, RTM_GETADDR) and the SIOCGIF* ioctls on inet sockets.
+//! The network interfaces droidrt shows: loopback, plus the TUN devices
+//! programs create (system_server's Thread network makes "thread-wpan").
+//! There is no traffic. One list feeds /sys/class/net, rtnetlink
+//! (RTM_GETLINK, RTM_GETADDR) and the SIOCGIF*/SIOCSIF* ioctls.
 
 use crate::errno::*;
 use crate::vfs::FileSystem;
+use std::sync::{Arc, Mutex, OnceLock};
 
-pub const LO_INDEX: i32 = 1;
-const LO_NAME: &str = "lo";
-const LO_MTU: u32 = 65536;
 const ARPHRD_LOOPBACK: u16 = 772;
-/// IFF_UP | IFF_LOOPBACK | IFF_RUNNING, and IFF_LOWER_UP (rtnetlink only).
-const LO_FLAGS: u32 = 0x1 | 0x8 | 0x40;
+/// A TUN device: no link-layer header.
+const ARPHRD_NONE: u16 = 0xfffe;
+const ARPHRD_ETHER: u16 = 1;
+const IFF_UP: u32 = 0x1;
+const IFF_LOOPBACK: u32 = 0x8;
+const IFF_POINTOPOINT: u32 = 0x10;
+const IFF_RUNNING: u32 = 0x40;
+const IFF_NOARP: u32 = 0x80;
+const IFF_MULTICAST: u32 = 0x1000;
 const IFF_LOWER_UP: u32 = 0x10000;
 
-/// /sys/class/net/lo.
-pub fn publish(sys: &dyn FileSystem) {
-    let put = |name: &str, value: String| super::block::put_file(sys, &format!("class/net/{LO_NAME}/{name}"), &(value + "\n"));
-    put("ifindex", LO_INDEX.to_string());
-    put("iflink", LO_INDEX.to_string());
-    put("type", ARPHRD_LOOPBACK.to_string());
-    put("mtu", LO_MTU.to_string());
-    put("flags", format!("{LO_FLAGS:#x}"));
+#[derive(Clone)]
+struct Iface {
+    name: String,
+    index: i32,
+    ty: u16,
+    mtu: u32,
+    flags: u32,
+}
+
+static IFACES: Mutex<Vec<Iface>> = Mutex::new(Vec::new());
+static NEXT_INDEX: Mutex<i32> = Mutex::new(2);
+static SYS: OnceLock<Arc<dyn FileSystem>> = OnceLock::new();
+
+fn lo() -> Iface {
+    Iface { name: "lo".into(), index: 1, ty: ARPHRD_LOOPBACK, mtu: 65536, flags: IFF_UP | IFF_LOOPBACK | IFF_RUNNING }
+}
+
+/// The interfaces, `lo` first.
+fn all() -> Vec<Iface> {
+    let mut v = vec![lo()];
+    v.extend(IFACES.lock().unwrap().iter().cloned());
+    v
+}
+
+fn by_name(name: &str) -> Option<Iface> {
+    all().into_iter().find(|i| i.name == name)
+}
+
+/// /sys/class/net/<name>.
+fn publish_iface(sys: &dyn FileSystem, i: &Iface) {
+    let put = |file: &str, value: String| super::block::put_file(sys, &format!("class/net/{}/{file}", i.name), &(value + "\n"));
+    put("ifindex", i.index.to_string());
+    put("iflink", i.index.to_string());
+    put("type", i.ty.to_string());
+    put("mtu", i.mtu.to_string());
+    put("flags", format!("{:#x}", i.flags));
     put("address", "00:00:00:00:00:00".into());
     put("broadcast", "00:00:00:00:00:00".into());
-    put("addr_len", "6".into());
-    put("operstate", "unknown".into());
+    put("addr_len", if i.ty == ARPHRD_NONE { "0" } else { "6" }.into());
+    put("operstate", if i.ty == ARPHRD_LOOPBACK { "unknown" } else if i.flags & IFF_UP != 0 { "up" } else { "down" }.into());
     put("carrier", "1".into());
     put("dev_id", "0x0".into());
-    put("tx_queue_len", "1000".into());
-    put("uevent", format!("INTERFACE={LO_NAME}\nIFINDEX={LO_INDEX}"));
+    put("tx_queue_len", if i.ty == ARPHRD_NONE { "500" } else { "1000" }.into());
+    put("uevent", format!("INTERFACE={}\nIFINDEX={}", i.name, i.index));
+}
+
+pub fn publish(sys: Arc<dyn FileSystem>) {
+    publish_iface(sys.as_ref(), &lo());
+    let _ = SYS.set(sys);
+}
+
+/// TUNSETIFF: a new TUN (or TAP) interface. `name` may hold a %d to number.
+pub fn add_tun(name: &str, tap: bool) -> Result<String, i64> {
+    let mut list = IFACES.lock().unwrap();
+    let name = if name.is_empty() || name.contains("%d") {
+        let pattern = if name.is_empty() { if tap { "tap%d" } else { "tun%d" } } else { name };
+        (0..).map(|n| pattern.replace("%d", &n.to_string())).find(|n| n != "lo" && !list.iter().any(|i| &i.name == n)).unwrap()
+    } else {
+        if name == "lo" || list.iter().any(|i| i.name == name) {
+            return Err(EBUSY);
+        }
+        name.to_string()
+    };
+    if name.len() > 15 {
+        return Err(EINVAL);
+    }
+    let mut next = NEXT_INDEX.lock().unwrap();
+    let iface = Iface {
+        name: name.clone(),
+        index: *next,
+        ty: if tap { ARPHRD_ETHER } else { ARPHRD_NONE },
+        mtu: 1500,
+        flags: if tap { IFF_MULTICAST } else { IFF_POINTOPOINT | IFF_NOARP | IFF_MULTICAST },
+    };
+    *next += 1;
+    if let Some(sys) = SYS.get() {
+        publish_iface(sys.as_ref(), &iface);
+    }
+    list.push(iface);
+    Ok(name)
+}
+
+/// The TUN device closed: its interface goes.
+pub fn remove(name: &str) {
+    IFACES.lock().unwrap().retain(|i| i.name != name);
+    if let Some(sys) = SYS.get() {
+        super::block::remove_tree(sys.as_ref(), &format!("class/net/{name}"));
+    }
 }
 
 fn attr(out: &mut Vec<u8>, ty: u16, data: &[u8]) {
@@ -38,8 +116,8 @@ fn attr(out: &mut Vec<u8>, ty: u16, data: &[u8]) {
     out.resize(out.len().next_multiple_of(4), 0);
 }
 
-/// RTM_NEWLINK for `lo`: ifinfomsg and its attributes.
-pub fn link_payload() -> Vec<u8> {
+/// RTM_NEWLINK for one interface: ifinfomsg and its attributes.
+fn link_payload(i: &Iface) -> Vec<u8> {
     const IFLA_ADDRESS: u16 = 1;
     const IFLA_BROADCAST: u16 = 2;
     const IFLA_IFNAME: u16 = 3;
@@ -47,19 +125,30 @@ pub fn link_payload() -> Vec<u8> {
     const IFLA_TXQLEN: u16 = 13;
     const IFLA_OPERSTATE: u16 = 16;
     const IFLA_CARRIER: u16 = 33;
+    let up = i.flags & IFF_UP != 0;
     let mut p = vec![0u8, 0];
-    p.extend_from_slice(&ARPHRD_LOOPBACK.to_le_bytes());
-    p.extend_from_slice(&LO_INDEX.to_le_bytes());
-    p.extend_from_slice(&(LO_FLAGS | IFF_LOWER_UP).to_le_bytes());
+    p.extend_from_slice(&i.ty.to_le_bytes());
+    p.extend_from_slice(&i.index.to_le_bytes());
+    p.extend_from_slice(&(i.flags | if up { IFF_LOWER_UP } else { 0 }).to_le_bytes());
     p.extend_from_slice(&0u32.to_le_bytes());
-    attr(&mut p, IFLA_IFNAME, b"lo\0");
-    attr(&mut p, IFLA_MTU, &LO_MTU.to_le_bytes());
+    let mut name = i.name.as_bytes().to_vec();
+    name.push(0);
+    attr(&mut p, IFLA_IFNAME, &name);
+    attr(&mut p, IFLA_MTU, &i.mtu.to_le_bytes());
     attr(&mut p, IFLA_TXQLEN, &1000u32.to_le_bytes());
-    attr(&mut p, IFLA_OPERSTATE, &[0]); // IF_OPER_UNKNOWN, as Linux's lo
+    // IF_OPER_UNKNOWN for lo (as Linux), UP / DOWN otherwise.
+    attr(&mut p, IFLA_OPERSTATE, &[if i.ty == ARPHRD_LOOPBACK { 0 } else if up { 6 } else { 2 }]);
     attr(&mut p, IFLA_CARRIER, &[1]);
-    attr(&mut p, IFLA_ADDRESS, &[0; 6]);
-    attr(&mut p, IFLA_BROADCAST, &[0; 6]);
+    if i.ty != ARPHRD_NONE {
+        attr(&mut p, IFLA_ADDRESS, &[0; 6]);
+        attr(&mut p, IFLA_BROADCAST, &[0; 6]);
+    }
     p
+}
+
+/// RTM_GETLINK dump: every interface.
+pub fn link_payloads() -> Vec<Vec<u8>> {
+    all().iter().map(link_payload).collect()
 }
 
 /// RTM_NEWADDR payloads for `lo` (127.0.0.1/8, ::1/128), of `family` (0: both).
@@ -73,7 +162,7 @@ pub fn addr_payloads(family: u8) -> Vec<Vec<u8>> {
     let mut out = Vec::new();
     if family == 0 || family == 2 {
         let mut p = vec![2u8, 8, IFA_F_PERMANENT as u8, RT_SCOPE_HOST];
-        p.extend_from_slice(&(LO_INDEX as u32).to_le_bytes());
+        p.extend_from_slice(&1u32.to_le_bytes());
         attr(&mut p, IFA_ADDRESS, &[127, 0, 0, 1]);
         attr(&mut p, IFA_LOCAL, &[127, 0, 0, 1]);
         attr(&mut p, IFA_LABEL, b"lo\0");
@@ -82,7 +171,7 @@ pub fn addr_payloads(family: u8) -> Vec<Vec<u8>> {
     }
     if family == 0 || family == 10 {
         let mut p = vec![10u8, 128, IFA_F_PERMANENT as u8, RT_SCOPE_HOST];
-        p.extend_from_slice(&(LO_INDEX as u32).to_le_bytes());
+        p.extend_from_slice(&1u32.to_le_bytes());
         let mut one = [0u8; 16];
         one[15] = 1;
         attr(&mut p, IFA_ADDRESS, &one);
@@ -92,14 +181,14 @@ pub fn addr_payloads(family: u8) -> Vec<Vec<u8>> {
     out
 }
 
-/// Which interface an RTM_GETLINK request names: by index, or IFLA_IFNAME.
-pub fn link_requested(body: &[u8]) -> bool {
+/// The interface an RTM_GETLINK request names (by index, or IFLA_IFNAME).
+pub fn link_requested(body: &[u8]) -> Option<Vec<u8>> {
     if body.len() < 16 {
-        return false;
+        return None;
     }
     let index = i32::from_le_bytes(body[4..8].try_into().unwrap());
     if index != 0 {
-        return index == LO_INDEX;
+        return all().iter().find(|i| i.index == index).map(link_payload);
     }
     let mut off = 16;
     while off + 4 <= body.len() {
@@ -111,11 +200,11 @@ pub fn link_requested(body: &[u8]) -> bool {
         if ty == 3 {
             let name = &body[off + 4..off + len];
             let end = name.iter().position(|&b| b == 0).unwrap_or(name.len());
-            return &name[..end] == LO_NAME.as_bytes();
+            return by_name(&String::from_utf8_lossy(&name[..end])).as_ref().map(link_payload);
         }
         off += len.next_multiple_of(4);
     }
-    false
+    None
 }
 
 /// The SIOCGIF* / SIOCSIF* ioctls on an inet socket. `req` is the caller's
@@ -131,33 +220,139 @@ pub fn ifreq_ioctl(cmd: u64, req: &mut [u8; 40]) -> Result<(), i64> {
     const SIOCGIFINDEX: u64 = 0x8933;
     if cmd == SIOCGIFNAME {
         let index = i32::from_le_bytes(req[16..20].try_into().unwrap());
-        if index != LO_INDEX {
-            return Err(ENODEV);
-        }
+        let i = all().into_iter().find(|i| i.index == index).ok_or(ENODEV)?;
         req[..16].fill(0);
-        req[..2].copy_from_slice(LO_NAME.as_bytes());
+        req[..i.name.len()].copy_from_slice(i.name.as_bytes());
         return Ok(());
     }
     let end = req[..16].iter().position(|&b| b == 0).unwrap_or(16);
-    if &req[..end] != LO_NAME.as_bytes() {
-        return Err(ENODEV);
-    }
+    let name = String::from_utf8_lossy(&req[..end]).into_owned();
+    let i = by_name(&name).ok_or(ENODEV)?;
+    let set = |f: &dyn Fn(&mut Iface)| {
+        if let Some(x) = IFACES.lock().unwrap().iter_mut().find(|x| x.name == name) {
+            f(x);
+            if let Some(sys) = SYS.get() {
+                publish_iface(sys.as_ref(), x);
+            }
+        }
+    };
     let u = &mut req[16..];
     match cmd {
-        SIOCGIFINDEX => u[..4].copy_from_slice(&LO_INDEX.to_le_bytes()),
-        SIOCGIFFLAGS => u[..2].copy_from_slice(&(LO_FLAGS as u16).to_le_bytes()),
-        SIOCGIFMTU => u[..4].copy_from_slice(&LO_MTU.to_le_bytes()),
+        SIOCGIFINDEX => u[..4].copy_from_slice(&i.index.to_le_bytes()),
+        SIOCGIFFLAGS => u[..2].copy_from_slice(&((i.flags & 0xffff) as u16).to_le_bytes()),
+        SIOCGIFMTU => u[..4].copy_from_slice(&i.mtu.to_le_bytes()),
         SIOCGIFHWADDR => {
             u.fill(0);
-            u[..2].copy_from_slice(&ARPHRD_LOOPBACK.to_le_bytes());
+            u[..2].copy_from_slice(&i.ty.to_le_bytes());
         }
-        SIOCGIFADDR => {
+        SIOCGIFADDR if i.ty == ARPHRD_LOOPBACK => {
             u.fill(0);
             u[..2].copy_from_slice(&2u16.to_le_bytes()); // AF_INET
             u[4..8].copy_from_slice(&[127, 0, 0, 1]);
         }
-        SIOCSIFFLAGS | SIOCSIFMTU => {} // lo stays up, at its MTU
+        SIOCGIFADDR => return Err(EADDRNOTAVAIL),
+        // lo stays up at its MTU; others take what they are given.
+        SIOCSIFFLAGS => {
+            let flags = u16::from_le_bytes([u[0], u[1]]) as u32;
+            set(&|x| x.flags = (x.flags & !0xffff) | flags | if flags & IFF_UP != 0 { IFF_RUNNING } else { 0 });
+        }
+        SIOCSIFMTU => {
+            let mtu = u32::from_le_bytes(u[..4].try_into().unwrap());
+            if !(68..=65535).contains(&mtu) {
+                return Err(EINVAL);
+            }
+            set(&|x| x.mtu = mtu);
+        }
         _ => return Err(ENOTTY),
     }
     Ok(())
+}
+
+pub const TUN_MINOR: u32 = 200;
+
+pub fn tun_rdev() -> u64 {
+    super::block::makedev(super::block::MISC_MAJOR, TUN_MINOR)
+}
+
+/// An open /dev/tun: once TUNSETIFF names it, an interface. No packet ever
+/// arrives; what is written is dropped.
+pub struct Tun {
+    st: Mutex<TunState>,
+}
+
+#[derive(Default)]
+struct TunState {
+    iface: Option<String>,
+    flags: u16,
+    persist: bool,
+}
+
+impl Tun {
+    pub fn new() -> Tun {
+        Tun { st: Mutex::new(TunState::default()) }
+    }
+
+    pub fn ioctl(&self, cmd: u64, arg: u64, io: &mut dyn super::ashmem::Io) -> Result<i64, i64> {
+        const TUNSETIFF: u64 = 0x4004_54ca;
+        const TUNSETPERSIST: u64 = 0x4004_54cb;
+        const TUNGETFEATURES: u64 = 0x8004_54cf;
+        const TUNGETIFF: u64 = 0x8004_54d2;
+        const IFF_TUN: u16 = 0x1;
+        const IFF_TAP: u16 = 0x2;
+        /// IFF_TUN | IFF_TAP | IFF_NAPI | IFF_NAPI_FRAGS | IFF_NO_CARRIER |
+        /// IFF_MULTI_QUEUE | IFF_NO_PI | IFF_ONE_QUEUE | IFF_VNET_HDR | IFF_TUN_EXCL.
+        const FEATURES: u32 = 0x1 | 0x2 | 0x10 | 0x20 | 0x40 | 0x100 | 0x1000 | 0x2000 | 0x4000 | 0x8000;
+        let mut st = self.st.lock().unwrap();
+        match cmd {
+            TUNSETIFF => {
+                if st.iface.is_some() {
+                    return Err(EINVAL);
+                }
+                let mut req = [0u8; 40];
+                io.read(arg, &mut req)?;
+                let flags = u16::from_le_bytes([req[16], req[17]]);
+                let tap = match flags & (IFF_TUN | IFF_TAP) {
+                    IFF_TUN => false,
+                    IFF_TAP => true,
+                    _ => return Err(EINVAL),
+                };
+                let end = req[..16].iter().position(|&b| b == 0).unwrap_or(16);
+                let name = add_tun(&String::from_utf8_lossy(&req[..end]), tap)?;
+                req[..16].fill(0);
+                req[..name.len()].copy_from_slice(name.as_bytes());
+                io.write(arg, &req)?;
+                st.iface = Some(name);
+                st.flags = flags;
+                Ok(0)
+            }
+            TUNGETIFF => {
+                let name = st.iface.clone().ok_or(EBADFD)?;
+                let mut req = [0u8; 40];
+                req[..name.len()].copy_from_slice(name.as_bytes());
+                req[16..18].copy_from_slice(&st.flags.to_le_bytes());
+                io.write(arg, &req)?;
+                Ok(0)
+            }
+            TUNGETFEATURES => {
+                io.write(arg, &FEATURES.to_le_bytes())?;
+                Ok(0)
+            }
+            TUNSETPERSIST => {
+                st.persist = arg != 0;
+                Ok(0)
+            }
+            // Owner, group, link type, offloads, filters, buffer and header sizes.
+            0x4004_54cc..=0x4004_54d8 => Ok(0),
+            _ => Err(EINVAL),
+        }
+    }
+}
+
+impl Drop for Tun {
+    fn drop(&mut self) {
+        let st = self.st.get_mut().unwrap();
+        if let (Some(name), false) = (&st.iface, st.persist) {
+            remove(name);
+        }
+    }
 }

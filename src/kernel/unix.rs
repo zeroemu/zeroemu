@@ -18,8 +18,6 @@ use std::sync::{Arc, Mutex, Weak};
 const AF_UNIX: u64 = 1;
 pub const S_IFSOCK: u32 = 0o140000;
 const AT_FDCWD: i64 = -100;
-/// Sockets are created 0777 less the umask, which is fixed at 022 (as umask(2) reports).
-const UMASK: u32 = 0o022;
 pub const SOCK_STREAM: u32 = 1;
 pub const SOCK_DGRAM: u32 = 2;
 pub const SOCK_SEQPACKET: u32 = 5;
@@ -548,10 +546,36 @@ impl Kernel {
             if let Kind::Inet(s) = &f.kind {
                 return self.inet_syscall(no, t, s, a);
             }
+            if let Kind::Vsock(v) = &f.kind {
+                return match no {
+                    connect => {
+                        let addr = t.proc.mm().read_vec(a[1], (a[2] as usize).min(128))?;
+                        v.connect(&addr).map(|_| 0)
+                    }
+                    sendto | sendmsg if no == sendto => {
+                        let data = t.proc.mm().read_vec(a[1], a[2] as usize)?;
+                        v.write(&data).map(|n| n as i64)
+                    }
+                    recvfrom if a[4] == 0 => {
+                        let data = v.read(t, a[2] as usize, f.nonblock() || a[3] & 0x40 != 0)?;
+                        t.proc.mm().write(a[1], &data)?;
+                        Ok(data.len() as i64)
+                    }
+                    shutdown | setsockopt => Ok(0),
+                    _ => Err(EOPNOTSUPP),
+                };
+            }
         }
         match no {
             socket if a[0] == netlink::AF_NETLINK => self.netlink_socket(t, a),
             socket if a[0] == super::inet::AF_INET || a[0] == super::inet::AF_INET6 => self.inet_socket(t, a),
+            socket if a[0] == super::vsock::AF_VSOCK => {
+                if a[1] & 0xf != SOCK_STREAM as u64 {
+                    return Err(ESOCKTNOSUPPORT);
+                }
+                let file = File::new(Kind::Vsock(super::vsock::Vsock::new()), (a[1] & SOCK_NONBLOCK) as u32);
+                t.proc.files.lock().unwrap().alloc(file, a[1] & SOCK_CLOEXEC != 0, 0)
+            }
             socket => {
                 if a[0] != AF_UNIX {
                     return Err(EAFNOSUPPORT);
@@ -608,7 +632,7 @@ impl Kernel {
                     let vfs = self.vfs.as_deref().ok_or(ENOENT)?;
                     let path = String::from_utf8_lossy(&name).into_owned();
                     let cwd = t.proc.cwd.lock().unwrap().clone();
-                    let node = bind_node(vfs, &cwd, &path, 0o777 & !UMASK, &sock)?;
+                    let node = bind_node(vfs, &cwd, &path, 0o777 & !t.proc.umask.load(Ordering::Relaxed), &sock)?;
                     st.node = Some(node_key(&vfs.fs_arc(&node), node.ino));
                     st.log_tap = node.path == "/dev/socket/logdw";
                 }

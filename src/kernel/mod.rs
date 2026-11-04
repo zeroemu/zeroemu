@@ -23,6 +23,7 @@ mod inotify;
 mod locks;
 mod logd;
 mod net;
+mod power;
 mod memory;
 mod misc;
 mod mount;
@@ -38,6 +39,7 @@ mod specialfd;
 mod sysctl;
 mod unix;
 mod vcpus;
+mod vsock;
 mod wait;
 mod xattr;
 
@@ -266,6 +268,8 @@ pub struct Process {
     pub sec: selinux::ProcSec,
     /// Its mount namespace (vfs.rs).
     pub mnt_ns: AtomicU32,
+    /// umask(2): permission bits new files, directories and sockets lack.
+    pub umask: AtomicU32,
 }
 
 pub struct Thread {
@@ -416,7 +420,8 @@ impl Kernel {
         if let Some(d) = &drm {
             d.publish(dev.as_ref(), sys.as_ref());
         }
-        net::publish(sys.as_ref());
+        net::publish(sys.clone());
+        power::publish(sys.as_ref());
         let sysctl = sysctl::Sysctl::new();
         // libcutils opens /dev/ashmem<boot id> (init names the node so).
         {
@@ -424,6 +429,11 @@ impl Kernel {
             if let Ok(root) = dev.root() {
                 for name in ["ashmem".to_string(), format!("ashmem{}", sysctl.get("kernel/random/boot_id"))] {
                     let _ = dev.create(root, &name, 0o020666, ashmem::rdev());
+                }
+                // The TUN device, at Android's path and Linux's.
+                let _ = dev.create(root, "tun", 0o020660, net::tun_rdev());
+                if let Ok(d) = dev.mkdir(root, "net", 0o755) {
+                    let _ = dev.create(d, "tun", 0o020660, net::tun_rdev());
                 }
             }
         }
@@ -605,6 +615,7 @@ impl Kernel {
             attrs: Mutex::new(control::ProcAttrs::first()),
             sec: self.selinux.initial_sec(),
             mnt_ns: AtomicU32::new(crate::vfs::INIT_NS),
+            umask: AtomicU32::new(0o022),
         });
         self.root_pid.store(pid, Ordering::Relaxed);
         self.procs.lock().unwrap().insert(pid, proc.clone());
@@ -706,6 +717,7 @@ impl Kernel {
     fn syscall(self: &Arc<Self>, t: &Arc<Thread>, vcpu: &mut dyn Vcpu, regs: &SyscallRegs) -> Ret {
         let sysno = self.arch.sysno(regs.nr);
         let a = regs.args;
+        files::CURRENT.with(|c| c.set((t.proc.pid, t.tid, regs.nr)));
         let (pc, lr, fp) = match dump_after().map(|_| vcpu.state()) {
             Some(CpuState::Aarch64(st)) => (st.pc, st.x[30], st.x[29]),
             _ => (0, 0, 0),

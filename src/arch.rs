@@ -118,6 +118,7 @@ syscalls! {
     pread64 = 67, 17;
     pwrite64 = 68, 18;
     ppoll = 73, 271;
+    pselect6 = 72, 270;
     signalfd4 = 74, 289;
     timerfd_create = 85, 283;
     timerfd_settime = 86, 286;

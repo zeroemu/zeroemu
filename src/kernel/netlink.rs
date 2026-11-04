@@ -332,13 +332,15 @@ impl Netlink {
                 // addresses exist, no routes; changes are accepted as if applied.
                 match ((ty - 16) & 3, dump) {
                     (2, true) => Reply::Dump(match ty {
-                        RTM_GETLINK => vec![nlmsg(RTM_NEWLINK, NLM_F_MULTI, seq, port, &super::net::link_payload())],
+                        RTM_GETLINK => super::net::link_payloads().iter().map(|p| nlmsg(RTM_NEWLINK, NLM_F_MULTI, seq, port, p)).collect(),
                         RTM_GETADDR => super::net::addr_payloads(body[0]).iter().map(|p| nlmsg(RTM_NEWADDR, NLM_F_MULTI, seq, port, p)).collect(),
                         _ => Vec::new(),
                     }),
                     (2, false) => match ty {
-                        RTM_GETLINK if super::net::link_requested(body) => Reply::Ok(vec![nlmsg(RTM_NEWLINK, 0, seq, port, &super::net::link_payload())]),
-                        RTM_GETLINK => Reply::Err(ENODEV),
+                        RTM_GETLINK => match super::net::link_requested(body) {
+                            Some(p) => Reply::Ok(vec![nlmsg(RTM_NEWLINK, 0, seq, port, &p)]),
+                            None => Reply::Err(ENODEV),
+                        },
                         RTM_GETROUTE => Reply::Err(ENETUNREACH),
                         _ => Reply::Err(EOPNOTSUPP),
                     },

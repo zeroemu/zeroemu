@@ -1400,6 +1400,15 @@ fn nap(deadline: Option<Instant>, timer: Option<Instant>) -> Duration {
     until.map_or(POLL, |d| d.saturating_duration_since(Instant::now()).min(POLL)).max(Duration::from_micros(50))
 }
 
+/// The namespace node behind an open file, if it keeps one.
+pub(super) fn node_of(f: &File) -> Option<Node> {
+    match &f.kind {
+        Kind::Node(nf) => Some(nf.lock().unwrap().node.clone()),
+        Kind::Mem(m) => m.node.clone(),
+        _ => None,
+    }
+}
+
 /// What /proc/<pid>/fd/<n> points at.
 pub(super) fn file_name(f: &File) -> String {
     match &f.kind {

@@ -107,6 +107,34 @@ pub trait FileSystem: Send + Sync {
     fn changes(&self, _ino: u64) -> Option<Arc<AtomicU64>> {
         None
     }
+    // Extended attributes, by full name ("security.selinux"); `flags` takes
+    // XATTR_CREATE / XATTR_REPLACE. Name syntax and per-namespace rules are
+    // checked by the syscall layer; a filesystem refuses what it can't store.
+    fn getxattr(&self, _ino: u64, _name: &str) -> Result<Vec<u8>, i64> {
+        Err(ENODATA)
+    }
+    fn setxattr(&self, _ino: u64, _name: &str, _value: &[u8], _flags: u32) -> Result<(), i64> {
+        Err(if self.writable() { EOPNOTSUPP } else { EROFS })
+    }
+    fn listxattr(&self, _ino: u64) -> Result<Vec<String>, i64> {
+        Ok(vec![])
+    }
+    fn removexattr(&self, _ino: u64, _name: &str) -> Result<(), i64> {
+        Err(if self.writable() { EOPNOTSUPP } else { EROFS })
+    }
+}
+
+pub const XATTR_CREATE: u32 = 1;
+pub const XATTR_REPLACE: u32 = 2;
+pub const XATTR_SELINUX: &str = "security.selinux";
+
+/// getxattr over a parsed attribute list (the read-only images).
+fn find_xattr(attrs: io::Result<Vec<(String, Vec<u8>)>>, name: &str) -> Result<Vec<u8>, i64> {
+    attrs.map_err(io_errno)?.into_iter().find(|(n, _)| n == name).map(|(_, v)| v).ok_or(ENODATA)
+}
+
+fn xattr_names(attrs: io::Result<Vec<(String, Vec<u8>)>>) -> Result<Vec<String>, i64> {
+    Ok(attrs.map_err(io_errno)?.into_iter().map(|(n, _)| n).collect())
 }
 
 impl FileSystem for Erofs {
@@ -147,6 +175,12 @@ impl FileSystem for Erofs {
     }
     fn read_all(&self, ino: u64) -> io::Result<Arc<[u8]>> {
         self.read(&self.inode(ino)?)
+    }
+    fn getxattr(&self, ino: u64, name: &str) -> Result<Vec<u8>, i64> {
+        find_xattr(self.inode(ino).and_then(|i| self.xattrs(&i)), name)
+    }
+    fn listxattr(&self, ino: u64) -> Result<Vec<String>, i64> {
+        xattr_names(self.inode(ino).and_then(|i| self.xattrs(&i)))
     }
 }
 
@@ -194,6 +228,12 @@ impl FileSystem for Ext4 {
     }
     fn read_all(&self, ino: u64) -> io::Result<Arc<[u8]>> {
         self.read(&self.inode(ino)?)
+    }
+    fn getxattr(&self, ino: u64, name: &str) -> Result<Vec<u8>, i64> {
+        find_xattr(self.xattrs(ino), name)
+    }
+    fn listxattr(&self, ino: u64) -> Result<Vec<String>, i64> {
+        xattr_names(self.xattrs(ino))
     }
 }
 
@@ -282,6 +322,22 @@ impl FileSystem for LazyFs {
     fn read_all(&self, ino: u64) -> io::Result<Arc<[u8]>> {
         let (fs, ino) = self.real(ino)?;
         fs.read_all(ino)
+    }
+    fn getxattr(&self, ino: u64, name: &str) -> Result<Vec<u8>, i64> {
+        let (fs, ino) = self.real(ino).map_err(io_errno)?;
+        fs.getxattr(ino, name)
+    }
+    fn setxattr(&self, ino: u64, name: &str, value: &[u8], flags: u32) -> Result<(), i64> {
+        let (fs, ino) = self.real(ino).map_err(io_errno)?;
+        fs.setxattr(ino, name, value, flags)
+    }
+    fn listxattr(&self, ino: u64) -> Result<Vec<String>, i64> {
+        let (fs, ino) = self.real(ino).map_err(io_errno)?;
+        fs.listxattr(ino)
+    }
+    fn removexattr(&self, ino: u64, name: &str) -> Result<(), i64> {
+        let (fs, ino) = self.real(ino).map_err(io_errno)?;
+        fs.removexattr(ino, name)
     }
 }
 
@@ -989,6 +1045,22 @@ impl Vfs {
             return Err(EROFS);
         }
         self.fs(node).set_attr(node.ino, mode, owner, mtime)
+    }
+
+    pub fn getxattr(&self, node: &Node, name: &str) -> Result<Vec<u8>, i64> {
+        self.fs(node).getxattr(node.ino, name)
+    }
+
+    pub fn setxattr(&self, node: &Node, name: &str, value: &[u8], flags: u32) -> Result<(), i64> {
+        self.fs(node).setxattr(node.ino, name, value, flags)
+    }
+
+    pub fn listxattr(&self, node: &Node) -> Result<Vec<String>, i64> {
+        self.fs(node).listxattr(node.ino)
+    }
+
+    pub fn removexattr(&self, node: &Node, name: &str) -> Result<(), i64> {
+        self.fs(node).removexattr(node.ino, name)
     }
 
     pub fn readdir(&self, node: &Node) -> Result<Vec<Dirent>, i64> {

@@ -25,6 +25,7 @@ mod specialfd;
 mod sysctl;
 mod unix;
 mod wait;
+mod xattr;
 
 use crate::arch::{Arch, Sysno};
 use crate::errno::*;
@@ -267,6 +268,7 @@ impl Kernel {
             props.set(None, "logd.ready", "true"); // logd is answered in the kernel (logd.rs)
             dev.add_file("__properties__", 0o444, props.file.clone());
         }
+        xattr::label_mounts(&v);
         // /proc reads kernel state, so the kernel is built around it.
         Ok(Arc::new_cyclic(|me| {
             v.mount("/proc", procfs::ProcFs::new(me.clone()));
@@ -537,6 +539,10 @@ impl Kernel {
 
             // files
             n if files::handles(n) => match self.file_syscall(n, t, a) {
+                Ok(v) => v,
+                Err(e) => -e,
+            },
+            n if xattr::handles(n) => match self.xattr_syscall(n, t, a) {
                 Ok(v) => v,
                 Err(e) => -e,
             },

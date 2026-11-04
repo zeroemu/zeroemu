@@ -95,6 +95,8 @@ pub enum Kind {
     Special(SpecialOpen),
     /// A pseudo-terminal master or slave (pty.rs).
     Pty(super::pty::End),
+    /// An eBPF map or program (bpf.rs).
+    Bpf(Arc<super::bpf::BpfObj>),
 }
 
 /// A file whose contents a kernel subsystem computes (selinuxfs,
@@ -353,6 +355,7 @@ pub(super) fn poll_ready(f: &File, t: &Thread, depth: u32) -> u16 {
         Kind::Epoll(ep) => if ep.is_ready(t, depth) { POLLIN } else { 0 },
         Kind::Socket(s) => s.poll(),
         Kind::Pty(p) => p.poll(),
+        Kind::Bpf(_) => 0,
         Kind::Netlink(n) => n.poll(),
         Kind::Binder(b) => {
             (if binder::readable(b, t.tid) { POLLIN } else { 0 }) | POLLOUT
@@ -1265,7 +1268,7 @@ impl Kernel {
             Kind::Kmsg => chr(0x010b),
             Kind::Pipe(_) => Stat { mode: 0o010600, nlink: 1, ..Default::default() },
             Kind::Socket(_) | Kind::Netlink(_) => Stat { mode: 0o140777, nlink: 1, ..Default::default() },
-            Kind::Event(_) | Kind::Timer(_) | Kind::Signal(_) | Kind::Epoll(_) => Stat { mode: 0o600, nlink: 1, ..Default::default() }, // anon_inode
+            Kind::Event(_) | Kind::Timer(_) | Kind::Signal(_) | Kind::Epoll(_) | Kind::Bpf(_) => Stat { mode: 0o600, nlink: 1, ..Default::default() }, // anon_inode
             Kind::Binder(_) => Stat { mode: 0o020666, nlink: 1, rdev: 0xa36, ..Default::default() },
             Kind::Block(b) => Stat { mode: S_IFBLK | 0o600, nlink: 1, rdev: b.devt, ..Default::default() },
             Kind::LoopControl => chr(block::makedev(block::MISC_MAJOR, block::LOOP_CONTROL_MINOR)),
@@ -1503,6 +1506,7 @@ pub(super) fn file_name(f: &File) -> String {
         Kind::Signal(_) => "anon_inode:[signalfd]".into(),
         Kind::Epoll(_) => "anon_inode:[eventpoll]".into(),
         Kind::Binder(_) => "/dev/binder".into(),
+        Kind::Bpf(o) => super::bpf::file_name(o).into(),
         Kind::Pty(p) if p.master => "/dev/ptmx".into(),
         Kind::Pty(p) => format!("/dev/pts/{}", p.pty.index),
         Kind::Block(b) => format!("/dev/block/{}", block::name(b.devt)),

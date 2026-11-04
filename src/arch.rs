@@ -234,6 +234,7 @@ syscalls! {
     renameat2 = 276, 316;
     getrandom = 278, 318;
     memfd_create = 279, 319;
+    bpf = 280, 321;
     membarrier = 283, 324;
     statx = 291, 332;
     rseq = 293, 334;

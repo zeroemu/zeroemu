@@ -9,6 +9,7 @@
 
 mod binder;
 mod block;
+mod bpf;
 mod cgroup;
 mod control;
 mod creds;
@@ -544,6 +545,11 @@ impl Kernel {
             mprotect => self.sys_mprotect(t, a[0], a[1], a[2] as u32),
             mremap => self.sys_mremap(t, a[0], a[1], a[2], a[3], a[4]),
             madvise => self.sys_madvise(t, a[0], a[1], a[2]),
+
+            bpf => match self.sys_bpf(t, a[0], a[1], a[2]) {
+                Ok(v) => v,
+                Err(e) => -e,
+            },
 
             // futexes
             futex => self.sys_futex(t, a[0], a[1] as u32, a[2] as u32, a[3], a[4], a[5] as u32),

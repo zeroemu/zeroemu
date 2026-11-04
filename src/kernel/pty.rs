@@ -206,6 +206,7 @@ impl End {
             if t.interrupted() {
                 return Err(ERESTARTSYS);
             }
+            super::vcpus::blocking();
             st = self.pty.cv.wait_timeout(st, POLL).unwrap().0;
         }
     }
@@ -240,6 +241,7 @@ impl End {
             if t.interrupted() {
                 return if done > 0 { Ok(done) } else { Err(ERESTARTSYS) };
             }
+            super::vcpus::blocking();
             st = self.pty.cv.wait_timeout(st, POLL).unwrap().0;
         }
     }

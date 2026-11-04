@@ -3,8 +3,10 @@
 //!
 //! The table is an immutable snapshot behind an `RwLock<Arc<_>>`: resolution
 //! clones the `Arc` and never holds a lock while it calls into filesystems,
-//! and mount/umount build a new snapshot and publish it. There is one mount
-//! namespace, shared by every process.
+//! and mount/umount build a new snapshot and publish it. Each mount
+//! namespace has its own table; a host thread resolves paths in the
+//! namespace of the guest process it runs (`set_current_ns`), so callers
+//! need not pass it around.
 
 use crate::errno::*;
 use crate::image::erofs::Erofs;
@@ -13,6 +15,7 @@ use crate::tmpfs::MemFile;
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::cell::Cell;
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 pub const S_IFMT: u32 = 0o170000;
@@ -510,9 +513,29 @@ impl Table {
     }
 }
 
+/// The first mount namespace, which the kernel itself and the first process use.
+pub const INIT_NS: u32 = 0;
+
+thread_local! {
+    static CURRENT_NS: Cell<u32> = const { Cell::new(INIT_NS) };
+}
+
+/// The mount namespace this host thread resolves paths in.
+pub fn current_ns() -> u32 {
+    CURRENT_NS.with(Cell::get)
+}
+
+pub fn set_current_ns(ns: u32) {
+    CURRENT_NS.with(|c| c.set(ns));
+}
+
+type Space = Arc<RwLock<Arc<Table>>>;
+
 #[derive(Default)]
 pub struct Vfs {
-    table: RwLock<Arc<Table>>,
+    /// Mount namespaces by id.
+    spaces: RwLock<HashMap<u32, Space>>,
+    ns_ids: AtomicU32,
     /// Serializes changes: copy the table, edit it, publish it.
     edit: Mutex<()>,
     ids: AtomicU32,
@@ -555,20 +578,108 @@ fn under(path: &str, dir: &str) -> bool {
     dir == "/" || path == dir || path.strip_prefix(dir).is_some_and(|r| r.starts_with('/'))
 }
 
+/// The mounts in `tab` that propagate_umount takes with `m` (attached on
+/// `dest`): its copies on `dest`'s peers and slaves, with what is beneath them
+/// if `detach`, and only unbusy ones otherwise.
+fn propagated_copies(tab: &Table, dest: &Mount, m: &Mount, detach: bool) -> HashSet<u32> {
+    let mut out = HashSet::new();
+    let group = dest.propagation.lock().unwrap().shared;
+    if group == 0 {
+        return out;
+    }
+    let inner = rebase(&m.path, &dest.path, &dest.root_path);
+    for r in tab.mounts.iter().filter(|r| r.id != dest.id && Arc::ptr_eq(&r.sb, &dest.sb)) {
+        let p = *r.propagation.lock().unwrap();
+        if (p.shared != group && p.master != group) || !under(&inner, &r.root_path) {
+            continue;
+        }
+        let at = rebase(&inner, &r.root_path, &r.path);
+        for c in tab.mounts.iter().filter(|c| c.parent == r.id && c.path == at && Arc::ptr_eq(&c.sb, &m.sb) && c.root == m.root) {
+            let sub = tab.subtree(c);
+            if sub.len() == 1 || detach {
+                out.extend(sub);
+            }
+        }
+    }
+    out
+}
+
 impl Vfs {
-    fn table(&self) -> Arc<Table> {
-        self.table.read().unwrap().clone()
+    /// Namespace `ns`'s table (the first namespace's if `ns` is gone).
+    fn ns_space(&self, ns: u32) -> Space {
+        if let Some(s) = self.spaces.read().unwrap().get(&ns) {
+            return s.clone();
+        }
+        self.spaces.write().unwrap().entry(INIT_NS).or_default().clone()
     }
 
-    /// Applies `f` to a copy of the mount list and publishes the result.
+    fn table(&self) -> Arc<Table> {
+        self.ns_space(current_ns()).read().unwrap().clone()
+    }
+
+    /// Applies `f` to a copy of the current namespace's mount list and
+    /// publishes the result. `f` may also change other namespaces through
+    /// `elsewhere` (propagation), under the same lock.
     fn edit<R>(&self, f: impl FnOnce(&Table, &mut Vec<Arc<Mount>>) -> Result<R, i64>) -> Result<R, i64> {
         let _g = self.edit.lock().unwrap();
-        let tab = self.table();
+        let space = self.ns_space(current_ns());
+        let tab = space.read().unwrap().clone();
         let mut mounts = tab.mounts.clone();
         let r = f(&tab, &mut mounts)?;
-        *self.table.write().unwrap() = Arc::new(Table::new(mounts));
+        *space.write().unwrap() = Arc::new(Table::new(mounts));
         self.touch();
         Ok(r)
+    }
+
+    /// Runs `f` on every namespace but the current one (with `edit`'s lock held).
+    fn elsewhere(&self, mut f: impl FnMut(&Table, &mut Vec<Arc<Mount>>)) {
+        let me = current_ns();
+        let spaces: Vec<Space> = self.spaces.read().unwrap().iter().filter(|(id, _)| **id != me).map(|(_, s)| s.clone()).collect();
+        for space in spaces {
+            let tab = space.read().unwrap().clone();
+            let mut mounts = tab.mounts.clone();
+            f(&tab, &mut mounts);
+            if mounts.len() != tab.mounts.len() {
+                *space.write().unwrap() = Arc::new(Table::new(mounts));
+            }
+        }
+    }
+
+    /// unshare(CLONE_NEWNS): a new namespace holding a copy of the current
+    /// one's mounts. Copies of shared mounts are their peers, so mount events
+    /// keep propagating between the namespaces (init's /bootstrap-apex).
+    pub fn clone_ns(&self) -> u32 {
+        let _g = self.edit.lock().unwrap();
+        let tab = self.table();
+        let mut ids: HashMap<u32, u32> = HashMap::new();
+        let mut mounts = Vec::with_capacity(tab.mounts.len());
+        for m in &tab.mounts {
+            let id = self.ids.fetch_add(1, Ordering::Relaxed) + ROOT_PARENT + 1;
+            ids.insert(m.id, id);
+            mounts.push((m, id));
+        }
+        let copies = mounts
+            .into_iter()
+            .map(|(m, id)| {
+                Arc::new(Mount {
+                    id,
+                    parent: ids.get(&m.parent).copied().unwrap_or(m.parent),
+                    path: m.path.clone(),
+                    sb: m.sb.clone(),
+                    root: m.root,
+                    root_path: m.root_path.clone(),
+                    flags: AtomicU64::new(m.flags.load(Ordering::Relaxed)),
+                    propagation: Mutex::new(*m.propagation.lock().unwrap()),
+                })
+            })
+            .collect();
+        let ns = self.ns_ids.fetch_add(1, Ordering::Relaxed) + 1;
+        self.spaces.write().unwrap().insert(ns, Arc::new(RwLock::new(Arc::new(Table::new(copies)))));
+        ns
+    }
+
+    pub fn has_ns(&self, ns: u32) -> bool {
+        ns == INIT_NS || self.spaces.read().unwrap().contains_key(&ns)
     }
 
     /// Notes a change to the mount table (or a mount's flags) for pollers of /proc/mounts.
@@ -729,7 +840,8 @@ impl Vfs {
             let dest = tab.mounts.iter().find(|m| m.id == target.mnt.id).cloned().ok_or(ENOENT)?; // ENOENT: its mount went away meanwhile
             let m = self.new_mount(&dest, target.path.clone(), sb, Some(root), "/".into(), flags, 0);
             mounts.push(m.clone());
-            self.propagate(mounts, &dest, &[m]);
+            self.propagate(mounts, &dest, std::slice::from_ref(&m));
+            self.elsewhere(|_, ms| self.propagate(ms, &dest, std::slice::from_ref(&m)));
             Ok(())
         })
     }
@@ -769,6 +881,7 @@ impl Vfs {
             }
             let tree = mounts[first..].to_vec();
             self.propagate(mounts, &dest, &tree);
+            self.elsewhere(|_, ms| self.propagate(ms, &dest, &tree));
             Ok(())
         })
     }
@@ -795,22 +908,12 @@ impl Vfs {
                 return Err(EBUSY);
             }
             // propagate_umount: the copies on the parent's peers and slaves go too (busy ones stay).
-            if let Some(dest) = tab.mounts.iter().find(|x| x.id == m.parent) {
-                let group = dest.propagation.lock().unwrap().shared;
-                let inner = rebase(&m.path, &dest.path, &dest.root_path);
-                for r in tab.mounts.iter().filter(|r| r.id != dest.id && group != 0 && Arc::ptr_eq(&r.sb, &dest.sb)) {
-                    let p = *r.propagation.lock().unwrap();
-                    if (p.shared != group && p.master != group) || !under(&inner, &r.root_path) {
-                        continue;
-                    }
-                    let at = rebase(&inner, &r.root_path, &r.path);
-                    for c in tab.mounts.iter().filter(|c| c.parent == r.id && c.path == at && Arc::ptr_eq(&c.sb, &m.sb) && c.root == m.root) {
-                        let sub = tab.subtree(c);
-                        if sub.len() == 1 || detach {
-                            gone.extend(sub);
-                        }
-                    }
-                }
+            if let Some(dest) = tab.mounts.iter().find(|x| x.id == m.parent).cloned() {
+                gone.extend(propagated_copies(tab, &dest, &m, detach));
+                self.elsewhere(|t, ms| {
+                    let ids = propagated_copies(t, &dest, &m, detach);
+                    ms.retain(|x| !ids.contains(&x.id));
+                });
             }
             let removed = mounts.iter().filter(|x| gone.contains(&x.id)).cloned().collect();
             mounts.retain(|x| !gone.contains(&x.id));

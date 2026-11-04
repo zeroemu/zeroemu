@@ -24,6 +24,7 @@ impl Events {
 
     /// Sleeps until the counter moves past `seen` or `timeout` elapses.
     pub fn wait(&self, seen: u64, timeout: Duration) {
+        super::vcpus::blocking();
         let g = self.generation.lock().unwrap();
         if *g == seen {
             let _ = self.cv.wait_timeout_while(g, timeout, |g| *g == seen).unwrap();

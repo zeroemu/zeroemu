@@ -170,6 +170,7 @@ impl Kernel {
                 return if *w.woken.lock().unwrap() { 0 } else { -EINTR };
             }
             let nap = deadline.map_or(POLL, |d| d.saturating_duration_since(Instant::now()).min(POLL));
+            super::vcpus::blocking();
             woken = w.cv.wait_timeout(woken, nap).unwrap().0;
         }
     }

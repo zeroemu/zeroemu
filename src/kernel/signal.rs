@@ -452,6 +452,7 @@ impl Kernel {
         let old = t.mask.swap(mask & !UNBLOCKABLE, Ordering::Relaxed);
         *t.saved_mask.lock().unwrap() = Some(old);
         while !t.interrupted() {
+            super::vcpus::blocking();
             std::thread::sleep(POLL.min(std::time::Duration::from_millis(2)));
         }
         -EINTR

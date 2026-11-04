@@ -79,7 +79,8 @@ check "mkdir -p over mounts" "made"               /system/bin/sh -c 'mkdir -p /d
 check "sysctl write"        "panic=7 host=droid"  /system/bin/sh -c 'echo 7 > /proc/sys/kernel/panic; echo droid > /proc/sys/kernel/hostname; echo "panic=$(cat /proc/sys/kernel/panic) host=$(uname -n)"'
 check "oom_score_adj"       "adj=-500 legacy=-8"  /system/bin/sh -c 'echo -500 > /proc/self/oom_score_adj; echo "adj=$(cat /proc/$$/oom_score_adj) legacy=$(cat /proc/$$/oom_adj)"'
 check "cgroup v1"           "1:cpu:/fg"           /system/bin/sh -c 'mkdir /dev/cpuctl && mount -t cgroup -o cpu none /dev/cpuctl && mkdir /dev/cpuctl/fg && echo $$ > /dev/cpuctl/fg/cgroup.procs && cat /proc/self/cgroup'
-check "unshare + nsenter"   "mnt:[4026531841]"    /system/bin/sh -c 'unshare -m nsenter -t 1 -m readlink /proc/self/ns/mnt'
+check "unshare + nsenter"   "mnt:[4026531841]"    /system/bin/sh -c 'unshare -m nsenter -t 1 -m readlink /proc/self/ns/mnt; true'
+check "mount namespaces"    "inner:4026532001 outer:a" /system/bin/sh -c 'mount -t tmpfs tmpfs /mnt; echo a > /mnt/x; echo "$(unshare -m sh -c "umount /mnt; echo inner:\$(readlink /proc/self/ns/mnt | tr -dc 0-9)") outer:$(cat /mnt/x)"'
 # A loop device over an APEX's ext4 payload (a stored zip entry), mounted like apexd does.
 SHIM=/system/apex/com.android.apex.cts.shim.apex
 OFF=$("$BIN" --system "$IMG" --cat $SHIM | perl -0777 -ne '$h = index($_, "apex_payload.img") - 30; ($n, $e) = unpack("v v", substr($_, $h + 26, 4)); print $h + 30 + $n + $e')

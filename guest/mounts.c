@@ -181,10 +181,10 @@ int cmain(void) {
     check(sys(NR_unshare, CLONE_NEWNET) == -EINVAL, "unshare(CLONE_NEWNET): EINVAL");
     char link[64];
     i64 ln = sys(NR_readlinkat, AT_FDCWD, "/proc/self/ns/mnt", link, sizeof link);
-    check(ln == 16 && seq(link, "mnt:[4026531841]", 16), "readlink /proc/self/ns/mnt");
+    check(ln == 16 && seq(link, "mnt:[4026532001]", 16), "readlink /proc/self/ns/mnt: a new namespace");
     int nfd = (int)sys(NR_openat, AT_FDCWD, "/proc/self/ns/mnt", O_RDONLY, 0);
     sys(NR_fstat, nfd, st);
-    check(nfd >= 0 && st[1] == 4026531841ul, "open /proc/self/ns/mnt: the nsfs inode");
+    check(nfd >= 0 && st[1] == 4026532001ul, "open /proc/self/ns/mnt: the nsfs inode");
     check(sys(NR_setns, nfd, CLONE_NEWNS) == 0 && sys(NR_setns, nfd, 0) == 0, "setns to the mount namespace");
     check(sys(NR_setns, nfd, CLONE_NEWNET) == -EINVAL, "setns with the wrong type: EINVAL");
     check(sys(NR_setns, 1, CLONE_NEWNS) == -EINVAL, "setns on a non-namespace fd: EINVAL");

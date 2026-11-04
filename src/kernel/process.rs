@@ -11,7 +11,7 @@ use crate::hv::{CpuState, Vcpu};
 use crate::mm::AddressSpace;
 use crate::vfs::{S_IFMT, S_IFREG};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 const CLONE_VM: u64 = 0x100;
@@ -130,6 +130,7 @@ impl Kernel {
             creds: Mutex::new(parent.creds.lock().unwrap().clone()),
             attrs: Mutex::new(parent.attrs.lock().unwrap().fork(t.tid)),
             sec: parent.sec.clone(),
+            mnt_ns: AtomicU32::new(parent.mnt_ns.load(Ordering::Relaxed)),
         });
         let th = Thread::new(pid, child.clone(), t.mask.load(Ordering::Relaxed));
         th.sec.inherit(&t.sec);
@@ -198,6 +199,7 @@ impl Kernel {
             }
         }
         while t.proc.threads.lock().unwrap().len() > 1 {
+            super::vcpus::blocking();
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
     }
@@ -353,6 +355,7 @@ impl Kernel {
             if t.interrupted() {
                 return Err(ERESTARTSYS);
             }
+            super::vcpus::blocking();
             children = proc.child_cv.wait_timeout(children, POLL).unwrap().0;
         }
     }

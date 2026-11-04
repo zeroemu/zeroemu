@@ -30,6 +30,7 @@ mod signal;
 mod specialfd;
 mod sysctl;
 mod unix;
+mod vcpus;
 mod wait;
 mod xattr;
 
@@ -56,6 +57,8 @@ const ERESTARTSYS: i64 = 512;
 
 /// How often blocked threads re-check for signals and process exit.
 const POLL: Duration = Duration::from_millis(20);
+/// Guest threads at once (each is a host thread; vCPUs are shared).
+const MAX_THREADS: usize = 16384;
 
 /// A C `int` syscall argument (fds, dirfds, pids): only the low 32 bits are
 /// defined, so AT_FDCWD arrives as 0xffffff9c.
@@ -82,7 +85,10 @@ pub struct Kernel {
     procs: Mutex<HashMap<i32, Arc<Process>>>,
     next_id: AtomicI32,
     next_asid: AtomicU32,
-    live_vcpus: AtomicUsize,
+    /// Host threads running guest threads.
+    live_threads: AtomicUsize,
+    /// The vCPUs guest threads share.
+    vcpus: Arc<vcpus::Pool>,
     futex: futex::Futexes,
     root_pid: AtomicI32,
     pub props: Arc<properties::Properties>,
@@ -180,6 +186,8 @@ pub struct Process {
     pub attrs: Mutex<control::ProcAttrs>,
     /// SELinux context (and the one before the last execve).
     pub sec: selinux::ProcSec,
+    /// Its mount namespace (vfs.rs).
+    pub mnt_ns: AtomicU32,
 }
 
 pub struct Thread {
@@ -255,6 +263,7 @@ impl Kernel {
     /// have set up (the property area and service, logd).
     pub fn new(hv: Arc<dyn Hypervisor>, vfs: Option<Vfs>, strace: bool, boot: bool) -> Result<Arc<Kernel>, String> {
         let phys = PhysMem::new(hv.clone());
+        let max_vcpus = hv.max_vcpus();
         let pages = hv.kernel_pages(&mut || {
             let gpa = phys.alloc().expect("no memory for the kernel window");
             (gpa, phys.host(gpa))
@@ -304,7 +313,8 @@ impl Kernel {
             procs: Mutex::new(HashMap::new()),
             next_id: AtomicI32::new(1),
             next_asid: AtomicU32::new(1),
-            live_vcpus: AtomicUsize::new(0),
+            live_threads: AtomicUsize::new(0),
+            vcpus: vcpus::Pool::new(max_vcpus),
             futex: futex::Futexes::default(),
             root_pid: AtomicI32::new(0),
             props,
@@ -356,6 +366,7 @@ impl Kernel {
             creds: Mutex::new(creds::Creds::root()),
             attrs: Mutex::new(control::ProcAttrs::first()),
             sec: self.selinux.initial_sec(),
+            mnt_ns: AtomicU32::new(crate::vfs::INIT_NS),
         });
         self.root_pid.store(pid, Ordering::Relaxed);
         self.procs.lock().unwrap().insert(pid, proc.clone());
@@ -375,11 +386,11 @@ impl Kernel {
         status.unwrap()
     }
 
-    /// Runs `thread` on a new host thread with its own vCPU.
+    /// Runs `thread` on a new host thread (it gets a vCPU when it runs guest code).
     fn spawn(self: &Arc<Self>, thread: Arc<Thread>, state: CpuState) -> Result<(), i64> {
-        if self.live_vcpus.fetch_add(1, Ordering::AcqRel) >= self.hv.max_vcpus() {
-            self.live_vcpus.fetch_sub(1, Ordering::AcqRel);
-            eprintln!("[droidrt] thread limit: the hypervisor allows {} vCPUs", self.hv.max_vcpus());
+        if self.live_threads.fetch_add(1, Ordering::AcqRel) >= MAX_THREADS {
+            self.live_threads.fetch_sub(1, Ordering::AcqRel);
+            eprintln!("[droidrt] thread limit ({MAX_THREADS}) reached");
             return Err(EAGAIN);
         }
         let k = self.clone();
@@ -389,26 +400,19 @@ impl Kernel {
             .stack_size(1 << 20)
             .spawn(move || {
                 k.thread_main(&t, state);
-                k.live_vcpus.fetch_sub(1, Ordering::AcqRel);
+                k.live_threads.fetch_sub(1, Ordering::AcqRel);
             })
             .map(|_| ())
             .map_err(|_| {
-                self.live_vcpus.fetch_sub(1, Ordering::AcqRel);
+                self.live_threads.fetch_sub(1, Ordering::AcqRel);
                 EAGAIN
             })
     }
 
     fn thread_main(self: &Arc<Self>, t: &Arc<Thread>, state: CpuState) {
+        crate::vfs::set_current_ns(t.proc.mnt_ns.load(Ordering::Relaxed));
         let root = t.proc.mm().root;
-        let mut vcpu = match self.hv.create_vcpu(root, &state) {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("[droidrt] tid {}: {e}", t.tid);
-                self.thread_exit(t, 127 << 8);
-                return;
-            }
-        };
-        *t.kick.lock().unwrap() = Some(vcpu.kicker());
+        let mut vcpu: Box<dyn Vcpu> = Box::new(vcpus::LazyVcpu::new(self.hv.clone(), self.vcpus.clone(), t.clone(), root, state));
         let mut stale = crate::mm::Stale::default();
         let mut restart: Option<SyscallRegs> = None;
         let mut exit_code = 0;
@@ -456,7 +460,6 @@ impl Kernel {
                 vcpu.flush_tlb();
             }
         }
-        *t.kick.lock().unwrap() = None;
         drop(vcpu); // destroyed on the thread that owns it
         stale.release(&self.phys);
         self.thread_exit(t, exit_code);

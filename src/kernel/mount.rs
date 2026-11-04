@@ -1,11 +1,9 @@
 //! mount(2), umount2(2), unshare(2) and setns(2), plus the text of
 //! /proc/mounts and /proc/<pid>/mountinfo.
 //!
-//! There is one mount namespace, shared by every process: unshare(CLONE_NEWNS)
-//! and setns() succeed without creating or switching anything, so a mount
-//! made "in" one namespace shows in all of them (as if every mount were
-//! shared). Android's init, which builds a bootstrap and a default namespace,
-//! then sees both as the same.
+//! unshare(CLONE_NEWNS) gives the caller a copy of its mount namespace and
+//! setns() moves it to the one behind a /proc/<pid>/ns/mnt fd (vfs.rs keeps
+//! the tables). Every other namespace kind has a single instance.
 
 use super::cgroup::{CgroupFs, V1_CONTROLLERS};
 use super::{Kernel, Thread, block, int};
@@ -303,8 +301,13 @@ impl Kernel {
                 if flags & !ok != 0 {
                     return Err(EINVAL);
                 }
-                if flags & CLONE_NEWNS != 0 && !self.creds(t).capable(super::creds::CAP_SYS_ADMIN) {
-                    return Err(EPERM);
+                if flags & CLONE_NEWNS != 0 {
+                    if !self.creds(t).capable(super::creds::CAP_SYS_ADMIN) {
+                        return Err(EPERM);
+                    }
+                    let ns = self.vfs.as_deref().ok_or(EINVAL)?.clone_ns();
+                    t.proc.mnt_ns.store(ns, Ordering::Relaxed);
+                    crate::vfs::set_current_ns(ns);
                 }
                 Ok(0)
             }
@@ -330,7 +333,15 @@ impl Kernel {
                 if !self.creds(t).capable(super::creds::CAP_SYS_ADMIN) {
                     return Err(EPERM);
                 }
-                Ok(0) // already in it: there is one namespace of each kind
+                // One namespace of every other kind: already in it.
+                if let Some(ns) = super::procfs::ns_mnt(node.ino) {
+                    if !vfs.has_ns(ns) {
+                        return Err(EINVAL);
+                    }
+                    t.proc.mnt_ns.store(ns, Ordering::Relaxed);
+                    crate::vfs::set_current_ns(ns);
+                }
+                Ok(0)
             }
             _ => Err(ENOSYS),
         }

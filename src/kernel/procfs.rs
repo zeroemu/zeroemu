@@ -107,10 +107,34 @@ const NAMESPACES: [(&str, &str, u64); 10] = [
     ("uts", "uts", 4026531838),
 ];
 
+/// NAMESPACES' index of "mnt": the one kind with more than one namespace.
+const MNT: u64 = 2;
+
+/// An nsfs inode's `extra`: the NAMESPACES index, and for "mnt" which mount
+/// namespace (captured when the link is followed, so an open fd keeps it).
+fn ns_extra(i: u64, mnt_ns: u32) -> u64 {
+    i | if i == MNT { (mnt_ns as u64) << 4 } else { 0 }
+}
+
+/// The namespace's inode number, as readlink and stat show it.
+fn ns_inum(extra: u64) -> u64 {
+    let (i, ns) = (extra & 0xf, extra >> 4);
+    let base = NAMESPACES[i as usize % NAMESPACES.len()].2;
+    if i == MNT && ns != 0 { 4026532000 + ns } else { base }
+}
+
 /// The kind ("mnt", "net", ...) of a namespace file opened through /proc/<pid>/ns.
 pub(super) fn ns_kind(ino: u64) -> Option<&'static str> {
     match decode(ino)? {
-        (K::NsFile, _, i) => NAMESPACES.get(i as usize).map(|n| n.1),
+        (K::NsFile, _, i) => NAMESPACES.get((i & 0xf) as usize).map(|n| n.1),
+        _ => None,
+    }
+}
+
+/// The mount namespace behind an open /proc/<pid>/ns/mnt.
+pub(super) fn ns_mnt(ino: u64) -> Option<u32> {
+    match decode(ino)? {
+        (K::NsFile, _, i) if i & 0xf == MNT => Some((i >> 4) as u32),
         _ => None,
     }
 }
@@ -358,9 +382,9 @@ impl ProcFs {
                 Ok(Content::Dir(NAMESPACES.iter().enumerate().map(|(i, n)| (n.0.to_string(), mk(K::PNsLink, pid, i as u64))).collect()))
             }
             K::PNsLink => {
-                self.proc(pid)?;
-                let (_, kind, inum) = NAMESPACES[extra as usize % NAMESPACES.len()];
-                Ok(Content::Link(format!("{kind}:[{inum}]")))
+                let p = self.proc(pid)?;
+                let kind = NAMESPACES[extra as usize % NAMESPACES.len()].1;
+                Ok(Content::Link(format!("{kind}:[{}]", ns_inum(ns_extra(extra, p.mnt_ns.load(Ordering::Relaxed))))))
             }
             K::NsFile => Ok(Content::File(Vec::new())),
             K::Cgroups => text(super::cgroup::proc_cgroups(&kernel)),
@@ -439,7 +463,7 @@ impl FileSystem for ProcFs {
         let mtime = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
         // An nsfs inode's number is the namespace's id.
         let st_ino = match decode(ino) {
-            Some((K::NsFile, _, i)) => NAMESPACES[i as usize % NAMESPACES.len()].2,
+            Some((K::NsFile, _, i)) => ns_inum(i),
             _ => ino,
         };
         Ok(Stat { dev: 0, ino: st_ino, mode, nlink: 1, uid: 0, gid: 0, rdev: 0, size, mtime })
@@ -501,7 +525,7 @@ impl FileSystem for ProcFs {
 
     fn magic_link(&self, ino: u64) -> Option<u64> {
         match decode(ino)? {
-            (K::PNsLink, pid, i) => Some(mk(K::NsFile, pid, i)),
+            (K::PNsLink, pid, i) => Some(mk(K::NsFile, pid, ns_extra(i, self.proc(pid).ok()?.mnt_ns.load(Ordering::Relaxed)))),
             _ => None,
         }
     }

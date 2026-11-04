@@ -71,6 +71,7 @@ impl Kernel {
                     if t.interrupted() {
                         return Err(EINTR);
                     }
+                    super::vcpus::blocking();
                     std::thread::sleep(deadline.saturating_duration_since(Instant::now()).min(POLL));
                 }
                 Ok(0)

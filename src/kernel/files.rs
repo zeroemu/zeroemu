@@ -302,6 +302,7 @@ impl Pipe {
             if t.interrupted() {
                 return Err(ERESTARTSYS);
             }
+            super::vcpus::blocking();
             st = self.cv.wait_timeout(st, POLL).unwrap().0;
         }
     }
@@ -330,6 +331,7 @@ impl Pipe {
             if t.interrupted() {
                 return if done > 0 { Ok(done) } else { Err(ERESTARTSYS) };
             }
+            super::vcpus::blocking();
             st = self.cv.wait_timeout(st, POLL).unwrap().0;
         }
     }

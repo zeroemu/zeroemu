@@ -112,6 +112,15 @@ impl CpuState {
         }
     }
 
+    /// The syscall number and arguments, as `Vcpu::syscall_regs` reads them.
+    pub fn syscall_regs(&self) -> SyscallRegs {
+        match self {
+            CpuState::Aarch64(s) => SyscallRegs { nr: s.x[8], args: [s.x[0], s.x[1], s.x[2], s.x[3], s.x[4], s.x[5]] },
+            // rax; rdi, rsi, rdx, r10, r8, r9
+            CpuState::X86_64(s) => SyscallRegs { nr: s.gpr[0], args: [s.gpr[7], s.gpr[6], s.gpr[2], s.gpr[10], s.gpr[8], s.gpr[9]] },
+        }
+    }
+
     pub fn set_tls(&mut self, tls: u64) {
         match self {
             CpuState::Aarch64(s) => s.tpidr = tls,

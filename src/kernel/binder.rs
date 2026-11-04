@@ -292,8 +292,13 @@ impl World {
         n
     }
 
-    /// The handle process `p` uses for `node`, created (and the owner told) on first use.
-    fn handle_for(&mut self, p: ProcId, node: NodeId, strong: bool) -> u32 {
+    /// The handle process `p` uses for `node`, created (and the owner told) on
+    /// first use. When the owner's thread `by` is the one handing the object
+    /// out, BR_INCREFS/BR_ACQUIRE go on that thread's own list, as Linux's
+    /// binder_translate_binder does: it reads them before its transaction
+    /// completes, while its Parcel still holds the object alive. Queued on the
+    /// process, another thread could get them after the object is gone.
+    fn handle_for(&mut self, p: ProcId, node: NodeId, strong: bool, by: Option<(ProcId, i32)>) -> u32 {
         let proc = self.procs.get_mut(&p).unwrap();
         let h = match proc.node_refs.get(&node) {
             Some(&h) => h,
@@ -311,8 +316,13 @@ impl World {
         if !n.acquired && !n.dead {
             n.acquired = true;
             let owner = n.owner;
-            if let Some(op) = self.procs.get_mut(&owner) {
-                op.todo.push_back(Work::Acquire(node));
+            match by {
+                Some((bp, tid)) if bp == owner => self.thread(owner, tid).todo.push_back(Work::Acquire(node)),
+                _ => {
+                    if let Some(op) = self.procs.get_mut(&owner) {
+                        op.todo.push_back(Work::Acquire(node));
+                    }
+                }
             }
         }
         h
@@ -502,7 +512,7 @@ impl Kernel {
                 if handle == 0 && !w.procs[&b.id].refs.contains_key(&0) {
                     // First use of the context manager's handle.
                     let Some(mgr) = w.mgr[ctx] else { return Ok(()) };
-                    w.handle_for(b.id, mgr, false);
+                    w.handle_for(b.id, mgr, false, None);
                 }
                 if let Some(r) = w.procs.get_mut(&b.id).unwrap().refs.get_mut(&handle) {
                     match cmd {
@@ -662,7 +672,7 @@ impl Kernel {
                 ty @ (TYPE_BINDER | TYPE_WEAK_BINDER) if o + 24 <= out.data.len() => {
                     let (flags, ptr, cookie) = (u32_at(&out.data, o + 4), u64_at(&out.data, o + 8), u64_at(&out.data, o + 16));
                     let n = w.node_for(me, ptr, cookie, flags);
-                    let h = w.handle_for(to, n, ty == TYPE_BINDER);
+                    let h = w.handle_for(to, n, ty == TYPE_BINDER, Some((me, t.tid)));
                     out.data[o..o + 4].copy_from_slice(&(if ty == TYPE_BINDER { TYPE_HANDLE } else { TYPE_WEAK_HANDLE }).to_le_bytes());
                     out.data[o + 8..o + 16].copy_from_slice(&(h as u64).to_le_bytes());
                     out.data[o + 16..o + 24].fill(0);
@@ -682,7 +692,7 @@ impl Kernel {
                         out.data[o + 8..o + 16].copy_from_slice(&ptr.to_le_bytes());
                         out.data[o + 16..o + 24].copy_from_slice(&cookie.to_le_bytes());
                     } else {
-                        let h = w.handle_for(to, n, ty == TYPE_HANDLE);
+                        let h = w.handle_for(to, n, ty == TYPE_HANDLE, None);
                         out.data[o + 8..o + 16].copy_from_slice(&(h as u64).to_le_bytes());
                     }
                 }

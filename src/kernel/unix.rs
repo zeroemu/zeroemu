@@ -425,7 +425,7 @@ impl Socket {
     }
 
     /// Receives up to `max` bytes: data, passed files, sender address, sender
-    /// credentials, and whether a datagram was truncated.
+    /// credentials, and the real datagram length (the copied length, for a stream).
     fn recv(&self, t: &Thread, max: usize, flags: u64, nonblock: bool) -> Result<Received, i64> {
         let peek = flags & MSG_PEEK != 0;
         let mut out = Vec::new();
@@ -448,8 +448,8 @@ impl Socket {
                 let mut q = self.rx.lock().unwrap();
                 if self.ty != SOCK_STREAM {
                     if let Some(m) = q.msgs.front() {
-                        let truncated = m.data.len() > max;
-                        out.extend_from_slice(&m.data[..m.data.len().min(max)]);
+                        let real = m.data.len();
+                        out.extend_from_slice(&m.data[..real.min(max)]);
                         from = m.from.clone();
                         cred = m.cred;
                         if !peek {
@@ -459,7 +459,7 @@ impl Socket {
                             drop(q);
                             EVENTS.bump();
                         }
-                        return Ok((out, fds, from, cred, truncated));
+                        return Ok((out, fds, from, cred, real));
                     }
                 } else {
                     let mut consumed = false;
@@ -497,26 +497,30 @@ impl Socket {
                         if !peek {
                             EVENTS.bump();
                         }
-                        return Ok((out, fds, from, cred, false));
+                        let n = out.len();
+                        return Ok((out, fds, from, cred, n));
                     }
                 }
                 if q.write_closed || gone || shut_rd {
-                    return Ok((out, fds, from, cred, false)); // EOF
+                    let n = out.len();
+                    return Ok((out, fds, from, cred, n)); // EOF
                 }
             }
             if nonblock {
-                return if out.is_empty() { Err(EAGAIN) } else { Ok((out, fds, from, cred, false)) };
+                let n = out.len();
+                return if n == 0 { Err(EAGAIN) } else { Ok((out, fds, from, cred, n)) };
             }
             if t.interrupted() {
-                return if out.is_empty() { Err(ERESTARTSYS) } else { Ok((out, fds, from, cred, false)) };
+                let n = out.len();
+                return if n == 0 { Err(ERESTARTSYS) } else { Ok((out, fds, from, cred, n)) };
             }
             EVENTS.wait(seen, POLL);
         }
     }
 }
 
-/// (data, passed files, sender address, sender credentials, truncated).
-type Received = (Vec<u8>, Vec<Arc<File>>, Vec<u8>, Cred, bool);
+/// (data, passed files, sender address, sender credentials, real datagram length).
+type Received = (Vec<u8>, Vec<Arc<File>>, Vec<u8>, Cred, usize);
 
 /// Reads plain bytes and fds out of a socket file's read/write path.
 pub fn read(sock: &Socket, t: &Thread, max: usize, nonblock: bool) -> Result<Vec<u8>, i64> {
@@ -714,12 +718,13 @@ impl Kernel {
             recvfrom => {
                 let (sock, file) = self.sock(t, int(a[0]))?;
                 let nonblock = file.nonblock() || a[3] & MSG_DONTWAIT != 0;
-                let (data, _fds, from, _cred, truncated) = sock.recv(t, a[2].min(IO_MAX) as usize, a[3], nonblock)?;
+                let (data, _fds, from, _cred, real) = sock.recv(t, a[2].min(IO_MAX) as usize, a[3], nonblock)?;
                 t.proc.mm().write(a[1], &data)?;
                 if a[4] != 0 {
                     self.write_addr(t, a[4], a[5], (!from.is_empty()).then_some(&from[..]))?;
                 }
-                Ok(if truncated && a[3] & MSG_TRUNC != 0 { data.len().max(a[2] as usize) } else { data.len() } as i64)
+                // MSG_TRUNC: the return value is the real datagram length.
+                Ok(if a[3] & MSG_TRUNC != 0 { real } else { data.len() } as i64)
             }
             sendmsg => self.sendmsg(t, int(a[0]), a[1], a[2]),
             recvmsg => self.recvmsg(t, int(a[0]), a[1], a[2]),
@@ -928,7 +933,7 @@ impl Kernel {
         }
         let total: u64 = iovs.iter().map(|v| v.1).sum();
         let nonblock = file.nonblock() || flags & MSG_DONTWAIT != 0;
-        let (data, fds, from, cred, truncated) = sock.recv(t, total.min(IO_MAX) as usize, flags, nonblock)?;
+        let (data, fds, from, cred, real) = sock.recv(t, total.min(IO_MAX) as usize, flags, nonblock)?;
 
         // Scatter into the iovecs.
         {
@@ -945,7 +950,7 @@ impl Kernel {
         }
         // Control messages: credentials if asked for, then passed files.
         let mut ctl = Vec::new();
-        let mut msg_flags = if truncated { MSG_TRUNC as u32 } else { 0 };
+        let mut msg_flags = if real > data.len() { MSG_TRUNC as u32 } else { 0 };
         if sock.st.lock().unwrap().passcred {
             push_cmsg(&mut ctl, SCM_CREDENTIALS, &cred.bytes());
         }
@@ -978,7 +983,7 @@ impl Kernel {
         if name != 0 {
             self.write_addr(t, name, msg + 8, (!from.is_empty()).then_some(&from[..]))?;
         }
-        Ok(data.len() as i64)
+        Ok(if flags & MSG_TRUNC != 0 { real as i64 } else { data.len() as i64 })
     }
 }
 

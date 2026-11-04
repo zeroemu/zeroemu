@@ -275,6 +275,9 @@ static void unix_paths(void) {
     struct { int pid; u32 uid, gid; } pc;
     u32 pcl = sizeof pc;
     check(sys(NR_getsockopt, me, 1, 17 /* SO_PEERCRED */, &pc, &pcl) == 0 && pc.pid == (int)sys(NR_getpid, 0), "datagram SO_PEERCRED: the peer's pid");
+    sys(NR_sendto, me, "abcdefgh", 8, 0, 0, 0);
+    char tiny[3];
+    check(sys(NR_recvfrom, dg, tiny, 3, 0x20 /* MSG_TRUNC */, 0, 0) == 8 && seq(tiny, "abc", 3), "MSG_TRUNC: return value is the real datagram length");
 }
 
 // ---- netlink ----

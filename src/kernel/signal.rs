@@ -185,13 +185,26 @@ fn sig_name(sig: u32) -> String {
         .map_or_else(|| format!("signal {sig}"), |s| s.to_string())
 }
 
+/// Whether `act` makes `sig` a no-op (for init, any default action is).
+fn ignored(act: &SigAction, sig: u32, init: bool) -> bool {
+    sig != SIGKILL && (act.handler == SIG_IGN || (act.handler == SIG_DFL && (init || default_action(sig) == Default_::Ignore)))
+}
+
 impl Thread {
     pub(super) fn has_deliverable_signal(&self) -> bool {
         let mask = self.mask.load(Ordering::Relaxed) & !UNBLOCKABLE;
-        let deliverable =
-            |p: &std::collections::HashMap<u32, SigInfo>| p.keys().any(|&s| bit(s) & mask == 0);
-        deliverable(&self.pending.lock().unwrap())
-            || deliverable(&self.proc.pending.lock().unwrap())
+        let unmasked = |p: &std::collections::HashMap<u32, SigInfo>| {
+            p.keys().copied().filter(|&s| bit(s) & mask == 0).collect::<Vec<_>>()
+        };
+        let mut sigs = unmasked(&self.pending.lock().unwrap());
+        sigs.extend(unmasked(&self.proc.pending.lock().unwrap()));
+        if sigs.is_empty() {
+            return false;
+        }
+        // One queued while blocked may be ignored now: it interrupts nothing
+        // (deliver_signals drops it). The root process is always pid 1.
+        let actions = self.proc.sig.lock().unwrap();
+        sigs.into_iter().any(|s| !ignored(&actions.get(s), s, self.proc.pid == 1))
     }
 
     fn take_signal(&self) -> Option<(u32, SigInfo)> {
@@ -220,9 +233,7 @@ impl Kernel {
             return false;
         }
         let act = proc.sig.lock().unwrap().get(sig);
-        sig != SIGKILL
-            && (act.handler == SIG_IGN
-                || (act.handler == SIG_DFL && (init || default_action(sig) == Default_::Ignore)))
+        ignored(&act, sig, init)
     }
 
     fn is_init(&self, proc: &Process) -> bool {

@@ -25,6 +25,7 @@ typedef unsigned short u16;
 #define NR_personality 92
 #define NR_exit_group 94
 #define NR_waitid 95
+#define NR_ppoll 73
 #define NR_signalfd4 74
 #define NR_nanosleep 101
 #define NR_rt_sigprocmask 135
@@ -684,6 +685,17 @@ static void process_tree(void) {
     check(wait_status(a) >> 8 == 6, "and the child is still there to reap");
     sys(NR_close, sfd);
     sys(NR_rt_sigprocmask, 1 /* SIG_UNBLOCK */, &chld, 0, 8);
+    a = fork_();
+    if (a == 0) {
+        // SIGCHLD (default: ignore) left pending while blocked, then unblocked by ppoll's mask.
+        sys(NR_rt_sigprocmask, 0, &chld, 0, 8);
+        i64 k = fork_();
+        if (k == 0) exit_(0);
+        wait_status(k);
+        u64 ts[2] = { 0, 30000000 }, none = 0;
+        exit_(sys(NR_ppoll, 0, 0, ts, &none, 8) == 0 ? 0 : 1);
+    }
+    check(wait_status(a) == 0, "a pending ignored signal does not interrupt a wait that unblocks it");
 
     // A pid 1 that never reaps cannot pile up orphaned zombies without bound.
     a = fork_();

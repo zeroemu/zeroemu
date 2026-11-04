@@ -35,6 +35,7 @@ const SO_RCVBUF: u64 = 8;
 const SO_PASSCRED: u64 = 16;
 const SO_PEERCRED: u64 = 17;
 const SO_ACCEPTCONN: u64 = 30;
+const SO_PEERSEC: u64 = 31;
 const SO_PROTOCOL: u64 = 38;
 const SO_DOMAIN: u64 = 39;
 const SHUT_RD: u64 = 0;
@@ -62,11 +63,13 @@ struct Cred {
     pid: i32,
     uid: u32,
     gid: u32,
+    /// SELinux label (selinux::sid); 0 for kernel-side services.
+    sid: u32,
 }
 
 impl Cred {
     fn of(t: &Thread) -> Cred {
-        Cred { pid: t.proc.pid, uid: 0, gid: 0 }
+        Cred { pid: t.proc.pid, uid: 0, gid: 0, sid: super::selinux::socket_sid(t) }
     }
     fn bytes(&self) -> [u8; 12] {
         let mut b = [0u8; 12];
@@ -141,7 +144,7 @@ fn service_socket(name: &str, ty: u32, service: Arc<dyn Service>, listening: boo
         if listening {
             st.backlog = Some(VecDeque::new());
         }
-        st.listen_cred = Cred { pid: 1, uid: 0, gid: 0 };
+        st.listen_cred = Cred { pid: 1, uid: 0, gid: 0, sid: 0 };
     }
     NAMES.lock().unwrap().insert(name.as_bytes().to_vec(), Arc::downgrade(&sock));
     sock
@@ -190,7 +193,7 @@ impl Socket {
             return true; // a reader that stopped reading: drop rather than grow
         }
         q.bytes += data.len();
-        q.msgs.push_back(Msg { data, off: 0, fds: Vec::new(), from: Vec::new(), cred: Cred { pid: 1, uid: 0, gid: 0 } });
+        q.msgs.push_back(Msg { data, off: 0, fds: Vec::new(), from: Vec::new(), cred: Cred { pid: 1, uid: 0, gid: 0, sid: 0 } });
         drop(q);
         EVENTS.bump();
         true
@@ -236,7 +239,7 @@ impl Socket {
             if !reply.is_empty() {
                 let mut q = client.rx.lock().unwrap();
                 q.bytes += reply.len();
-                q.msgs.push_back(Msg { data: reply, off: 0, fds: Vec::new(), from: Vec::new(), cred: Cred { pid: 1, uid: 0, gid: 0 } });
+                q.msgs.push_back(Msg { data: reply, off: 0, fds: Vec::new(), from: Vec::new(), cred: Cred { pid: 1, uid: 0, gid: 0, sid: 0 } });
             }
         }
         EVENTS.bump();
@@ -570,7 +573,7 @@ impl Kernel {
                 if let Some(svc) = &listener.service {
                     // A kernel-side service answers on its own; nothing to accept.
                     let server = Arc::new(Socket { ty: sock.ty, rx: Mutex::new(Queue::default()), st: Mutex::new(State::default()), service: Some(svc.clone()), svc_buf: Mutex::new(Vec::new()) });
-                    Socket::connect_pair(&sock, &server, Cred::of(t), Cred { pid: 1, uid: 0, gid: 0 });
+                    Socket::connect_pair(&sock, &server, Cred::of(t), Cred { pid: 1, uid: 0, gid: 0, sid: 0 });
                     sock.st.lock().unwrap().peer_server = Some(server);
                     return Ok(0);
                 }
@@ -653,6 +656,19 @@ impl Kernel {
                 let (sock, _) = self.sock(t, int(a[0]))?;
                 if a[1] != SOL_SOCKET {
                     return Err(ENOPROTOOPT);
+                }
+                if a[2] == SO_PEERSEC {
+                    // The peer's label from connect/socketpair time; ERANGE says how much room it needs.
+                    let sid = if sock.ty == SOCK_DGRAM { 0 } else { sock.st.lock().unwrap().peer_cred.sid };
+                    let ctx = super::selinux::peer_context(sid).ok_or(ENOPROTOOPT)?;
+                    let mut mm = t.proc.mm();
+                    let cap = mm.read_u32(a[4])? as usize;
+                    mm.write_u32(a[4], ctx.len() as u32)?;
+                    if cap < ctx.len() {
+                        return Err(ERANGE);
+                    }
+                    mm.write(a[3], &ctx)?;
+                    return Ok(0);
                 }
                 let st = sock.st.lock().unwrap();
                 let val: Vec<u8> = match a[2] {

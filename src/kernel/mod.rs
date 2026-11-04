@@ -18,6 +18,7 @@ mod misc;
 mod process;
 mod procfs;
 mod properties;
+mod selinux;
 mod signal;
 mod specialfd;
 mod unix;
@@ -78,6 +79,8 @@ pub struct Kernel {
     pub props: Arc<properties::Properties>,
     /// Loop and device-mapper devices.
     blocks: Arc<block::Blocks>,
+    /// SELinux state and selinuxfs.
+    selinux: Arc<selinux::Selinux>,
     /// Kernel-side socket services (kept alive here; looked up by name).
     _services: Vec<Arc<unix::Socket>>,
     /// The root process's wait status once it exits; droidrt then exits.
@@ -135,16 +138,6 @@ fn mount_tmpfs(vfs: &mut Vfs, phys: &Arc<PhysMem>) -> Arc<crate::tmpfs::Tmpfs> {
         sys.mkdir_p(d, 0o755);
     }
     vfs.mount("/sys", sys);
-    // selinuxfs, permissive and policy-less: libselinux finds it (statfs
-    // says SELINUX_MAGIC), maps its status page, and with deny_unknown=0
-    // every access check on an unknown class is allowed.
-    let selinux = Tmpfs::with_type(phys.clone(), 0o755, "selinuxfs");
-    for (name, content) in [("enforce", "0"), ("deny_unknown", "0"), ("reject_unknown", "0"), ("policyvers", "33"), ("mls", "1"), ("checkreqprot", "0")] {
-        selinux.write_file(name, 0o644, content);
-    }
-    // struct selinux_kernel_status: version 1, sequence 0, enforcing 0, policyload 0, deny_unknown 0.
-    selinux.write_file("status", 0o444, "\u{1}\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0");
-    vfs.mount("/sys/fs/selinux", selinux);
     dev_handle
 }
 
@@ -167,6 +160,7 @@ pub struct Process {
     exiting: Mutex<Option<i32>>,
     /// Process-directed pending signals.
     pending: Mutex<HashMap<u32, SigInfo>>,
+    pub sec: selinux::ProcSec,
 }
 
 pub struct Thread {
@@ -180,6 +174,7 @@ pub struct Thread {
     altstack: Mutex<(u64, u64, i32)>,
     kick: Mutex<Option<Arc<dyn Kick>>>,
     dying: AtomicBool,
+    pub sec: selinux::ThreadSec,
 }
 
 /// Locked access to a live process's address space.
@@ -215,6 +210,7 @@ impl Thread {
             altstack: Mutex::new((0, 0, signal::SS_DISABLE)),
             kick: Mutex::new(None),
             dying: AtomicBool::new(false),
+            sec: Default::default(),
         })
     }
 
@@ -261,6 +257,8 @@ impl Kernel {
         // /proc reads kernel state, so the kernel is built around it.
         Ok(Arc::new_cyclic(|me| {
             v.mount("/proc", procfs::ProcFs::new(me.clone()));
+            let selinux = selinux::Selinux::new(me.clone(), phys.clone(), boot);
+            v.mount("/sys/fs/selinux", selinux.clone());
             let svc: Arc<dyn unix::Service> = Arc::new(PropertyService { kernel: me.clone() });
             let mut services = Vec::new();
             if !boot {
@@ -286,6 +284,7 @@ impl Kernel {
             root_pid: AtomicI32::new(0),
             props,
             blocks,
+            selinux,
             _services: services,
             exit: (Mutex::new(None), Condvar::new()),
             }
@@ -327,6 +326,7 @@ impl Kernel {
             status: Mutex::new(None),
             exiting: Mutex::new(None),
             pending: Mutex::new(HashMap::new()),
+            sec: selinux::ProcSec::new(self.selinux.initial),
         });
         self.root_pid.store(pid, Ordering::Relaxed);
         self.procs.lock().unwrap().insert(pid, proc.clone());

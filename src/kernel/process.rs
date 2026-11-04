@@ -48,6 +48,7 @@ impl Kernel {
             return Err(EINVAL);
         }
         let th = Thread::new(tid, t.proc.clone(), t.mask.load(Ordering::Relaxed));
+        th.sec.inherit(&t.sec);
         {
             let mut mm = t.proc.mm();
             if flags & CLONE_PARENT_SETTID != 0 {
@@ -92,8 +93,10 @@ impl Kernel {
             status: Mutex::new(None),
             exiting: Mutex::new(None),
             pending: Mutex::new(HashMap::new()),
+            sec: parent.sec.clone(),
         });
         let th = Thread::new(pid, child.clone(), t.mask.load(Ordering::Relaxed));
+        th.sec.inherit(&t.sec);
         *th.altstack.lock().unwrap() = *t.altstack.lock().unwrap();
         if flags & CLONE_CHILD_CLEARTID != 0 {
             th.clear_child_tid.store(ctid, Ordering::Relaxed);
@@ -137,6 +140,9 @@ impl Kernel {
         *t.altstack.lock().unwrap() = (0, 0, super::signal::SS_DISABLE);
         *t.proc.exe.lock().unwrap() = exe;
         *t.proc.cmdline.lock().unwrap() = cmdline;
+        if let Some(vfs) = self.vfs.as_deref() {
+            self.selinux.exec(t, vfs, &cwd, &path);
+        }
         vcpu.set_page_tables(mm.root);
         vcpu.set_state(&state);
         let old = t.proc.mm.lock().unwrap().replace(mm);

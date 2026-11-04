@@ -116,7 +116,12 @@ impl Kernel {
                 if !user_allowed(vfs, &n, &name)? {
                     return Err(ENODATA);
                 }
-                copy_out(t, a[2], a[3], XATTR_SIZE_MAX, &vfs.getxattr(&n, &name)?)
+                let mut v = vfs.getxattr(&n, &name)?;
+                // SELinux reports a context NUL-terminated, however the filesystem stored it.
+                if name == XATTR_SELINUX && v.last().is_some_and(|&c| c != 0) {
+                    v.push(0);
+                }
+                copy_out(t, a[2], a[3], XATTR_SIZE_MAX, &v)
             }
             (Op::Get, Target::Memfd(f)) => {
                 check_namespace(&name)?;

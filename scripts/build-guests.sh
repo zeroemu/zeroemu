@@ -19,6 +19,10 @@ for arch in aarch64 x86_64; do
     clang -target "$triple" -O2 -ffreestanding -fno-stack-protector -fno-pic \
         -fno-builtin -nostdlib -c guest/m2.c -o "$OUT/m2_$arch.o"
     "$LLD" -flavor gnu -static -o "$OUT/m2_$arch" "$OUT/m2_$arch.o"
+
+    clang -target "$triple" -O2 -ffreestanding -fno-stack-protector -fno-pic \
+        -fno-builtin -nostdlib -c guest/xattr.c -o "$OUT/xattr_$arch.o"
+    "$LLD" -flavor gnu -static -o "$OUT/xattr_$arch" "$OUT/xattr_$arch.o"
 done
 
 # arm64-only tests (they use arm64 inline asm for raw syscalls).

@@ -78,6 +78,14 @@ check "log to stderr"       "I droidrt-test: hello log" /system/bin/log -t droid
 check "logcat -d"           "W/t2      (    3): two"  /system/bin/sh -c 'log -t t1 one; log -p w -t t2 two; logcat -d -v brief -s t2 2>&1'
 check "logcat stream"       "I/t3      (    4): live" /system/bin/sh -c 'logcat -v brief -s t3 > /data/local/tmp/o & sleep 0.3; log -t t3 live; sleep 0.3; kill %1; cat /data/local/tmp/o'
 check "logcat -c"           "one=0 two=1"         /system/bin/sh -c 'log -t t one; logcat -c; log -t t two; d=$(logcat -d -s t); echo "one=$(echo "$d" | grep -c one) two=$(echo "$d" | grep -c two)"'
+# extended attributes: SELinux labels from the image, tmpfs labels and xattrs
+check "EROFS label"         "u:object_r:init_exec:s0 /system/bin/init" /system/bin/toybox ls -Z /system/bin/init
+check "ext4 APEX label"     "u:object_r:adbd_exec:s0 /apex/com.android.adbd/bin/adbd" /system/bin/toybox ls -Z /apex/com.android.adbd/bin/adbd
+check "tmpfs mount labels"  "/dev=u:object_r:device:s0 /dev/socket=u:object_r:socket_device:s0" /system/bin/sh -c 'echo $(ls -Zd /dev /dev/socket | while read c p; do echo "$p=$c"; done)'
+check "chcon on tmpfs"      "u:object_r:system_file:s0 f" /system/bin/sh -c 'cd /data/local/tmp && echo x > f && chcon u:object_r:system_file:s0 f && ls -Z f'
+check "setfattr/getfattr"   'user.droidrt="hello"' /system/bin/sh -c 'touch /tmp/f && setfattr -n user.droidrt -v hello /tmp/f && getfattr -d -n user.droidrt /tmp/f'
+check "image is read-only"  "Read-only file system" /system/bin/toybox chcon u:object_r:shell_exec:s0 /system/bin/sh
+check "restorecon relabels" "from u:object_r:system_file:s0 to u:object_r:shell_data_file:s0" /system/bin/sh -c 'touch /data/local/tmp/f && chcon u:object_r:system_file:s0 /data/local/tmp/f && restorecon -v /data/local/tmp/f 2>&1'
 
 # Exit status needs its own path: the program's code must become droidrt's.
 perl -e 'alarm 60; exec @ARGV' "$BIN" --system "$IMG" /system/bin/sh -c 'exit 3' >/dev/null 2>&1

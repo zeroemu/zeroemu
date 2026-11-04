@@ -82,13 +82,22 @@ struct Node {
 #[derive(Clone, Default)]
 pub struct Xattrs(BTreeMap<String, Vec<u8>>);
 
+/// tmpfs stores security.*, trusted.* and user.* only. Anything else,
+/// including system.* (no POSIX ACLs), is EOPNOTSUPP on get, set and remove.
+fn tmpfs_xattr(name: &str) -> bool {
+    ["security.", "trusted.", "user."].iter().any(|p| name.starts_with(p))
+}
+
 impl Xattrs {
     pub fn get(&self, name: &str) -> Result<Vec<u8>, i64> {
+        if !tmpfs_xattr(name) {
+            return Err(EOPNOTSUPP);
+        }
         self.0.get(name).cloned().ok_or(ENODATA)
     }
 
     pub fn set(&mut self, name: &str, value: &[u8], flags: u32) -> Result<(), i64> {
-        if !["security.", "trusted.", "user."].iter().any(|p| name.starts_with(p)) {
+        if !tmpfs_xattr(name) {
             return Err(EOPNOTSUPP);
         }
         match self.0.contains_key(name) {
@@ -105,6 +114,9 @@ impl Xattrs {
     }
 
     pub fn remove(&mut self, name: &str) -> Result<(), i64> {
+        if !tmpfs_xattr(name) {
+            return Err(EOPNOTSUPP);
+        }
         self.0.remove(name).map(|_| ()).ok_or(ENODATA)
     }
 

@@ -21,6 +21,7 @@ use std::sync::{Arc, Mutex};
 
 const PARAM_USER_DATA: u64 = 1;
 const PARAM_RENDERER_FLAGS: u64 = 2;
+const PARAM_RENDERER_FEATURES: u64 = 11;
 const PARAM_FENCE_CALLBACK: u64 = 3;
 const PARAM_WIN0_WIDTH: u64 = 4;
 const PARAM_WIN0_HEIGHT: u64 = 5;
@@ -347,6 +348,9 @@ impl Gfxstream {
         {
             unsafe { std::env::set_var("ANDROID_EGL_ON_EGL", "1") };
         }
+        // The guest's gralloc is minigbm, as in the Android Emulator's
+        // virtio-gpu mode; DROIDRT_GPU_FEATURES overrides ("Name:enabled,...").
+        let features = std::ffi::CString::new(std::env::var("DROIDRT_GPU_FEATURES").unwrap_or_else(|_| "Minigbm:enabled".into())).unwrap_or_default();
         let user = Arc::as_ptr(self) as usize as u64;
         let mut params = [
             Param { key: PARAM_USER_DATA, value: user },
@@ -357,6 +361,7 @@ impl Gfxstream {
             Param { key: PARAM_WIN0_WIDTH, value: win.px_width as u64 },
             Param { key: PARAM_WIN0_HEIGHT, value: win.px_height as u64 },
             Param { key: PARAM_DEBUG_CALLBACK, value: on_debug as *const () as usize as u64 },
+            Param { key: PARAM_RENDERER_FEATURES, value: features.as_ptr() as usize as u64 },
         ];
         let r = unsafe { (self.api.init)(params.as_mut_ptr(), params.len() as u64) };
         if r != 0 {
@@ -543,6 +548,18 @@ impl GpuBackend for Gfxstream {
         if unsafe { (self.api.transfer_read)(handle, 0, 0, stride, 0, &b, 0, &iov, 1) } == 0 {
             window::present(w, h, stride, info.drm_fourcc, &buf);
         }
+    }
+
+    fn read_pixels(&self, handle: u32) -> Option<(u32, u32, Vec<u8>)> {
+        let info = self.resource_info(handle)?;
+        let (w, h) = (info.width, info.height);
+        if w == 0 || h == 0 || w > 8192 || h > 8192 {
+            return None;
+        }
+        let mut buf = vec![0u8; w as usize * h as usize * 4];
+        let iov = Iovec { iov_base: buf.as_mut_ptr() as *mut c_void, iov_len: buf.len() };
+        let b = CBox { x: 0, y: 0, z: 0, w, h, d: 1 };
+        (unsafe { (self.api.transfer_read)(handle, 0, 0, w * 4, 0, &b, 0, &iov, 1) } == 0).then_some((w, h, buf))
     }
 
     fn set_fence_handler(&self, handler: Arc<dyn Fn(Fence) + Send + Sync>) {

@@ -23,7 +23,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 const USAGE: &str = "usage: droidrt [--system <system.img>] [--strace] [--display] <program> [args...]
-       droidrt --system <system.img> --boot [--headless] [init args...]
+       droidrt --system <system.img> --boot [--headless] [--push <host>:<guest>]... [--run <cmd>] [init args...]
        droidrt --system <system.img> --ls <path> | --cat <path>
        droidrt --gpu-selftest";
 
@@ -53,6 +53,8 @@ fn run() -> Result<i32, String> {
     let mut inspect: Option<(String, String)> = None;
     let mut strace = std::env::var_os("DROIDRT_STRACE").is_some();
     let mut boot = false;
+    let mut push: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut run: Option<String> = None;
     let mut display = false;
     let mut headless = false;
     let mut gpu_selftest = false;
@@ -68,6 +70,15 @@ fn run() -> Result<i32, String> {
             // so init starts at its second stage. A window comes with it
             // unless --headless is also given.
             "--boot" => boot = true,
+            // Development: copy a host file into the booted device (a
+            // writable path such as /data/local/tmp/x), and run a shell command
+            // once SurfaceFlinger is up, its output on the terminal.
+            "--push" => {
+                let spec = args.next().ok_or(USAGE)?;
+                let (host, guest) = spec.split_once(':').ok_or(format!("--push wants <host file>:<guest path>, got {spec}"))?;
+                push.push((guest.to_string(), std::fs::read(host).map_err(|e| format!("{host}: {e}"))?));
+            }
+            "--run" => run = Some(args.next().ok_or(USAGE)?),
             "--display" => display = true,
             "--headless" => headless = true,
             "--gpu-selftest" => gpu_selftest = true,
@@ -95,6 +106,10 @@ fn run() -> Result<i32, String> {
         argv.insert(0, "/system/bin/init".into());
     }
     let argv_copy = argv.clone();
+    if !boot && (!push.is_empty() || run.is_some()) {
+        return Err("--push and --run need --boot".into());
+    }
+    let extras = boot.then_some(kernel::BootExtras { push, run });
     // --headless wins over both --display and the window --boot implies.
     // DROIDRT_GPU=fake is the in-memory virtio-gpu (guest tests, no window).
     let show = !headless && (display || boot);
@@ -116,7 +131,7 @@ fn run() -> Result<i32, String> {
         let system = system.clone();
         std::thread::spawn(move || {
             let _stop = Stop(done_thr);
-            let code = boot_guest(root, system, vfs, strace, boot, argv, argv_copy, gpu_guest);
+            let code = boot_guest(root, system, vfs, strace, extras, argv, argv_copy, gpu_guest);
             *slot_thr.lock().unwrap_or_else(|p| p.into_inner()) = Some(code);
         });
         gpu::pump_until(&done);
@@ -124,7 +139,7 @@ fn run() -> Result<i32, String> {
         drop(gpu);
         return slot.lock().unwrap_or_else(|p| p.into_inner()).take().unwrap_or_else(|| Err("guest thread panicked".into()));
     }
-    boot_guest(root, system, vfs, strace, boot, argv, argv_copy, gpu)
+    boot_guest(root, system, vfs, strace, extras, argv, argv_copy, gpu)
 }
 
 struct Stop(Arc<AtomicBool>);
@@ -140,7 +155,7 @@ fn boot_guest(
     system: Option<PathBuf>,
     vfs: Option<vfs::Vfs>,
     strace: bool,
-    boot: bool,
+    extras: Option<kernel::BootExtras>,
     argv: Vec<String>,
     argv_copy: Vec<String>,
     gpu: Option<Arc<dyn gpu::GpuBackend>>,
@@ -158,7 +173,7 @@ fn boot_guest(
         Some(img) => android::logical_partitions(img).map_err(|e| format!("{}: {e}", img.display()))?,
         None => Vec::new(),
     };
-    let kernel = Kernel::new(hv::create()?, vfs, partitions, strace, boot, gpu)?;
+    let kernel = Kernel::new(hv::create()?, vfs, partitions, strace, extras, gpu)?;
     let mut mm = kernel.new_address_space().map_err(|e| format!("address space: errno {e}"))?;
     let (state, exe) = if system.is_some() {
         kernel

@@ -1223,7 +1223,11 @@ impl Kernel {
             Kind::Kmsg => {
                 // "<prio>tag: message" records, one per write.
                 let text = String::from_utf8_lossy(&data);
-                let text = text.trim_start_matches(|c: char| c == '<' || c.is_ascii_digit() || c == '>');
+                // Only a "<priority>" prefix: a message may itself start with digits.
+                let text = match text.strip_prefix('<').and_then(|r| r.split_once('>')) {
+                    Some((prio, rest)) if prio.chars().all(|c| c.is_ascii_digit()) => rest,
+                    _ => &text,
+                };
                 eprintln!("[kmsg] {}", text.trim_end());
                 data.len()
             }

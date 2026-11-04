@@ -129,6 +129,49 @@ impl unix::Service for PropertyService {
 
 /// The writable filesystems a device has after first-stage init, empty
 /// apart from the basics (init itself is not run yet). Returns /dev.
+/// Additions to a booted image, for development: files pushed into the
+/// device (like adb push) and a shell command init runs once SurfaceFlinger
+/// is up, its output on the terminal.
+#[derive(Default)]
+pub struct BootExtras {
+    /// (guest path in a writable filesystem such as /data, contents)
+    pub push: Vec<(String, Vec<u8>)>,
+    pub run: Option<String>,
+}
+
+fn apply_extras(v: &Vfs, dev: &crate::tmpfs::Tmpfs, extras: &BootExtras) -> Result<(), String> {
+    let put = |path: &str, data: &[u8]| -> Result<(), String> {
+        let fail = |e: i64| format!("--push {path}: errno {e}");
+        let (parent, name) = path.rsplit_once('/').filter(|(_, n)| !n.is_empty()).ok_or(format!("--push {path}: not a file path"))?;
+        let mut dir = v.resolve("/", "/", true).map_err(fail)?;
+        for part in parent.split('/').filter(|p| !p.is_empty()) {
+            if v.resolve(&dir.path, part, true).is_err() {
+                v.mkdir(&dir, part, 0o755).map_err(fail)?;
+            }
+            dir = v.resolve(&dir.path, part, true).map_err(fail)?;
+        }
+        let node = match v.resolve(&dir.path, name, true) {
+            Ok(n) => n,
+            Err(_) => v.create(&dir, name, crate::vfs::S_IFREG | 0o755, 0).map_err(fail)?,
+        };
+        let file = v.mem_file(&node).ok_or(format!("--push {path}: not on a writable filesystem"))?;
+        file.truncate(0);
+        file.write_at(0, data).map(|_| ()).map_err(fail)
+    };
+    for (path, data) in &extras.push {
+        put(path, data)?;
+    }
+    let Some(cmd) = &extras.run else { return Ok(()) };
+    // Its output goes to /dev/kmsg, which droidrt prints.
+    put("/data/local/tmp/.droidrt-run.sh", format!("exec >/dev/kmsg 2>&1\n{cmd}\n").as_bytes())?;
+    let rc = v.resolve("/", "/system/etc/init/hw/init.rc", true).map_err(|e| format!("init.rc: errno {e}"))?;
+    let mut text = String::from_utf8_lossy(&v.read_all(&rc).map_err(|e| format!("init.rc: errno {e}"))?).into_owned();
+    text += "\n# Added by droidrt --run.\nservice droidrt_run /system/bin/sh /data/local/tmp/.droidrt-run.sh\n    user root\n    group root\n    seclabel u:r:shell:s0\n    stdio_to_kmsg\n    oneshot\n    disabled\n\non property:init.svc.surfaceflinger=running\n    start droidrt_run\n";
+    dev.write_file(".droidrt/init.rc", 0o644, &text);
+    let src = v.resolve("/", "/dev/.droidrt/init.rc", true).map_err(|e| format!("init.rc copy: errno {e}"))?;
+    v.bind(&src, &rc, false).map_err(|e| format!("init.rc bind: errno {e}"))
+}
+
 /// What first-stage init leaves for the second stage beyond the partitions
 /// droidrt already mounted: a writable /metadata, and an fstab describing the
 /// mounts that exist (bound over the vendor's, which names virtio disks
@@ -313,7 +356,8 @@ impl Kernel {
     /// have set up (the property area and service, logd).
     /// `partitions`: the image's logical partitions, mapped as device-mapper
     /// devices as first-stage init would.
-    pub fn new(hv: Arc<dyn Hypervisor>, vfs: Option<Vfs>, partitions: Vec<(String, crate::image::Dev)>, strace: bool, boot: bool, gpu: Option<Arc<dyn crate::gpu::GpuBackend>>) -> Result<Arc<Kernel>, String> {
+    pub fn new(hv: Arc<dyn Hypervisor>, vfs: Option<Vfs>, partitions: Vec<(String, crate::image::Dev)>, strace: bool, extras: Option<BootExtras>, gpu: Option<Arc<dyn crate::gpu::GpuBackend>>) -> Result<Arc<Kernel>, String> {
+        let boot = extras.is_some();
         let phys = PhysMem::new(hv.clone());
         let max_vcpus = hv.max_vcpus();
         let pages = hv.kernel_pages(&mut || {
@@ -338,8 +382,9 @@ impl Kernel {
         for (name, dev) in partitions {
             blocks.add_static(&name, dev);
         }
-        if boot {
+        if let Some(extras) = &extras {
             first_stage_mounts(&v, &phys, &dev, &names);
+            apply_extras(&v, &dev, extras)?;
         }
         // Properties, as init would set them up: defaults from build.prop,
         // shared read-only with every process at /dev/__properties__.

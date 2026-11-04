@@ -997,6 +997,9 @@ fn virt_map(o: &Open, arg: u64, io: &mut dyn Io) -> Result<i64, i64> {
 fn virt_res_info(o: &Open, arg: u64, io: &mut dyn Io) -> Result<i64, i64> {
     let mut b = load(io, arg, 0x45, 16)?;
     let gem = o.gem(ru32(&b, 0))?;
+    if trace() {
+        eprintln!("[drm] {} res_info gem {} -> res {} size {}", io.comm(), ru32(&b, 0), gem.res.id, gem.res.size);
+    }
     wu32(&mut b, 4, gem.res.id);
     wu32(&mut b, 8, gem.res.size as u32);
     wu32(&mut b, 12, gem.res.blob_mem);
@@ -1015,6 +1018,10 @@ fn virt_transfer(o: &Open, cmd: u64, arg: u64, io: &mut dyn Io) -> Result<i64, i
         bx: Box3 { x: ru32(&b, 4), y: ru32(&b, 8), z: ru32(&b, 12), w: ru32(&b, 16), h: ru32(&b, 20), d: ru32(&b, 24) },
         offset: ru32(&b, 32) as u64,
     };
+    if trace() {
+        let dir = if ioc_nr(cmd) == 0x46 { "FROM_HOST" } else { "TO_HOST" };
+        eprintln!("[drm] {} xfer {dir} res {} {}x{} at {},{} off {} size {}", io.comm(), gem.res.id, t.bx.w, t.bx.h, t.bx.x, t.bx.y, t.offset, gem.res.size);
+    }
     let xfer = if ioc_nr(cmd) == 0x46 { o.dev.gpu.transfer_read(gem.res.id, &t) } else { o.dev.gpu.transfer_write(gem.res.id, &t) };
     if let Err(e) = xfer {
         eprintln!(
@@ -1084,7 +1091,14 @@ fn make_fence(dev: &Device, ctx: u32, ring: u8, io: &mut dyn Io, cloexec: bool) 
     if trace() {
         eprintln!("[drm] fence {id} ctx {ctx} ring {ring} created");
     }
-    if let Err(e) = dev.gpu.create_fence(Fence { flags: 0, fence_id: id, ctx_id: ctx, ring_idx: ring }) {
+    // As Linux does for contexts made with CONTEXT_INIT: the fence belongs to
+    // the context's ring, so it signals after that ring's queued work. Without
+    // RING_IDX the renderer puts it on the global timeline, where it signals
+    // before the context's rendering is done.
+    const FLAG_FENCE: u32 = 1;
+    const FLAG_INFO_RING_IDX: u32 = 2;
+    let flags = if ctx == 0 { FLAG_FENCE } else { FLAG_FENCE | FLAG_INFO_RING_IDX };
+    if let Err(e) = dev.gpu.create_fence(Fence { flags, fence_id: id, ctx_id: ctx, ring_idx: ring }) {
         dev.inner.lock().unwrap().fences.remove(&id);
         point.signal();
         let _ = e;
@@ -1381,6 +1395,24 @@ fn mode_rmfb(o: &Open, arg: u64, io: &mut dyn Io) -> Result<i64, i64> {
 }
 
 fn present(o: &Open, fb: u32, user: u64, event: bool) -> Result<(), i64> {
+    // Debugging: DROIDRT_DUMP_RES=<dir> saves, on every 40th flip, each
+    // display-sized resource as the host renderer sees it.
+    if let Ok(dir) = std::env::var("DROIDRT_DUMP_RES") {
+        static FLIPS: AtomicU64 = AtomicU64::new(0);
+        let n = FLIPS.fetch_add(1, Ordering::Relaxed);
+        if n % 40 == 20 && n < 400 {
+            let ids: Vec<u32> = o.dev.inner.lock().unwrap().resources.keys().copied().collect();
+            let scan = o.dev.inner.lock().unwrap().kms.fbs.get(&fb).map(|f| f.res.id).unwrap_or(0);
+            for id in ids {
+                if let Some((w, h, px)) = o.dev.gpu.read_pixels(id)
+                    && w * h >= 400 * 800
+                {
+                    let tag = if id == scan { "scanout" } else { "res" };
+                    let _ = std::fs::write(format!("{dir}/flip{n:03}_{tag}{id}_{w}x{h}.raw"), px);
+                }
+            }
+        }
+    }
     let mut k = o.dev.inner.lock().unwrap();
     if fb != 0 && !k.kms.fbs.contains_key(&fb) {
         return Err(ENOENT);

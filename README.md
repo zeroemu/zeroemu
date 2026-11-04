@@ -34,7 +34,7 @@ arm64 Android on Apple Silicon and Windows on ARM, x86_64 Android on x86_64 PCs.
 | M1: Android's own `linker64`, `toybox`, and `mksh` straight from an SDK `system.img` | done (macOS, Android 16 image) |
 | M2: demand paging, threads, futex, `fork`/`execve`/`wait4`, pipes, signals | done on macOS; x86_64 written (signal frames, TLB shootdown), untested |
 | M3: binder, `servicemanager`, property service, `logd` | binder, properties, `servicemanager`, logd done (macOS); `init` next |
-| M4: SurfaceFlinger with a composer HAL that renders to Metal / D3D12 | |
+| M4: SurfaceFlinger with a composer HAL that renders to Metal / D3D12 | in progress: Android's graphics stack runs unmodified on a virtio-gpu device backed by the Android Emulator's gfxstream renderer; the first boot-animation frame reaches the window (macOS) |
 | M5: zygote, ART, `system_server`, launcher, apps | |
 
 M1 reads the image directly; nothing is extracted to disk. The chain is
@@ -104,11 +104,24 @@ Android log records (`liblog`, i.e. `ALOGI` and friends) print to stderr as
 `<secs since start> <pid> <tid> <prio> <tag>: <message>`; `DROIDRT_LOG=<V|D|I|W|E|F|S>`
 sets the lowest priority shown (default `I`; `S` silences them).
 
+`--boot` runs Android's own `init` in a window (`--headless` for none,
+`DROIDRT_BACKGROUND=1` to open it without taking focus). It needs the Android
+Emulator installed: droidrt loads its GPU renderer, `libgfxstream_backend`,
+from the SDK (or `DROIDRT_GFXSTREAM=<path>`). For development, `--push
+<host file>:<guest path>` copies a file into the booted device (e.g. into
+`/data/local/tmp`) and `--run "<cmd>"` runs a shell command once SurfaceFlinger
+is up, its output on stderr. `droidrt --gpu-selftest` checks the renderer and
+window alone.
+
 `DROIDRT_STRACE=1` (or `--strace`) logs every syscall; `DROIDRT_BINDER_TRACE=1`
 logs every binder transaction; `DROIDRT_WATCHDOG=<secs>` forces a stuck guest
 out of the VM and dumps its registers. Fatal faults print a backtrace as
 library+offset, and writes to `/dev/kmsg` (where `servicemanager` and `init`
-log) appear on stderr.
+log) appear on stderr. `DROIDRT_DUMP=<secs>` prints, every that many seconds,
+each guest thread with the syscall it is in, for how long, and its backtrace.
+`DROIDRT_DRM_TRACE=1` logs GPU ioctls, transfers and fences;
+`DROIDRT_GPU_LOG=<E|W|I|D>` shows the renderer's own log; `DROIDRT_SAVE_FRAMES=<dir>`
+and `DROIDRT_DUMP_RES=<dir>` save displayed frames and GPU buffers as raw pixels.
 
 On macOS, `cargo run` signs the binary with the `com.apple.security.hypervisor`
 entitlement (see `scripts/macos-runner.sh`); without it the VM cannot be created.

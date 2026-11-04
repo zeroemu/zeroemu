@@ -217,6 +217,17 @@ static FRAME_NEW: AtomicBool = AtomicBool::new(false);
 
 /// Called from any thread with a scanout's pixels.
 pub fn present(w: u32, h: u32, stride: u32, fourcc: u32, pixels: &[u8]) {
+    // Debugging: DROIDRT_SAVE_FRAMES=<dir> keeps every 8th frame shown (60 at
+    // most) as raw pixels, named by time since the first.
+    if let Ok(dir) = std::env::var("DROIDRT_SAVE_FRAMES") {
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        static T0: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let t = T0.get_or_init(Instant::now).elapsed().as_millis();
+        if n.is_multiple_of(8) && n < 480 {
+            let _ = std::fs::write(format!("{dir}/f{n:04}_{t:06}ms_{w}x{h}_{stride}_{fourcc:x}.raw"), pixels);
+        }
+    }
     let mut slot = FRAME.lock().unwrap_or_else(|p| p.into_inner());
     match slot.as_mut() {
         Some(f) if f.data.len() == pixels.len() => {

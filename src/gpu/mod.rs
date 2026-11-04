@@ -143,6 +143,10 @@ pub trait GpuBackend: Send + Sync {
 
     /// Shows a resource on the display (a scanout update or page flip).
     fn flush(&self, handle: u32);
+    /// Debugging: a resource's current pixels as the host renderer sees them.
+    fn read_pixels(&self, _handle: u32) -> Option<(u32, u32, Vec<u8>)> {
+        None
+    }
     /// Where completed fences go; set once, before any submission.
     fn set_fence_handler(&self, handler: Arc<dyn Fn(Fence) + Send + Sync>);
 }

@@ -8,6 +8,8 @@
 //! syscalls simply block that host thread.
 
 mod binder;
+#[allow(dead_code)] // wired into files.rs and mount(2) next
+mod block;
 mod epoll;
 mod files;
 mod futex;

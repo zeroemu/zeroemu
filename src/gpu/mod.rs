@@ -179,6 +179,8 @@ pub fn selftest() -> Result<i32, String> {
         cb.store(thread_token(), Ordering::Relaxed);
         eprintln!("droidrt: fence {} ctx {} flags {:#x} ring {}", f.fence_id, f.ctx_id, f.flags, f.ring_idx);
     }));
+    // The guest calls these from a vCPU thread. The present is bounced onto
+    // this thread through the window ops, so pump while the worker runs.
     let slot: Arc<Mutex<Option<Result<String, String>>>> = Arc::new(Mutex::new(None));
     let slot2 = slot.clone();
     let gpu2 = gpu.clone();
@@ -194,14 +196,9 @@ pub fn selftest() -> Result<i32, String> {
     while !drawn.load(Ordering::Acquire) && start.elapsed() < Duration::from_secs(30) {
         pump_for(0.05);
     }
-    // The repaint lands on this thread; hold the window so it can be captured.
     pump_for(3.0);
     screenshot();
-    let report = slot
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .take()
-        .unwrap_or_else(|| Err("gpu selftest thread failed".into()))?;
+    let report = slot.lock().unwrap_or_else(|p| p.into_inner()).take().unwrap_or_else(|| Err("gpu selftest thread failed".into()))?;
     eprintln!("droidrt: main-thread {main_tok}");
     eprintln!("droidrt: fence-callback-thread {}", cb_tok.load(Ordering::Relaxed));
     eprintln!("{report}");

@@ -4,6 +4,7 @@
 
 use std::ffi::{CString, c_void};
 use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
+use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 #[repr(C)]
@@ -146,8 +147,10 @@ pub fn open(fb_w: u32, fb_h: u32) -> Result<NativeWindow, String> {
         msg_id(window, sel("makeKeyAndOrderFront:"), std::ptr::null_mut());
         msg_bool(app, sel("activateIgnoringOtherApps:"), 1);
         msg_void(app, sel("finishLaunching"));
-        let view = msg0(window, sel("contentView"));
-        if view.is_null() {
+        // createSubWindow messages this pointer with frame / contentRectForFrameRect:
+        // / contentView / makeKeyAndOrderFront:, which are NSWindow methods, then
+        // inserts its own EmuGLView into the content view.
+        if msg0(window, sel("contentView")).is_null() {
             return Err("NSWindow contentView is null".into());
         }
         let number = msg_i64_ret(window, sel("windowNumber"));
@@ -156,7 +159,7 @@ pub fn open(fb_w: u32, fb_h: u32) -> Result<NativeWindow, String> {
             WINDOW_ID.store(number as u64, Ordering::Release);
         }
         eprintln!("droidrt: window {win_w:.0}x{win_h:.0} points for {fb_w}x{fb_h} (id {number})");
-        Ok(NativeWindow { handle: view, width: win_w as i32, height: win_h as i32 })
+        Ok(NativeWindow { handle: window, width: win_w as i32, height: win_h as i32 })
     }
 }
 
@@ -171,7 +174,47 @@ pub fn window_id() -> Option<u64> {
     if id == 0 { None } else { Some(id) }
 }
 
+struct UiJob {
+    f: unsafe extern "C" fn(*mut c_void),
+    data: *mut c_void,
+    done: std::sync::Arc<(Mutex<bool>, Condvar)>,
+}
+
+// The pointer is a gfxstream cookie handed back to the callback on the UI thread.
+unsafe impl Send for UiJob {}
+
+static UI_QUEUE: Mutex<Vec<UiJob>> = Mutex::new(Vec::new());
+
+/// gfxstream asks the host to run a present on the thread that owns the window.
+/// The library's default of this is a no-op, which drops the frame.
+pub fn run_on_ui_thread(f: unsafe extern "C" fn(*mut c_void), data: *mut c_void, wait: bool) {
+    if unsafe { libc::pthread_main_np() } != 0 {
+        unsafe { f(data) };
+        return;
+    }
+    let done = std::sync::Arc::new((Mutex::new(false), Condvar::new()));
+    UI_QUEUE.lock().unwrap_or_else(|p| p.into_inner()).push(UiJob { f, data, done: done.clone() });
+    if wait {
+        let (lock, cv) = &*done;
+        let mut flag = lock.lock().unwrap_or_else(|p| p.into_inner());
+        while !*flag {
+            flag = cv.wait(flag).unwrap_or_else(|p| p.into_inner());
+        }
+    }
+}
+
+fn drain_ui() {
+    let jobs = std::mem::take(&mut *UI_QUEUE.lock().unwrap_or_else(|p| p.into_inner()));
+    for job in jobs {
+        unsafe { (job.f)(job.data) };
+        let (lock, cv) = &*job.done;
+        *lock.lock().unwrap_or_else(|p| p.into_inner()) = true;
+        cv.notify_all();
+    }
+}
+
 fn pump_once(wait_s: f64) {
+    drain_ui();
     let app = APP.load(Ordering::Acquire);
     if app.is_null() {
         std::thread::sleep(Duration::from_secs_f64(wait_s));
@@ -186,6 +229,7 @@ fn pump_once(wait_s: f64) {
             msg_void(app, sel("updateWindows"));
         }
     }
+    drain_ui();
 }
 
 pub fn pump_until(done: &std::sync::atomic::AtomicBool) {

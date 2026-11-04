@@ -194,6 +194,73 @@ pub struct Gfxstream {
 unsafe impl Send for Gfxstream {}
 unsafe impl Sync for Gfxstream {}
 
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct WindowOps {
+    is_ui: unsafe extern "C" fn() -> i32,
+    run_on_ui: unsafe extern "C" fn(unsafe extern "C" fn(*mut c_void), *mut c_void, i32),
+    paint: unsafe extern "C" fn(u32, u32) -> i32,
+    is_folded: unsafe extern "C" fn() -> i32,
+    get_folded: unsafe extern "C" fn(*mut i32, *mut i32, *mut i32, *mut i32),
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" fn window_is_ui() -> i32 {
+    unsafe { libc::pthread_main_np() }
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" fn window_run_on_ui(f: unsafe extern "C" fn(*mut c_void), data: *mut c_void, wait: i32) {
+    window::run_on_ui_thread(f, data, wait != 0);
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" fn window_paint(_display: u32, _color_buffer: u32) -> i32 {
+    0
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" fn window_is_folded() -> i32 {
+    0
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" fn window_get_folded(x: *mut i32, y: *mut i32, w: *mut i32, h: *mut i32) {
+    if !x.is_null() {
+        unsafe { *x = 0 };
+    }
+    if !y.is_null() {
+        unsafe { *y = 0 };
+    }
+    if !w.is_null() {
+        unsafe { *w = 0 };
+    }
+    if !h.is_null() {
+        unsafe { *h = 0 };
+    }
+}
+
+#[cfg(target_os = "macos")]
+static WINDOW_OPS: WindowOps = WindowOps {
+    is_ui: window_is_ui,
+    run_on_ui: window_run_on_ui,
+    paint: window_paint,
+    is_folded: window_is_folded,
+    get_folded: window_get_folded,
+};
+
+#[cfg(target_os = "macos")]
+fn install_window_ops(lib: *mut c_void) {
+    let name = CString::new("_ZN9gfxstream4host31set_gfxstream_window_operationsERK20gfxstream_window_ops").unwrap();
+    let p = unsafe { libc::dlsym(lib, name.as_ptr()) };
+    if p.is_null() {
+        eprintln!("droidrt: set_gfxstream_window_operations missing");
+        return;
+    }
+    let set: unsafe extern "C" fn(*const WindowOps) = unsafe { std::mem::transmute(p) };
+    unsafe { set(&WINDOW_OPS) };
+}
+
 fn log_max_from_env() -> u32 {
     match std::env::var("DROIDRT_GPU_LOG").ok().as_deref() {
         None => DEBUG_ERROR,
@@ -280,7 +347,10 @@ impl Gfxstream {
             return Err(format!("stream_renderer_init returned {r}"));
         }
         *self.live.lock().unwrap_or_else(|p| p.into_inner()) = true;
-        // native handle is an NSView* on macOS and an HWND on Windows.
+        #[cfg(target_os = "macos")]
+        install_window_ops(self._lib);
+        // macOS: NSWindow*. createSubWindow builds the GL/Metal subview itself.
+        // Windows: HWND (the window stub does not reach this call).
         unsafe {
             (self.api.setup_window)(win.handle, 0, 0, win.width, win.height, fb_w as i32, fb_h as i32);
         }
@@ -540,6 +610,8 @@ fn lookup<T>(lib: *mut c_void, name: &str) -> Result<T, String> {
 #[cfg(unix)]
 fn load_backend(path: &std::path::Path) -> Result<*mut c_void, String> {
     let dir = path.parent().ok_or_else(|| format!("gfxstream: {} has no directory", path.display()))?;
+    #[cfg(target_os = "macos")]
+    install_library_search(dir);
     // Absolute dlopen does not search @rpath. A library already in the process
     // satisfies a later @rpath/libX.dylib dependency, so walk the dlerror chain
     // and preload each missing sibling before retrying.
@@ -570,6 +642,8 @@ fn load_backend(path: &std::path::Path) -> Result<*mut c_void, String> {
             }
         }
     }
+    #[cfg(target_os = "macos")]
+    rebind_imported_dlopen();
     opened.last().copied().ok_or_else(|| "gfxstream: dlopen produced no handle".into())
 }
 
@@ -613,4 +687,206 @@ fn load_backend(path: &std::path::Path) -> Result<*mut c_void, String> {
     } else {
         Ok(h)
     }
+}
+
+// gfxstream dlopens libshadertranslator.dylib, libEGL.dylib and libGLESv2.dylib
+// by bare filename. dyld does not search DYLD_LIBRARY_PATH for an ad-hoc signed
+// executable, so redirect those names into the emulator's lib64 (and its
+// gles_angle/ and vulkan/ subdirectories) before the real dlopen.
+#[cfg(target_os = "macos")]
+fn install_library_search(dir: &std::path::Path) {
+    let mut dirs = vec![dir.to_path_buf()];
+    for sub in ["gles_angle", "vulkan"] {
+        let p = dir.join(sub);
+        if p.is_dir() {
+            dirs.push(p);
+        }
+    }
+    if std::env::var_os("VK_ICD_FILENAMES").is_none() {
+        let icd = dir.join("vulkan/MoltenVK_icd.json");
+        if icd.is_file() {
+            unsafe { std::env::set_var("VK_ICD_FILENAMES", &icd) };
+        }
+    }
+    let _ = SEARCH_DIRS.set(dirs);
+    if REAL_DLOPEN.load(Ordering::Relaxed).is_null() {
+        let name = CString::new("dlopen").unwrap();
+        REAL_DLOPEN.store(unsafe { libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr()) }, Ordering::Relaxed);
+    }
+}
+
+#[cfg(target_os = "macos")]
+static SEARCH_DIRS: std::sync::OnceLock<Vec<std::path::PathBuf>> = std::sync::OnceLock::new();
+
+#[cfg(target_os = "macos")]
+static REAL_DLOPEN: std::sync::atomic::AtomicPtr<c_void> = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
+// dyld ignores __interpose in the main executable, so rewrite each loaded
+// image's imported _dlopen slot. stream_renderer_init then resolves
+// libshadertranslator / libEGL / libGLESv2 from the emulator tree.
+#[cfg(target_os = "macos")]
+fn rebind_imported_dlopen() {
+    unsafe {
+        let n = _dyld_image_count();
+        for i in 1..n {
+            rebind_image(_dyld_get_image_header(i), _dyld_get_image_vmaddr_slide(i));
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" fn hooked_dlopen(path: *const libc::c_char, mode: libc::c_int) -> *mut c_void {
+    let real = real_dlopen();
+    if !path.is_null() {
+        let raw = unsafe { CStr::from_ptr(path) }.to_bytes();
+        let bare = raw.strip_prefix(b"./").unwrap_or(raw);
+        if !bare.contains(&b'/')
+            && let Some(dirs) = SEARCH_DIRS.get()
+            && let Ok(name) = std::str::from_utf8(bare)
+        {
+            for d in dirs {
+                let cand = d.join(name);
+                if !cand.is_file() {
+                    continue;
+                }
+                let Ok(c) = CString::new(cand.to_string_lossy().as_bytes()) else { continue };
+                let h = unsafe { real(c.as_ptr(), mode) };
+                if !h.is_null() {
+                    rebind_imported_dlopen();
+                    return h;
+                }
+            }
+        }
+    }
+    unsafe { real(path, mode) }
+}
+
+#[cfg(target_os = "macos")]
+fn real_dlopen() -> unsafe extern "C" fn(*const libc::c_char, libc::c_int) -> *mut c_void {
+    let p = REAL_DLOPEN.load(Ordering::Relaxed);
+    if p.is_null() {
+        libc::dlopen
+    } else {
+        let f: unsafe extern "C" fn(*const libc::c_char, libc::c_int) -> *mut c_void = unsafe { std::mem::transmute(p) };
+        f
+    }
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn _dyld_image_count() -> u32;
+    fn _dyld_get_image_header(index: u32) -> *const MachHeader64;
+    fn _dyld_get_image_vmaddr_slide(index: u32) -> isize;
+}
+
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct MachHeader64 {
+    magic: u32,
+    cputype: u32,
+    cpusubtype: u32,
+    filetype: u32,
+    ncmds: u32,
+    sizeofcmds: u32,
+    flags: u32,
+    reserved: u32,
+}
+
+#[cfg(target_os = "macos")]
+fn rebind_image(header: *const MachHeader64, slide: isize) -> u32 {
+    if header.is_null() || unsafe { (*header).magic } != 0xfeedfacf {
+        return 0;
+    }
+    let ncmds = unsafe { (*header).ncmds };
+    let mut cmd = unsafe { header.add(1) as *const u8 };
+    let mut symoff = 0u32;
+    let mut nsyms = 0u32;
+    let mut stroff = 0u32;
+    let mut strsize = 0u32;
+    let mut indirectoff = 0u32;
+    let mut linkedit_vmaddr = 0u64;
+    let mut linkedit_fileoff = 0u64;
+    let mut have_linkedit = false;
+    let mut sections: Vec<(u64, u64, u32)> = Vec::new();
+    unsafe {
+        for _ in 0..ncmds {
+            let cmd_id = (cmd as *const u32).read_unaligned();
+            let cmdsize = (cmd.add(4) as *const u32).read_unaligned();
+            if cmdsize < 8 {
+                return 0;
+            }
+            if cmd_id == 0x2 && cmdsize >= 24 {
+                symoff = (cmd.add(8) as *const u32).read_unaligned();
+                nsyms = (cmd.add(12) as *const u32).read_unaligned();
+                stroff = (cmd.add(16) as *const u32).read_unaligned();
+                strsize = (cmd.add(20) as *const u32).read_unaligned();
+            } else if cmd_id == 0xb && cmdsize >= 64 {
+                indirectoff = (cmd.add(56) as *const u32).read_unaligned();
+            } else if cmd_id == 0x19 && cmdsize >= 72 {
+                let name = std::slice::from_raw_parts(cmd.add(8), 16);
+                let vmaddr = (cmd.add(24) as *const u64).read_unaligned();
+                let fileoff = (cmd.add(40) as *const u64).read_unaligned();
+                let nsects = (cmd.add(64) as *const u32).read_unaligned();
+                if name.starts_with(b"__LINKEDIT") {
+                    linkedit_vmaddr = vmaddr;
+                    linkedit_fileoff = fileoff;
+                    have_linkedit = true;
+                }
+                let mut sect = cmd.add(72);
+                for _ in 0..nsects {
+                    if sect.add(80) > cmd.add(cmdsize as usize) {
+                        break;
+                    }
+                    let flags = (sect.add(64) as *const u32).read_unaligned();
+                    let kind = flags & 0xff;
+                    if kind == 0x6 || kind == 0x7 {
+                        let addr = (sect.add(32) as *const u64).read_unaligned();
+                        let size = (sect.add(40) as *const u64).read_unaligned();
+                        let reserved1 = (sect.add(68) as *const u32).read_unaligned();
+                        sections.push((addr, size, reserved1));
+                    }
+                    sect = sect.add(80);
+                }
+            }
+            cmd = cmd.add(cmdsize as usize);
+        }
+    }
+    if !have_linkedit || nsyms == 0 || strsize == 0 {
+        return 0;
+    }
+    let base = (slide as u64).wrapping_add(linkedit_vmaddr).wrapping_sub(linkedit_fileoff);
+    let strtab = base.wrapping_add(stroff as u64) as *const u8;
+    let syms = base.wrapping_add(symoff as u64) as *const u8;
+    let indirect = base.wrapping_add(indirectoff as u64) as *const u32;
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(4096) as usize;
+    let mut patched = 0u32;
+    for (addr, size, reserved1) in sections {
+        let count = (size / 8) as u32;
+        for i in 0..count {
+            let sym_index = unsafe { indirect.add((reserved1 + i) as usize).read() };
+            if sym_index & 0x80000000 != 0 || sym_index & 0x40000000 != 0 || sym_index >= nsyms {
+                continue;
+            }
+            // nlist_64: n_strx at offset 0.
+            let strx = unsafe { (syms.add(sym_index as usize * 16) as *const u32).read() };
+            if strx >= strsize || strsize - strx < 8 {
+                continue;
+            }
+            let symname = unsafe { std::slice::from_raw_parts(strtab.add(strx as usize), 8) };
+            if symname != b"_dlopen\0" {
+                continue;
+            }
+            let hook = hooked_dlopen as *const () as *mut c_void;
+            let slot = (slide as usize).wrapping_add(addr as usize).wrapping_add(i as usize * 8) as *mut *mut c_void;
+            unsafe {
+                let page_start = (slot as usize) & !(page - 1);
+                libc::mprotect(page_start as *mut c_void, page, libc::PROT_READ | libc::PROT_WRITE);
+                if *slot != hook {
+                    *slot = hook;
+                    patched += 1;
+                }
+            }
+        }
+    }
+    patched
 }

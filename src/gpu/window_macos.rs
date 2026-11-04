@@ -30,12 +30,15 @@ struct NSRect {
 
 pub struct NativeWindow {
     pub handle: *mut c_void,
-    /// Content size in pixels (points times the screen's backing scale).
-    /// gfxstream sizes its subview from these and divides by the window's
-    /// backing scale, so a point-sized value is drawn 2x too big on Retina
-    /// and the framebuffer is clipped.
+    /// Content size in points. `setupWindow` uses this as the NSView frame;
+    /// a pixel size is placed in point coordinates and hangs off the window
+    /// (on a 2x display, 810x1800 at y=-900, so only a quarter of it shows).
     pub width: i32,
     pub height: i32,
+    /// Same content size in pixels. The guest display matches the view's
+    /// backing store, so a Retina window is 1:1 with what Android renders.
+    pub px_width: i32,
+    pub px_height: i32,
 }
 
 static APP: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
@@ -174,7 +177,13 @@ pub fn open(fb_w: u32, fb_h: u32) -> Result<NativeWindow, String> {
         let px_w = (win_w * dpr).round().max(1.0);
         let px_h = (win_h * dpr).round().max(1.0);
         eprintln!("droidrt: window {win_w:.0}x{win_h:.0} points ({px_w:.0}x{px_h:.0} px, dpr {dpr}) for {fb_w}x{fb_h} (id {number})");
-        Ok(NativeWindow { handle: window, width: px_w as i32, height: px_h as i32 })
+        Ok(NativeWindow {
+            handle: window,
+            width: win_w as i32,
+            height: win_h as i32,
+            px_width: px_w as i32,
+            px_height: px_h as i32,
+        })
     }
 }
 

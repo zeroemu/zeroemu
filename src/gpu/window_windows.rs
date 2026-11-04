@@ -11,6 +11,8 @@ pub struct NativeWindow {
     pub handle: *mut c_void,
     pub width: i32,
     pub height: i32,
+    pub px_width: i32,
+    pub px_height: i32,
 }
 
 pub fn open(fb_w: u32, fb_h: u32) -> Result<NativeWindow, String> {

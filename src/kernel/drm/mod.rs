@@ -132,7 +132,9 @@ fn modeinfo() -> [u8; 68] {
     wu32(&mut m, 24, 60);
     wu32(&mut m, 28, 1 | 4); // PHSYNC | PVSYNC
     wu32(&mut m, 32, (1 << 3) | (1 << 6)); // PREFERRED | DRIVER
-    m[36..46].copy_from_slice(b"1080x2400");
+    // name[32] starts at byte 36. The mode string is shorter than the field.
+    let name = b"1080x2400";
+    m[36..36 + name.len()].copy_from_slice(name);
     m
 }
 
@@ -338,6 +340,8 @@ struct Inner {
 pub struct Device {
     gpu: Arc<dyn GpuBackend>,
     phys: Arc<PhysMem>,
+    /// Bit i set when capset i exists. Cached: probing virgl on this renderer logs an error.
+    capsets: u64,
     inner: Mutex<Inner>,
 }
 
@@ -346,6 +350,7 @@ impl Device {
         let dev = Arc::new(Device {
             gpu: gpu.clone(),
             phys,
+            capsets: capset_mask(gpu.as_ref()),
             inner: Mutex::new(Inner {
                 next_res: 0,
                 next_ctx: 0,
@@ -548,6 +553,7 @@ fn ioctl_name(cmd: u64) -> String {
             0x0b => "GEM_OPEN",
             0x0c => "GET_CAP",
             0x0d => "SET_CLIENT_CAP",
+            0x11 => "AUTH_MAGIC",
             0x1e => "SET_MASTER",
             0x1f => "DROP_MASTER",
             0x2d => "PRIME_HANDLE_TO_FD",
@@ -599,7 +605,7 @@ fn dispatch(o: &Open, cmd: u64, arg: u64, io: &mut dyn Io) -> Result<i64, i64> {
         0x00 => version(arg, io),
         0x01 => unique(arg, io),
         0x02 => magic(arg, io),
-        0x07 | 0x1e | 0x1f => Ok(0),
+        0x07 | 0x1e | 0x1f | 0x11 => Ok(0), // SET_VERSION, master, AUTH_MAGIC
         0x09 => gem_close(o, arg, io),
         0x0c => get_cap(arg, io),
         0x0d => set_client_cap(o, arg, io),
@@ -642,10 +648,17 @@ fn dispatch(o: &Open, cmd: u64, arg: u64, io: &mut dyn Io) -> Result<i64, i64> {
 
 fn load(io: &mut dyn Io, arg: u64, cmd: u64, min: usize) -> Result<Vec<u8>, i64> {
     // Callers pass either a full ioctl command or just its number. A bare
-    // number has a zero size field, so the struct we know is what we read.
+    // number has a zero size field. A shorter guest struct (an older uapi)
+    // is zero-extended so fields it doesn't have stay 0.
     let sized = ioc_size(cmd);
-    let n = if sized >= min { sized } else { min };
-    io.read_mem(arg, n)
+    if sized == 0 {
+        return io.read_mem(arg, min);
+    }
+    let mut b = io.read_mem(arg, sized.min(4096))?;
+    if b.len() < min {
+        b.resize(min, 0);
+    }
+    Ok(b)
 }
 
 fn store(io: &mut dyn Io, arg: u64, buf: &[u8]) -> Result<(), i64> {
@@ -739,6 +752,10 @@ fn prime_handle_to_fd(o: &Open, arg: u64, io: &mut dyn Io) -> Result<i64, i64> {
 fn prime_fd_to_handle(o: &Open, arg: u64, io: &mut dyn Io) -> Result<i64, i64> {
     let mut b = io.read_mem(arg, 12)?;
     let dma = io.dma_of(ru32(&b, 8) as i32 as i64)?;
+    let ctx = o.st.lock().unwrap().ctx;
+    if ctx != 0 {
+        o.dev.gpu.ctx_attach_resource(ctx, dma.gem.res.id);
+    }
     let (handle, _) = o.gems.lock().unwrap().insert(dma.gem.res.clone());
     wu32(&mut b, 0, handle);
     store(io, arg, &b)?;
@@ -759,7 +776,7 @@ fn virt_getparam(o: &Open, arg: u64, io: &mut dyn Io) -> Result<i64, i64> {
     let b = io.read_mem(arg, 16)?;
     let param = ru64(&b, 0);
     let ptr = ru64(&b, 8);
-    let mask = capset_mask(&*o.dev.gpu);
+    let mask = o.dev.capsets;
     let value = match param {
         1 => u64::from(mask & (1 << 1 | 1 << 3 | 1 << 8) != 0), // 3D_FEATURES
         2 | 3 | 4 | 5 | 6 => 1,                                 // capset fix, blob, host visible, cross device, context init
@@ -778,7 +795,7 @@ fn virt_get_caps(o: &Open, arg: u64, io: &mut dyn Io) -> Result<i64, i64> {
     let ver = ru32(&b, 4);
     let addr = ru64(&b, 8);
     let size = ru32(&b, 16) as usize;
-    if o.dev.gpu.capset_info(id).is_none() {
+    if o.dev.capsets & (1u64 << id.min(63)) == 0 {
         return Err(EINVAL);
     }
     let caps = o.dev.gpu.capset(id, ver);
@@ -824,7 +841,7 @@ fn virt_context_init(o: &Open, arg: u64, io: &mut dyn Io) -> Result<i64, i64> {
             _ => return Err(EINVAL),
         }
     }
-    if capset != 0 && o.dev.gpu.capset_info(capset).is_none() {
+    if capset != 0 && o.dev.capsets & (1u64 << capset.min(63)) == 0 {
         return Err(EINVAL);
     }
     if rings > 64 {
@@ -900,6 +917,11 @@ fn virt_res_create(o: &Open, arg: u64, io: &mut dyn Io) -> Result<i64, i64> {
     };
     if let Err(e) = o.dev.gpu.resource_create(&args, iov) {
         return Err(e);
+    }
+    // Opening a handle attaches the object to the file's context (drm_gem_handle_create).
+    let ctx = o.st.lock().unwrap().ctx;
+    if ctx != 0 {
+        o.dev.gpu.ctx_attach_resource(ctx, id);
     }
     let res = new_res(&o.dev, id, size, stride, 0, Some(guest));
     o.dev.track_res(res.clone());
@@ -989,7 +1011,14 @@ fn virt_transfer(o: &Open, cmd: u64, arg: u64, io: &mut dyn Io) -> Result<i64, i
         bx: Box3 { x: ru32(&b, 4), y: ru32(&b, 8), z: ru32(&b, 12), w: ru32(&b, 16), h: ru32(&b, 20), d: ru32(&b, 24) },
         offset: ru32(&b, 32) as u64,
     };
-    if ioc_nr(cmd) == 0x46 { o.dev.gpu.transfer_read(gem.res.id, &t)? } else { o.dev.gpu.transfer_write(gem.res.id, &t)? };
+    let xfer = if ioc_nr(cmd) == 0x46 { o.dev.gpu.transfer_read(gem.res.id, &t) } else { o.dev.gpu.transfer_write(gem.res.id, &t) };
+    if let Err(e) = xfer {
+        eprintln!(
+            "[drm] transfer res {} ctx {} box {}x{}x{} at {},{},{} level {} stride {} off {} ioctl {} bytes",
+            gem.res.id, t.ctx_id, t.bx.w, t.bx.h, t.bx.d, t.bx.x, t.bx.y, t.bx.z, t.level, t.stride, t.offset, ioc_size(cmd)
+        );
+        return Err(e);
+    }
     Ok(0)
 }
 

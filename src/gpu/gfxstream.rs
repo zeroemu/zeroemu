@@ -333,16 +333,26 @@ pub fn open(width: u32, height: u32) -> Result<Arc<dyn GpuBackend>, String> {
 impl Gfxstream {
     fn start(self: &Arc<Self>, fb_w: u32, fb_h: u32, win: &NativeWindow) -> Result<(), String> {
         LOG_MAX.store(log_max_from_env(), Ordering::Relaxed);
+        // This build's internal shaders are `#version 300 es` when it thinks the
+        // host is GLES, and desktop GL rejects those, so the window stays black.
+        // The emulator's ANGLE libs (found by the dlopen hook) are a GLES 3 host.
+        #[cfg(target_os = "macos")]
+        if std::env::var_os("ANDROID_EGL_ON_EGL").is_none()
+            && SEARCH_DIRS.get().is_some_and(|dirs| {
+                dirs.iter().any(|d| d.join("libEGL.dylib").is_file() && d.join("libGLESv2.dylib").is_file())
+            })
+        {
+            unsafe { std::env::set_var("ANDROID_EGL_ON_EGL", "1") };
+        }
         let user = Arc::as_ptr(self) as usize as u64;
         let mut params = [
             Param { key: PARAM_USER_DATA, value: user },
             Param { key: PARAM_RENDERER_FLAGS, value: RENDERER_FLAGS },
             Param { key: PARAM_FENCE_CALLBACK, value: on_fence as *const () as usize as u64 },
-            // The renderer's window is the on-screen pixel size. The guest
-            // framebuffer (fb_w/fb_h, passed to setup_window) is scaled into it;
-            // using the framebuffer here draws it 1:1 and clips the rest.
-            Param { key: PARAM_WIN0_WIDTH, value: win.width as u64 },
-            Param { key: PARAM_WIN0_HEIGHT, value: win.height as u64 },
+            // Guest display size is the view's pixel backing. The NSView frame
+            // below is in points, so the same image fills the window.
+            Param { key: PARAM_WIN0_WIDTH, value: win.px_width as u64 },
+            Param { key: PARAM_WIN0_HEIGHT, value: win.px_height as u64 },
             Param { key: PARAM_DEBUG_CALLBACK, value: on_debug as *const () as usize as u64 },
         ];
         let r = unsafe { (self.api.init)(params.as_mut_ptr(), params.len() as u64) };

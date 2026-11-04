@@ -76,6 +76,7 @@ syscalls! {
     epoll_create1 = 20, 291;
     epoll_ctl = 21, 233;
     epoll_pwait = 22, 281;
+    epoll_pwait2 = 441, 441;
     getcwd = 17, 79;
     dup = 23, 32;
     dup3 = 24, 292;

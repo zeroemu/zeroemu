@@ -61,7 +61,7 @@ pub fn handles(no: Sysno) -> bool {
         no,
         openat | close | read | pread64 | readv | write | writev | pwrite64 | lseek | fstat | newfstatat | statx | faccessat
             | faccessat2 | readlinkat | getdents64 | getcwd | chdir | fchdir | dup | dup2 | dup3 | fcntl | ioctl | statfs
-            | fstatfs | umask | pipe2 | ppoll | eventfd2 | epoll_create1 | epoll_ctl | epoll_pwait | timerfd_create
+            | fstatfs | umask | pipe2 | ppoll | eventfd2 | epoll_create1 | epoll_ctl | epoll_pwait | epoll_pwait2 | timerfd_create
             | timerfd_settime | timerfd_gettime | signalfd4 | mknodat | mkdirat | unlinkat | symlinkat | linkat | renameat
             | renameat2 | truncate | ftruncate | fallocate | fchmod | fchmodat | fchown | fchownat | sync | fsync | fdatasync
             | utimensat | memfd_create
@@ -450,6 +450,17 @@ impl Kernel {
                     *pos = new as u64;
                     return Ok(new);
                 }
+                // dma-buf: lseek(SEEK_END, 0) is how minigbm learns the size. No position is kept.
+                if let Kind::DmaBuf(b) = &f.kind {
+                    if a[1] != 0 {
+                        return Err(EINVAL);
+                    }
+                    return match a[2] {
+                        0 => Ok(0),
+                        2 => Ok(b.size() as i64),
+                        _ => Err(EINVAL),
+                    };
+                }
                 if let Kind::Block(b) = &f.kind {
                     let len = self.blocks.device(b.devt).map_or(0, |d| d.len());
                     let mut pos = b.pos.lock().unwrap();
@@ -721,6 +732,12 @@ impl Kernel {
                 epoll.ctl(a[1], int(a[2]) as i32, &target, events, data).map(|_| 0)
             }
             epoll_pwait => self.epoll_pwait(t, int(a[0]), a[1], int(a[2]), int(a[3]), a[4]),
+            // Same wait as epoll_pwait; the timeout is a timespec (NULL blocks).
+            // libgui's BLASTBufferQueue waits this way for a buffer release.
+            epoll_pwait2 => {
+                let ms = epoll_timespec_ms(t, a[3])?;
+                self.epoll_pwait(t, int(a[0]), a[1], int(a[2]), ms, a[4])
+            }
             timerfd_create => {
                 let tf = TimerFd::new(a[0], self.boot)?;
                 let f = File::new(Kind::Timer(tf), a[1] as u32 & O_NONBLOCK);
@@ -1485,6 +1502,21 @@ impl Kernel {
         self.restore_mask(t, old, &r);
         r
     }
+}
+
+/// `epoll_pwait2`'s timeout: NULL waits forever, and a positive timespec rounds
+/// up to the next millisecond so a sub-millisecond wait does not become a poll.
+fn epoll_timespec_ms(t: &Thread, ts: u64) -> Result<i64, i64> {
+    if ts == 0 {
+        return Ok(-1);
+    }
+    let b = t.proc.mm().read_vec(ts, 16)?;
+    let sec = i64::from_le_bytes(b[0..8].try_into().unwrap());
+    let nsec = i64::from_le_bytes(b[8..16].try_into().unwrap());
+    if sec < 0 || !(0..1_000_000_000).contains(&nsec) {
+        return Err(EINVAL);
+    }
+    Ok(sec.saturating_mul(1000).saturating_add((nsec + 999_999) / 1_000_000))
 }
 
 /// How long a poller may sleep: until its deadline or the next timer, and

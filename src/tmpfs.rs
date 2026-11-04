@@ -341,7 +341,17 @@ impl FileSystem for Tmpfs {
             {
                 return Err(ENOTEMPTY);
             }
-            nodes.remove(&old);
+            // The replaced name is one link. A socket (or any other inode)
+            // with another name must stay reachable; only the last link goes.
+            if matches!(&nodes[&old].kind, Kind::Dir { .. }) {
+                nodes.remove(&old);
+            } else {
+                let n = nodes.get_mut(&old).unwrap();
+                n.nlink -= 1;
+                if n.nlink == 0 {
+                    nodes.remove(&old);
+                }
+            }
         }
         if let Some(Kind::Dir { entries, .. }) = nodes.get_mut(&odir).map(|n| &mut n.kind) {
             entries.remove(oname);

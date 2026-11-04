@@ -259,6 +259,13 @@ static void unix_paths(void) {
     glen = sizeof got;
     sys(NR_getsockname, ab, &got, &glen);
     check(glen == 8 && got.path[0] == 0, "autobind: a 5-hex-digit abstract name");
+
+    // A rename onto one name of a hard-linked socket drops that link only.
+    int hl = server("/tmp/u/hl");
+    sys(NR_linkat, AT_FDCWD, "/tmp/u/hl", AT_FDCWD, "/tmp/u/hl2", 0);
+    sys(NR_close, sys(NR_openat, AT_FDCWD, "/tmp/u/other", 0101, 0644));
+    sys(NR_renameat, AT_FDCWD, "/tmp/u/other", AT_FDCWD, "/tmp/u/hl");
+    check(reaches(hl, "/tmp/u/hl2"), "rename over one hard link leaves the other bound");
 }
 
 // ---- netlink ----

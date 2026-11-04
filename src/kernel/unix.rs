@@ -13,9 +13,9 @@ use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex, Weak};
 
 const AF_UNIX: u64 = 1;
-const SOCK_STREAM: u32 = 1;
-const SOCK_DGRAM: u32 = 2;
-const SOCK_SEQPACKET: u32 = 5;
+pub const SOCK_STREAM: u32 = 1;
+pub const SOCK_DGRAM: u32 = 2;
+pub const SOCK_SEQPACKET: u32 = 5;
 const SOCK_NONBLOCK: u64 = 0o4000;
 const SOCK_CLOEXEC: u64 = 0o2000000;
 const MSG_PEEK: u64 = 0x2;
@@ -120,24 +120,42 @@ pub struct Socket {
     svc_buf: Mutex<Vec<u8>>,
 }
 
-/// A kernel-side socket server: given the bytes received so far on one
-/// connection, consumes complete requests and returns a reply for each.
+/// A kernel-side socket server (what a daemon like init or logd would be).
 pub trait Service: Send + Sync {
-    fn handle(&self, buf: &mut Vec<u8>) -> Option<Vec<u8>>;
+    /// Stream connections: consumes complete requests from the bytes received
+    /// so far, returning one reply for each.
+    fn handle(&self, _buf: &mut Vec<u8>) -> Option<Vec<u8>> {
+        None
+    }
+    /// Datagram sockets: one message from process `pid`.
+    fn datagram(&self, _data: &[u8], _pid: i32) {}
+    /// Seqpacket connections: one packet; answer with `conn.push`/`conn.finish`.
+    fn packet(&self, _conn: &Arc<Socket>, _data: &[u8]) {}
 }
 
-/// Registers a kernel-side stream service under `name` (a path); the
-/// returned socket must be kept alive.
-pub fn listen_service(name: &str, service: Arc<dyn Service>) -> Arc<Socket> {
-    let sock = Arc::new(Socket { ty: SOCK_STREAM, rx: Mutex::new(Queue::default()), st: Mutex::new(State::default()), service: Some(service), svc_buf: Mutex::new(Vec::new()) });
+fn service_socket(name: &str, ty: u32, service: Arc<dyn Service>, listening: bool) -> Arc<Socket> {
+    let sock = Arc::new(Socket { ty, rx: Mutex::new(Queue::default()), st: Mutex::new(State::default()), service: Some(service), svc_buf: Mutex::new(Vec::new()) });
     {
         let mut st = sock.st.lock().unwrap();
         st.name = Some(name.as_bytes().to_vec());
-        st.backlog = Some(VecDeque::new());
+        if listening {
+            st.backlog = Some(VecDeque::new());
+        }
         st.listen_cred = Cred { pid: 1, uid: 0, gid: 0 };
     }
     NAMES.lock().unwrap().insert(name.as_bytes().to_vec(), Arc::downgrade(&sock));
     sock
+}
+
+/// Registers a kernel-side stream or seqpacket service under `name` (a
+/// path); the returned socket must be kept alive.
+pub fn listen_service(name: &str, ty: u32, service: Arc<dyn Service>) -> Arc<Socket> {
+    service_socket(name, ty, service, true)
+}
+
+/// Registers a kernel-side datagram sink under `name`.
+pub fn bind_service(name: &str, service: Arc<dyn Service>) -> Arc<Socket> {
+    service_socket(name, SOCK_DGRAM, service, false)
 }
 
 /// Bound names (path or "\0abstract") -> sockets.
@@ -164,10 +182,47 @@ impl Socket {
         Arc::new(Socket { ty, rx: Mutex::new(Queue::default()), st: Mutex::new(State::default()), service: None, svc_buf: Mutex::new(Vec::new()) })
     }
 
-    /// Feeds what arrived on a kernel-service connection to its service,
+    /// Sends a packet to the client of a kernel-service connection.
+    pub fn push(&self, data: Vec<u8>) -> bool {
+        let Some(client) = self.peer() else { return false };
+        let mut q = client.rx.lock().unwrap();
+        if q.bytes > 4 << 20 {
+            return true; // a reader that stopped reading: drop rather than grow
+        }
+        q.bytes += data.len();
+        q.msgs.push_back(Msg { data, off: 0, fds: Vec::new(), from: Vec::new(), cred: Cred { pid: 1, uid: 0, gid: 0 } });
+        drop(q);
+        EVENTS.bump();
+        true
+    }
+
+    /// Ends a kernel-service connection: the client reads EOF after the data.
+    pub fn finish(&self) {
+        if let Some(client) = self.peer() {
+            client.rx.lock().unwrap().write_closed = true;
+        }
+        EVENTS.bump();
+    }
+
+    /// Feeds what arrived on a kernel-service socket to its service,
     /// queueing the replies for the client.
-    fn serve(&self) {
+    fn serve(self: &Arc<Self>) {
         let Some(svc) = &self.service else { return };
+        if self.ty != SOCK_STREAM {
+            let msgs: Vec<Msg> = {
+                let mut q = self.rx.lock().unwrap();
+                q.bytes = 0;
+                q.msgs.drain(..).collect()
+            };
+            for m in msgs {
+                if self.ty == SOCK_DGRAM {
+                    svc.datagram(&m.data, m.cred.pid);
+                } else {
+                    svc.packet(self, &m.data);
+                }
+            }
+            return;
+        }
         let mut buf = self.svc_buf.lock().unwrap();
         {
             let mut q = self.rx.lock().unwrap();
@@ -235,7 +290,7 @@ impl Socket {
     }
 
     /// Queues a message for `target` (the peer, or a bound datagram socket).
-    fn deliver(&self, t: &Thread, target: &Socket, msg: Msg, nonblock: bool) -> Result<(), i64> {
+    fn deliver(&self, t: &Thread, target: &Arc<Socket>, msg: Msg, nonblock: bool) -> Result<(), i64> {
         loop {
             let seen = EVENTS.current();
             {

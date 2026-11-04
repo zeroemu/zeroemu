@@ -320,42 +320,27 @@ impl Kernel {
             }
             read => self.read(t, int(a[0]), a[1], a[2], None),
             pread64 => self.read(t, int(a[0]), a[1], a[2], Some(a[3])),
+            // One read (or write) for all the buffers, so a datagram or a
+            // kmsg record stays one message.
             readv => {
-                let mut total = 0;
-                for i in 0..a[2].min(1024) {
-                    let (base, len) = {
-                        let mut mm = t.proc.mm();
-                        (mm.read_u64(a[1] + i * 16)?, mm.read_u64(a[1] + i * 16 + 8)?)
-                    };
-                    match self.read(t, int(a[0]), base, len, None) {
-                        Ok(n) => {
-                            total += n;
-                            if (n as u64) < len {
-                                break;
-                            }
-                        }
-                        Err(e) if total == 0 => return Err(e),
-                        Err(_) => break,
-                    }
+                let iov = self.iovecs(t, a[1], a[2])?;
+                let data = self.read_vec(t, int(a[0]), iov.iter().map(|v| v.1).sum(), None)?;
+                let (mut mm, mut off) = (t.proc.mm(), 0);
+                for (base, len) in iov {
+                    let n = (len as usize).min(data.len() - off);
+                    mm.write(base, &data[off..off + n])?;
+                    off += n;
                 }
-                Ok(total)
+                Ok(data.len() as i64)
             }
             write => self.write(t, int(a[0]), a[1], a[2]),
             pwrite64 => self.write_at(t, int(a[0]), a[1], a[2], Some(a[3])),
             writev => {
-                let mut total = 0;
-                for i in 0..a[2].min(1024) {
-                    let (base, len) = {
-                        let mut mm = t.proc.mm();
-                        (mm.read_u64(a[1] + i * 16)?, mm.read_u64(a[1] + i * 16 + 8)?)
-                    };
-                    match self.write(t, int(a[0]), base, len) {
-                        Ok(n) => total += n,
-                        Err(e) if total == 0 => return Err(e),
-                        Err(_) => break,
-                    }
+                let mut data = Vec::new();
+                for (base, len) in self.iovecs(t, a[1], a[2])? {
+                    data.extend(t.proc.mm().read_vec(base, len.min(IO_MAX - data.len() as u64) as usize)?);
                 }
-                Ok(total)
+                self.write_vec(t, int(a[0]), data, None)
             }
             lseek => {
                 let f = t.proc.files.lock().unwrap().get(int(a[0]))?;
@@ -902,7 +887,27 @@ impl Kernel {
         self.node_data(&mut nf)
     }
 
+    /// An iovec array, its total length capped at IO_MAX.
+    fn iovecs(&self, t: &Thread, iov: u64, n: u64) -> Result<Vec<(u64, u64)>, i64> {
+        let mut mm = t.proc.mm();
+        let mut out = Vec::new();
+        let mut total = 0;
+        for i in 0..n.min(1024) {
+            let (base, len) = (mm.read_u64(iov + i * 16)?, mm.read_u64(iov + i * 16 + 8)?);
+            let len = len.min(IO_MAX - total);
+            total += len;
+            out.push((base, len));
+        }
+        Ok(out)
+    }
+
     fn read(&self, t: &Thread, fd: i64, buf: u64, count: u64, at: Option<u64>) -> Result<i64, i64> {
+        let data = self.read_vec(t, fd, count, at)?;
+        t.proc.mm().write(buf, &data)?;
+        Ok(data.len() as i64)
+    }
+
+    fn read_vec(&self, t: &Thread, fd: i64, count: u64, at: Option<u64>) -> Result<Vec<u8>, i64> {
         let f = t.proc.files.lock().unwrap().get(fd)?;
         let count = count.min(IO_MAX) as usize;
         let data = match &f.kind {
@@ -958,8 +963,7 @@ impl Kernel {
             }
             _ => return Err(EBADF),
         };
-        t.proc.mm().write(buf, &data)?;
-        Ok(data.len() as i64)
+        Ok(data)
     }
 
     fn write(&self, t: &Arc<Thread>, fd: i64, buf: u64, count: u64) -> Result<i64, i64> {
@@ -967,8 +971,12 @@ impl Kernel {
     }
 
     fn write_at(&self, t: &Arc<Thread>, fd: i64, buf: u64, count: u64, at: Option<u64>) -> Result<i64, i64> {
-        let f = t.proc.files.lock().unwrap().get(fd)?;
         let data = t.proc.mm().read_vec(buf, count.min(IO_MAX) as usize)?;
+        self.write_vec(t, fd, data, at)
+    }
+
+    fn write_vec(&self, t: &Arc<Thread>, fd: i64, data: Vec<u8>, at: Option<u64>) -> Result<i64, i64> {
+        let f = t.proc.files.lock().unwrap().get(fd)?;
         let n = match &f.kind {
             Kind::Stdout => std::io::stdout().write_all(&data).and_then(|_| std::io::stdout().flush()).map(|_| data.len()).map_err(|_| EIO)?,
             Kind::Stderr => std::io::stderr().write_all(&data).map(|_| data.len()).map_err(|_| EIO)?,

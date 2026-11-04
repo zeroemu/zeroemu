@@ -11,6 +11,7 @@ mod binder;
 mod epoll;
 mod files;
 mod futex;
+mod logd;
 mod memory;
 mod misc;
 mod process;
@@ -245,15 +246,17 @@ impl Kernel {
         // shared read-only with every process at /dev/__properties__.
         let props = properties::Properties::new(phys.clone());
         props.load_defaults(&v);
+        props.set(None, "logd.ready", "true"); // logd is answered in the kernel (logd.rs)
         dev.add_file("__properties__", 0o444, props.file.clone());
         // /proc reads kernel state, so the kernel is built around it.
         Ok(Arc::new_cyclic(|me| {
             v.mount("/proc", procfs::ProcFs::new(me.clone()));
             let svc: Arc<dyn unix::Service> = Arc::new(PropertyService { kernel: me.clone() });
-            let services = vec![
-                unix::listen_service("/dev/socket/property_service", svc.clone()),
-                unix::listen_service("/dev/socket/property_service_for_system", svc),
+            let mut services = vec![
+                unix::listen_service("/dev/socket/property_service", unix::SOCK_STREAM, svc.clone()),
+                unix::listen_service("/dev/socket/property_service_for_system", unix::SOCK_STREAM, svc),
             ];
+            services.extend(logd::start());
             Kernel {
             arch: Arch::HOST,
             vfs: Some(Arc::new(v)),

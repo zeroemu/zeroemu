@@ -33,7 +33,7 @@ arm64 Android on Apple Silicon and Windows on ARM, x86_64 Android on x86_64 PCs.
 | M0: Windows Hypervisor Platform backend (x86_64) | ported to paged memory; builds clean, **not yet run on Windows** |
 | M1: Android's own `linker64`, `toybox`, and `mksh` straight from an SDK `system.img` | done (macOS, Android 16 image) |
 | M2: demand paging, threads, futex, `fork`/`execve`/`wait4`, pipes, signals | done on macOS; x86_64 written (signal frames, TLB shootdown), untested |
-| M3: binder, `servicemanager`, property service, `logd` | binder, properties, `servicemanager` done (macOS); `logd`, `init` next |
+| M3: binder, `servicemanager`, property service, `logd` | binder, properties, `servicemanager`, logd done (macOS); `init` next |
 | M4: SurfaceFlinger with a composer HAL that renders to Metal / D3D12 | |
 | M5: zygote, ART, `system_server`, launcher, apps | |
 
@@ -71,8 +71,10 @@ M3 so far adds the IPC Android's system services stand on: `eventfd`,
 `epoll`, `timerfd`, `signalfd`, Unix sockets with `SCM_RIGHTS`, tmpfs
 (`/dev`, `/data`, `/tmp`, …) with `MAP_SHARED` and `memfd`, `/proc`, `/sys`,
 a permissive selinuxfs, the property area and property service (as init
-provides them), and a binder driver. Android's own `servicemanager` runs, and
-`service list` / `service check` talk to it over binder.
+provides them), a binder driver, and logd's sockets. Android's own
+`servicemanager` runs, and `service list` / `service check` talk to it over
+binder. Every process's liblog output is printed to stderr, and Android's
+`logcat` (dump, stream, `-c`, `-g`) reads it back from the kernel's buffer.
 
 ## Build and run
 
@@ -89,6 +91,10 @@ cargo run --release -- --system $IMG /system/bin/sh      # Android's mksh, readi
 cargo run --release -- --system $IMG --ls /system/bin    # inspect the image without running anything
 ./scripts/test-android.sh                                # end-to-end checks against the image
 ```
+
+Android log records (`liblog`, i.e. `ALOGI` and friends) print to stderr as
+`<secs since start> <pid> <tid> <prio> <tag>: <message>`; `DROIDRT_LOG=<V|D|I|W|E|F|S>`
+sets the lowest priority shown (default `I`; `S` silences them).
 
 `DROIDRT_STRACE=1` (or `--strace`) logs every syscall; `DROIDRT_BINDER_TRACE=1`
 logs every binder transaction; `DROIDRT_WATCHDOG=<secs>` forces a stuck guest

@@ -14,6 +14,7 @@ use crate::vfs::{FileSystem, Node, S_IFMT, Vfs};
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, Weak};
+use std::time::{Duration, Instant};
 
 const AF_UNIX: u64 = 1;
 pub const S_IFSOCK: u32 = 0o140000;
@@ -103,6 +104,136 @@ struct Queue {
     write_closed: bool,
 }
 
+/// SOL_SOCKET options that read back as they were set, whatever the family.
+pub(super) struct SockOpts {
+    rcvtimeo: Option<Duration>,
+    sndtimeo: Option<Duration>,
+    linger: [u8; 8],
+    ints: BTreeMap<u64, u32>,
+}
+
+const SO_REUSEADDR: u64 = 2;
+const SO_DONTROUTE: u64 = 5;
+const SO_BROADCAST: u64 = 6;
+const SO_KEEPALIVE: u64 = 9;
+const SO_OOBINLINE: u64 = 10;
+const SO_NO_CHECK: u64 = 11;
+const SO_PRIORITY: u64 = 12;
+const SO_LINGER: u64 = 13;
+const SO_REUSEPORT: u64 = 15;
+const SO_RCVLOWAT: u64 = 18;
+const SO_SNDLOWAT: u64 = 19;
+const SO_RCVTIMEO: u64 = 20;
+const SO_SNDTIMEO: u64 = 21;
+const SO_TIMESTAMP: u64 = 29;
+const SO_MARK: u64 = 36;
+const SO_PEEK_OFF: u64 = 42;
+const SO_BUSY_POLL: u64 = 46;
+const SO_RCVTIMEO_NEW: u64 = 66;
+const SO_SNDTIMEO_NEW: u64 = 67;
+
+impl Default for SockOpts {
+    fn default() -> SockOpts {
+        SockOpts { rcvtimeo: None, sndtimeo: None, linger: [0; 8], ints: BTreeMap::new() }
+    }
+}
+
+impl SockOpts {
+    fn int_default(opt: u64) -> Option<u32> {
+        match opt {
+            SO_RCVLOWAT | SO_SNDLOWAT => Some(1),
+            SO_PEEK_OFF => Some(u32::MAX), // -1: off
+            SO_REUSEADDR | SO_DONTROUTE | SO_BROADCAST | SO_KEEPALIVE | SO_OOBINLINE | SO_NO_CHECK | SO_PRIORITY | SO_REUSEPORT | SO_TIMESTAMP | SO_MARK | SO_BUSY_POLL => Some(0),
+            _ => None,
+        }
+    }
+
+    /// setsockopt: the option's raw value (Ok(false): not one of these).
+    pub(super) fn set(&mut self, opt: u64, val: &[u8]) -> Result<bool, i64> {
+        match opt {
+            SO_RCVTIMEO | SO_SNDTIMEO | SO_RCVTIMEO_NEW | SO_SNDTIMEO_NEW => {
+                if val.len() < 16 {
+                    return Err(EINVAL);
+                }
+                let sec = i64::from_le_bytes(val[..8].try_into().unwrap());
+                let usec = i64::from_le_bytes(val[8..16].try_into().unwrap());
+                if !(0..1_000_000).contains(&usec) {
+                    return Err(EDOM);
+                }
+                // As sock_set_timeout: {0, 0} blocks forever, a negative time not at all.
+                let timeout = if sec < 0 {
+                    Some(Duration::ZERO)
+                } else if sec == 0 && usec == 0 {
+                    None
+                } else {
+                    Some(Duration::new(sec as u64, usec as u32 * 1000))
+                };
+                if matches!(opt, SO_RCVTIMEO | SO_RCVTIMEO_NEW) {
+                    self.rcvtimeo = timeout;
+                } else {
+                    self.sndtimeo = timeout;
+                }
+                Ok(true)
+            }
+            SO_LINGER => {
+                self.linger.copy_from_slice(val.get(..8).ok_or(EINVAL)?);
+                Ok(true)
+            }
+            _ if Self::int_default(opt).is_some() => {
+                let v = val.get(..4).ok_or(EINVAL)?;
+                self.ints.insert(opt, u32::from_le_bytes(v.try_into().unwrap()));
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    pub(super) fn get(&self, opt: u64) -> Option<Vec<u8>> {
+        match opt {
+            SO_RCVTIMEO | SO_SNDTIMEO | SO_RCVTIMEO_NEW | SO_SNDTIMEO_NEW => {
+                let t = if matches!(opt, SO_RCVTIMEO | SO_RCVTIMEO_NEW) { self.rcvtimeo } else { self.sndtimeo };
+                let (s, us) = t.map_or((0, 0), |d| (d.as_secs() as i64, d.subsec_micros() as i64));
+                Some([s.to_le_bytes(), us.to_le_bytes()].concat())
+            }
+            SO_LINGER => Some(self.linger.to_vec()),
+            _ => {
+                let d = Self::int_default(opt)?;
+                Some(self.ints.get(&opt).copied().unwrap_or(d).to_le_bytes().to_vec())
+            }
+        }
+    }
+}
+
+/// An option's value as setsockopt was given it.
+pub(super) fn sockopt_bytes(t: &Thread, val: u64, len: u64) -> Result<Vec<u8>, i64> {
+    t.proc.mm().read_vec(val, len.min(64) as usize)
+}
+
+/// When a blocking call with this SO_RCVTIMEO / SO_SNDTIMEO gives up.
+fn deadline(timeout: Option<Duration>) -> Option<Instant> {
+    timeout.map(|d| Instant::now() + d)
+}
+
+/// One sleep of a blocking socket call. A timeout ran out: EAGAIN. Signals
+/// restart a call with no timeout, and end one that has (sock_intr_errno).
+fn wait_or_give_up(t: &Thread, seen: u64, until: Option<Instant>) -> Result<(), i64> {
+    if t.interrupted() {
+        return Err(if until.is_some() { EINTR } else { ERESTARTSYS });
+    }
+    let nap = match until {
+        Some(at) => {
+            let left = at.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(EAGAIN);
+            }
+            left.min(POLL)
+        }
+        None => POLL,
+    };
+    EVENTS.wait(seen, nap);
+    Ok(())
+}
+
 #[derive(Default)]
 struct State {
     /// The address as bound: sun_path bytes, a path or "\0name".
@@ -118,6 +249,7 @@ struct State {
     backlog: Option<VecDeque<Arc<Socket>>>,
     listen_cred: Cred,
     passcred: bool,
+    opts: SockOpts,
     shut_rd: bool,
     shut_wr: bool,
     /// For a client of a kernel-side service: keeps the server end alive.
@@ -358,6 +490,7 @@ impl Socket {
 
     /// Queues a message for `target` (the peer, or a bound datagram socket).
     fn deliver(&self, t: &Thread, target: &Arc<Socket>, msg: Msg, nonblock: bool) -> Result<(), i64> {
+        let until = deadline(self.st.lock().unwrap().opts.sndtimeo);
         loop {
             let seen = EVENTS.current();
             {
@@ -374,10 +507,7 @@ impl Socket {
             if nonblock {
                 return Err(EAGAIN);
             }
-            if t.interrupted() {
-                return Err(ERESTARTSYS);
-            }
-            EVENTS.wait(seen, POLL);
+            wait_or_give_up(t, seen, until)?;
         }
     }
 
@@ -435,6 +565,7 @@ impl Socket {
         let mut out = Vec::new();
         let mut fds = Vec::new();
         let (mut from, mut cred) = (Vec::new(), Cred::default());
+        let until = deadline(self.st.lock().unwrap().opts.rcvtimeo);
         loop {
             let seen = EVENTS.current();
             let (connected, shut_rd, gone) = {
@@ -514,11 +645,10 @@ impl Socket {
                 let n = out.len();
                 return if n == 0 { Err(EAGAIN) } else { Ok((out, fds, from, cred, n)) };
             }
-            if t.interrupted() {
+            if let Err(e) = wait_or_give_up(t, seen, until) {
                 let n = out.len();
-                return if n == 0 { Err(ERESTARTSYS) } else { Ok((out, fds, from, cred, n)) };
+                return if n == 0 { Err(e) } else { Ok((out, fds, from, cred, n)) };
             }
-            EVENTS.wait(seen, POLL);
         }
     }
 }
@@ -539,7 +669,7 @@ impl Kernel {
     pub(super) fn socket_syscall(&self, no: Sysno, t: &Arc<Thread>, a: [u64; 6]) -> Result<i64, i64> {
         use Sysno::*;
         if no != socket && no != socketpair {
-            let f = t.proc.files.lock().unwrap().get(int(a[0]))?;
+            let f = t.files().get(int(a[0]))?;
             if let Kind::Netlink(nl) = &f.kind {
                 return self.netlink_syscall(no, t, nl, &f, a);
             }
@@ -574,7 +704,7 @@ impl Kernel {
                     return Err(ESOCKTNOSUPPORT);
                 }
                 let file = File::new(Kind::Vsock(super::vsock::Vsock::new()), (a[1] & SOCK_NONBLOCK) as u32);
-                t.proc.files.lock().unwrap().alloc(file, a[1] & SOCK_CLOEXEC != 0, 0)
+                t.files().alloc(file, a[1] & SOCK_CLOEXEC != 0, 0)
             }
             socket => {
                 if a[0] != AF_UNIX {
@@ -582,7 +712,7 @@ impl Kernel {
                 }
                 let ty = sock_type(a[1])?;
                 let file = File::new(Kind::Socket(Socket::new(ty, Cred::of(t))), (a[1] & SOCK_NONBLOCK) as u32);
-                t.proc.files.lock().unwrap().alloc(file, a[1] & SOCK_CLOEXEC != 0, 0)
+                t.files().alloc(file, a[1] & SOCK_CLOEXEC != 0, 0)
             }
             socketpair => {
                 if a[0] != AF_UNIX {
@@ -595,7 +725,7 @@ impl Kernel {
                 let flags = (a[1] & SOCK_NONBLOCK) as u32;
                 let cloexec = a[1] & SOCK_CLOEXEC != 0;
                 let (fx, fy) = {
-                    let mut files = t.proc.files.lock().unwrap();
+                    let mut files = t.files();
                     let fx = files.alloc(File::new(Kind::Socket(x), flags), cloexec, 0)?;
                     match files.alloc(File::new(Kind::Socket(y), flags), cloexec, 0) {
                         Ok(fy) => (fx, fy),
@@ -657,6 +787,7 @@ impl Kernel {
             accept | accept4 => {
                 let (sock, file) = self.sock(t, int(a[0]))?;
                 let flags = if no == accept4 { a[3] } else { 0 };
+                let until = deadline(sock.st.lock().unwrap().opts.rcvtimeo);
                 let conn = loop {
                     let seen = EVENTS.current();
                     {
@@ -669,15 +800,12 @@ impl Kernel {
                     if file.nonblock() {
                         return Err(EAGAIN);
                     }
-                    if t.interrupted() {
-                        return Err(ERESTARTSYS);
-                    }
-                    EVENTS.wait(seen, POLL);
+                    wait_or_give_up(t, seen, until)?;
                 };
                 EVENTS.bump();
                 let peer_name = conn.peer().and_then(|p| p.st.lock().unwrap().name.clone());
                 let f = File::new(Kind::Socket(conn), (flags & SOCK_NONBLOCK) as u32);
-                let fd = t.proc.files.lock().unwrap().alloc(f, flags & SOCK_CLOEXEC != 0, 0)?;
+                let fd = t.files().alloc(f, flags & SOCK_CLOEXEC != 0, 0)?;
                 if a[1] != 0 {
                     self.write_addr(t, a[1], a[2], peer_name.as_deref())?;
                 }
@@ -792,8 +920,11 @@ impl Kernel {
                 if a[1] == SOL_SOCKET && a[2] == SO_PASSCRED {
                     let on = t.proc.mm().read_u32(a[3])? != 0;
                     sock.st.lock().unwrap().passcred = on;
+                } else if a[1] == SOL_SOCKET {
+                    let val = sockopt_bytes(t, a[3], a[4])?;
+                    sock.st.lock().unwrap().opts.set(a[2], &val)?;
                 }
-                Ok(0) // buffer sizes, timeouts, reuse flags: accepted
+                Ok(0) // buffer sizes and the like: accepted
             }
             getsockopt => {
                 let (sock, _) = self.sock(t, int(a[0]))?;
@@ -826,7 +957,10 @@ impl Kernel {
                     // property service checks it). Every process runs in one
                     // domain, as /proc/<pid>/attr/current says.
                     SO_PEERSEC if st.connected => b"u:r:su:s0\0".to_vec(),
-                    _ => return Err(ENOPROTOOPT),
+                    opt => st.opts.get(opt).ok_or_else(|| {
+                        eprintln!("[droidrt] getsockopt(AF_UNIX, SOL_SOCKET, {opt}) unsupported");
+                        ENOPROTOOPT
+                    })?,
                 };
                 drop(st);
                 let mut mm = t.proc.mm();
@@ -845,7 +979,7 @@ impl Kernel {
     }
 
     fn sock(&self, t: &Thread, fd: i64) -> Result<(Arc<Socket>, Arc<File>), i64> {
-        let f = t.proc.files.lock().unwrap().get(fd)?;
+        let f = t.files().get(fd)?;
         match &f.kind {
             Kind::Socket(s) => Ok((s.clone(), f.clone())),
             _ => Err(ENOTSOCK),
@@ -962,7 +1096,7 @@ impl Kernel {
                     return Err(EINVAL);
                 }
                 if level as u64 == SOL_SOCKET && ty == SCM_RIGHTS {
-                    let files = t.proc.files.lock().unwrap();
+                    let files = t.files();
                     for c in ctl[off + 16..off + len].chunks_exact(4) {
                         fds.push(files.get(i32::from_le_bytes(c.try_into().unwrap()) as i64)?);
                     }
@@ -1016,7 +1150,7 @@ impl Kernel {
             if (controllen as usize) < ctl.len() + need {
                 msg_flags |= MSG_CTRUNC; // the files are dropped, as on Linux
             } else {
-                let mut files = t.proc.files.lock().unwrap();
+                let mut files = t.files();
                 let mut raw = Vec::new();
                 for f in fds {
                     let nfd = files.alloc(f, flags & MSG_CMSG_CLOEXEC != 0, 0)?;

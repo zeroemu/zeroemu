@@ -608,6 +608,11 @@ impl Kernel {
                 w.thread(me, t.tid).todo.push_back(Work::FailedReply);
                 return;
             };
+            // The top must be a call to this thread, not its own outgoing one.
+            if w.txns.get(&txn).is_some_and(|x| x.from == Some((me, t.tid))) {
+                w.thread(me, t.tid).todo.push_back(Work::FailedReply);
+                return;
+            }
             w.thread(me, t.tid).stack.pop();
             match w.txns.remove(&txn).and_then(|x| x.from) {
                 Some((fp, ft)) if w.procs.contains_key(&fp) => (fp, Some(ft), None),
@@ -648,6 +653,10 @@ impl Kernel {
         let Some(buffer) = w.alloc(to, total) else {
             eprintln!("[droidrt] binder: no receive buffer space in pid {}", w.procs[&to].pid);
             w.thread(me, t.tid).todo.push_back(Work::FailedReply);
+            // The caller is waiting for this reply: it fails too, rather than hang.
+            if let (true, Some(ft)) = (out.reply, to_thread) {
+                w.thread(to, ft).todo.push_back(Work::FailedReply);
+            }
             drop(g);
             EVENTS.bump();
             return;
@@ -657,7 +666,7 @@ impl Kernel {
         let mut sg_cursor = buffer + data_len + offs_len;
         let mut sg_addr: HashMap<u64, u64> = HashMap::new();
         let mut patches: Vec<(u64, u64)> = Vec::new(); // (VA in receiver, value): parent pointer fixups
-        let (receiver, sender) = (w.procs[&to].process.upgrade(), t.proc.clone());
+        let receiver = w.procs[&to].process.upgrade();
         let mut fd_work: Vec<(usize, Arc<File>)> = Vec::new();
         let mut fda_work: Vec<(u64, u64, usize)> = Vec::new(); // (parent object offset, byte offset in parent, count)
         let offsets = out.offsets.clone();
@@ -696,7 +705,7 @@ impl Kernel {
                         out.data[o + 8..o + 16].copy_from_slice(&(h as u64).to_le_bytes());
                     }
                 }
-                TYPE_FD if o + 24 <= out.data.len() => match sender.files.lock().unwrap().get(u32_at(&out.data, o + 8) as i64) {
+                TYPE_FD if o + 24 <= out.data.len() => match t.files().get(u32_at(&out.data, o + 8) as i64) {
                     Ok(f) => fd_work.push((o + 8, f)),
                     Err(_) => {
                         failed = true;
@@ -741,12 +750,35 @@ impl Kernel {
             _ => {
                 w.free(to, buffer);
                 w.thread(me, t.tid).todo.push_back(Work::FailedReply);
+                // The caller is waiting for this reply: it fails too, rather than hang.
+                if let (true, Some(ft)) = (out.reply, to_thread) {
+                    w.thread(to, ft).todo.push_back(Work::FailedReply);
+                }
                 drop(g);
                 EVENTS.bump();
                 return;
             }
         };
-        // File descriptors land in the receiver's table.
+        // File descriptors land in the receiver's table. The sender's are looked
+        // up first: a process may be sending to itself.
+        let mut fda_files = Vec::new();
+        {
+            let senders = t.files();
+            for &(po, off, n) in &fda_work {
+                let buf = &out.sg[&po];
+                for i in 0..n {
+                    let at = off as usize + i * 4;
+                    if at + 4 > buf.len() {
+                        failed = true;
+                        break;
+                    }
+                    match senders.get(u32_at(buf, at) as i64) {
+                        Ok(f) => fda_files.push((po, at, f)),
+                        Err(_) => failed = true,
+                    }
+                }
+            }
+        }
         {
             let mut files = receiver.files.lock().unwrap();
             for (at, f) in fd_work {
@@ -755,21 +787,10 @@ impl Kernel {
                     Err(_) => failed = true,
                 }
             }
-            for (po, off, n) in fda_work {
-                let buf = out.sg.get_mut(&po).unwrap();
-                for i in 0..n {
-                    let at = off as usize + i * 4;
-                    if at + 4 > buf.len() {
-                        failed = true;
-                        break;
-                    }
-                    match sender.files.lock().ok().and_then(|f| f.get(u32_at(buf, at) as i64).ok()) {
-                        Some(f) => match files.alloc(f, true, 0) {
-                            Ok(fd) => buf[at..at + 4].copy_from_slice(&(fd as u32).to_le_bytes()),
-                            Err(_) => failed = true,
-                        },
-                        None => failed = true,
-                    }
+            for (po, at, f) in fda_files {
+                match files.alloc(f, true, 0) {
+                    Ok(fd) => out.sg.get_mut(&po).unwrap()[at..at + 4].copy_from_slice(&(fd as u32).to_le_bytes()),
+                    Err(_) => failed = true,
                 }
             }
         }
@@ -794,6 +815,10 @@ impl Kernel {
         if copied.is_err() || failed {
             w.free(to, buffer);
             w.thread(me, t.tid).todo.push_back(Work::FailedReply);
+            // The caller is waiting for this reply: it fails too, rather than hang.
+            if let (true, Some(ft)) = (out.reply, to_thread) {
+                w.thread(to, ft).todo.push_back(Work::FailedReply);
+            }
             drop(g);
             EVENTS.bump();
             return;
@@ -887,15 +912,17 @@ impl Kernel {
                 if !w.procs.contains_key(&b.id) {
                     return Err(EBADF);
                 }
-                let waiting = !w.thread(b.id, t.tid).stack.is_empty() && {
-                    let top = *w.thread(b.id, t.tid).stack.last().unwrap();
-                    w.txns.get(&top).is_some_and(|x| x.from.is_some_and(|(p, th)| p == b.id && th == t.tid))
-                };
-                let looper = w.thread(b.id, t.tid).looper != 0;
+                let th = w.thread(b.id, t.tid);
+                let looper = th.looper != 0;
+                // As Linux's binder_available_for_proc_work_ilocked: a thread
+                // still in a transaction, or with work of its own, takes nothing
+                // for the process. Nested incoming calls would make its replies
+                // pop the wrong transaction and reach the wrong callers.
+                let idle = th.stack.is_empty() && th.todo.is_empty();
                 while out.len() + 80 <= max {
                     let work = match w.thread(b.id, t.tid).todo.pop_front() {
                         Some(x) => x,
-                        None if !waiting && (looper || w.procs[&b.id].threads.len() <= 1) => match w.procs.get_mut(&b.id).unwrap().todo.pop_front() {
+                        None if idle && (looper || w.procs[&b.id].threads.len() <= 1) => match w.procs.get_mut(&b.id).unwrap().todo.pop_front() {
                             Some(x) => x,
                             None => break,
                         },

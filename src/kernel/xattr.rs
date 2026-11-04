@@ -188,7 +188,7 @@ impl Kernel {
     }
 
     fn fd_xattr_target(&self, t: &Thread, fd: i64) -> Result<Target, i64> {
-        let f = t.proc.files.lock().unwrap().get(fd)?;
+        let f = t.files().get(fd)?;
         if let Some(n) = node_of(&f) {
             return Ok(Target::Node(n));
         }

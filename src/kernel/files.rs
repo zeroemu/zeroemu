@@ -71,7 +71,7 @@ pub fn handles(no: Sysno) -> bool {
             | fstatfs | umask | pipe2 | ppoll | eventfd2 | epoll_create1 | epoll_ctl | epoll_pwait | epoll_pwait2 | timerfd_create
             | timerfd_settime | timerfd_gettime | signalfd4 | mknodat | mkdirat | unlinkat | symlinkat | linkat | renameat
             | renameat2 | truncate | ftruncate | fallocate | fchmod | fchmodat | fchown | fchownat | sync | fsync | fdatasync
-            | utimensat | memfd_create | flock | pselect6 | inotify_init1 | inotify_add_watch | inotify_rm_watch
+            | utimensat | memfd_create | flock | pselect6 | sendfile | copy_file_range | inotify_init1 | inotify_add_watch | inotify_rm_watch
     )
 }
 
@@ -557,7 +557,7 @@ impl Kernel {
             openat => self.openat(t, int(a[0]), a[1], a[2], a[3]),
             close => {
                 let entry = {
-                    let mut files = t.proc.files.lock().unwrap();
+                    let mut files = t.files();
                     let traced = files.traced;
                     let slot = usize::try_from(int(a[0])).ok().and_then(|i| files.fds.get_mut(i));
                     match slot.and_then(|s| s.take()) {
@@ -576,7 +576,7 @@ impl Kernel {
                 Ok(0)
             }
             flock => {
-                let f = t.proc.files.lock().unwrap().get(int(a[0]))?;
+                let f = t.files().get(int(a[0]))?;
                 const LOCK_SH: u64 = 1;
                 const LOCK_EX: u64 = 2;
                 const LOCK_NB: u64 = 4;
@@ -615,7 +615,7 @@ impl Kernel {
                 self.write_vec(t, int(a[0]), data, None)
             }
             lseek => {
-                let f = t.proc.files.lock().unwrap().get(int(a[0]))?;
+                let f = t.files().get(int(a[0]))?;
                 if let Kind::Mem(m) = &f.kind {
                     let mut pos = m.pos.lock().unwrap();
                     let base = match a[2] {
@@ -718,14 +718,14 @@ impl Kernel {
                 Ok(0)
             }
             dup => {
-                let mut files = t.proc.files.lock().unwrap();
+                let mut files = t.files();
                 let f = files.get(int(a[0]))?;
                 files.alloc(f, false, 0)
             }
             dup2 | dup3 => {
                 let (old, new) = (int(a[0]), int(a[1]));
                 let flags = if no == dup3 { a[2] } else { 0 };
-                let mut files = t.proc.files.lock().unwrap();
+                let mut files = t.files();
                 let f = files.get(old)?;
                 if old == new {
                     return if no == dup3 { Err(EINVAL) } else { Ok(new) };
@@ -738,7 +738,7 @@ impl Kernel {
             }
             fcntl => {
                 let fd = int(a[0]);
-                let mut files = t.proc.files.lock().unwrap();
+                let mut files = t.files();
                 match a[1] {
                     F_DUPFD | F_DUPFD_CLOEXEC => {
                         let f = files.get(fd)?;
@@ -795,7 +795,7 @@ impl Kernel {
                 }
             }
             ioctl => {
-                let f = t.proc.files.lock().unwrap().get(int(a[0]))?;
+                let f = t.files().get(int(a[0]))?;
                 let cmd = a[1] as u32 as u64;
                 match &f.kind {
                     Kind::Drm(d) => return super::drm::ioctl(d, cmd, a[2], &mut DrmIo { t }),
@@ -813,7 +813,7 @@ impl Kernel {
                     Kind::DmControl => return self.blocks.dm_ioctl(cmd, a[2], &mut BlockCaller { k: self, t }),
                     Kind::Pty(p) if cmd == super::pty::TIOCGPTPEER => {
                         let file = File::new(Kind::Pty(p.peer()?), (a[2] & O_NONBLOCK as u64) as u32);
-                        return t.proc.files.lock().unwrap().alloc(file, a[2] & O_CLOEXEC != 0, 0);
+                        return t.files().alloc(file, a[2] & O_CLOEXEC != 0, 0);
                     }
                     Kind::Pty(p) if !matches!(a[1], 0x5450 | 0x5451 | 0x5421) => return p.ioctl(t, cmd, a[2]),
                     // Socket ioctls (SIOC*): the interfaces.
@@ -824,7 +824,7 @@ impl Kernel {
                 const FIOCLEX: u64 = 0x5451;
                 const FIONBIO: u64 = 0x5421;
                 let fd = int(a[0]);
-                let mut files = t.proc.files.lock().unwrap();
+                let mut files = t.files();
                 match a[1] {
                     FIOCLEX | FIONCLEX => {
                         files.entry_mut(fd)?.cloexec = a[1] == FIOCLEX;
@@ -840,7 +840,7 @@ impl Kernel {
                 }
             }
             fstatfs => {
-                let f = t.proc.files.lock().unwrap().get(int(a[0]))?;
+                let f = t.files().get(int(a[0]))?;
                 let node = match &f.kind {
                     Kind::Node(nf) => Some(nf.lock().unwrap().node.clone()),
                     Kind::Mem(m) => m.node.clone(),
@@ -868,7 +868,7 @@ impl Kernel {
                 let r = File::new(Kind::Pipe(PipeEnd { pipe: shared.clone(), write: false }), flags);
                 let w = File::new(Kind::Pipe(PipeEnd { pipe: shared, write: true }), flags);
                 let (rfd, wfd) = {
-                    let mut files = t.proc.files.lock().unwrap();
+                    let mut files = t.files();
                     let rfd = files.alloc(r, cloexec, 0)?;
                     match files.alloc(w, cloexec, 0) {
                         Ok(wfd) => (rfd, wfd),
@@ -882,7 +882,7 @@ impl Kernel {
                 fds[..4].copy_from_slice(&(rfd as i32).to_le_bytes());
                 fds[4..].copy_from_slice(&(wfd as i32).to_le_bytes());
                 if let Err(e) = t.proc.mm().write(a[0], &fds) {
-                    let mut files = t.proc.files.lock().unwrap();
+                    let mut files = t.files();
                     files.fds[rfd as usize] = None;
                     files.fds[wfd as usize] = None;
                     return Err(e);
@@ -891,6 +891,28 @@ impl Kernel {
             }
             ppoll => self.ppoll(t, a[0], a[1], a[2], a[3]),
             pselect6 => self.pselect6(t, a),
+            sendfile => {
+                let (out_fd, in_fd, off, count) = (int(a[0]), int(a[1]), a[2], a[3]);
+                let out = t.files().get(out_fd)?;
+                if out.flags.load(Ordering::Relaxed) & O_APPEND != 0 {
+                    return Err(EINVAL);
+                }
+                let at = if off == 0 { None } else { Some(t.proc.mm().read_u64(off)?) };
+                self.copy_between(t, in_fd, at, out_fd, None, count, off)
+            }
+            copy_file_range => {
+                if a[5] != 0 {
+                    return Err(EINVAL);
+                }
+                let (in_off, out_off) = (a[1], a[3]);
+                let at = if in_off == 0 { None } else { Some(t.proc.mm().read_u64(in_off)?) };
+                let to = if out_off == 0 { None } else { Some(t.proc.mm().read_u64(out_off)?) };
+                let n = self.copy_between(t, int(a[0]), at, int(a[2]), to, a[4], in_off)?;
+                if let Some(o) = to {
+                    t.proc.mm().write_u64(out_off, o + n as u64)?;
+                }
+                Ok(n)
+            }
             mknodat | mkdirat | unlinkat | symlinkat | linkat | renameat | renameat2 | truncate | ftruncate | fallocate | fchmod
             | fchmodat | fchown | fchownat | sync | fsync | fdatasync | utimensat | memfd_create => self.change_syscall(no, t, a),
             inotify_init1 => {
@@ -900,10 +922,10 @@ impl Kernel {
                     return Err(EINVAL);
                 }
                 let f = File::new(Kind::Inotify(super::inotify::Inotify::new()), (a[0] & IN_NONBLOCK) as u32);
-                t.proc.files.lock().unwrap().alloc(f, a[0] & IN_CLOEXEC != 0, 0)
+                t.files().alloc(f, a[0] & IN_CLOEXEC != 0, 0)
             }
             inotify_add_watch | inotify_rm_watch => {
-                let f = t.proc.files.lock().unwrap().get(int(a[0]))?;
+                let f = t.files().get(int(a[0]))?;
                 let Kind::Inotify(i) = &f.kind else { return Err(EINVAL) };
                 if no == inotify_rm_watch {
                     return i.rm_watch(a[1] as i32);
@@ -916,18 +938,18 @@ impl Kernel {
             }
             eventfd2 => {
                 let f = File::new(Kind::Event(EventFd::new(a[0] as u32 as u64, a[1])), a[1] as u32 & O_NONBLOCK);
-                t.proc.files.lock().unwrap().alloc(f, a[1] & O_CLOEXEC != 0, 0)
+                t.files().alloc(f, a[1] & O_CLOEXEC != 0, 0)
             }
             epoll_create1 => {
                 if a[0] & !O_CLOEXEC != 0 {
                     return Err(EINVAL);
                 }
                 let f = File::new(Kind::Epoll(Epoll::default()), 0);
-                t.proc.files.lock().unwrap().alloc(f, a[0] & O_CLOEXEC != 0, 0)
+                t.files().alloc(f, a[0] & O_CLOEXEC != 0, 0)
             }
             epoll_ctl => {
                 let (ep, target) = {
-                    let files = t.proc.files.lock().unwrap();
+                    let files = t.files();
                     (files.get(int(a[0]))?, files.get(int(a[2]))?)
                 };
                 let Kind::Epoll(epoll) = &ep.kind else { return Err(EINVAL) };
@@ -953,10 +975,10 @@ impl Kernel {
             timerfd_create => {
                 let tf = TimerFd::new(a[0], self.boot)?;
                 let f = File::new(Kind::Timer(tf), a[1] as u32 & O_NONBLOCK);
-                t.proc.files.lock().unwrap().alloc(f, a[1] & O_CLOEXEC != 0, 0)
+                t.files().alloc(f, a[1] & O_CLOEXEC != 0, 0)
             }
             timerfd_settime => {
-                let f = t.proc.files.lock().unwrap().get(int(a[0]))?;
+                let f = t.files().get(int(a[0]))?;
                 let Kind::Timer(tf) = &f.kind else { return Err(EINVAL) };
                 let new = t.proc.mm().read_vec(a[2], 32)?;
                 let old = tf.settime(a[1], &new);
@@ -966,7 +988,7 @@ impl Kernel {
                 Ok(0)
             }
             timerfd_gettime => {
-                let f = t.proc.files.lock().unwrap().get(int(a[0]))?;
+                let f = t.files().get(int(a[0]))?;
                 let Kind::Timer(tf) = &f.kind else { return Err(EINVAL) };
                 t.proc.mm().write(a[1], &tf.gettime())?;
                 Ok(0)
@@ -974,13 +996,13 @@ impl Kernel {
             signalfd4 => {
                 let mask = t.proc.mm().read_u64(a[1])? & !((1 << 8) | (1 << 18)); // never SIGKILL/SIGSTOP
                 if int(a[0]) != -1 {
-                    let f = t.proc.files.lock().unwrap().get(int(a[0]))?;
+                    let f = t.files().get(int(a[0]))?;
                     let Kind::Signal(sf) = &f.kind else { return Err(EINVAL) };
                     sf.mask.store(mask, Ordering::Relaxed);
                     return Ok(int(a[0]));
                 }
                 let f = File::new(Kind::Signal(SignalFd { mask: AtomicU64::new(mask) }), a[3] as u32 & O_NONBLOCK);
-                t.proc.files.lock().unwrap().alloc(f, a[3] & O_CLOEXEC != 0, 0)
+                t.files().alloc(f, a[3] & O_CLOEXEC != 0, 0)
             }
             _ => Err(ENOSYS),
         }
@@ -994,7 +1016,7 @@ impl Kernel {
         if dirfd == AT_FDCWD {
             return Ok(t.proc.cwd.lock().unwrap().clone());
         }
-        let f = t.proc.files.lock().unwrap().get(dirfd)?;
+        let f = t.files().get(dirfd)?;
         let Kind::Node(nf) = &f.kind else { return Err(ENOTDIR) };
         let nf = nf.lock().unwrap();
         if nf.stat.mode & S_IFMT != S_IFDIR {
@@ -1024,7 +1046,7 @@ impl Kernel {
                 return self.vfs()?.resolve("/", &exe, true);
             }
             if let Some(fd) = rel.strip_prefix("fd/").and_then(|n| n.parse::<i64>().ok()) {
-                let f = t.proc.files.lock().unwrap().get(fd).map_err(|_| ENOENT)?;
+                let f = t.files().get(fd).map_err(|_| ENOENT)?;
                 return match &f.kind {
                     Kind::Node(nf) => Ok(nf.lock().unwrap().node.clone()),
                     Kind::Mem(m) => m.node.clone().ok_or(ENOENT),
@@ -1045,16 +1067,29 @@ impl Kernel {
         if flags & O_TMPFILE == O_TMPFILE {
             return Err(EOPNOTSUPP);
         }
-        let node = match self.resolve(t, dirfd, &path, flags & of.nofollow == 0) {
-            Ok(_) if flags & O_CREAT != 0 && flags & O_EXCL != 0 => return Err(EEXIST),
-            Ok(n) => n,
-            Err(ENOENT) if flags & O_CREAT != 0 => {
-                let (dir, name) = self.parent(t, dirfd, &path)?;
-                let node = self.vfs()?.create(&dir, &name, S_IFREG | (mode as u32 & 0o7777 & !t.proc.umask.load(Ordering::Relaxed)), 0)?;
-                inotify::notify(&inotify::join(&dir.path, &name), inotify::IN_CREATE, 0);
-                node
+        let creating = flags & O_CREAT != 0;
+        let exclusive = creating && flags & O_EXCL != 0;
+        let mut lost_races = 0;
+        let node = loop {
+            match self.resolve(t, dirfd, &path, flags & of.nofollow == 0) {
+                Ok(_) if exclusive => return Err(EEXIST),
+                Ok(n) => break n,
+                Err(ENOENT) if creating => {
+                    let (dir, name) = self.parent(t, dirfd, &path)?;
+                    match self.vfs()?.create(&dir, &name, S_IFREG | (mode as u32 & 0o7777 & !t.proc.umask.load(Ordering::Relaxed)), 0) {
+                        Ok(node) => {
+                            inotify::notify(&inotify::join(&dir.path, &name), inotify::IN_CREATE, 0);
+                            break node;
+                        }
+                        // Another thread made it since the lookup: without O_EXCL,
+                        // open that one (SQLite falls back to read-only otherwise).
+                        // Bounded, as a dangling symlink stays ENOENT, then EEXIST.
+                        Err(EEXIST) if !exclusive && lost_races < 8 => lost_races += 1,
+                        Err(e) => return Err(e),
+                    }
+                }
+                Err(e) => return Err(e),
             }
-            Err(e) => return Err(e),
         };
         let vfs = self.vfs()?;
         let stat = vfs.stat(&node)?;
@@ -1106,7 +1141,7 @@ impl Kernel {
             _ if access != 0 => return Err(EROFS),
             _ => Kind::Node(NodeFile::open(vfs, node, stat, false)),
         };
-        t.proc.files.lock().unwrap().alloc(File::new(kind, status), cloexec, 0)
+        t.files().alloc(File::new(kind, status), cloexec, 0)
     }
 
     /// (directory, final name) of a path relative to `dirfd`.
@@ -1119,7 +1154,7 @@ impl Kernel {
     pub(super) fn target(&self, t: &Thread, dirfd: i64, path: u64, flags: u64) -> Result<Node, i64> {
         let p = if path == 0 { String::new() } else { t.proc.mm().read_cstr(path)? };
         if p.is_empty() && (path == 0 || flags & AT_EMPTY_PATH != 0) {
-            let f = t.proc.files.lock().unwrap().get(dirfd)?;
+            let f = t.files().get(dirfd)?;
             return match &f.kind {
                 Kind::Node(nf) => Ok(nf.lock().unwrap().node.clone()),
                 Kind::Mem(m) => m.node.clone().ok_or(EBADF),
@@ -1130,7 +1165,7 @@ impl Kernel {
     }
 
     fn mem(&self, t: &Thread, fd: i64) -> Result<Arc<File>, i64> {
-        let f = t.proc.files.lock().unwrap().get(fd)?;
+        let f = t.files().get(fd)?;
         match &f.kind {
             Kind::Mem(_) => Ok(f),
             Kind::Node(_) => Err(EINVAL),
@@ -1290,7 +1325,7 @@ impl Kernel {
                 let name = t.proc.mm().read_cstr(a[0])?;
                 let file = MemFile::new(self.phys.clone());
                 let m = MemOpen { node: None, name: format!("/memfd:{name} (deleted)"), file, pos: Mutex::new(0), readable: true, writable: true };
-                t.proc.files.lock().unwrap().alloc(File::new(Kind::Mem(m), 0), a[1] & MFD_CLOEXEC != 0, 0)
+                t.files().alloc(File::new(Kind::Mem(m), 0), a[1] & MFD_CLOEXEC != 0, 0)
             }
             _ => Err(ENOSYS),
         }
@@ -1298,13 +1333,13 @@ impl Kernel {
 
     /// The path of a mapped file, for /proc/<pid>/maps.
     pub(super) fn fd_name(&self, t: &Thread, fd: i64) -> Option<String> {
-        let f = t.proc.files.lock().unwrap().get(fd).ok()?;
+        let f = t.files().get(fd).ok()?;
         Some(file_name(&f))
     }
 
     /// For MAP_SHARED of a file: the shared pages behind a writable file.
     pub(super) fn fd_shared_object(&self, t: &Thread, fd: i64) -> Result<Option<Arc<SharedObject>>, i64> {
-        let f = t.proc.files.lock().unwrap().get(fd)?;
+        let f = t.files().get(fd)?;
         Ok(match &f.kind {
             Kind::Mem(m) => Some(m.file.obj.clone()),
             _ => None,
@@ -1323,7 +1358,7 @@ impl Kernel {
 
     /// Contents of a regular file behind `fd` (for file-backed mmap).
     pub(super) fn fd_file_data(&self, t: &Thread, fd: i64) -> Result<Arc<[u8]>, i64> {
-        let f = t.proc.files.lock().unwrap().get(fd)?;
+        let f = t.files().get(fd)?;
         if let Kind::Mem(m) = &f.kind {
             return Ok(m.file.read_at(0, usize::MAX).into()); // MAP_PRIVATE: a snapshot
         }
@@ -1356,7 +1391,7 @@ impl Kernel {
     }
 
     fn read_vec(&self, t: &Thread, fd: i64, count: u64, at: Option<u64>) -> Result<Vec<u8>, i64> {
-        let f = t.proc.files.lock().unwrap().get(fd)?;
+        let f = t.files().get(fd)?;
         let count = count.min(IO_MAX) as usize;
         let data = match &f.kind {
             Kind::Stdin => {
@@ -1460,7 +1495,7 @@ impl Kernel {
     }
 
     fn write_vec(&self, t: &Arc<Thread>, fd: i64, data: Vec<u8>, at: Option<u64>) -> Result<i64, i64> {
-        let f = t.proc.files.lock().unwrap().get(fd)?;
+        let f = t.files().get(fd)?;
         let n = match &f.kind {
             Kind::Stdout => std::io::stdout().write_all(&data).and_then(|_| std::io::stdout().flush()).map(|_| data.len()).map_err(|_| EIO)?,
             Kind::Stderr => std::io::stderr().write_all(&data).map(|_| data.len()).map_err(|_| EIO)?,
@@ -1544,7 +1579,7 @@ impl Kernel {
 
     fn fd_stat(&self, t: &Thread, fd: i64) -> Result<Stat, i64> {
         let chr = |rdev| Stat { mode: 0o020620, rdev, nlink: 1, ..Default::default() };
-        let f = t.proc.files.lock().unwrap().get(fd)?;
+        let f = t.files().get(fd)?;
         Ok(match &f.kind {
             Kind::Stdin | Kind::Stdout | Kind::Stderr => chr(0x8800), // /dev/pts/0
             Kind::Null => chr(0x0103),
@@ -1591,7 +1626,7 @@ impl Kernel {
         let target = if path == "/proc/self/exe" {
             t.proc.exe.lock().unwrap().clone().into_bytes()
         } else if let Some(fd) = self_fd {
-            let f = t.proc.files.lock().unwrap().get(fd).map_err(|_| ENOENT)?;
+            let f = t.files().get(fd).map_err(|_| ENOENT)?;
             file_name(&f).into_bytes()
         } else {
             let node = self.resolve(t, dirfd, &path, false)?;
@@ -1607,7 +1642,7 @@ impl Kernel {
     }
 
     fn getdents64(&self, t: &Thread, fd: i64, buf: u64, count: u64) -> Result<i64, i64> {
-        let f = t.proc.files.lock().unwrap().get(fd)?;
+        let f = t.files().get(fd)?;
         let Kind::Node(nf) = &f.kind else { return Err(ENOTDIR) };
         let mut guard = nf.lock().unwrap();
         if guard.stat.mode & S_IFMT != S_IFDIR {
@@ -1688,6 +1723,27 @@ impl Kernel {
         r
     }
 
+    /// sendfile and copy_file_range: one read, one write. Short counts are
+    /// legal and every caller loops. An explicit input offset is advanced
+    /// in the caller's memory (`off_ptr`) by what was actually written.
+    #[allow(clippy::too_many_arguments)]
+    fn copy_between(&self, t: &Arc<Thread>, in_fd: i64, at: Option<u64>, out_fd: i64, to: Option<u64>, count: u64, off_ptr: u64) -> Result<i64, i64> {
+        // Reading moves in_fd's position; note where it was, for a short write.
+        let start = if at.is_none() { self.file_syscall(Sysno::lseek, t, [in_fd as u64, 0, 1, 0, 0, 0]).ok() } else { None };
+        let data = self.read_vec(t, in_fd, count, at)?;
+        if data.is_empty() {
+            return Ok(0);
+        }
+        let want = data.len() as i64;
+        let n = self.write_vec(t, out_fd, data, to)?;
+        if let Some(o) = at {
+            t.proc.mm().write_u64(off_ptr, o + n as u64)?;
+        } else if let (Some(s), true) = (start, n < want) {
+            self.file_syscall(Sysno::lseek, t, [in_fd as u64, (s + n) as u64, 0, 0, 0, 0])?;
+        }
+        Ok(n)
+    }
+
     /// select(2) over ppoll's readiness: fd_set bitmaps in, the ready bits out.
     fn pselect6(&self, t: &Thread, a: [u64; 6]) -> Result<i64, i64> {
         const POLLPRI: u16 = 0x2;
@@ -1722,7 +1778,7 @@ impl Kernel {
             let mut count = 0;
             let mut timer: Option<Instant> = None;
             {
-                let files = t.proc.files.lock().unwrap();
+                let files = t.files();
                 for fd in 0..nfds {
                     if !(0..3).any(|i| wanted(fd, &sets[i])) {
                         continue;
@@ -1768,7 +1824,7 @@ impl Kernel {
             let mut ready = 0;
             let mut timer: Option<Instant> = None;
             {
-                let files = t.proc.files.lock().unwrap();
+                let files = t.files();
                 for p in raw.chunks_exact_mut(8) {
                     let fd = i32::from_le_bytes(p[0..4].try_into().unwrap());
                     let events = u16::from_le_bytes(p[4..6].try_into().unwrap());
@@ -1806,7 +1862,7 @@ impl Kernel {
         if max <= 0 {
             return Err(EINVAL);
         }
-        let f = t.proc.files.lock().unwrap().get(epfd)?;
+        let f = t.files().get(epfd)?;
         let Kind::Epoll(ep) = &f.kind else { return Err(EINVAL) };
         let deadline = (timeout_ms >= 0).then(|| Instant::now() + Duration::from_millis(timeout_ms as u64));
         let old = self.swap_mask(t, sigmask)?;
@@ -1914,19 +1970,19 @@ impl super::drm::Io for DrmIo<'_> {
         self.t.proc.mm().write(addr, data)
     }
     fn add_sync(&mut self, sync: super::drm::SyncFile, cloexec: bool) -> Result<i64, i64> {
-        self.t.proc.files.lock().unwrap().alloc(File::new(Kind::Sync(sync), 0), cloexec, 0)
+        self.t.files().alloc(File::new(Kind::Sync(sync), 0), cloexec, 0)
     }
     fn add_dma(&mut self, dma: super::drm::DmaBuf, cloexec: bool) -> Result<i64, i64> {
-        self.t.proc.files.lock().unwrap().alloc(File::new(Kind::DmaBuf(dma), 0), cloexec, 0)
+        self.t.files().alloc(File::new(Kind::DmaBuf(dma), 0), cloexec, 0)
     }
     fn sync_of(&mut self, fd: i64) -> Result<super::drm::SyncFile, i64> {
-        match &self.t.proc.files.lock().unwrap().get(fd)?.kind {
+        match &self.t.files().get(fd)?.kind {
             Kind::Sync(s) => Ok(s.clone()),
             _ => Err(EINVAL),
         }
     }
     fn dma_of(&mut self, fd: i64) -> Result<super::drm::DmaBuf, i64> {
-        match &self.t.proc.files.lock().unwrap().get(fd)?.kind {
+        match &self.t.files().get(fd)?.kind {
             Kind::DmaBuf(d) => Ok(d.clone()),
             _ => Err(EINVAL),
         }
@@ -1963,7 +2019,7 @@ impl block::Caller for BlockCaller<'_> {
         self.t.proc.mm().write(addr, data)
     }
     fn backing(&mut self, fd: i32) -> Result<(crate::image::Dev, String), i64> {
-        let f = self.t.proc.files.lock().unwrap().get(fd as i64)?;
+        let f = self.t.files().get(fd as i64)?;
         match &f.kind {
             Kind::Node(nf) => {
                 let node = nf.lock().unwrap().node.clone();

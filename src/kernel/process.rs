@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 const CLONE_VM: u64 = 0x100;
+const CLONE_FILES: u64 = 0x400;
 const CLONE_SIGHAND: u64 = 0x800;
 const CLONE_THREAD: u64 = 0x10000;
 const CLONE_SETTLS: u64 = 0x80000;
@@ -79,7 +80,13 @@ impl Kernel {
         if flags & CLONE_VM == 0 || flags & CLONE_SIGHAND == 0 {
             return Err(EINVAL);
         }
-        let th = Thread::new(tid, t.proc.clone(), t.mask.load(Ordering::Relaxed));
+        // Without CLONE_FILES, a copy of the caller's table; with it, the caller's.
+        let own_files = if flags & CLONE_FILES != 0 {
+            t.own_files.clone()
+        } else {
+            Some(Arc::new(Mutex::new(t.files().fork_copy(t.proc.pid))))
+        };
+        let th = Thread::new(tid, t.proc.clone(), t.mask.load(Ordering::Relaxed), own_files);
         *th.attrs.lock().unwrap() = t.attrs.lock().unwrap().fork();
         th.sec.inherit(&t.sec);
         {
@@ -115,7 +122,7 @@ impl Kernel {
             pid,
             ppid: AtomicI32::new(parent.pid),
             mm: Mutex::new(Some(mm)),
-            files: Mutex::new(parent.files.lock().unwrap().fork_copy(pid)),
+            files: Mutex::new(t.files().fork_copy(pid)),
             cwd: Mutex::new(parent.cwd.lock().unwrap().clone()),
             exe: Mutex::new(parent.exe.lock().unwrap().clone()),
             cmdline: Mutex::new(parent.cmdline.lock().unwrap().clone()),
@@ -133,7 +140,7 @@ impl Kernel {
             mnt_ns: AtomicU32::new(parent.mnt_ns.load(Ordering::Relaxed)),
             umask: AtomicU32::new(parent.umask.load(Ordering::Relaxed)),
         });
-        let th = Thread::new(pid, child.clone(), t.mask.load(Ordering::Relaxed));
+        let th = Thread::new(pid, child.clone(), t.mask.load(Ordering::Relaxed), None);
         th.sec.inherit(&t.sec);
         *th.altstack.lock().unwrap() = *t.altstack.lock().unwrap();
         *th.attrs.lock().unwrap() = t.attrs.lock().unwrap().fork();
@@ -176,7 +183,7 @@ impl Kernel {
         // the old page tables when they are freed.
         self.exit_group_others(t);
         {
-            let mut files = t.proc.files.lock().unwrap();
+            let mut files = t.files();
             files.set_traced(super::files::fd_trace_wanted(&exe).then_some(t.proc.pid));
             files.close_on_exec();
         }

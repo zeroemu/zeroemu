@@ -313,7 +313,7 @@ impl Kernel {
             }
             Sysno::setns => {
                 let fd = int(a[0]);
-                t.proc.files.lock().unwrap().get(fd)?;
+                t.files().get(fd)?;
                 let node = self.target(t, fd, 0, 0).map_err(|_| EINVAL)?;
                 let vfs = self.vfs.as_deref().ok_or(EINVAL)?;
                 let kind = (vfs.fs_type(&node) == "proc").then(|| super::procfs::ns_kind(node.ino)).flatten().ok_or(EINVAL)?;

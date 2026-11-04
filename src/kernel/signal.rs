@@ -219,10 +219,15 @@ impl Thread {
     }
 
     fn take_signal(&self) -> Option<(u32, SigInfo)> {
+        // Synchronous signals first, as Linux's next_signal does: a fault's frame
+        // must be the one the guest runs, with the faulting PC in it.
+        const SYNCHRONOUS: [u32; 6] = [SIGSEGV, 7 /* SIGBUS */, SIGILL, 5 /* SIGTRAP */, 8 /* SIGFPE */, 31 /* SIGSYS */];
         let mask = self.mask.load(Ordering::Relaxed) & !UNBLOCKABLE;
         for pending in [&self.pending, &self.proc.pending] {
             let mut p = pending.lock().unwrap();
-            if let Some(&sig) = p.keys().filter(|&&s| bit(s) & mask == 0).min() {
+            let ready = |s: &&u32| bit(**s) & mask == 0;
+            let sig = p.keys().filter(ready).find(|s| SYNCHRONOUS.contains(s)).or_else(|| p.keys().filter(ready).min()).copied();
+            if let Some(sig) = sig {
                 return p.remove(&sig).map(|i| (sig, i));
             }
         }
@@ -287,6 +292,12 @@ impl Kernel {
     }
 
     /// A fault the thread caused: delivered to its handler, or fatal.
+    /// Whether a fault raising `sig` runs a handler rather than killing.
+    pub(super) fn signal_caught(&self, t: &Thread, sig: u32) -> bool {
+        let act = t.proc.sig.lock().unwrap().get(sig);
+        act.handler != SIG_DFL && act.handler != SIG_IGN && t.mask.load(Ordering::Relaxed) & bit(sig) == 0
+    }
+
     pub(super) fn force_signal(&self, t: &Arc<Thread>, sig: u32, info: SigInfo, pc: u64) {
         let act = t.proc.sig.lock().unwrap().get(sig);
         let blocked = t.mask.load(Ordering::Relaxed) & bit(sig) != 0;

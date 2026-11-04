@@ -237,17 +237,17 @@ impl BpfObj {
 
 impl Kernel {
     fn bpf_fd(&self, t: &Thread, obj: Arc<BpfObj>) -> Result<i64, i64> {
-        t.proc.files.lock().unwrap().alloc(File::new(Kind::Bpf(obj), 0), true, 0)
+        t.files().alloc(File::new(Kind::Bpf(obj), 0), true, 0)
     }
 
     /// What a program attaches to: a cgroup directory, by its path.
     fn attach_target(&self, t: &Thread, fd: u32) -> Result<String, i64> {
-        let file = t.proc.files.lock().unwrap().get(fd as i64)?;
+        let file = t.files().get(fd as i64)?;
         file.node_path().ok_or(EINVAL)
     }
 
     fn bpf_obj(&self, t: &Thread, fd: u32) -> Result<Arc<BpfObj>, i64> {
-        match &t.proc.files.lock().unwrap().get(fd as i64)?.kind {
+        match &t.files().get(fd as i64)?.kind {
             Kind::Bpf(o) => Ok(o.clone()),
             _ => Err(EINVAL),
         }

@@ -120,6 +120,7 @@ struct State {
     passcred: bool,
     /// FLAG_OPTS bits that are on.
     opts: u32,
+    sol: super::unix::SockOpts,
 }
 
 pub struct Netlink {
@@ -479,7 +480,7 @@ impl Kernel {
         let nl = Arc::new(Netlink { proto, ty, port: AtomicU32::new(0), st: Mutex::new(st) });
         REG.lock().unwrap().all.insert(Arc::as_ptr(&nl) as usize, Arc::downgrade(&nl));
         let f = File::new(Kind::Netlink(nl), (a[1] & SOCK_NONBLOCK) as u32);
-        t.proc.files.lock().unwrap().alloc(f, a[1] & SOCK_CLOEXEC != 0, 0)
+        t.files().alloc(f, a[1] & SOCK_CLOEXEC != 0, 0)
     }
 
     /// The socket syscalls on a netlink descriptor.
@@ -557,6 +558,12 @@ impl Kernel {
             }
             recvmsg => self.netlink_recvmsg(t, nl, f, a[1], a[2]),
             setsockopt => {
+                if a[1] == SOL_SOCKET {
+                    let val = super::unix::sockopt_bytes(t, a[3], a[4])?;
+                    if nl.st.lock().unwrap().sol.set(a[2], &val)? {
+                        return Ok(0);
+                    }
+                }
                 if a[4] < 4 && !(a[1] == SOL_SOCKET && a[2] == SO_BINDTODEVICE) {
                     return Err(EINVAL);
                 }
@@ -608,6 +615,7 @@ impl Kernel {
                         words.iter().flat_map(|w| w.to_le_bytes()).collect()
                     }
                     (SOL_NETLINK, o) if o < 32 && FLAG_OPTS & 1 << o != 0 => word((st.opts & 1 << o != 0) as u32),
+                    (SOL_SOCKET, o) => st.sol.get(o).ok_or(ENOPROTOOPT)?,
                     _ => return Err(ENOPROTOOPT),
                 };
                 drop(st);

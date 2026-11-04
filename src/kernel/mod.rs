@@ -289,6 +289,9 @@ pub struct Thread {
     pub sec: selinux::ThreadSec,
     /// The syscall in progress, for thread dumps.
     in_syscall: Mutex<Option<SyscallSnap>>,
+    /// A descriptor table of its own: cloned without CLONE_FILES. Bionic's
+    /// crash handler makes such a thread and closes everything in it.
+    own_files: Option<Arc<Mutex<FdTable>>>,
 }
 
 /// Where a thread entered the kernel: what a thread dump prints for it. The
@@ -324,6 +327,12 @@ pub fn reserve_dump_signal() {
     unsafe {
         libc::pthread_sigmask(libc::SIG_BLOCK, &dump_signal(), std::ptr::null_mut());
     }
+}
+
+/// DROIDRT_FAULTLOG=1 reports every fault that raises a signal, handled or not.
+fn fault_log() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("DROIDRT_FAULTLOG").is_some())
 }
 
 /// DROIDRT_STRACE=<name> traces only processes whose executable path
@@ -363,8 +372,9 @@ impl Process {
 }
 
 impl Thread {
-    fn new(tid: i32, proc: Arc<Process>, mask: u64) -> Arc<Thread> {
+    fn new(tid: i32, proc: Arc<Process>, mask: u64, own_files: Option<Arc<Mutex<FdTable>>>) -> Arc<Thread> {
         Arc::new(Thread {
+            own_files,
             tid,
             proc,
             clear_child_tid: AtomicU64::new(0),
@@ -381,6 +391,14 @@ impl Thread {
     }
 
     /// Whether a blocking wait should give up now (signal or exit).
+    /// The descriptor table this thread's syscalls use.
+    pub(super) fn files(&self) -> std::sync::MutexGuard<'_, FdTable> {
+        match &self.own_files {
+            Some(f) => f.lock().unwrap(),
+            None => self.proc.files.lock().unwrap(),
+        }
+    }
+
     pub(super) fn interrupted(&self) -> bool {
         self.dying.load(Ordering::Acquire) || self.has_deliverable_signal()
     }
@@ -619,7 +637,7 @@ impl Kernel {
         });
         self.root_pid.store(pid, Ordering::Relaxed);
         self.procs.lock().unwrap().insert(pid, proc.clone());
-        let thread = Thread::new(pid, proc.clone(), 0);
+        let thread = Thread::new(pid, proc.clone(), 0, None);
         thread.attrs.lock().unwrap().comm = control::comm_of(argv.first().map_or("", String::as_str));
         proc.threads.lock().unwrap().push(thread.clone());
         self.spawn(thread, state).map_err(|e| format!("cannot start the first thread: errno {e}"))
@@ -691,13 +709,22 @@ impl Kernel {
                     }
                 }
                 Exit::PageFault { pc, addr, write, exec } => {
-                    if t.proc.mm().fault(addr, write, exec).is_err() {
-                        self.crash_report(t, vcpu.as_ref(), "SIGSEGV", pc, addr, write);
-                        self.force_signal(t, signal::SIGSEGV, SigInfo::fault(signal::SIGSEGV, 1, addr), pc);
+                    let faulted = t.proc.mm().fault(addr, write, exec);
+                    if let Err(code) = faulted {
+                        // ART takes these all the time (implicit null and suspend
+                        // checks) and handles them. Only one that kills is a crash:
+                        // a real one comes back here once its handler gives up.
+                        if !self.signal_caught(t, signal::SIGSEGV) || fault_log() {
+                            self.crash_report(t, vcpu.as_ref(), "SIGSEGV", pc, addr, write);
+                        }
+                        self.force_signal(t, signal::SIGSEGV, SigInfo::fault(signal::SIGSEGV, code, addr), pc);
                     }
                 }
                 Exit::Fault { pc, addr, detail } => {
                     eprintln!("[droidrt] tid {}: guest fault at pc={pc:#x} addr={addr:#x}: {detail}", t.tid);
+                    if !self.signal_caught(t, signal::SIGILL) {
+                        self.crash_report(t, vcpu.as_ref(), "SIGILL", pc, addr, false);
+                    }
                     self.force_signal(t, signal::SIGILL, SigInfo::fault(signal::SIGILL, 1, pc), pc);
                 }
                 Exit::Interrupted => {}
@@ -802,6 +829,11 @@ impl Kernel {
             mprotect => self.sys_mprotect(t, a[0], a[1], a[2] as u32),
             mremap => self.sys_mremap(t, a[0], a[1], a[2], a[3], a[4]),
             madvise => self.sys_madvise(t, a[0], a[1], a[2]),
+            msync => self.sys_msync(t, a[0], a[1], a[2]),
+            mlock | munlock | mlock2 => self.sys_mlock(t, a[0], a[1], if no == mlock2 { a[2] } else { 0 }),
+            mlockall => self.sys_mlockall(a[0]),
+            munlockall => 0,
+            mincore => self.sys_mincore(t, a[0], a[1], a[2]),
 
             bpf => match self.sys_bpf(t, a[0], a[1], a[2]) {
                 Ok(v) => v,
@@ -876,6 +908,10 @@ impl Kernel {
     /// Called on the exiting thread's host thread after its vCPU is gone.
     fn thread_exit(self: &Arc<Self>, t: &Arc<Thread>, code: i32) {
         let proc = &t.proc;
+        // A table only this thread had closes with it (pipe readers see EOF).
+        if let Some(f) = t.own_files.as_ref().filter(|f| Arc::strong_count(f) == 1) {
+            drop(std::mem::replace(&mut *f.lock().unwrap(), FdTable::empty()));
+        }
         let ctid = t.clear_child_tid.swap(0, Ordering::Relaxed);
         if ctid != 0 && proc.mm.lock().unwrap().as_mut().is_some_and(|mm| mm.write_u32(ctid, 0).is_ok()) {
             let key = self.futex_key(t, ctid, false);

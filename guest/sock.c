@@ -30,6 +30,7 @@ typedef unsigned short u16;
 #define NR_exit_group 94
 #define NR_getpid 172
 #define NR_socket 198
+#define NR_socketpair 199
 #define NR_bind 200
 #define NR_listen 201
 #define NR_accept 202
@@ -342,19 +343,33 @@ static void netlink(void) {
     check(sys(NR_ppoll, &pfd, 1, zero, 0, 8) == 1 && pfd.revents == 4, "poll: writable, not readable");
 
     unsigned char ifinfo[16] = { 0 };
+    // Only lo exists: a link dump is one RTM_NEWLINK, then NLMSG_DONE.
     nl_send(r, 18 /* RTM_GETLINK */, 1 | 0x300 /* REQUEST|DUMP */, 7, ifinfo, 16);
     i64 n = nl_recv(r, 0);
+    check(n > 32 && reply.h.type == 16 && reply.h.flags == 2 /* MULTI */ && reply.h.seq == 7 && *(int *)(reply.b + 20) == 1 && seq(reply.b + 36, "lo", 3), "RTM_GETLINK dump: lo, index 1");
+    n = nl_recv(r, 0);
     check(n == 20 && reply.h.type == 3 && reply.h.seq == 7 && reply.h.pid == nl_port(r) && *(int *)(reply.b + 16) == 0 && reply_from.pid == 0, "RTM_GETLINK dump ends with NLMSG_DONE");
     nl_send(r, 16 /* RTM_NEWLINK */, 1 | 4 /* ACK */, 8, ifinfo, 16);
     n = nl_recv(r, 0);
     check(n == 36 && reply.h.type == 2 && *(int *)(reply.b + 16) == 0 && reply.h.seq == 8 && reply.h.flags == 0x100, "NLM_F_ACK: NLMSG_ERROR 0 (capped)");
+    *(int *)(ifinfo + 4) = 99;
     nl_send(r, 18, 1, 9, ifinfo, 16);
     n = nl_recv(r, 0);
-    check(n == 52 && reply.h.type == 2 && *(int *)(reply.b + 16) == -ENODEV, "RTM_GETLINK for one link: ENODEV, request echoed");
+    check(n == 52 && reply.h.type == 2 && *(int *)(reply.b + 16) == -ENODEV, "RTM_GETLINK for a missing link: ENODEV, request echoed");
+    *(int *)(ifinfo + 4) = 1;
+    nl_send(r, 18, 1, 9, ifinfo, 16);
+    n = nl_recv(r, 0);
+    check(n > 32 && reply.h.type == 16 && reply.h.flags == 0 && *(int *)(reply.b + 20) == 1, "RTM_GETLINK for lo: its RTM_NEWLINK");
+    *(int *)(ifinfo + 4) = 0;
+    // lo's two addresses, then NLMSG_DONE.
     nl_send(r, 22 /* RTM_GETADDR */, 1 | 0x300, 10, ifinfo, 8);
     u32 trunc_len = (u32)nl_recv(r, 0x2 | 0x20 /* MSG_PEEK|MSG_TRUNC */);
     n = nl_recv(r, 0);
-    check(trunc_len == 20 && n == 20 && reply.h.type == 3 && reply.h.seq == 10, "MSG_PEEK|MSG_TRUNC sizes the next message");
+    check(trunc_len == n && n > 24 && reply.h.type == 20 && reply.h.seq == 10 && reply.b[16] == 2, "MSG_PEEK|MSG_TRUNC sizes the next message: lo's IPv4 address");
+    n = nl_recv(r, 0);
+    check(n > 24 && reply.h.type == 20 && reply.b[16] == 10, "and its IPv6 address");
+    n = nl_recv(r, 0);
+    check(n == 20 && reply.h.type == 3 && reply.h.seq == 10, "RTM_GETADDR dump ends with NLMSG_DONE");
 
     // Unicast between processes' sockets.
     struct sockaddr_nl peer = { 16, 0, nl_port(r), 0 };
@@ -413,9 +428,43 @@ static void netlink(void) {
     check(mem[0] == 1u << 4 && mlen == 8, "NETLINK_ADD_MEMBERSHIP / LIST_MEMBERSHIPS");
 }
 
+// SOL_SOCKET options read back as set; timeouts end blocking calls.
+// Zygote aborts without the 16-byte SO_RCVTIMEO read-back.
+static void sockopts(void) {
+    int sv[2];
+    check(sys(NR_socketpair, 1 /* AF_UNIX */, 1 /* SOCK_STREAM */, 0, sv) == 0, "socketpair for options");
+    long tv[2] = {7, 7};
+    int len = 16;
+    check(sys(NR_getsockopt, sv[0], 1, 20 /* SO_RCVTIMEO */, tv, &len) == 0 && len == 16 && tv[0] == 0 && tv[1] == 0, "SO_RCVTIMEO reads as 16 bytes of zero");
+    tv[0] = 0, tv[1] = 50000;
+    check(sys(NR_setsockopt, sv[0], 1, 20, tv, 16) == 0, "set a 50 ms receive timeout");
+    tv[0] = tv[1] = 7;
+    check(sys(NR_getsockopt, sv[0], 1, 20, tv, &len) == 0 && tv[0] == 0 && tv[1] == 50000, "and read it back");
+    check(sys(NR_setsockopt, sv[0], 1, 20, tv, 4) == -22, "a short timeval: EINVAL");
+    long bad[2] = {0, 1000000};
+    check(sys(NR_setsockopt, sv[0], 1, 20, bad, 16) == -33, "microseconds out of range: EDOM");
+    char c;
+    check(sys(NR_read, sv[0], &c, 1) == -11, "an empty socket's read times out: EAGAIN");
+    sys(NR_write, sv[1], "x", 1);
+    check(sys(NR_read, sv[0], &c, 1) == 1 && c == 'x', "queued data still comes first");
+    long linger[2] = {7, 7};
+    len = 8;
+    check(sys(NR_getsockopt, sv[0], 1, 13 /* SO_LINGER */, linger, &len) == 0 && len == 8 && (int)linger[0] == 0, "SO_LINGER reads as 8 bytes");
+    int v = 7;
+    len = 4;
+    check(sys(NR_getsockopt, sv[0], 1, 18 /* SO_RCVLOWAT */, &v, &len) == 0 && v == 1, "SO_RCVLOWAT defaults to 1");
+    v = 1;
+    sys(NR_setsockopt, sv[0], 1, 2 /* SO_REUSEADDR */, &v, 4);
+    v = 0;
+    check(sys(NR_getsockopt, sv[0], 1, 2, &v, &len) == 0 && v == 1, "SO_REUSEADDR reads back");
+    sys(NR_close, sv[0]);
+    sys(NR_close, sv[1]);
+}
+
 int cmain(void) {
     unix_paths();
     netlink();
+    sockopts();
     puts_(failures ? "SOME CHECKS FAILED\n" : "all checks passed\n");
     return failures;
 }

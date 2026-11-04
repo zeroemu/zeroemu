@@ -145,6 +145,12 @@ impl Kernel {
                     _ => Err(EINVAL),
                 }
             }
+            // Disk quotas are off (installd then counts by hand); it asks per mount.
+            quotactl => Err(ESRCH),
+            // The drivers a module would bring are droidrt's own.
+            finit_module | init_module | delete_module => Ok(0),
+            // The guest's clock is the host's: nothing to set.
+            settimeofday => Ok(0),
             rseq | clone3 => Err(ENOSYS), // bionic falls back cleanly
             _ => Err(ENOSYS),
         }

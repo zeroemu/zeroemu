@@ -113,6 +113,11 @@ impl SharedObject {
         Ok(())
     }
 
+    /// Whether the page holding `off` has been allocated.
+    pub fn has_frame(&self, off: u64) -> bool {
+        self.pages.lock().unwrap().get((off / PAGE) as usize).is_some_and(|&f| f != 0)
+    }
+
     /// Zeroes everything from `off` on (truncation). Frames stay allocated,
     /// since other address spaces may still map them.
     pub fn zero_from(&self, off: u64) {
@@ -421,9 +426,16 @@ impl AddressSpace {
         match self.find(crate::arch::untag(va)) {
             Some((start, v)) => {
                 let name = v.name.as_deref().unwrap_or("[anon]");
-                // Offsets are relative to the first mapping of the same file.
-                let base = self.vmas.range(..=start).rev().take_while(|(_, x)| x.name.as_deref() == Some(name)).last().map_or(start, |(&s, _)| s);
-                format!("{name}+{:#x}", va - base)
+                let va = crate::arch::untag(va);
+                match &v.backing {
+                    // The offset in the file, whatever gaps the linker left between segments.
+                    Backing::File { offset, .. } | Backing::Shared { offset, .. } => format!("{name}+{:#x}", offset + (va - start)),
+                    // Otherwise relative to the first mapping of that name.
+                    _ => {
+                        let base = self.vmas.range(..=start).rev().take_while(|(_, x)| x.name.as_deref() == Some(name)).last().map_or(start, |(&s, _)| s);
+                        format!("{name}+{:#x}", va - base)
+                    }
+                }
             }
             None => "?".into(),
         }
@@ -505,26 +517,48 @@ impl AddressSpace {
         any
     }
 
-    pub fn protect(&mut self, start: u64, len: u64, prot: u32) -> Result<(), i64> {
-        let end = start.saturating_add(page_up(len));
-        if !start.is_multiple_of(PAGE) || end > USER_TOP {
-            return Err(EINVAL);
-        }
-        // Linux fails with ENOMEM if any part of the range is unmapped.
+    /// Whether every byte of [start, end) is mapped.
+    pub fn covered(&self, start: u64, end: u64) -> bool {
         let mut cur = start;
         for (&s, v) in self.vmas.range(..end) {
             if v.end <= cur {
                 continue;
             }
             if s > cur {
-                return Err(ENOMEM);
+                return false;
             }
             cur = v.end;
             if cur >= end {
-                break;
+                return true;
             }
         }
-        if cur < end {
+        cur >= end
+    }
+
+    /// mincore: one byte per page of [start, end), 1 for one in memory.
+    pub fn residency(&self, start: u64, end: u64) -> Vec<u8> {
+        let mut out = vec![0u8; ((end - start) / PAGE) as usize];
+        self.visit(start, end, &mut |_, _, va, _| out[((va - start) / PAGE) as usize] = 1);
+        // Not mapped here yet, but in memory all the same: shared pages others touched.
+        for (&s, v) in self.vmas.range(..end) {
+            if let Backing::Shared { obj, offset } = &v.backing {
+                for va in (s.max(start)..v.end.min(end)).step_by(PAGE as usize) {
+                    if obj.has_frame(offset + (va - s)) {
+                        out[((va - start) / PAGE) as usize] = 1;
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    pub fn protect(&mut self, start: u64, len: u64, prot: u32) -> Result<(), i64> {
+        let end = start.saturating_add(page_up(len));
+        if !start.is_multiple_of(PAGE) || end > USER_TOP {
+            return Err(EINVAL);
+        }
+        // Linux fails with ENOMEM if any part of the range is unmapped.
+        if !self.covered(start, end) {
             return Err(ENOMEM);
         }
         self.split(start);
@@ -642,9 +676,13 @@ impl AddressSpace {
     }
 
     /// Handles a guest page fault. `Err` means the access is invalid (SIGSEGV).
-    pub fn fault(&mut self, addr: u64, write: bool, exec: bool) -> Result<(), ()> {
+    /// Handles a page fault. On failure, the si_code for SIGSEGV: nothing mapped
+    /// there (SEGV_MAPERR), or the mapping forbids the access (SEGV_ACCERR).
+    pub fn fault(&mut self, addr: u64, write: bool, exec: bool) -> Result<(), i32> {
+        const SEGV_MAPERR: i32 = 1;
+        const SEGV_ACCERR: i32 = 2;
         let page = page_down(addr);
-        let Some((start, vma)) = self.find(page) else { return Err(()) };
+        let Some((start, vma)) = self.find(page) else { return Err(SEGV_MAPERR) };
         let ok = if exec {
             vma.prot & PROT_EXEC != 0
         } else if write {
@@ -653,10 +691,10 @@ impl AddressSpace {
             vma.prot & (PROT_READ | PROT_WRITE | PROT_EXEC) != 0
         };
         if !ok {
-            return Err(());
+            return Err(SEGV_ACCERR);
         }
         let (prot, vma) = (vma.prot, vma.clone());
-        let slot = walk(&self.phys, &mut self.tables, self.root.root, 0, page, true).map_err(|_| ())?.unwrap();
+        let slot = walk(&self.phys, &mut self.tables, self.root.root, 0, page, true).map_err(|_| SEGV_MAPERR)?.unwrap();
         let e = self.phys.read_u64(slot);
         if paging::is_valid(e) {
             if !paging::permits(e, write, exec) {
@@ -666,7 +704,7 @@ impl AddressSpace {
             self.tlb_dirty = true;
             return Ok(());
         }
-        let frame = self.populate(start, &vma, page).map_err(|_| ())?;
+        let frame = self.populate(start, &vma, page).map_err(|_| SEGV_MAPERR)?;
         self.phys.write_u64(slot, paging::user_page(frame, prot));
         Ok(())
     }

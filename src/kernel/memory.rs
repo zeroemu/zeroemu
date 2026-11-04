@@ -35,7 +35,7 @@ impl Kernel {
         };
         // A binder fd's receive area: read-only to the process, filled by the driver.
         if flags & MAP_ANONYMOUS == 0
-            && let Ok(f) = t.proc.files.lock().unwrap().get(fd)
+            && let Ok(f) = t.files().get(fd)
             && let Some(b) = super::binder::mmap_area(&f)
         {
             if prot & 2 != 0 {
@@ -55,7 +55,7 @@ impl Kernel {
             };
         }
         if flags & MAP_ANONYMOUS == 0
-            && let Ok(f) = t.proc.files.lock().unwrap().get(fd)
+            && let Ok(f) = t.files().get(fd)
         {
             let mapped = match &f.kind {
                 super::files::Kind::Drm(d) => Some(d.mmap(offset, len)),
@@ -127,6 +127,60 @@ impl Kernel {
         let fixed = (flags & MREMAP_FIXED != 0).then_some(new_addr);
         match t.proc.mm().remap(crate::arch::untag(old), old_len, new_len, flags & MREMAP_MAYMOVE != 0, fixed) {
             Ok(a) => a as i64,
+            Err(e) => -e,
+        }
+    }
+
+    /// Nothing to write back: writable files are memory, and shared mappings
+    /// of them are that memory. dex2oat fails its compile if this fails.
+    pub(super) fn sys_msync(&self, t: &Thread, addr: u64, len: u64, flags: u64) -> i64 {
+        const MS_ASYNC: u64 = 1;
+        const MS_INVALIDATE: u64 = 2;
+        const MS_SYNC: u64 = 4;
+        let start = crate::arch::untag(addr);
+        if !start.is_multiple_of(PAGE) || flags & !(MS_ASYNC | MS_INVALIDATE | MS_SYNC) != 0 || flags & (MS_ASYNC | MS_SYNC) == MS_ASYNC | MS_SYNC {
+            return -EINVAL;
+        }
+        let end = start.saturating_add(len.next_multiple_of(PAGE));
+        if t.proc.mm().covered(start, end) { 0 } else { -ENOMEM }
+    }
+
+    /// mlock, munlock, mlock2: guest memory is never swapped, so only the range
+    /// is checked. Nothing is faulted in, as PinnerService pins whole APKs.
+    pub(super) fn sys_mlock(&self, t: &Thread, addr: u64, len: u64, flags: u64) -> i64 {
+        const MLOCK_ONFAULT: u64 = 1;
+        if flags & !MLOCK_ONFAULT != 0 {
+            return -EINVAL;
+        }
+        let va = crate::arch::untag(addr);
+        let start = va & !(PAGE - 1);
+        let end = va.saturating_add(len).next_multiple_of(PAGE);
+        if t.proc.mm().covered(start, end) { 0 } else { -ENOMEM }
+    }
+
+    pub(super) fn sys_mlockall(&self, flags: u64) -> i64 {
+        const MCL_CURRENT: u64 = 1;
+        const MCL_FUTURE: u64 = 2;
+        const MCL_ONFAULT: u64 = 4;
+        if flags & !(MCL_CURRENT | MCL_FUTURE | MCL_ONFAULT) != 0 || flags == 0 || flags == MCL_ONFAULT {
+            return -EINVAL;
+        }
+        0
+    }
+
+    pub(super) fn sys_mincore(&self, t: &Thread, addr: u64, len: u64, vec: u64) -> i64 {
+        let start = crate::arch::untag(addr);
+        if !start.is_multiple_of(PAGE) {
+            return -EINVAL;
+        }
+        let end = start.saturating_add(len.next_multiple_of(PAGE));
+        let mut mm = t.proc.mm();
+        if !mm.covered(start, end) {
+            return -ENOMEM;
+        }
+        let bytes = mm.residency(start, end);
+        match mm.write(vec, &bytes) {
+            Ok(()) => 0,
             Err(e) => -e,
         }
     }

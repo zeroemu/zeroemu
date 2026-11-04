@@ -35,6 +35,7 @@ pub struct Inet {
     pub family: u64,
     pub ty: u32,
     pub proto: u32,
+    opts: Mutex<super::unix::SockOpts>,
 }
 
 impl Inet {
@@ -120,9 +121,9 @@ impl Kernel {
         if !(1..=3).contains(&ty) && ty != 5 {
             return Err(EINVAL);
         }
-        let sock = Inet { family: a[0], ty, proto: a[2] as u32 };
+        let sock = Inet { family: a[0], ty, proto: a[2] as u32, opts: Mutex::default() };
         let file = File::new(Kind::Inet(Arc::new(sock)), (a[1] & SOCK_NONBLOCK) as u32);
-        t.proc.files.lock().unwrap().alloc(file, a[1] & SOCK_CLOEXEC != 0, 0)
+        t.files().alloc(file, a[1] & SOCK_CLOEXEC != 0, 0)
     }
 
     pub(super) fn inet_syscall(&self, no: Sysno, t: &Arc<Thread>, s: &Inet, a: [u64; 6]) -> Result<i64, i64> {
@@ -182,7 +183,13 @@ impl Kernel {
                 SO_DOMAIN => s.family as u32,
                 SO_PROTOCOL => s.proto,
                 SO_ERROR => 0,
-                _ => return Err(ENOPROTOOPT),
+                _ => {
+                    let v = s.opts.lock().unwrap().get(name).ok_or(ENOPROTOOPT)?;
+                    let mut mm = t.proc.mm();
+                    mm.write(val, &v[..len.min(v.len())])?;
+                    mm.write_u32(lenp, len.min(v.len()) as u32)?;
+                    return Ok(0);
+                }
             };
             let mut mm = t.proc.mm();
             mm.write(val, &v.to_le_bytes()[..len.min(4)])?;
@@ -236,6 +243,11 @@ impl Kernel {
 
     fn inet_setsockopt(&self, t: &Arc<Thread>, s: &Inet, a: [u64; 6]) -> Result<i64, i64> {
         let (level, name, val, len) = (a[1], a[2], a[3], a[4] as usize);
+        if level == SOL_SOCKET {
+            let v = super::unix::sockopt_bytes(t, val, a[4])?;
+            s.opts.lock().unwrap().set(name, &v)?;
+            return Ok(0);
+        }
         if s.ty != SOCK_RAW || level != if s.v6() { SOL_IPV6 } else { SOL_IP } {
             return Ok(0); // TOS, TTL, buffer sizes...: accepted
         }

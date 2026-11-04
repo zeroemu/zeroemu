@@ -19,6 +19,7 @@ mod logd;
 mod memory;
 mod misc;
 mod mount;
+mod netlink;
 mod process;
 mod procfs;
 mod properties;
@@ -282,14 +283,15 @@ impl Kernel {
         Ok(Arc::new_cyclic(|me| {
             v.mount("/proc", procfs::ProcFs::new(me.clone()));
             let svc: Arc<dyn unix::Service> = Arc::new(PropertyService { kernel: me.clone() });
+            // Socket nodes in /dev/socket, with init's modes and owners.
             let mut services = Vec::new();
             if !boot {
-                services.push(unix::listen_service("/dev/socket/property_service", unix::SOCK_STREAM, svc.clone()));
-                services.push(unix::listen_service("/dev/socket/property_service_for_system", unix::SOCK_STREAM, svc));
+                services.push(unix::listen_service(&v, "/dev/socket/property_service", unix::SOCK_STREAM, 0o666, (0, 0), svc.clone()));
+                services.push(unix::listen_service(&v, "/dev/socket/property_service_for_system", unix::SOCK_STREAM, 0o660, (0, 1000), svc));
             }
             // Also in boot mode, until init starts the real logd, which
             // replaces these (init unlinks a socket's path before binding it).
-            services.extend(logd::start());
+            services.extend(logd::start(&v));
             Kernel {
             arch: Arch::HOST,
             vfs: Some(Arc::new(v)),

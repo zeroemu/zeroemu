@@ -58,8 +58,9 @@ Known gaps:
   restored in full, which that scheduler builds on).
 - `fork` copies memory eagerly; copy-on-write comes before zygote (M5).
 - Binder never drops references, so nodes are never released.
-- No inet or netlink sockets yet; Unix socket names live in a kernel table
-  rather than as filesystem nodes.
+- No inet sockets yet. Netlink answers like a machine with no network
+  interfaces: `ip link` and `ss` dumps come back empty, and uevents arrive
+  only when something broadcasts one.
 - SELinux is present but policy-less and permissive.
 - Images older than Android 10 (no `super` partition) aren't supported.
 - APEX mount names come from file names (`com.android.tzdata6` should be
@@ -75,6 +76,10 @@ provides them), a binder driver, and logd's sockets. Android's own
 `servicemanager` runs, and `service list` / `service check` talk to it over
 binder. Every process's liblog output is printed to stderr, and Android's
 `logcat` (dump, stream, `-c`, `-g`) reads it back from the kernel's buffer.
+Path-bound Unix sockets are `S_IFSOCK` nodes, as on Linux (`ls -l
+/dev/socket` lists the kernel's own services), so init can unlink them and
+bind its own; once the real logd owns `/dev/socket/logdw`, the kernel still
+prints what it receives.
 
 ## Build and run
 

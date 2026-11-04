@@ -115,6 +115,15 @@ check "ionice"              "Best-effort: prio 3" /system/bin/sh -c 'ionice -c 2
 check "hostname"            "droidrt-host"        /system/bin/sh -c 'hostname droidrt-host; uname -n'
 check "setsid"              "own session"         /system/bin/toybox setsid /system/bin/sh -c '[ "$(cut -d" " -f6 /proc/$$/stat)" = $$ ] && echo "own session"'
 check "orphan adopted by 1" "ppid=1 ok"           /system/bin/sh -c '(sh -c "sleep 0.3; echo ppid=\$(cut -d\" \" -f4 /proc/\$\$/stat) ok" &); sleep 0.6'
+# Unix sockets are filesystem nodes; netlink answers
+check "/dev/socket nodes"   "s-w--w--w- logd /dev/socket/logdw" /system/bin/toybox stat -c '%A %U %n' /dev/socket/logdw
+check "nc -U round trip"    "server got: over a path" /system/bin/sh -c 'cd /data/local/tmp && nc -U -l -s srv > out & sleep 0.3; echo "over a path" | nc -U /data/local/tmp/srv; wait; echo "server got: $(cat /data/local/tmp/out)"'
+check "socket node"         "socket 755"          /system/bin/sh -c 'nc -U -l -s /data/local/tmp/s & sleep 0.3; stat -c "%F %a" /data/local/tmp/s; kill %1'
+check "unlinked socket"     "connect: No such file or directory" /system/bin/sh -c 'nc -U -l -s /data/local/tmp/s & sleep 0.3; rm /data/local/tmp/s; echo x | nc -U /data/local/tmp/s; kill %1'
+# A process's socket takes over logdw (as the real logd's does); the kernel prints what it receives.
+check "logd takeover tap"   "I taptest: printed by the tap" /system/bin/sh -c '(sleep 0.6; echo "printed by the tap") | log -t taptest & sleep 0.2; rm /dev/socket/logdw; nc -U -u -l -s /dev/socket/logdw 2>/dev/null & sleep 0.8'
+check "logd takeover"       "kernel logd got 0"   /system/bin/sh -c '(sleep 0.6; echo "printed by the tap") | log -t taptest & sleep 0.2; rm /dev/socket/logdw; nc -U -u -l -s /dev/socket/logdw 2>/dev/null & sleep 0.8; echo "kernel logd got $(logcat -d -s taptest | grep -c tap)"'
+check "netlink dumps"       "link=0 addr=0 route=0 ss=0" /system/bin/sh -c 'ip link; l=$?; ip addr; a=$?; ip route; r=$?; ss -a >/dev/null; echo "link=$l addr=$a route=$r ss=$?"'
 
 # Exit status needs its own path: the program's code must become droidrt's.
 perl -e 'alarm 60; exec @ARGV' "$BIN" --system "$IMG" /system/bin/sh -c 'exit 3' >/dev/null 2>&1

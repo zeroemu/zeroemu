@@ -13,6 +13,8 @@ typedef unsigned int u32;
 #define NR_epoll_pwait 22
 #define NR_fcntl 25
 #define NR_mkdirat 34
+#define NR_linkat 37
+#define NR_renameat 38
 #define NR_umount2 39
 #define NR_mount 40
 #define NR_statfs 43
@@ -76,6 +78,7 @@ static void check(int cond, const char *name) {
 #define EBADF 9
 #define EAGAIN 11
 #define EBUSY 16
+#define EXDEV 18
 #define ENODEV 19
 #define EINVAL 22
 #define ENOSPC 28
@@ -140,7 +143,12 @@ int cmain(void) {
     sys(NR_mkdirat, AT_FDCWD, "/tmp/dst", 0755);
     put("/tmp/src/hello", "bound\n");
     check(sys(NR_mount, "/tmp/src", "/tmp/dst", 0, MS_BIND, 0) == 0 && slurp("/tmp/dst/hello") == 6 && seq(buf, "bound", 5), "bind mount shows the source");
-    put("/tmp/dst/also", "bound\n");
+    check(sys(NR_linkat, AT_FDCWD, "/tmp/src/hello", AT_FDCWD, "/tmp/dst/also", 0) == 0 && slurp("/tmp/dst/also") == 6, "link across a bind of the same filesystem");
+    put("/tmp/src/mv", "m");
+    check(sys(NR_renameat, AT_FDCWD, "/tmp/src/mv", AT_FDCWD, "/tmp/dst/moved", 0) == 0 && slurp("/tmp/src/mv") == -ENOENT, "rename across a bind of the same filesystem");
+    sys(NR_mkdirat, AT_FDCWD, "/tmp/other", 0755);
+    check(sys(NR_mount, "tmpfs", "/tmp/other", "tmpfs", 0, 0) == 0 && sys(NR_linkat, AT_FDCWD, "/tmp/src/hello", AT_FDCWD, "/tmp/other/x", 0) == -EXDEV, "link to another filesystem: EXDEV");
+    sys(NR_umount2, "/tmp/other", 0);
     int dfd = (int)sys(NR_openat, AT_FDCWD, "/tmp/dst/also", O_RDWR, 0);
     check(dfd >= 0 && sys(NR_mount, 0, "/tmp/dst", 0, MS_REMOUNT | MS_BIND | MS_RDONLY, 0) == 0, "remount,bind,ro");
     check(sys(NR_write, dfd, "no", 2) == -EROFS && put("/tmp/dst/x", "no") == -EROFS && put("/tmp/src/x", "yes") == 3, "read-only there only, including an fd opened before");

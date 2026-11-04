@@ -963,11 +963,10 @@ impl Vfs {
     }
 
     pub fn link(&self, node: &Node, dir: &Node, name: &str) -> Result<(), i64> {
-        // Linux compares superblocks, so a bind mount of the same filesystem is not EXDEV.
-        if !Arc::ptr_eq(&node.mnt.sb, &dir.mnt.sb) {
+        self.creatable(dir, name)?;
+        if node.mnt.id != dir.mnt.id {
             return Err(EXDEV);
         }
-        self.creatable(dir, name)?;
         self.fs(dir).link(node.ino, dir.ino, name)
     }
 
@@ -977,7 +976,7 @@ impl Vfs {
     }
 
     pub fn rename(&self, odir: &Node, oname: &str, ndir: &Node, nname: &str, noreplace: bool) -> Result<(), i64> {
-        if !Arc::ptr_eq(&odir.mnt.sb, &ndir.mnt.sb) {
+        if odir.mnt.id != ndir.mnt.id {
             return Err(EXDEV);
         }
         self.removable(odir, oname)?;

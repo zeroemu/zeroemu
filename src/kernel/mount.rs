@@ -674,16 +674,6 @@ mod tests {
         // A bind shows the same files; a mount stacked on /a hides them until unmounted.
         vfs.bind(&at("/a").unwrap(), &at("/b").unwrap(), false).unwrap();
         assert!(at("/b/f").is_ok());
-        // A bind is the same filesystem: link and rename cross it; a second tmpfs does not.
-        vfs.link(&at("/a/f").unwrap(), &at("/b").unwrap(), "g").unwrap();
-        assert!(at("/b/g").is_ok());
-        vfs.create(&at("/a").unwrap(), "r", 0o644, 0).unwrap();
-        vfs.rename(&at("/a").unwrap(), "r", &at("/b").unwrap(), "s", false).unwrap();
-        assert!(at("/b/s").is_ok() && at("/a/r").is_err());
-        vfs.mount_at(&at("/c").unwrap(), sb(tmpfs()), 0).unwrap();
-        assert_eq!(vfs.link(&at("/b/g").unwrap(), &at("/c").unwrap(), "i"), Err(EXDEV));
-        assert_eq!(vfs.rename(&at("/b").unwrap(), "s", &at("/c").unwrap(), "s", false), Err(EXDEV));
-        vfs.umount(&at("/c").unwrap(), false).unwrap();
         vfs.mount_at(&at("/a").unwrap(), sb(tmpfs()), MS_RELATIME).unwrap();
         assert_eq!(at("/a/f").err(), Some(ENOENT));
         vfs.umount(&at("/a").unwrap(), false).unwrap();

@@ -44,6 +44,10 @@ mod imp {
             Err(unsupported())
         }
 
+        fn unmap_ram(&self, _gpa: u64, _size: u64) -> Result<(), String> {
+            Err(unsupported())
+        }
+
         fn kernel_pages(&self, _alloc: &mut dyn FnMut() -> (u64, *mut u8)) -> Vec<KernelPage> {
             Vec::new()
         }
@@ -90,7 +94,7 @@ mod imp {
         WHvDeletePartition, WHvDeleteVirtualProcessor, WHvGetCapability,
         WHvGetVirtualProcessorRegisters, WHvGetVirtualProcessorState,
         WHvGetVirtualProcessorXsaveState, WHvMapGpaRange, WHvMapGpaRangeFlagExecute,
-        WHvMapGpaRangeFlagRead, WHvMapGpaRangeFlagWrite,
+        WHvMapGpaRangeFlagRead, WHvMapGpaRangeFlagWrite, WHvUnmapGpaRange,
         WHvPartitionPropertyCodeExceptionExitBitmap, WHvPartitionPropertyCodeExtendedVmExits,
         WHvPartitionPropertyCodeLocalApicEmulationMode, WHvPartitionPropertyCodeProcessorCount,
         WHvPartitionPropertyCodeProcessorXsaveFeatures, WHvRunVirtualProcessor,
@@ -319,9 +323,12 @@ mod imp {
         fn map_ram(&self, host: *mut u8, gpa: u64, size: u64) -> Result<(), String> {
             let base = (host as u64).wrapping_sub(gpa);
             let prev = self.shared.host_base.load(Ordering::Acquire);
+            // Guest RAM is one contiguous host reservation. Device memory
+            // (GPU blobs above PHYS_MAX) is a separate host allocation; WHP
+            // maps it, but guest_u64 only translates the RAM window.
             if prev == 0 {
                 self.shared.host_base.store(base, Ordering::Release);
-            } else if prev != base {
+            } else if prev != base && gpa < crate::phys::PHYS_MAX {
                 return Err("guest RAM is not one contiguous host mapping".into());
             }
             ok("WHvMapGpaRange", unsafe {
@@ -333,6 +340,10 @@ mod imp {
                     WHvMapGpaRangeFlagRead | WHvMapGpaRangeFlagWrite | WHvMapGpaRangeFlagExecute,
                 )
             })
+        }
+
+        fn unmap_ram(&self, gpa: u64, size: u64) -> Result<(), String> {
+            ok("WHvUnmapGpaRange", unsafe { WHvUnmapGpaRange(self.shared.handle, gpa, size) })
         }
 
         fn kernel_pages(&self, alloc: &mut dyn FnMut() -> (u64, *mut u8)) -> Vec<KernelPage> {

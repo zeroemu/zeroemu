@@ -30,6 +30,10 @@ struct NSRect {
 
 pub struct NativeWindow {
     pub handle: *mut c_void,
+    /// Content size in pixels (points times the screen's backing scale).
+    /// gfxstream sizes its subview from these and divides by the window's
+    /// backing scale, so a point-sized value is drawn 2x too big on Retina
+    /// and the framebuffer is clipped.
     pub width: i32,
     pub height: i32,
 }
@@ -85,6 +89,11 @@ unsafe fn msg_bool(obj: *mut c_void, sel: *mut c_void, a: i8) {
     unsafe { f(obj, sel, a) }
 }
 
+unsafe fn msg_f64_ret(obj: *mut c_void, sel: *mut c_void) -> f64 {
+    let f: unsafe extern "C" fn(*mut c_void, *mut c_void) -> f64 = unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+    unsafe { f(obj, sel) }
+}
+
 unsafe fn msg_f64_id(obj: *mut c_void, sel: *mut c_void, a: f64) -> *mut c_void {
     let f: unsafe extern "C" fn(*mut c_void, *mut c_void, f64) -> *mut c_void = unsafe { std::mem::transmute(objc_msgSend as *const ()) };
     unsafe { f(obj, sel, a) }
@@ -132,9 +141,13 @@ pub fn open(fb_w: u32, fb_h: u32) -> Result<NativeWindow, String> {
         };
         let max_w = (vis.size.width - 48.0).max(320.0);
         let max_h = (vis.size.height - 48.0).max(320.0);
-        let scale = (max_w / fb_w as f64).min(max_h / fb_h as f64).min(1.0);
-        let win_w = (fb_w as f64 * scale).floor().max(1.0);
-        let win_h = (fb_h as f64 * scale).floor().max(1.0);
+        let fit = (max_w / fb_w as f64).min(max_h / fb_h as f64).min(1.0);
+        let win_w = (fb_w as f64 * fit).floor().max(1.0);
+        let win_h = (fb_h as f64 * fit).floor().max(1.0);
+        let mut dpr = if screen.is_null() { 1.0 } else { msg_f64_ret(screen, sel("backingScaleFactor")) };
+        if dpr < 1.0 {
+            dpr = 1.0;
+        }
         let rect = NSRect { origin: NSPoint { x: 0.0, y: 0.0 }, size: NSSize { width: win_w, height: win_h } };
         // titled | closable | miniaturizable | resizable, buffered, don't defer.
         let window = msg_init_window(msg0(cls("NSWindow"), sel("alloc")), sel("initWithContentRect:styleMask:backing:defer:"), rect, 15, 2, 0);
@@ -158,8 +171,10 @@ pub fn open(fb_w: u32, fb_h: u32) -> Result<NativeWindow, String> {
         if number > 0 {
             WINDOW_ID.store(number as u64, Ordering::Release);
         }
-        eprintln!("droidrt: window {win_w:.0}x{win_h:.0} points for {fb_w}x{fb_h} (id {number})");
-        Ok(NativeWindow { handle: window, width: win_w as i32, height: win_h as i32 })
+        let px_w = (win_w * dpr).round().max(1.0);
+        let px_h = (win_h * dpr).round().max(1.0);
+        eprintln!("droidrt: window {win_w:.0}x{win_h:.0} points ({px_w:.0}x{px_h:.0} px, dpr {dpr}) for {fb_w}x{fb_h} (id {number})");
+        Ok(NativeWindow { handle: window, width: px_w as i32, height: px_h as i32 })
     }
 }
 

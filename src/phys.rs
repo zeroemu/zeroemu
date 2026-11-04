@@ -10,12 +10,19 @@ use std::sync::{Arc, Mutex};
 pub const PAGE: u64 = 4096;
 /// Guest RAM ceiling: fits the default 36-bit IPA space of Apple Silicon.
 pub const PHYS_MAX: u64 = 32 << 30;
+/// IPA width this HVF configuration advertises (TCR_EL1.IPS). Device memory
+/// (GPU blobs) is mapped above `PHYS_MAX` and must stay inside it.
+pub const IPA_BITS: u32 = 36;
+/// Hypervisor.framework maps only 16 KiB-aligned host, GPA and size.
+pub const DEV_ALIGN: u64 = 16 << 10;
 const CHUNK: u64 = 64 << 20;
 
 pub struct PhysMem {
     base: NonNull<u8>,
     hv: Arc<dyn Hypervisor>,
     alloc: Mutex<Alloc>,
+    /// Host mappings installed above `PHYS_MAX` (not frames of `base`).
+    ext: Mutex<Ext>,
 }
 
 struct Alloc {
@@ -25,6 +32,19 @@ struct Alloc {
     bump: u64,
     /// Freed frames, zeroed again when reused.
     free: Vec<u64>,
+}
+
+struct Ext {
+    /// Next GPA to try, 16 KiB aligned, at or above `PHYS_MAX`.
+    bump: u64,
+    free: Vec<(u64, u64)>,
+    live: Vec<ExtRange>,
+}
+
+struct ExtRange {
+    gpa: u64,
+    size: u64,
+    host: usize,
 }
 
 // The reservation is plain memory shared by all guest threads; frame
@@ -39,7 +59,48 @@ impl PhysMem {
             hv,
             // Frame 0 is never handed out, so 0 can mean "no frame".
             alloc: Mutex::new(Alloc { mapped: 0, bump: PAGE, free: Vec::new() }),
+            ext: Mutex::new(Ext { bump: PHYS_MAX, free: Vec::new(), live: Vec::new() }),
         })
+    }
+
+    /// Maps already-allocated host memory into the IPA space above RAM.
+    /// `host` and `size` are rounded up to `DEV_ALIGN` (HVF's requirement);
+    /// the returned GPA is aligned the same way. The range stays mapped until
+    /// `unmap_external`.
+    pub fn map_external(&self, host: *mut u8, size: u64) -> Result<u64, i64> {
+        if host.is_null() || (host as u64) & (DEV_ALIGN - 1) != 0 || size == 0 {
+            return Err(crate::errno::EINVAL);
+        }
+        let size = size.div_ceil(DEV_ALIGN) * DEV_ALIGN;
+        let mut ext = self.ext.lock().unwrap();
+        let gpa = if let Some(i) = ext.free.iter().position(|&(_, n)| n == size) {
+            ext.free.swap_remove(i).0
+        } else {
+            let gpa = ext.bump;
+            let end = gpa.checked_add(size).ok_or(crate::errno::ENOMEM)?;
+            if end > 1u64 << IPA_BITS {
+                return Err(crate::errno::ENOMEM);
+            }
+            ext.bump = end;
+            gpa
+        };
+        if let Err(e) = self.hv.map_ram(host, gpa, size) {
+            ext.free.push((gpa, size));
+            eprintln!("[droidrt] device memory: {e}");
+            return Err(crate::errno::ENOMEM);
+        }
+        ext.live.push(ExtRange { gpa, size, host: host as usize });
+        Ok(gpa)
+    }
+
+    pub fn unmap_external(&self, gpa: u64) {
+        let mut ext = self.ext.lock().unwrap();
+        let Some(i) = ext.live.iter().position(|r| r.gpa == gpa) else { return };
+        let range = ext.live.swap_remove(i);
+        if let Err(e) = self.hv.unmap_ram(range.gpa, range.size) {
+            eprintln!("[droidrt] device memory unmap: {e}");
+        }
+        ext.free.push((range.gpa, range.size));
     }
 
     /// A zeroed frame.
@@ -72,10 +133,14 @@ impl PhysMem {
         self.alloc.lock().unwrap().free.push(gpa);
     }
 
-    /// Host address of guest-physical `gpa` (within an allocated frame).
+    /// Host address of guest-physical `gpa` (a RAM frame, or a device mapping).
     pub fn host(&self, gpa: u64) -> *mut u8 {
-        debug_assert!(gpa < PHYS_MAX);
-        unsafe { self.base.as_ptr().add(gpa as usize) }
+        if gpa < PHYS_MAX {
+            return unsafe { self.base.as_ptr().add(gpa as usize) };
+        }
+        let ext = self.ext.lock().unwrap();
+        let range = ext.live.iter().find(|r| (r.gpa..r.gpa + r.size).contains(&gpa)).expect("device gpa");
+        unsafe { (range.host as *mut u8).add((gpa - range.gpa) as usize) }
     }
 
     pub fn read_u64(&self, gpa: u64) -> u64 {

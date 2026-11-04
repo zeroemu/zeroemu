@@ -52,6 +52,14 @@ impl Hypervisor for Hvf {
         Ok(())
     }
 
+    fn unmap_ram(&self, gpa: u64, size: u64) -> Result<(), String> {
+        let ret = unsafe { hv_vm_unmap(gpa, size as usize) };
+        if ret != HV_SUCCESS {
+            return Err(format!("hv_vm_unmap({gpa:#x}, {size:#x}) failed ({ret:#x})"));
+        }
+        Ok(())
+    }
+
     fn kernel_pages(&self, alloc: &mut dyn FnMut() -> (u64, *mut u8)) -> Vec<KernelPage> {
         let (gpa, host) = alloc();
         let put = |off: u64, insn: u32| unsafe { (host.add(off as usize) as *mut u32).write(insn) };

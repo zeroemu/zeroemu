@@ -1026,6 +1026,9 @@ mod tests {
         fn map_ram(&self, _: *mut u8, _: u64, _: u64) -> Result<(), String> {
             Ok(())
         }
+        fn unmap_ram(&self, _: u64, _: u64) -> Result<(), String> {
+            Ok(())
+        }
         fn kernel_pages(&self, _: &mut dyn FnMut() -> (u64, *mut u8)) -> Vec<KernelPage> {
             Vec::new()
         }

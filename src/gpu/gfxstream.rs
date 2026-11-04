@@ -338,8 +338,11 @@ impl Gfxstream {
             Param { key: PARAM_USER_DATA, value: user },
             Param { key: PARAM_RENDERER_FLAGS, value: RENDERER_FLAGS },
             Param { key: PARAM_FENCE_CALLBACK, value: on_fence as *const () as usize as u64 },
-            Param { key: PARAM_WIN0_WIDTH, value: fb_w as u64 },
-            Param { key: PARAM_WIN0_HEIGHT, value: fb_h as u64 },
+            // The renderer's window is the on-screen pixel size. The guest
+            // framebuffer (fb_w/fb_h, passed to setup_window) is scaled into it;
+            // using the framebuffer here draws it 1:1 and clips the rest.
+            Param { key: PARAM_WIN0_WIDTH, value: win.width as u64 },
+            Param { key: PARAM_WIN0_HEIGHT, value: win.height as u64 },
             Param { key: PARAM_DEBUG_CALLBACK, value: on_debug as *const () as usize as u64 },
         ];
         let r = unsafe { (self.api.init)(params.as_mut_ptr(), params.len() as u64) };

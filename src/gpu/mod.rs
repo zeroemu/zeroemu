@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+pub(crate) mod fake;
 mod gfxstream;
 #[cfg(target_os = "macos")]
 mod window_macos;
@@ -150,6 +151,11 @@ pub trait GpuBackend: Send + Sync {
 /// Must run on the main thread.
 pub fn open(width: u32, height: u32) -> Result<Arc<dyn GpuBackend>, String> {
     gfxstream::open(width, height)
+}
+
+/// In-memory backend (`DROIDRT_GPU=fake`): no renderer, no window.
+pub fn fake() -> Arc<dyn GpuBackend> {
+    fake::Fake::new()
 }
 
 /// Block the main thread in the native event loop until `done` is set.

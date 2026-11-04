@@ -54,6 +54,30 @@ impl Kernel {
                 Err(e) => -e,
             };
         }
+        if flags & MAP_ANONYMOUS == 0
+            && let Ok(f) = t.proc.files.lock().unwrap().get(fd)
+        {
+            let mapped = match &f.kind {
+                super::files::Kind::Drm(d) => Some(d.mmap(offset, len)),
+                super::files::Kind::DmaBuf(b) => Some(b.mmap(offset, len)),
+                _ => None,
+            };
+            if let Some(mapped) = mapped {
+                let backing = match mapped {
+                    Ok(b) => b,
+                    Err(e) => return -e,
+                };
+                let name = super::files::file_name(&f);
+                let mut mm = t.proc.mm();
+                return match mm.map(place, len, prot & !PROT_IGNORED, backing) {
+                    Ok(a) => {
+                        mm.set_name(a, len, &name);
+                        a as i64
+                    }
+                    Err(e) => -e,
+                };
+            }
+        }
         let shared = flags & MAP_SHARED != 0;
         let backing = if flags & MAP_ANONYMOUS != 0 {
             if shared { Backing::Shared { obj: SharedObject::new(self.phys.clone()), offset: 0 } } else { Backing::Anon }

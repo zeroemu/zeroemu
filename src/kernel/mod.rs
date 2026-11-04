@@ -13,6 +13,7 @@ mod bpf;
 mod cgroup;
 mod control;
 mod creds;
+mod drm;
 mod epoll;
 mod files;
 mod futex;
@@ -54,10 +55,10 @@ use signal::{Actions, SigInfo};
 
 /// Returned by a blocking syscall interrupted by a signal: restarted
 /// transparently unless a handler without SA_RESTART runs (Linux's ERESTARTSYS).
-const ERESTARTSYS: i64 = 512;
+pub(super) const ERESTARTSYS: i64 = 512;
 
 /// How often blocked threads re-check for signals and process exit.
-const POLL: Duration = Duration::from_millis(20);
+pub(super) const POLL: Duration = Duration::from_millis(20);
 /// Guest threads at once (each is a host thread; vCPUs are shared).
 const MAX_THREADS: usize = 16384;
 
@@ -101,6 +102,11 @@ pub struct Kernel {
     selinux: Arc<selinux::Selinux>,
     /// Kernel-side socket services (kept alive here; looked up by name).
     _services: Vec<Arc<unix::Socket>>,
+    /// virtio-gpu, when a renderer (or the fake backend) was handed in.
+    /// None on a headless boot: no /dev/dri nodes.
+    drm: Option<Arc<drm::Device>>,
+    #[allow(dead_code)]
+    gpu: Option<Arc<dyn crate::gpu::GpuBackend>>,
     /// The root process's wait status once it exits; droidrt then exits.
     exit: (Mutex<Option<i32>>, Condvar),
 }
@@ -270,7 +276,7 @@ impl Thread {
     }
 
     /// Whether a blocking wait should give up now (signal or exit).
-    fn interrupted(&self) -> bool {
+    pub(super) fn interrupted(&self) -> bool {
         self.dying.load(Ordering::Acquire) || self.has_deliverable_signal()
     }
 
@@ -287,7 +293,7 @@ impl Kernel {
     /// have set up (the property area and service, logd).
     /// `partitions`: the image's logical partitions, mapped as device-mapper
     /// devices as first-stage init would.
-    pub fn new(hv: Arc<dyn Hypervisor>, vfs: Option<Vfs>, partitions: Vec<(String, crate::image::Dev)>, strace: bool, boot: bool) -> Result<Arc<Kernel>, String> {
+    pub fn new(hv: Arc<dyn Hypervisor>, vfs: Option<Vfs>, partitions: Vec<(String, crate::image::Dev)>, strace: bool, boot: bool, gpu: Option<Arc<dyn crate::gpu::GpuBackend>>) -> Result<Arc<Kernel>, String> {
         let phys = PhysMem::new(hv.clone());
         let max_vcpus = hv.max_vcpus();
         let pages = hv.kernel_pages(&mut || {
@@ -303,7 +309,11 @@ impl Kernel {
         });
         let dev = mount_tmpfs(&mut v, &phys);
         let sys = v.resolve("/", "/sys", true).map(|n| v.fs_arc(&n)).map_err(|e| format!("/sys: errno {e}"))?;
-        let blocks = block::Blocks::new(dev.clone(), sys);
+        let blocks = block::Blocks::new(dev.clone(), sys.clone());
+        let drm = gpu.as_ref().map(|g| drm::Device::new(g.clone(), phys.clone()));
+        if let Some(d) = &drm {
+            d.publish(dev.as_ref(), sys.as_ref());
+        }
         let names: Vec<String> = partitions.iter().map(|(n, _)| n.clone()).collect();
         for (name, dev) in partitions {
             blocks.add_static(&name, dev);
@@ -356,6 +366,8 @@ impl Kernel {
             selinux,
             _services: services,
             exit: (Mutex::new(None), Condvar::new()),
+            drm,
+            gpu,
             }
         }))
     }

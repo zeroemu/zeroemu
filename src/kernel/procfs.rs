@@ -177,7 +177,7 @@ const BOOT_ARGS: &str = "androidboot.hardware=ranchu androidboot.selinux=permiss
 androidboot.hardware.gralloc=minigbm androidboot.hardware.gltransport=virtio-gpu-asg \
 androidboot.qemu.gltransport.name=virtio-gpu-asg androidboot.qemu.gltransport.drawFlushInterval=800 \
 androidboot.hardware.vulkan=ranchu androidboot.opengles.version=196609 androidboot.qemu.vsync=60 \
-androidboot.debug.hwui.renderer=skiagl androidboot.debug.sf.nobootanimation=1 \
+androidboot.debug.hwui.renderer=skiagl \
 androidboot.hardware.cpu.pagesize=4096 androidboot.qemu.avd_name=droidrt";
 
 impl ProcFs {

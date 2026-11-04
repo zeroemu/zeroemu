@@ -97,6 +97,12 @@ pub enum Kind {
     Pty(super::pty::End),
     /// An eBPF map or program (bpf.rs).
     Bpf(Arc<super::bpf::BpfObj>),
+    /// virtio-gpu card0 or renderD128 (drm.rs).
+    Drm(super::drm::Open),
+    /// A dma-buf exported from a GEM object.
+    DmaBuf(super::drm::DmaBuf),
+    /// A sync_file, the fd libsync waits on.
+    Sync(super::drm::SyncFile),
 }
 
 /// A file whose contents a kernel subsystem computes (selinuxfs,
@@ -375,7 +381,9 @@ pub(super) fn poll_ready(f: &File, t: &Thread, depth: u32) -> u16 {
             }
             None => POLLIN | POLLOUT,
         },
-        Kind::Null | Kind::Zero | Kind::Random | Kind::Mem(_) | Kind::Block(_) | Kind::LoopControl | Kind::DmControl | Kind::Special(_) => POLLIN | POLLOUT,
+        Kind::Null | Kind::Zero | Kind::Random | Kind::Mem(_) | Kind::Block(_) | Kind::LoopControl | Kind::DmControl | Kind::Special(_) | Kind::DmaBuf(_) => POLLIN | POLLOUT,
+        Kind::Drm(d) => d.poll_bits(),
+        Kind::Sync(s) => s.poll(),
         Kind::Kmsg => POLLOUT,
         Kind::Pipe(end) => {
             let st = end.pipe.st.lock().unwrap();
@@ -597,6 +605,9 @@ impl Kernel {
                 let f = t.proc.files.lock().unwrap().get(int(a[0]))?;
                 let cmd = a[1] as u32 as u64;
                 match &f.kind {
+                    Kind::Drm(d) => return super::drm::ioctl(d, cmd, a[2], &mut DrmIo { t }),
+                    Kind::DmaBuf(_) => return super::drm::dma_ioctl(cmd, a[2], &mut DrmIo { t }),
+                    Kind::Sync(s) => return super::drm::sync_ioctl(s, cmd, a[2], &mut DrmIo { t }),
                     Kind::Binder(b) => return self.binder_ioctl(t, &f, b, cmd, a[2]),
                     Kind::Block(b) => return self.blocks.ioctl(b.devt, cmd, a[2], &mut BlockCaller { k: self, t }),
                     Kind::LoopControl => return self.blocks.loop_control(cmd, a[2]),
@@ -828,6 +839,7 @@ impl Kernel {
                 r if super::pty::is_slave(r) => Kind::Pty(super::pty::open_slave(r)?),
                 r if r == block::makedev(block::MISC_MAJOR, block::LOOP_CONTROL_MINOR) => Kind::LoopControl,
                 r if r == block::makedev(block::MISC_MAJOR, block::DM_CONTROL_MINOR) => Kind::DmControl,
+                r if super::drm::is_node(r) => Kind::Drm(self.drm.as_ref().ok_or(ENXIO)?.open(r)),
                 rdev => binder::file_for(t, rdev).ok_or(ENXIO)?,
             },
             S_IFBLK if self.blocks.device(stat.rdev).is_some() => Kind::Block(BlockOpen { devt: stat.rdev, pos: Mutex::new(0) }),
@@ -1125,6 +1137,7 @@ impl Kernel {
                 tf.read(t, f.nonblock())?.to_le_bytes().to_vec()
             }
             Kind::Signal(sf) => sf.read(t, count, f.nonblock())?,
+            Kind::Drm(d) => d.read_events(t, count, f.nonblock())?,
             Kind::Mem(m) => {
                 if !m.readable {
                     return Err(EBADF);
@@ -1268,7 +1281,9 @@ impl Kernel {
             Kind::Kmsg => chr(0x010b),
             Kind::Pipe(_) => Stat { mode: 0o010600, nlink: 1, ..Default::default() },
             Kind::Socket(_) | Kind::Netlink(_) => Stat { mode: 0o140777, nlink: 1, ..Default::default() },
-            Kind::Event(_) | Kind::Timer(_) | Kind::Signal(_) | Kind::Epoll(_) | Kind::Bpf(_) => Stat { mode: 0o600, nlink: 1, ..Default::default() }, // anon_inode
+            Kind::Event(_) | Kind::Timer(_) | Kind::Signal(_) | Kind::Epoll(_) | Kind::Bpf(_) | Kind::Sync(_) => Stat { mode: 0o600, nlink: 1, ..Default::default() }, // anon_inode
+            Kind::Drm(d) => Stat { mode: 0o020666, rdev: d.rdev(), nlink: 1, ..Default::default() },
+            Kind::DmaBuf(b) => Stat { mode: 0o600, nlink: 1, size: b.size(), ..Default::default() },
             Kind::Binder(_) => Stat { mode: 0o020666, nlink: 1, rdev: 0xa36, ..Default::default() },
             Kind::Block(b) => Stat { mode: S_IFBLK | 0o600, nlink: 1, rdev: b.devt, ..Default::default() },
             Kind::LoopControl => chr(block::makedev(block::MISC_MAJOR, block::LOOP_CONTROL_MINOR)),
@@ -1512,7 +1527,57 @@ pub(super) fn file_name(f: &File) -> String {
         Kind::Block(b) => format!("/dev/block/{}", block::name(b.devt)),
         Kind::LoopControl => "/dev/loop-control".into(),
         Kind::DmControl => "/dev/device-mapper".into(),
+        Kind::Drm(d) => d.path().into(),
+        Kind::DmaBuf(_) => "anon_inode:dmabuf".into(),
+        Kind::Sync(_) => "anon_inode:sync_file".into(),
         Kind::Stdin | Kind::Stdout | Kind::Stderr => "/dev/pts/0".into(),
+    }
+}
+
+struct DrmIo<'a> {
+    t: &'a Thread,
+}
+
+impl super::drm::Io for DrmIo<'_> {
+    fn read_mem(&mut self, addr: u64, n: usize) -> Result<Vec<u8>, i64> {
+        self.t.proc.mm().read_vec(addr, n)
+    }
+    fn write_mem(&mut self, addr: u64, data: &[u8]) -> Result<(), i64> {
+        self.t.proc.mm().write(addr, data)
+    }
+    fn add_sync(&mut self, sync: super::drm::SyncFile, cloexec: bool) -> Result<i64, i64> {
+        self.t.proc.files.lock().unwrap().alloc(File::new(Kind::Sync(sync), 0), cloexec, 0)
+    }
+    fn add_dma(&mut self, dma: super::drm::DmaBuf, cloexec: bool) -> Result<i64, i64> {
+        self.t.proc.files.lock().unwrap().alloc(File::new(Kind::DmaBuf(dma), 0), cloexec, 0)
+    }
+    fn sync_of(&mut self, fd: i64) -> Result<super::drm::SyncFile, i64> {
+        match &self.t.proc.files.lock().unwrap().get(fd)?.kind {
+            Kind::Sync(s) => Ok(s.clone()),
+            _ => Err(EINVAL),
+        }
+    }
+    fn dma_of(&mut self, fd: i64) -> Result<super::drm::DmaBuf, i64> {
+        match &self.t.proc.files.lock().unwrap().get(fd)?.kind {
+            Kind::DmaBuf(d) => Ok(d.clone()),
+            _ => Err(EINVAL),
+        }
+    }
+    fn comm(&self) -> String {
+        let c = self.t.attrs.lock().unwrap().comm.clone();
+        if c.is_empty() { self.t.proc.exe.lock().unwrap().rsplit('/').next().unwrap_or("?").to_string() } else { c }
+    }
+    fn wait_until(&mut self, pred: &mut dyn FnMut() -> bool) -> Result<(), i64> {
+        loop {
+            let seen = super::wait::EVENTS.current();
+            if pred() {
+                return Ok(());
+            }
+            if self.t.interrupted() {
+                return Err(super::ERESTARTSYS);
+            }
+            super::wait::EVENTS.wait(seen, super::POLL);
+        }
     }
 }
 

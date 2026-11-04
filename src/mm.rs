@@ -31,6 +31,33 @@ pub enum Backing {
     /// MAP_SHARED memory: the object owns the frames, every mapping (in any
     /// address space) points at the same ones.
     Shared { obj: Arc<SharedObject>, offset: u64 },
+    /// Guest-physical pages that are not RAM (a GPU blob mapped above
+    /// `PHYS_MAX`). The frames are not allocated or freed here; the last
+    /// `DevMem` reference unmaps the GPA, and only after a TLB flush when
+    /// the unmap path parked it in `Stale`.
+    Dev { mem: Arc<DevMem>, offset: u64 },
+}
+
+/// One device-memory mapping. `on_drop` runs when the last reference goes,
+/// which for an unmapped VMA is after the TLB flush (`Stale`).
+pub struct DevMem {
+    pub gpa: u64,
+    pub len: u64,
+    on_drop: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+}
+
+impl DevMem {
+    pub fn new(gpa: u64, len: u64, on_drop: impl FnOnce() + Send + 'static) -> Arc<DevMem> {
+        Arc::new(DevMem { gpa, len, on_drop: Mutex::new(Some(Box::new(on_drop))) })
+    }
+}
+
+impl Drop for DevMem {
+    fn drop(&mut self) {
+        if let Some(f) = self.on_drop.lock().unwrap().take() {
+            f();
+        }
+    }
 }
 
 /// Memory shared between mappings: tmpfs/memfd file contents and
@@ -115,6 +142,7 @@ impl Drop for SharedObject {
 pub struct Stale {
     frames: Vec<u64>,
     objs: Vec<Arc<SharedObject>>,
+    devs: Vec<Arc<DevMem>>,
 }
 
 impl Stale {
@@ -123,6 +151,9 @@ impl Stale {
             phys.free(f);
         }
         self.objs.clear();
+        // Device GPAs are unmapped here, after the TLB flush that made the
+        // translations go away.
+        self.devs.clear();
     }
 }
 
@@ -162,6 +193,13 @@ impl KernelWindow {
             phys.write_u64(slot, paging::kernel_page(p.gpa, p.exec));
         }
         Ok(KernelWindow { table }) // these tables live as long as the VM
+    }
+}
+
+fn bump_offset(b: &mut Backing, add: u64) {
+    match b {
+        Backing::File { offset, .. } | Backing::Shared { offset, .. } | Backing::Dev { offset, .. } => *offset += add,
+        Backing::Anon => {}
     }
 }
 
@@ -255,9 +293,7 @@ impl AddressSpace {
             return;
         }
         let mut right = vma.clone();
-        if let Backing::File { offset, .. } | Backing::Shared { offset, .. } = &mut right.backing {
-            *offset += at - start;
-        }
+        bump_offset(&mut right.backing, at - start);
         self.vmas.get_mut(&start).unwrap().end = at;
         self.vmas.insert(at, right);
     }
@@ -323,7 +359,7 @@ impl AddressSpace {
                 let (shared, offset) = match &v.backing {
                     Backing::Anon => (false, 0),
                     Backing::File { offset, .. } => (false, *offset),
-                    Backing::Shared { offset, .. } => (true, *offset),
+                    Backing::Shared { offset, .. } | Backing::Dev { offset, .. } => (true, *offset),
                 };
                 (s, v.end, v.prot, shared, offset, v.name.clone())
             })
@@ -364,8 +400,10 @@ impl AddressSpace {
         let freed = self.clear_pages(start, end);
         let doomed: Vec<u64> = self.vmas.range(start..end).map(|(&s, _)| s).collect();
         for s in doomed {
-            if let Some(Vma { backing: Backing::Shared { obj, .. }, .. }) = self.vmas.remove(&s) {
-                self.stale.objs.push(obj);
+            match self.vmas.remove(&s).map(|v| v.backing) {
+                Some(Backing::Shared { obj, .. }) => self.stale.objs.push(obj),
+                Some(Backing::Dev { mem, .. }) => self.stale.devs.push(mem),
+                _ => {}
             }
         }
         if freed {
@@ -397,7 +435,7 @@ impl AddressSpace {
     }
 
     fn is_shared(&self, va: u64) -> bool {
-        matches!(self.find(va), Some((_, Vma { backing: Backing::Shared { .. }, .. })))
+        matches!(self.find(va), Some((_, Vma { backing: Backing::Shared { .. } | Backing::Dev { .. }, .. })))
     }
 
     /// Clears the present pages of [start, end): private frames go to `stale`,
@@ -484,9 +522,7 @@ impl AddressSpace {
             }
             None => self.gap(new_len)?,
         };
-        if let Backing::File { offset, .. } | Backing::Shared { offset, .. } = &mut backing {
-            *offset += old - vstart;
-        }
+        bump_offset(&mut backing, old - vstart);
         let keep = old_len.min(new_len);
         let mut moves = Vec::new();
         self.visit(old, old + keep, &mut |phys, slot, va, e| {
@@ -587,6 +623,13 @@ impl AddressSpace {
     fn populate(&self, vma_start: u64, vma: &Vma, page: u64) -> Result<u64, i64> {
         if let Backing::Shared { obj, offset } = &vma.backing {
             return obj.frame(((offset + (page - vma_start)) / PAGE) as usize);
+        }
+        if let Backing::Dev { mem, offset } = &vma.backing {
+            let off = offset + (page - vma_start);
+            if off >= mem.len {
+                return Err(EFAULT);
+            }
+            return Ok(mem.gpa + off);
         }
         let frame = self.phys.alloc()?;
         if let Backing::File { data, offset } = &vma.backing {

@@ -169,6 +169,9 @@ pub trait Vcpu {
 pub trait Hypervisor: Send + Sync {
     /// Makes `size` bytes of host memory visible to the guest at `gpa`.
     fn map_ram(&self, host: *mut u8, gpa: u64, size: u64) -> Result<(), String>;
+    /// Removes a mapping installed by `map_ram`. The guest must not still
+    /// have translations for `gpa` (the caller flushes TLBs first).
+    fn unmap_ram(&self, gpa: u64, size: u64) -> Result<(), String>;
     /// Pages to map in every address space, given frames to place them in.
     /// Called once, before any vCPU exists.
     fn kernel_pages(&self, alloc: &mut dyn FnMut() -> (u64, *mut u8)) -> Vec<KernelPage>;

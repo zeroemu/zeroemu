@@ -87,9 +87,17 @@ fn run() -> Result<i32, String> {
     }
     let argv_copy = argv.clone();
     // --headless wins over both --display and the window --boot implies.
+    // DROIDRT_GPU=fake is the in-memory virtio-gpu (guest tests, no window).
     let show = !headless && (display || boot);
-    let gpu: Option<Arc<dyn gpu::GpuBackend>> = if show { Some(gpu::open(1080, 2400)?) } else { None };
-    if show {
+    let fake = std::env::var("DROIDRT_GPU").as_deref() == Ok("fake");
+    let gpu: Option<Arc<dyn gpu::GpuBackend>> = if fake {
+        Some(gpu::fake())
+    } else if show {
+        Some(gpu::open(1080, 2400)?)
+    } else {
+        None
+    };
+    if show && !fake {
         let gpu_guest = gpu.clone();
         let done = Arc::new(AtomicBool::new(false));
         let done_thr = done.clone();
@@ -128,8 +136,7 @@ fn boot_guest(
     argv_copy: Vec<String>,
     gpu: Option<Arc<dyn gpu::GpuBackend>>,
 ) -> Result<i32, String> {
-    // Held until the guest exits. Kernel::new grows a gpu argument at merge.
-    let _gpu = &gpu;
+    let gpu = gpu;
     let program = argv.first().ok_or(USAGE)?.clone();
     let envp = vec![
         "PATH=/product/bin:/apex/com.android.runtime/bin:/system/bin:/system_ext/bin:/vendor/bin".to_string(),
@@ -142,7 +149,7 @@ fn boot_guest(
         Some(img) => android::logical_partitions(img).map_err(|e| format!("{}: {e}", img.display()))?,
         None => Vec::new(),
     };
-    let kernel = Kernel::new(hv::create()?, vfs, partitions, strace, boot)?;
+    let kernel = Kernel::new(hv::create()?, vfs, partitions, strace, boot, gpu)?;
     let mut mm = kernel.new_address_space().map_err(|e| format!("address space: errno {e}"))?;
     let (state, exe) = if system.is_some() {
         kernel

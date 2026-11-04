@@ -4,6 +4,7 @@
 use crate::errno::*;
 use crate::image::erofs::Erofs;
 use crate::image::ext4::Ext4;
+use crate::tmpfs::MemFile;
 use std::io;
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -38,9 +39,48 @@ pub trait FileSystem: Send + Sync {
     fn lookup(&self, dir: u64, name: &str) -> io::Result<Option<u64>>;
     fn readdir(&self, dir: u64) -> io::Result<Vec<Dirent>>;
     fn read_all(&self, ino: u64) -> io::Result<Arc<[u8]>>;
+
+    /// For /proc/mounts.
+    fn fs_type(&self) -> &'static str {
+        "unknown"
+    }
+
+    // Writable filesystems (tmpfs) override these; images are read-only.
+    fn writable(&self) -> bool {
+        false
+    }
+    /// Live contents of a regular file, for read/write/MAP_SHARED.
+    fn mem_file(&self, _ino: u64) -> Option<Arc<MemFile>> {
+        None
+    }
+    /// Creates a regular file, or a special node when `mode` says so.
+    fn create(&self, _dir: u64, _name: &str, _mode: u32, _rdev: u64) -> Result<u64, i64> {
+        Err(EROFS)
+    }
+    fn mkdir(&self, _dir: u64, _name: &str, _mode: u32) -> Result<u64, i64> {
+        Err(EROFS)
+    }
+    fn symlink(&self, _dir: u64, _name: &str, _target: &str) -> Result<u64, i64> {
+        Err(EROFS)
+    }
+    fn link(&self, _ino: u64, _dir: u64, _name: &str) -> Result<(), i64> {
+        Err(EROFS)
+    }
+    fn unlink(&self, _dir: u64, _name: &str, _rmdir: bool) -> Result<(), i64> {
+        Err(EROFS)
+    }
+    fn rename(&self, _odir: u64, _oname: &str, _ndir: u64, _nname: &str, _noreplace: bool) -> Result<(), i64> {
+        Err(EROFS)
+    }
+    fn set_attr(&self, _ino: u64, _mode: Option<u32>, _owner: Option<(u32, u32)>, _mtime: Option<u64>) -> Result<(), i64> {
+        Err(EROFS)
+    }
 }
 
 impl FileSystem for Erofs {
+    fn fs_type(&self) -> &'static str {
+        "erofs"
+    }
     fn root(&self) -> io::Result<u64> {
         Ok(self.root_nid())
     }
@@ -86,6 +126,9 @@ fn ft_to_dt(ft: u8) -> u8 {
 }
 
 impl FileSystem for Ext4 {
+    fn fs_type(&self) -> &'static str {
+        "ext4"
+    }
     fn root(&self) -> io::Result<u64> {
         Ok(self.root_ino())
     }
@@ -163,6 +206,9 @@ impl LazyFs {
 }
 
 impl FileSystem for LazyFs {
+    fn fs_type(&self) -> &'static str {
+        self.fs.get().and_then(|r| r.as_ref().ok()).map_or("ext4", |f| f.fs_type())
+    }
     fn root(&self) -> io::Result<u64> {
         self.get()?.root()
     }
@@ -199,6 +245,9 @@ pub struct Vfs {
 }
 
 fn io_errno(e: io::Error) -> i64 {
+    if let Some(Errno(n)) = e.get_ref().and_then(|i| i.downcast_ref::<Errno>()) {
+        return *n;
+    }
     eprintln!("[droidrt] vfs I/O error: {e}");
     EIO
 }
@@ -324,6 +373,85 @@ impl Vfs {
 
     pub fn read_all(&self, node: &Node) -> Result<Arc<[u8]>, i64> {
         self.fs(node).read_all(node.ino).map_err(io_errno)
+    }
+
+    /// (mount point, filesystem type) in mount order.
+    pub fn mounts(&self) -> Vec<(String, &'static str)> {
+        self.mounts.iter().map(|m| (m.path.clone(), m.fs.fs_type())).collect()
+    }
+
+    pub fn fs_type(&self, node: &Node) -> &'static str {
+        self.fs(node).fs_type()
+    }
+
+    pub fn writable(&self, node: &Node) -> bool {
+        self.fs(node).writable()
+    }
+
+    pub fn mem_file(&self, node: &Node) -> Option<Arc<MemFile>> {
+        self.fs(node).mem_file(node.ino)
+    }
+
+    /// Resolves everything but the last component: (directory, name).
+    pub fn resolve_parent(&self, cwd: &str, path: &str) -> Result<(Node, String), i64> {
+        let trimmed = path.trim_end_matches('/');
+        let (dir, name) = match trimmed.rsplit_once('/') {
+            Some(("", name)) => ("/", name),
+            Some((dir, name)) => (dir, name),
+            None if path.starts_with('/') => return Err(EBUSY), // "/" itself
+            None => (".", trimmed),
+        };
+        if name.is_empty() || name == "." || name == ".." {
+            return Err(EINVAL);
+        }
+        let dir_node = self.resolve(cwd, dir, true)?;
+        if self.stat(&dir_node)?.mode & S_IFMT != S_IFDIR {
+            return Err(ENOTDIR);
+        }
+        if self.mount_at(&join(&dir_node.path, name)).is_some() {
+            return Err(EBUSY);
+        }
+        Ok((dir_node, name.to_string()))
+    }
+
+    /// A child of `dir`, looked up afresh (after creating it).
+    pub fn child(&self, dir: &Node, name: &str, ino: u64) -> Node {
+        Node { mount: dir.mount, ino, path: join(&dir.path, name) }
+    }
+
+    pub fn create(&self, dir: &Node, name: &str, mode: u32, rdev: u64) -> Result<Node, i64> {
+        let ino = self.fs(dir).create(dir.ino, name, mode, rdev)?;
+        Ok(self.child(dir, name, ino))
+    }
+
+    pub fn mkdir(&self, dir: &Node, name: &str, mode: u32) -> Result<(), i64> {
+        self.fs(dir).mkdir(dir.ino, name, mode).map(|_| ())
+    }
+
+    pub fn symlink(&self, dir: &Node, name: &str, target: &str) -> Result<(), i64> {
+        self.fs(dir).symlink(dir.ino, name, target).map(|_| ())
+    }
+
+    pub fn link(&self, node: &Node, dir: &Node, name: &str) -> Result<(), i64> {
+        if node.mount != dir.mount {
+            return Err(EXDEV);
+        }
+        self.fs(dir).link(node.ino, dir.ino, name)
+    }
+
+    pub fn unlink(&self, dir: &Node, name: &str, rmdir: bool) -> Result<(), i64> {
+        self.fs(dir).unlink(dir.ino, name, rmdir)
+    }
+
+    pub fn rename(&self, odir: &Node, oname: &str, ndir: &Node, nname: &str, noreplace: bool) -> Result<(), i64> {
+        if odir.mount != ndir.mount {
+            return Err(EXDEV);
+        }
+        self.fs(odir).rename(odir.ino, oname, ndir.ino, nname, noreplace)
+    }
+
+    pub fn set_attr(&self, node: &Node, mode: Option<u32>, owner: Option<(u32, u32)>, mtime: Option<u64>) -> Result<(), i64> {
+        self.fs(node).set_attr(node.ino, mode, owner, mtime)
     }
 
     pub fn readdir(&self, node: &Node) -> Result<Vec<Dirent>, i64> {

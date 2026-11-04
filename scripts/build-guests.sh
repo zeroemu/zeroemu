@@ -21,6 +21,13 @@ for arch in aarch64 x86_64; do
     "$LLD" -flavor gnu -static -o "$OUT/m2_$arch" "$OUT/m2_$arch.o"
 done
 
+# arm64-only tests (they use arm64 inline asm for raw syscalls).
+for t in m3 shm binder; do
+    clang -target aarch64-linux-gnu -O2 -ffreestanding -fno-stack-protector -fno-pic \
+        -fno-builtin -nostdlib -c "guest/$t.c" -o "$OUT/${t}_aarch64.o"
+    "$LLD" -flavor gnu -static -o "$OUT/${t}_aarch64" "$OUT/${t}_aarch64.o"
+done
+
 for t in fault bench; do
     clang -target aarch64-linux-gnu -c "guest/${t}_aarch64.S" -o "$OUT/${t}_aarch64.o"
     "$LLD" -flavor gnu -static -o "$OUT/${t}_aarch64" "$OUT/${t}_aarch64.o"

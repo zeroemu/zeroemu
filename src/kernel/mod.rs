@@ -7,12 +7,19 @@
 //! vCPU (Hypervisor.framework binds a vCPU to its creating thread). Blocking
 //! syscalls simply block that host thread.
 
+mod binder;
+mod epoll;
 mod files;
 mod futex;
 mod memory;
 mod misc;
 mod process;
+mod procfs;
+mod properties;
 mod signal;
+mod specialfd;
+mod unix;
+mod wait;
 
 use crate::arch::{Arch, Sysno};
 use crate::errno::*;
@@ -66,8 +73,75 @@ pub struct Kernel {
     live_vcpus: AtomicUsize,
     futex: futex::Futexes,
     root_pid: AtomicI32,
+    pub props: Arc<properties::Properties>,
+    /// Kernel-side socket services (kept alive here; looked up by name).
+    _services: Vec<Arc<unix::Socket>>,
     /// The root process's wait status once it exits; droidrt then exits.
     exit: (Mutex<Option<i32>>, Condvar),
+}
+
+fn cmdline_bytes(argv: &[String]) -> Vec<u8> {
+    argv.iter().flat_map(|a| a.bytes().chain([0])).collect()
+}
+
+/// init's property service, answered inside the kernel.
+struct PropertyService {
+    kernel: std::sync::Weak<Kernel>,
+}
+
+impl unix::Service for PropertyService {
+    fn handle(&self, buf: &mut Vec<u8>) -> Option<Vec<u8>> {
+        let k = self.kernel.upgrade()?;
+        properties::handle_request(&k.props, &k.futex, buf)
+    }
+}
+
+/// The writable filesystems a device has after first-stage init, empty
+/// apart from the basics (init itself is not run yet). Returns /dev.
+fn mount_tmpfs(vfs: &mut Vfs, phys: &Arc<PhysMem>) -> Arc<crate::tmpfs::Tmpfs> {
+    use crate::tmpfs::Tmpfs;
+    use crate::vfs::FileSystem;
+    let dev = Tmpfs::new(phys.clone(), 0o755);
+    let dev_handle = dev.clone();
+    for (name, rdev) in [("null", 0x103), ("zero", 0x105), ("random", 0x108), ("urandom", 0x109), ("kmsg", 0x10b)] {
+        dev.create(1, name, 0o020666, rdev).expect("tmpfs /dev");
+    }
+    for (name, rdev) in binder::DEVICES {
+        dev.create(1, name, 0o020666, rdev).expect("tmpfs /dev");
+    }
+    dev.mkdir_p("socket", 0o755);
+    dev.mkdir_p("pts", 0o755);
+    vfs.mount("/dev", dev);
+    let data = Tmpfs::new(phys.clone(), 0o771);
+    data.mkdir_p("local/tmp", 0o771);
+    data.mkdir_p("system", 0o775);
+    vfs.mount("/data", data);
+    vfs.mount("/tmp", Tmpfs::new(phys.clone(), 0o1777));
+    vfs.mount("/mnt", Tmpfs::new(phys.clone(), 0o755));
+    vfs.mount("/cache", Tmpfs::new(phys.clone(), 0o770));
+    // sysfs: what bionic's sysconf and friends read. No /sys/fs/selinux, so
+    // libselinux sees SELinux as disabled.
+    let sys = Tmpfs::with_type(phys.clone(), 0o755, "sysfs");
+    let n = std::thread::available_parallelism().map_or(1, |n| n.get()).min(64);
+    for f in ["online", "possible", "present"] {
+        sys.write_file(&format!("devices/system/cpu/{f}"), 0o444, &format!("0-{}\n", n - 1));
+    }
+    sys.write_file("devices/system/cpu/kernel_max", 0o444, "63\n");
+    for d in ["fs", "kernel", "class", "bus", "block", "dev/char", "dev/block", "module"] {
+        sys.mkdir_p(d, 0o755);
+    }
+    vfs.mount("/sys", sys);
+    // selinuxfs, permissive and policy-less: libselinux finds it (statfs
+    // says SELINUX_MAGIC), maps its status page, and with deny_unknown=0
+    // every access check on an unknown class is allowed.
+    let selinux = Tmpfs::with_type(phys.clone(), 0o755, "selinuxfs");
+    for (name, content) in [("enforce", "0"), ("deny_unknown", "0"), ("reject_unknown", "0"), ("policyvers", "33"), ("mls", "1"), ("checkreqprot", "0")] {
+        selinux.write_file(name, 0o644, content);
+    }
+    // struct selinux_kernel_status: version 1, sequence 0, enforcing 0, policyload 0, deny_unknown 0.
+    selinux.write_file("status", 0o444, "\u{1}\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0");
+    vfs.mount("/sys/fs/selinux", selinux);
+    dev_handle
 }
 
 pub struct Process {
@@ -77,6 +151,8 @@ pub struct Process {
     pub files: Mutex<FdTable>,
     pub cwd: Mutex<String>,
     pub exe: Mutex<String>,
+    /// argv, NUL-separated, for /proc/<pid>/cmdline.
+    pub cmdline: Mutex<Vec<u8>>,
     sig: Mutex<Actions>,
     threads: Mutex<Vec<Arc<Thread>>>,
     children: Mutex<Vec<i32>>,
@@ -151,16 +227,36 @@ impl Thread {
 }
 
 impl Kernel {
-    pub fn new(hv: Arc<dyn Hypervisor>, vfs: Option<Arc<Vfs>>, strace: bool) -> Result<Arc<Kernel>, String> {
+    pub fn new(hv: Arc<dyn Hypervisor>, vfs: Option<Vfs>, strace: bool) -> Result<Arc<Kernel>, String> {
         let phys = PhysMem::new(hv.clone());
         let pages = hv.kernel_pages(&mut || {
             let gpa = phys.alloc().expect("no memory for the kernel window");
             (gpa, phys.host(gpa))
         });
         let kwin = KernelWindow::new(&phys, &pages).map_err(|e| format!("kernel window: errno {e}"))?;
-        Ok(Arc::new(Kernel {
+        // Without an image the root itself is a tmpfs (for freestanding guests).
+        let mut v = vfs.unwrap_or_else(|| {
+            let mut v = Vfs::default();
+            v.mount("/", crate::tmpfs::Tmpfs::new(phys.clone(), 0o755));
+            v
+        });
+        let dev = mount_tmpfs(&mut v, &phys);
+        // Properties, as init would set them up: defaults from build.prop,
+        // shared read-only with every process at /dev/__properties__.
+        let props = properties::Properties::new(phys.clone());
+        props.load_defaults(&v);
+        dev.add_file("__properties__", 0o444, props.file.clone());
+        // /proc reads kernel state, so the kernel is built around it.
+        Ok(Arc::new_cyclic(|me| {
+            v.mount("/proc", procfs::ProcFs::new(me.clone()));
+            let svc: Arc<dyn unix::Service> = Arc::new(PropertyService { kernel: me.clone() });
+            let services = vec![
+                unix::listen_service("/dev/socket/property_service", svc.clone()),
+                unix::listen_service("/dev/socket/property_service_for_system", svc),
+            ];
+            Kernel {
             arch: Arch::HOST,
-            vfs,
+            vfs: Some(Arc::new(v)),
             hv,
             phys,
             kwin,
@@ -172,7 +268,10 @@ impl Kernel {
             live_vcpus: AtomicUsize::new(0),
             futex: futex::Futexes::default(),
             root_pid: AtomicI32::new(0),
+            props,
+            _services: services,
             exit: (Mutex::new(None), Condvar::new()),
+            }
         }))
     }
 
@@ -185,6 +284,7 @@ impl Kernel {
         let mut mm = AddressSpace::new(self.phys.clone(), &self.kwin, self.alloc_asid())?;
         // Where signal handlers return to (Linux puts this in the vDSO).
         mm.map(Placement::Fixed(signal::SIGRETURN_TRAMPOLINE), PAGE, PROT_READ | PROT_EXEC, Backing::File { data: signal::trampoline_page(), offset: 0 })?;
+        mm.set_name(signal::SIGRETURN_TRAMPOLINE, PAGE, "[sigpage]");
         Ok(mm)
     }
 
@@ -193,7 +293,7 @@ impl Kernel {
     }
 
     /// Starts the first process: `mm` already holds the program and its stack.
-    pub fn start(self: &Arc<Self>, mm: AddressSpace, exe: String, state: CpuState) -> Result<(), String> {
+    pub fn start(self: &Arc<Self>, mm: AddressSpace, exe: String, argv: &[String], state: CpuState) -> Result<(), String> {
         let pid = self.next_id.fetch_add(1, Ordering::Relaxed);
         let proc = Arc::new(Process {
             pid,
@@ -202,6 +302,7 @@ impl Kernel {
             files: Mutex::new(FdTable::stdio()),
             cwd: Mutex::new("/".into()),
             exe: Mutex::new(exe),
+            cmdline: Mutex::new(cmdline_bytes(argv)),
             sig: Mutex::new(Actions::default()),
             threads: Mutex::new(Vec::new()),
             children: Mutex::new(Vec::new()),
@@ -261,7 +362,7 @@ impl Kernel {
             }
         };
         *t.kick.lock().unwrap() = Some(vcpu.kicker());
-        let mut stale = Vec::new();
+        let mut stale = crate::mm::Stale::default();
         let mut restart: Option<SyscallRegs> = None;
         let mut exit_code = 0;
 
@@ -275,9 +376,7 @@ impl Kernel {
             }
             let exit = vcpu.run();
             // The flush requested last time ran on entry; now frames are safe to reuse.
-            for f in stale.drain(..) {
-                self.phys.free(f);
-            }
+            stale.release(&self.phys);
             match exit {
                 Exit::Syscall => {
                     let regs = vcpu.syscall_regs();
@@ -293,9 +392,7 @@ impl Kernel {
                 }
                 Exit::PageFault { pc, addr, write, exec } => {
                     if t.proc.mm().fault(addr, write, exec).is_err() {
-                        if self.strace {
-                            eprintln!("[strace] tid {} SIGSEGV at pc={pc:#x} addr={addr:#x} (write={write} exec={exec})", t.tid);
-                        }
+                        self.crash_report(t, vcpu.as_ref(), "SIGSEGV", pc, addr, write);
                         self.force_signal(t, signal::SIGSEGV, SigInfo::fault(signal::SIGSEGV, 1, addr), pc);
                     }
                 }
@@ -314,9 +411,7 @@ impl Kernel {
         }
         *t.kick.lock().unwrap() = None;
         drop(vcpu); // destroyed on the thread that owns it
-        for f in stale {
-            self.phys.free(f);
-        }
+        stale.release(&self.phys);
         self.thread_exit(t, exit_code);
     }
 
@@ -400,6 +495,12 @@ impl Kernel {
             futex => self.sys_futex(t, a[0], a[1] as u32, a[2] as u32, a[3], a[4], a[5] as u32),
             set_robust_list => 0,
 
+            // sockets
+            n if unix::handles(n) => match self.socket_syscall(n, t, a) {
+                Ok(v) => v,
+                Err(e) => -e,
+            },
+
             // files
             n if files::handles(n) => match self.file_syscall(n, t, a) {
                 Ok(v) => v,
@@ -415,12 +516,42 @@ impl Kernel {
         Ret::Value(v)
     }
 
+    /// A crash report: where it faulted and a frame-pointer backtrace, with
+    /// addresses as library+offset (there is no tombstoned to write one).
+    fn crash_report(&self, t: &Thread, vcpu: &dyn Vcpu, what: &str, pc: u64, addr: u64, write: bool) {
+        let mut mm = t.proc.mm();
+        eprintln!(
+            "[droidrt] pid {} tid {} ({}): {what} {} {addr:#x} at {}",
+            t.proc.pid,
+            t.tid,
+            t.proc.exe.lock().unwrap(),
+            if write { "writing" } else { "reading" },
+            mm.symbolize(pc)
+        );
+        if let CpuState::Aarch64(s) = vcpu.state() {
+            eprintln!("[droidrt]   lr {}", mm.symbolize(s.x[30]));
+            let mut fp = s.x[29];
+            for i in 0..16 {
+                let (Ok(next), Ok(ret)) = (mm.read_u64(fp), mm.read_u64(fp + 8)) else { break };
+                if ret == 0 {
+                    break;
+                }
+                eprintln!("[droidrt]   #{i:02} {}", mm.symbolize(ret));
+                if next <= fp {
+                    break;
+                }
+                fp = next;
+            }
+        }
+    }
+
     /// Called on the exiting thread's host thread after its vCPU is gone.
     fn thread_exit(self: &Arc<Self>, t: &Arc<Thread>, code: i32) {
         let proc = &t.proc;
         let ctid = t.clear_child_tid.swap(0, Ordering::Relaxed);
         if ctid != 0 && proc.mm.lock().unwrap().as_mut().is_some_and(|mm| mm.write_u32(ctid, 0).is_ok()) {
-            self.futex.wake(proc.pid, ctid, 1, u32::MAX);
+            let key = self.futex_key(t, ctid, false);
+            self.futex.wake(key, 1, u32::MAX);
         }
         let last = {
             let mut threads = proc.threads.lock().unwrap();

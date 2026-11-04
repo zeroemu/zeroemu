@@ -30,10 +30,10 @@ arm64 Android on Apple Silicon and Windows on ARM, x86_64 Android on x86_64 PCs.
 | Milestone | State |
 |---|---|
 | M0: kernel-less VM, static ELF, basic syscalls (macOS) | done |
-| M0: Windows Hypervisor Platform backend (x86_64) | written for M1's memory model; being ported to M2's |
+| M0: Windows Hypervisor Platform backend (x86_64) | ported to paged memory; builds clean, **not yet run on Windows** |
 | M1: Android's own `linker64`, `toybox`, and `mksh` straight from an SDK `system.img` | done (macOS, Android 16 image) |
-| M2: demand paging, threads, futex, `fork`/`execve`/`wait4`, pipes, signals | done on macOS; `epoll`/`eventfd` and x86_64 signal frames remain |
-| M3: binder, `servicemanager`, property service, `logd` | |
+| M2: demand paging, threads, futex, `fork`/`execve`/`wait4`, pipes, signals | done on macOS; x86_64 written (signal frames, TLB shootdown), untested |
+| M3: binder, `servicemanager`, property service, `logd` | binder, properties, `servicemanager` done (macOS); `logd`, `init` next |
 | M4: SurfaceFlinger with a composer HAL that renders to Metal / D3D12 | |
 | M5: zygote, ART, `system_server`, launcher, apps | |
 
@@ -57,13 +57,22 @@ Known gaps:
   so M5 needs threads multiplexed onto vCPUs (CPU state is already saved and
   restored in full, which that scheduler builds on).
 - `fork` copies memory eagerly; copy-on-write comes before zygote (M5).
-- No memory shared between processes yet (`MAP_SHARED` anonymous is private).
-- No `epoll`, `eventfd`, `timerfd`, or sockets yet (M3 needs them).
+- Binder never drops references, so nodes are never released.
+- No inet or netlink sockets yet; Unix socket names live in a kernel table
+  rather than as filesystem nodes.
+- SELinux is present but policy-less and permissive.
 - Images older than Android 10 (no `super` partition) aren't supported.
 - APEX mount names come from file names (`com.android.tzdata6` should be
   `com.android.tzdata`); reading `apex_manifest.pb` lazily would fix it.
 - `/linkerconfig/ld.config.txt` is not generated, so the linker warns and uses
   its default search paths.
+
+M3 so far adds the IPC Android's system services stand on: `eventfd`,
+`epoll`, `timerfd`, `signalfd`, Unix sockets with `SCM_RIGHTS`, tmpfs
+(`/dev`, `/data`, `/tmp`, …) with `MAP_SHARED` and `memfd`, `/proc`, `/sys`,
+a permissive selinuxfs, the property area and property service (as init
+provides them), and a binder driver. Android's own `servicemanager` runs, and
+`service list` / `service check` talk to it over binder.
 
 ## Build and run
 
@@ -81,8 +90,11 @@ cargo run --release -- --system $IMG --ls /system/bin    # inspect the image wit
 ./scripts/test-android.sh                                # end-to-end checks against the image
 ```
 
-`DROIDRT_STRACE=1` (or `--strace`) logs every syscall; `DROIDRT_WATCHDOG=<secs>`
-forces a stuck guest out of the VM and dumps its registers.
+`DROIDRT_STRACE=1` (or `--strace`) logs every syscall; `DROIDRT_BINDER_TRACE=1`
+logs every binder transaction; `DROIDRT_WATCHDOG=<secs>` forces a stuck guest
+out of the VM and dumps its registers. Fatal faults print a backtrace as
+library+offset, and writes to `/dev/kmsg` (where `servicemanager` and `init`
+log) appear on stderr.
 
 On macOS, `cargo run` signs the binary with the `com.apple.security.hypervisor`
 entitlement (see `scripts/macos-runner.sh`); without it the VM cannot be created.

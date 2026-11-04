@@ -1,0 +1,805 @@
+//! AF_UNIX sockets: socketpair and named (filesystem-path or abstract)
+//! stream, datagram, and seqpacket sockets, with SCM_RIGHTS fd passing and
+//! SCM_CREDENTIALS. Names live in a kernel-wide table rather than as inodes
+//! (the image filesystems are read-only).
+
+use super::files::{File, Kind};
+use super::signal::{SIGPIPE, SigInfo};
+use super::wait::EVENTS;
+use super::{ERESTARTSYS, Kernel, POLL, Thread, int};
+use crate::arch::Sysno;
+use crate::errno::*;
+use std::collections::{BTreeMap, VecDeque};
+use std::sync::{Arc, Mutex, Weak};
+
+const AF_UNIX: u64 = 1;
+const SOCK_STREAM: u32 = 1;
+const SOCK_DGRAM: u32 = 2;
+const SOCK_SEQPACKET: u32 = 5;
+const SOCK_NONBLOCK: u64 = 0o4000;
+const SOCK_CLOEXEC: u64 = 0o2000000;
+const MSG_PEEK: u64 = 0x2;
+const MSG_CTRUNC: u32 = 0x8;
+const MSG_TRUNC: u64 = 0x20;
+const MSG_DONTWAIT: u64 = 0x40;
+const MSG_WAITALL: u64 = 0x100;
+const MSG_NOSIGNAL: u64 = 0x4000;
+const MSG_CMSG_CLOEXEC: u64 = 0x4000_0000;
+const SOL_SOCKET: u64 = 1;
+const SCM_RIGHTS: i32 = 1;
+const SCM_CREDENTIALS: i32 = 2;
+const SO_TYPE: u64 = 3;
+const SO_ERROR: u64 = 4;
+const SO_SNDBUF: u64 = 7;
+const SO_RCVBUF: u64 = 8;
+const SO_PASSCRED: u64 = 16;
+const SO_PEERCRED: u64 = 17;
+const SO_ACCEPTCONN: u64 = 30;
+const SO_PROTOCOL: u64 = 38;
+const SO_DOMAIN: u64 = 39;
+const SHUT_RD: u64 = 0;
+const SHUT_WR: u64 = 1;
+/// Bytes a receive queue holds before senders block.
+const QUEUE_LIMIT: usize = 256 << 10;
+const IO_MAX: u64 = 16 << 20;
+
+pub const POLLIN: u16 = 0x1;
+pub const POLLOUT: u16 = 0x4;
+pub const POLLHUP: u16 = 0x10;
+pub const POLLRDHUP: u16 = 0x2000;
+
+pub fn handles(no: Sysno) -> bool {
+    use Sysno::*;
+    matches!(
+        no,
+        socket | socketpair | bind | listen | accept | accept4 | connect | getsockname | getpeername | sendto | recvfrom | setsockopt
+            | getsockopt | shutdown | sendmsg | recvmsg
+    )
+}
+
+#[derive(Clone, Copy, Default)]
+struct Cred {
+    pid: i32,
+    uid: u32,
+    gid: u32,
+}
+
+impl Cred {
+    fn of(t: &Thread) -> Cred {
+        Cred { pid: t.proc.pid, uid: 0, gid: 0 }
+    }
+    fn bytes(&self) -> [u8; 12] {
+        let mut b = [0u8; 12];
+        b[0..4].copy_from_slice(&self.pid.to_le_bytes());
+        b[4..8].copy_from_slice(&self.uid.to_le_bytes());
+        b[8..12].copy_from_slice(&self.gid.to_le_bytes());
+        b
+    }
+}
+
+struct Msg {
+    data: Vec<u8>,
+    /// Bytes of `data` already read (stream sockets read messages piecewise).
+    off: usize,
+    fds: Vec<Arc<File>>,
+    from: Vec<u8>,
+    cred: Cred,
+}
+
+#[derive(Default)]
+struct Queue {
+    msgs: VecDeque<Msg>,
+    bytes: usize,
+    /// The sending side shut down or went away: readers get EOF once drained.
+    write_closed: bool,
+}
+
+#[derive(Default)]
+struct State {
+    name: Option<Vec<u8>>,
+    connected: bool,
+    peer: Option<Weak<Socket>>,
+    peer_cred: Cred,
+    /// Default destination of a connected datagram socket.
+    dest: Option<Vec<u8>>,
+    backlog: Option<VecDeque<Arc<Socket>>>,
+    listen_cred: Cred,
+    passcred: bool,
+    shut_rd: bool,
+    shut_wr: bool,
+    /// For a client of a kernel-side service: keeps the server end alive.
+    peer_server: Option<Arc<Socket>>,
+}
+
+pub struct Socket {
+    ty: u32,
+    rx: Mutex<Queue>,
+    st: Mutex<State>,
+    /// Answered inside the kernel (e.g. the property service), not by a process.
+    service: Option<Arc<dyn Service>>,
+    svc_buf: Mutex<Vec<u8>>,
+}
+
+/// A kernel-side socket server: given the bytes received so far on one
+/// connection, consumes complete requests and returns a reply for each.
+pub trait Service: Send + Sync {
+    fn handle(&self, buf: &mut Vec<u8>) -> Option<Vec<u8>>;
+}
+
+/// Registers a kernel-side stream service under `name` (a path); the
+/// returned socket must be kept alive.
+pub fn listen_service(name: &str, service: Arc<dyn Service>) -> Arc<Socket> {
+    let sock = Arc::new(Socket { ty: SOCK_STREAM, rx: Mutex::new(Queue::default()), st: Mutex::new(State::default()), service: Some(service), svc_buf: Mutex::new(Vec::new()) });
+    {
+        let mut st = sock.st.lock().unwrap();
+        st.name = Some(name.as_bytes().to_vec());
+        st.backlog = Some(VecDeque::new());
+        st.listen_cred = Cred { pid: 1, uid: 0, gid: 0 };
+    }
+    NAMES.lock().unwrap().insert(name.as_bytes().to_vec(), Arc::downgrade(&sock));
+    sock
+}
+
+/// Bound names (path or "\0abstract") -> sockets.
+static NAMES: Mutex<BTreeMap<Vec<u8>, Weak<Socket>>> = Mutex::new(BTreeMap::new());
+
+impl Drop for Socket {
+    fn drop(&mut self) {
+        let st = self.st.get_mut().unwrap();
+        if let Some(peer) = st.peer.as_ref().and_then(Weak::upgrade) {
+            peer.rx.lock().unwrap().write_closed = true;
+        }
+        if let Some(name) = &st.name {
+            let mut names = NAMES.lock().unwrap();
+            if names.get(name).is_some_and(|w| w.strong_count() == 0) {
+                names.remove(name);
+            }
+        }
+        EVENTS.bump();
+    }
+}
+
+impl Socket {
+    fn new(ty: u32) -> Arc<Socket> {
+        Arc::new(Socket { ty, rx: Mutex::new(Queue::default()), st: Mutex::new(State::default()), service: None, svc_buf: Mutex::new(Vec::new()) })
+    }
+
+    /// Feeds what arrived on a kernel-service connection to its service,
+    /// queueing the replies for the client.
+    fn serve(&self) {
+        let Some(svc) = &self.service else { return };
+        let mut buf = self.svc_buf.lock().unwrap();
+        {
+            let mut q = self.rx.lock().unwrap();
+            for m in q.msgs.drain(..) {
+                buf.extend_from_slice(&m.data[m.off..]);
+            }
+            q.bytes = 0;
+        }
+        let Some(client) = self.peer() else { return };
+        while let Some(reply) = svc.handle(&mut buf) {
+            if !reply.is_empty() {
+                let mut q = client.rx.lock().unwrap();
+                q.bytes += reply.len();
+                q.msgs.push_back(Msg { data: reply, off: 0, fds: Vec::new(), from: Vec::new(), cred: Cred { pid: 1, uid: 0, gid: 0 } });
+            }
+        }
+        EVENTS.bump();
+    }
+
+    fn peer(&self) -> Option<Arc<Socket>> {
+        self.st.lock().unwrap().peer.as_ref().and_then(Weak::upgrade)
+    }
+
+    fn connect_pair(a: &Arc<Socket>, b: &Arc<Socket>, a_cred: Cred, b_cred: Cred) {
+        let mut sa = a.st.lock().unwrap();
+        sa.connected = true;
+        sa.peer = Some(Arc::downgrade(b));
+        sa.peer_cred = b_cred;
+        drop(sa);
+        let mut sb = b.st.lock().unwrap();
+        sb.connected = true;
+        sb.peer = Some(Arc::downgrade(a));
+        sb.peer_cred = a_cred;
+    }
+
+    pub fn poll(&self) -> u16 {
+        let st = self.st.lock().unwrap();
+        if let Some(backlog) = &st.backlog {
+            return if backlog.is_empty() { 0 } else { POLLIN };
+        }
+        let peer = st.peer.as_ref().and_then(Weak::upgrade);
+        let (connected, shut_rd, shut_wr) = (st.connected, st.shut_rd, st.shut_wr);
+        drop(st);
+        let rx = self.rx.lock().unwrap();
+        let gone = connected && self.ty != SOCK_DGRAM && peer.is_none();
+        let mut r = 0;
+        if !rx.msgs.is_empty() || rx.write_closed || gone || shut_rd {
+            r |= POLLIN;
+        }
+        if rx.write_closed || gone {
+            r |= POLLRDHUP;
+        }
+        drop(rx);
+        if gone {
+            r |= POLLHUP;
+        }
+        let writable = match &peer {
+            Some(p) => !shut_wr && p.rx.lock().unwrap().bytes < QUEUE_LIMIT,
+            None => self.ty == SOCK_DGRAM && !connected,
+        };
+        if writable {
+            r |= POLLOUT;
+        }
+        r
+    }
+
+    /// Queues a message for `target` (the peer, or a bound datagram socket).
+    fn deliver(&self, t: &Thread, target: &Socket, msg: Msg, nonblock: bool) -> Result<(), i64> {
+        loop {
+            let seen = EVENTS.current();
+            {
+                let mut q = target.rx.lock().unwrap();
+                if q.bytes + msg.data.len() <= QUEUE_LIMIT || q.bytes == 0 {
+                    q.bytes += msg.data.len();
+                    q.msgs.push_back(msg);
+                    drop(q);
+                    target.serve();
+                    EVENTS.bump();
+                    return Ok(());
+                }
+            }
+            if nonblock {
+                return Err(EAGAIN);
+            }
+            if t.interrupted() {
+                return Err(ERESTARTSYS);
+            }
+            EVENTS.wait(seen, POLL);
+        }
+    }
+
+    fn send(&self, t: &Thread, data: Vec<u8>, fds: Vec<Arc<File>>, dest: Option<Vec<u8>>, nonblock: bool) -> Result<usize, i64> {
+        let (name, connected, shut_wr, default_dest) = {
+            let st = self.st.lock().unwrap();
+            (st.name.clone().unwrap_or_default(), st.connected, st.shut_wr, st.dest.clone())
+        };
+        if shut_wr {
+            return Err(EPIPE);
+        }
+        let len = data.len();
+        let msg = Msg { data, off: 0, fds, from: name, cred: Cred::of(t) };
+        if self.ty == SOCK_DGRAM {
+            let target = match dest.or(default_dest) {
+                Some(d) => lookup(&d).ok_or(ECONNREFUSED)?,
+                None => self.peer().ok_or(ENOTCONN)?,
+            };
+            if target.ty != SOCK_DGRAM {
+                return Err(EPROTOTYPE);
+            }
+            self.deliver(t, &target, msg, nonblock)?;
+            return Ok(len);
+        }
+        if dest.is_some() && connected {
+            return Err(EISCONN);
+        }
+        let peer = self.peer().ok_or(if connected { EPIPE } else { ENOTCONN })?;
+        self.deliver(t, &peer, msg, nonblock)?;
+        Ok(len)
+    }
+
+    /// Receives up to `max` bytes: data, passed files, sender address, sender
+    /// credentials, and whether a datagram was truncated.
+    fn recv(&self, t: &Thread, max: usize, flags: u64, nonblock: bool) -> Result<Received, i64> {
+        let peek = flags & MSG_PEEK != 0;
+        let mut out = Vec::new();
+        let mut fds = Vec::new();
+        let (mut from, mut cred) = (Vec::new(), Cred::default());
+        loop {
+            let seen = EVENTS.current();
+            let (connected, shut_rd, gone) = {
+                let st = self.st.lock().unwrap();
+                if st.backlog.is_some() {
+                    return Err(EINVAL);
+                }
+                let gone = st.connected && self.ty != SOCK_DGRAM && st.peer.as_ref().and_then(Weak::upgrade).is_none();
+                (st.connected, st.shut_rd, gone)
+            };
+            if self.ty != SOCK_DGRAM && !connected {
+                return Err(ENOTCONN);
+            }
+            {
+                let mut q = self.rx.lock().unwrap();
+                if self.ty != SOCK_STREAM {
+                    if let Some(m) = q.msgs.front() {
+                        let truncated = m.data.len() > max;
+                        out.extend_from_slice(&m.data[..m.data.len().min(max)]);
+                        from = m.from.clone();
+                        cred = m.cred;
+                        if !peek {
+                            let m = q.msgs.pop_front().unwrap();
+                            q.bytes -= m.data.len();
+                            fds = m.fds;
+                            drop(q);
+                            EVENTS.bump();
+                        }
+                        return Ok((out, fds, from, cred, truncated));
+                    }
+                } else {
+                    let mut consumed = false;
+                    let mut i = 0;
+                    while out.len() < max && i < q.msgs.len() {
+                        let m = &q.msgs[i];
+                        // Files ride on the first message read; don't merge past another batch.
+                        if !m.fds.is_empty() && (consumed || !fds.is_empty()) {
+                            break;
+                        }
+                        let n = (m.data.len() - m.off).min(max - out.len());
+                        out.extend_from_slice(&m.data[m.off..m.off + n]);
+                        if !consumed {
+                            from = m.from.clone();
+                            cred = m.cred;
+                        }
+                        consumed = true;
+                        if peek {
+                            i += 1;
+                            continue;
+                        }
+                        let m = &mut q.msgs[i];
+                        fds.append(&mut m.fds);
+                        m.off += n;
+                        if m.off == m.data.len() {
+                            let m = q.msgs.remove(i).unwrap();
+                            q.bytes -= m.data.len();
+                        } else {
+                            break;
+                        }
+                    }
+                    let done = consumed && (flags & MSG_WAITALL == 0 || out.len() >= max);
+                    if done || (consumed && (q.write_closed || gone)) {
+                        drop(q);
+                        if !peek {
+                            EVENTS.bump();
+                        }
+                        return Ok((out, fds, from, cred, false));
+                    }
+                }
+                if q.write_closed || gone || shut_rd {
+                    return Ok((out, fds, from, cred, false)); // EOF
+                }
+            }
+            if nonblock {
+                return if out.is_empty() { Err(EAGAIN) } else { Ok((out, fds, from, cred, false)) };
+            }
+            if t.interrupted() {
+                return if out.is_empty() { Err(ERESTARTSYS) } else { Ok((out, fds, from, cred, false)) };
+            }
+            EVENTS.wait(seen, POLL);
+        }
+    }
+}
+
+/// (data, passed files, sender address, sender credentials, truncated).
+type Received = (Vec<u8>, Vec<Arc<File>>, Vec<u8>, Cred, bool);
+
+fn lookup(name: &[u8]) -> Option<Arc<Socket>> {
+    NAMES.lock().unwrap().get(name).and_then(Weak::upgrade)
+}
+
+/// Reads plain bytes and fds out of a socket file's read/write path.
+pub fn read(sock: &Socket, t: &Thread, max: usize, nonblock: bool) -> Result<Vec<u8>, i64> {
+    sock.recv(t, max, 0, nonblock).map(|r| r.0) // passed files are dropped by read(2), as on Linux
+}
+
+pub fn write(sock: &Socket, t: &Thread, data: Vec<u8>, nonblock: bool) -> Result<usize, i64> {
+    sock.send(t, data, Vec::new(), None, nonblock)
+}
+
+impl Kernel {
+    pub(super) fn socket_syscall(&self, no: Sysno, t: &Arc<Thread>, a: [u64; 6]) -> Result<i64, i64> {
+        use Sysno::*;
+        match no {
+            socket => {
+                if a[0] != AF_UNIX {
+                    return Err(EAFNOSUPPORT); // inet and netlink sockets: not yet
+                }
+                let ty = sock_type(a[1])?;
+                let file = File::new(Kind::Socket(Socket::new(ty)), (a[1] & SOCK_NONBLOCK) as u32);
+                t.proc.files.lock().unwrap().alloc(file, a[1] & SOCK_CLOEXEC != 0, 0)
+            }
+            socketpair => {
+                if a[0] != AF_UNIX {
+                    return Err(EAFNOSUPPORT);
+                }
+                let ty = sock_type(a[1])?;
+                let (x, y) = (Socket::new(ty), Socket::new(ty));
+                Socket::connect_pair(&x, &y, Cred::of(t), Cred::of(t));
+                let flags = (a[1] & SOCK_NONBLOCK) as u32;
+                let cloexec = a[1] & SOCK_CLOEXEC != 0;
+                let (fx, fy) = {
+                    let mut files = t.proc.files.lock().unwrap();
+                    let fx = files.alloc(File::new(Kind::Socket(x), flags), cloexec, 0)?;
+                    match files.alloc(File::new(Kind::Socket(y), flags), cloexec, 0) {
+                        Ok(fy) => (fx, fy),
+                        Err(e) => {
+                            files.close(fx);
+                            return Err(e);
+                        }
+                    }
+                };
+                let mut sv = [0u8; 8];
+                sv[..4].copy_from_slice(&(fx as i32).to_le_bytes());
+                sv[4..].copy_from_slice(&(fy as i32).to_le_bytes());
+                t.proc.mm().write(a[3], &sv)?;
+                Ok(0)
+            }
+            bind => {
+                let (sock, _) = self.sock(t, int(a[0]))?;
+                let name = self.read_addr(t, a[1], a[2])?.ok_or(EINVAL)?;
+                let mut names = NAMES.lock().unwrap();
+                if names.get(&name).is_some_and(|w| w.strong_count() > 0) {
+                    return Err(EADDRINUSE);
+                }
+                let mut st = sock.st.lock().unwrap();
+                if st.name.is_some() {
+                    return Err(EINVAL);
+                }
+                names.insert(name.clone(), Arc::downgrade(&sock));
+                st.name = Some(name);
+                Ok(0)
+            }
+            listen => {
+                let (sock, _) = self.sock(t, int(a[0]))?;
+                if sock.ty == SOCK_DGRAM {
+                    return Err(EOPNOTSUPP);
+                }
+                let mut st = sock.st.lock().unwrap();
+                if st.connected {
+                    return Err(EINVAL);
+                }
+                st.backlog.get_or_insert_with(VecDeque::new);
+                st.listen_cred = Cred::of(t);
+                Ok(0)
+            }
+            accept | accept4 => {
+                let (sock, file) = self.sock(t, int(a[0]))?;
+                let flags = if no == accept4 { a[3] } else { 0 };
+                let conn = loop {
+                    let seen = EVENTS.current();
+                    {
+                        let mut st = sock.st.lock().unwrap();
+                        let backlog = st.backlog.as_mut().ok_or(EINVAL)?;
+                        if let Some(c) = backlog.pop_front() {
+                            break c;
+                        }
+                    }
+                    if file.nonblock() {
+                        return Err(EAGAIN);
+                    }
+                    if t.interrupted() {
+                        return Err(ERESTARTSYS);
+                    }
+                    EVENTS.wait(seen, POLL);
+                };
+                EVENTS.bump();
+                let peer_name = conn.peer().and_then(|p| p.st.lock().unwrap().name.clone());
+                let f = File::new(Kind::Socket(conn), (flags & SOCK_NONBLOCK) as u32);
+                let fd = t.proc.files.lock().unwrap().alloc(f, flags & SOCK_CLOEXEC != 0, 0)?;
+                if a[1] != 0 {
+                    self.write_addr(t, a[1], a[2], peer_name.as_deref())?;
+                }
+                Ok(fd)
+            }
+            connect => {
+                let (sock, _) = self.sock(t, int(a[0]))?;
+                let name = self.read_addr(t, a[1], a[2])?.ok_or(EINVAL)?;
+                let target = lookup(&name);
+                if sock.ty == SOCK_DGRAM {
+                    let target = target.ok_or(ENOENT)?;
+                    if target.ty != SOCK_DGRAM {
+                        return Err(EPROTOTYPE);
+                    }
+                    let mut st = sock.st.lock().unwrap();
+                    st.dest = Some(name);
+                    st.peer = Some(Arc::downgrade(&target));
+                    st.connected = true;
+                    return Ok(0);
+                }
+                if sock.st.lock().unwrap().connected {
+                    return Err(EISCONN);
+                }
+                let listener = target.ok_or(ENOENT)?;
+                if listener.ty != sock.ty {
+                    return Err(EPROTOTYPE);
+                }
+                if let Some(svc) = &listener.service {
+                    // A kernel-side service answers on its own; nothing to accept.
+                    let server = Arc::new(Socket { ty: sock.ty, rx: Mutex::new(Queue::default()), st: Mutex::new(State::default()), service: Some(svc.clone()), svc_buf: Mutex::new(Vec::new()) });
+                    Socket::connect_pair(&sock, &server, Cred::of(t), Cred { pid: 1, uid: 0, gid: 0 });
+                    sock.st.lock().unwrap().peer_server = Some(server);
+                    return Ok(0);
+                }
+                let server = Socket::new(sock.ty);
+                let mut lst = listener.st.lock().unwrap();
+                let (listen_cred, listen_name) = (lst.listen_cred, lst.name.clone());
+                let backlog = lst.backlog.as_mut().ok_or(ECONNREFUSED)?;
+                if backlog.len() >= 4096 {
+                    return Err(EAGAIN);
+                }
+                server.st.lock().unwrap().name = listen_name;
+                Socket::connect_pair(&sock, &server, Cred::of(t), listen_cred);
+                backlog.push_back(server);
+                drop(lst);
+                EVENTS.bump();
+                Ok(0)
+            }
+            getsockname => {
+                let (sock, _) = self.sock(t, int(a[0]))?;
+                let name = sock.st.lock().unwrap().name.clone();
+                self.write_addr(t, a[1], a[2], name.as_deref())?;
+                Ok(0)
+            }
+            getpeername => {
+                let (sock, _) = self.sock(t, int(a[0]))?;
+                if !sock.st.lock().unwrap().connected {
+                    return Err(ENOTCONN);
+                }
+                let name = sock.peer().and_then(|p| p.st.lock().unwrap().name.clone());
+                self.write_addr(t, a[1], a[2], name.as_deref())?;
+                Ok(0)
+            }
+            sendto => {
+                let (sock, file) = self.sock(t, int(a[0]))?;
+                let data = t.proc.mm().read_vec(a[1], a[2].min(IO_MAX) as usize)?;
+                let dest = if a[4] != 0 { self.read_addr(t, a[4], a[5])? } else { None };
+                let nonblock = file.nonblock() || a[3] & MSG_DONTWAIT != 0;
+                self.finish_send(t, sock.send(t, data, Vec::new(), dest, nonblock), a[3])
+            }
+            recvfrom => {
+                let (sock, file) = self.sock(t, int(a[0]))?;
+                let nonblock = file.nonblock() || a[3] & MSG_DONTWAIT != 0;
+                let (data, _fds, from, _cred, truncated) = sock.recv(t, a[2].min(IO_MAX) as usize, a[3], nonblock)?;
+                t.proc.mm().write(a[1], &data)?;
+                if a[4] != 0 {
+                    self.write_addr(t, a[4], a[5], (!from.is_empty()).then_some(&from[..]))?;
+                }
+                Ok(if truncated && a[3] & MSG_TRUNC != 0 { data.len().max(a[2] as usize) } else { data.len() } as i64)
+            }
+            sendmsg => self.sendmsg(t, int(a[0]), a[1], a[2]),
+            recvmsg => self.recvmsg(t, int(a[0]), a[1], a[2]),
+            shutdown => {
+                let (sock, _) = self.sock(t, int(a[0]))?;
+                let mut st = sock.st.lock().unwrap();
+                if !st.connected {
+                    return Err(ENOTCONN);
+                }
+                if a[1] != SHUT_WR {
+                    st.shut_rd = true;
+                }
+                if a[1] != SHUT_RD {
+                    st.shut_wr = true;
+                    if let Some(p) = st.peer.as_ref().and_then(Weak::upgrade) {
+                        p.rx.lock().unwrap().write_closed = true;
+                    }
+                }
+                drop(st);
+                EVENTS.bump();
+                Ok(0)
+            }
+            setsockopt => {
+                let (sock, _) = self.sock(t, int(a[0]))?;
+                if a[1] == SOL_SOCKET && a[2] == SO_PASSCRED {
+                    let on = t.proc.mm().read_u32(a[3])? != 0;
+                    sock.st.lock().unwrap().passcred = on;
+                }
+                Ok(0) // buffer sizes, timeouts, reuse flags: accepted
+            }
+            getsockopt => {
+                let (sock, _) = self.sock(t, int(a[0]))?;
+                if a[1] != SOL_SOCKET {
+                    return Err(ENOPROTOOPT);
+                }
+                let st = sock.st.lock().unwrap();
+                let val: Vec<u8> = match a[2] {
+                    SO_PEERCRED => st.peer_cred.bytes().to_vec(),
+                    SO_TYPE => sock.ty.to_le_bytes().to_vec(),
+                    SO_ERROR | SO_PROTOCOL => 0u32.to_le_bytes().to_vec(),
+                    SO_DOMAIN => (AF_UNIX as u32).to_le_bytes().to_vec(),
+                    SO_SNDBUF | SO_RCVBUF => (QUEUE_LIMIT as u32).to_le_bytes().to_vec(),
+                    SO_PASSCRED => (st.passcred as u32).to_le_bytes().to_vec(),
+                    SO_ACCEPTCONN => (st.backlog.is_some() as u32).to_le_bytes().to_vec(),
+                    _ => return Err(ENOPROTOOPT),
+                };
+                drop(st);
+                let mut mm = t.proc.mm();
+                let cap = mm.read_u32(a[4])? as usize;
+                let n = cap.min(val.len());
+                mm.write(a[3], &val[..n])?;
+                mm.write_u32(a[4], n as u32)?;
+                Ok(0)
+            }
+            _ => Err(ENOSYS),
+        }
+    }
+
+    fn sock(&self, t: &Thread, fd: i64) -> Result<(Arc<Socket>, Arc<File>), i64> {
+        let f = t.proc.files.lock().unwrap().get(fd)?;
+        match &f.kind {
+            Kind::Socket(s) => Ok((s.clone(), f.clone())),
+            _ => Err(ENOTSOCK),
+        }
+    }
+
+    fn finish_send(&self, t: &Arc<Thread>, r: Result<usize, i64>, flags: u64) -> Result<i64, i64> {
+        match r {
+            Err(EPIPE) => {
+                if flags & MSG_NOSIGNAL == 0 {
+                    self.send_thread_signal(t, SIGPIPE, SigInfo::user(SIGPIPE, t.proc.pid));
+                }
+                Err(EPIPE)
+            }
+            r => r.map(|n| n as i64),
+        }
+    }
+
+    /// A `sockaddr_un` as a table key: an absolute path, or "\0name" for the
+    /// abstract namespace. `None` for an unnamed address.
+    fn read_addr(&self, t: &Thread, addr: u64, len: u64) -> Result<Option<Vec<u8>>, i64> {
+        if !(2..=110).contains(&len) {
+            return Err(EINVAL);
+        }
+        let b = t.proc.mm().read_vec(addr, len as usize)?;
+        if u16::from_le_bytes([b[0], b[1]]) as u64 != AF_UNIX {
+            return Err(EAFNOSUPPORT);
+        }
+        let path = &b[2..];
+        if path.is_empty() {
+            return Ok(None);
+        }
+        if path[0] == 0 {
+            return Ok(Some(path.to_vec()));
+        }
+        let p = String::from_utf8_lossy(path.split(|&c| c == 0).next().unwrap_or(path)).into_owned();
+        let abs = if p.starts_with('/') { p } else { format!("{}/{p}", t.proc.cwd.lock().unwrap().trim_end_matches('/')) };
+        Ok(Some(abs.into_bytes()))
+    }
+
+    fn write_addr(&self, t: &Thread, addr: u64, len_p: u64, name: Option<&[u8]>) -> Result<(), i64> {
+        let mut sa = (AF_UNIX as u16).to_le_bytes().to_vec();
+        if let Some(n) = name {
+            sa.extend_from_slice(n);
+            if n.first() != Some(&0) {
+                sa.push(0); // paths are NUL-terminated
+            }
+        }
+        let mut mm = t.proc.mm();
+        let cap = mm.read_u32(len_p)? as usize;
+        mm.write(addr, &sa[..cap.min(sa.len())])?;
+        mm.write_u32(len_p, sa.len() as u32)
+    }
+
+    fn sendmsg(&self, t: &Arc<Thread>, fd: i64, msg: u64, flags: u64) -> Result<i64, i64> {
+        let (sock, file) = self.sock(t, fd)?;
+        let (name, namelen, iov, iovlen, control, controllen) = {
+            let mut mm = t.proc.mm();
+            (mm.read_u64(msg)?, mm.read_u32(msg + 8)? as u64, mm.read_u64(msg + 16)?, mm.read_u64(msg + 24)?, mm.read_u64(msg + 32)?, mm.read_u64(msg + 40)?)
+        };
+        let mut data = Vec::new();
+        {
+            let mut mm = t.proc.mm();
+            for i in 0..iovlen.min(1024) {
+                let (base, len) = (mm.read_u64(iov + i * 16)?, mm.read_u64(iov + i * 16 + 8)?);
+                data.extend(mm.read_vec(base, len.min(IO_MAX) as usize)?);
+            }
+        }
+        let mut fds = Vec::new();
+        if control != 0 && controllen >= 16 {
+            let ctl = t.proc.mm().read_vec(control, controllen.min(4096) as usize)?;
+            let mut off = 0;
+            while off + 16 <= ctl.len() {
+                let len = u64::from_le_bytes(ctl[off..off + 8].try_into().unwrap()) as usize;
+                let level = i32::from_le_bytes(ctl[off + 8..off + 12].try_into().unwrap());
+                let ty = i32::from_le_bytes(ctl[off + 12..off + 16].try_into().unwrap());
+                if len < 16 || off + len > ctl.len() {
+                    return Err(EINVAL);
+                }
+                if level as u64 == SOL_SOCKET && ty == SCM_RIGHTS {
+                    let files = t.proc.files.lock().unwrap();
+                    for c in ctl[off + 16..off + len].chunks_exact(4) {
+                        fds.push(files.get(i32::from_le_bytes(c.try_into().unwrap()) as i64)?);
+                    }
+                }
+                off += len.next_multiple_of(8);
+            }
+        }
+        let dest = if name != 0 { self.read_addr(t, name, namelen)? } else { None };
+        let nonblock = file.nonblock() || flags & MSG_DONTWAIT != 0;
+        self.finish_send(t, sock.send(t, data, fds, dest, nonblock), flags)
+    }
+
+    fn recvmsg(&self, t: &Thread, fd: i64, msg: u64, flags: u64) -> Result<i64, i64> {
+        let (sock, file) = self.sock(t, fd)?;
+        let (name, iov, iovlen, control, controllen) = {
+            let mut mm = t.proc.mm();
+            (mm.read_u64(msg)?, mm.read_u64(msg + 16)?, mm.read_u64(msg + 24)?, mm.read_u64(msg + 32)?, mm.read_u64(msg + 40)?)
+        };
+        let mut iovs = Vec::new();
+        {
+            let mut mm = t.proc.mm();
+            for i in 0..iovlen.min(1024) {
+                iovs.push((mm.read_u64(iov + i * 16)?, mm.read_u64(iov + i * 16 + 8)?));
+            }
+        }
+        let total: u64 = iovs.iter().map(|v| v.1).sum();
+        let nonblock = file.nonblock() || flags & MSG_DONTWAIT != 0;
+        let (data, fds, from, cred, truncated) = sock.recv(t, total.min(IO_MAX) as usize, flags, nonblock)?;
+
+        // Scatter into the iovecs.
+        {
+            let mut mm = t.proc.mm();
+            let mut off = 0;
+            for (base, len) in iovs {
+                if off >= data.len() {
+                    break;
+                }
+                let n = (len as usize).min(data.len() - off);
+                mm.write(base, &data[off..off + n])?;
+                off += n;
+            }
+        }
+        // Control messages: credentials if asked for, then passed files.
+        let mut ctl = Vec::new();
+        let mut msg_flags = if truncated { MSG_TRUNC as u32 } else { 0 };
+        if sock.st.lock().unwrap().passcred {
+            push_cmsg(&mut ctl, SCM_CREDENTIALS, &cred.bytes());
+        }
+        if !fds.is_empty() {
+            let need = 16 + fds.len() * 4;
+            if (controllen as usize) < ctl.len() + need {
+                msg_flags |= MSG_CTRUNC; // the files are dropped, as on Linux
+            } else {
+                let mut files = t.proc.files.lock().unwrap();
+                let mut raw = Vec::new();
+                for f in fds {
+                    let nfd = files.alloc(f, flags & MSG_CMSG_CLOEXEC != 0, 0)?;
+                    raw.extend_from_slice(&(nfd as i32).to_le_bytes());
+                }
+                push_cmsg(&mut ctl, SCM_RIGHTS, &raw);
+            }
+        }
+        if ctl.len() > controllen as usize {
+            ctl.truncate(controllen as usize);
+            msg_flags |= MSG_CTRUNC;
+        }
+        {
+            let mut mm = t.proc.mm();
+            if !ctl.is_empty() {
+                mm.write(control, &ctl)?;
+            }
+            mm.write_u64(msg + 40, ctl.len() as u64)?;
+            mm.write_u32(msg + 48, msg_flags)?;
+        }
+        if name != 0 {
+            self.write_addr(t, name, msg + 8, (!from.is_empty()).then_some(&from[..]))?;
+        }
+        Ok(data.len() as i64)
+    }
+}
+
+fn sock_type(ty: u64) -> Result<u32, i64> {
+    match (ty & 0xf) as u32 {
+        t @ (SOCK_STREAM | SOCK_DGRAM | SOCK_SEQPACKET) => Ok(t),
+        _ => Err(EPROTONOSUPPORT),
+    }
+}
+
+/// Appends a `cmsghdr` (64-bit layout) with SOL_SOCKET level, padded to 8.
+fn push_cmsg(out: &mut Vec<u8>, ty: i32, data: &[u8]) {
+    out.extend_from_slice(&((16 + data.len()) as u64).to_le_bytes());
+    out.extend_from_slice(&(SOL_SOCKET as i32).to_le_bytes());
+    out.extend_from_slice(&ty.to_le_bytes());
+    out.extend_from_slice(data);
+    while !out.len().is_multiple_of(8) {
+        out.push(0);
+    }
+}

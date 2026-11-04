@@ -2,7 +2,7 @@
 
 use super::{Kernel, Thread};
 use crate::errno::*;
-use crate::mm::{Backing, Placement};
+use crate::mm::{Backing, Placement, SharedObject};
 use crate::phys::PAGE;
 
 const MAP_SHARED: u64 = 0x01;
@@ -33,20 +33,50 @@ impl Kernel {
         } else {
             Placement::Hint(addr)
         };
-        let backing = if flags & MAP_ANONYMOUS != 0 {
-            if flags & MAP_SHARED != 0 && self.strace {
-                // Treated as private until shared frames exist (ashmem, M3).
-                eprintln!("[droidrt] note: MAP_SHARED|MAP_ANONYMOUS treated as private");
+        // A binder fd's receive area: read-only to the process, filled by the driver.
+        if flags & MAP_ANONYMOUS == 0
+            && let Ok(f) = t.proc.files.lock().unwrap().get(fd)
+            && let Some(b) = super::binder::mmap_area(&f)
+        {
+            if prot & 2 != 0 {
+                return -EPERM;
             }
-            Backing::Anon
-        } else {
-            match self.fd_file_data(t, fd) {
-                Ok(data) => Backing::File { data, offset },
+            let len = len.min(4 << 20);
+            let mut mm = t.proc.mm();
+            let a = match mm.map(place, len, 1, Backing::Anon) {
+                Ok(a) => a,
                 Err(e) => return -e,
+            };
+            mm.set_name(a, len, "/dev/binderfs/binder");
+            drop(mm);
+            return match super::binder::set_area(b, a, len) {
+                Ok(()) => a as i64,
+                Err(e) => -e,
+            };
+        }
+        let shared = flags & MAP_SHARED != 0;
+        let backing = if flags & MAP_ANONYMOUS != 0 {
+            if shared { Backing::Shared { obj: SharedObject::new(self.phys.clone()), offset: 0 } } else { Backing::Anon }
+        } else {
+            match self.fd_shared_object(t, fd) {
+                Ok(Some(obj)) if shared => Backing::Shared { obj, offset },
+                Err(e) => return -e,
+                // Private mappings, and read-only image files, get a copy.
+                _ => match self.fd_file_data(t, fd) {
+                    Ok(data) => Backing::File { data, offset },
+                    Err(e) => return -e,
+                },
             }
         };
-        match t.proc.mm().map(place, len, prot & !PROT_IGNORED, backing) {
-            Ok(a) => a as i64,
+        let name = if flags & MAP_ANONYMOUS == 0 { self.fd_name(t, fd) } else { None };
+        let mut mm = t.proc.mm();
+        match mm.map(place, len, prot & !PROT_IGNORED, backing) {
+            Ok(a) => {
+                if let Some(n) = name {
+                    mm.set_name(a, len, &n);
+                }
+                a as i64
+            }
             Err(e) => -e,
         }
     }

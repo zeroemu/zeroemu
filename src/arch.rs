@@ -60,16 +60,33 @@ macro_rules! syscalls {
 
 // name = arm64/generic number, x86_64 number
 syscalls! {
+    eventfd2 = 19, 290;
+    epoll_create1 = 20, 291;
+    epoll_ctl = 21, 233;
+    epoll_pwait = 22, 281;
     getcwd = 17, 79;
     dup = 23, 32;
     dup3 = 24, 292;
     fcntl = 25, 72;
     ioctl = 29, 16;
+    mknodat = 33, 259;
+    mkdirat = 34, 258;
+    unlinkat = 35, 263;
+    symlinkat = 36, 266;
+    linkat = 37, 265;
+    renameat = 38, 264;
     statfs = 43, 137;
     fstatfs = 44, 138;
+    truncate = 45, 76;
+    ftruncate = 46, 77;
+    fallocate = 47, 285;
     faccessat = 48, 269;
     chdir = 49, 80;
     fchdir = 50, 81;
+    fchmod = 52, 91;
+    fchmodat = 53, 268;
+    fchownat = 54, 260;
+    fchown = 55, 93;
     openat = 56, 257;
     close = 57, 3;
     pipe2 = 59, 293;
@@ -82,9 +99,17 @@ syscalls! {
     pread64 = 67, 17;
     pwrite64 = 68, 18;
     ppoll = 73, 271;
+    signalfd4 = 74, 289;
+    timerfd_create = 85, 283;
+    timerfd_settime = 86, 286;
+    timerfd_gettime = 87, 287;
+    utimensat = 88, 280;
     readlinkat = 78, 267;
     newfstatat = 79, 262;
     fstat = 80, 5;
+    sync = 81, 162;
+    fsync = 82, 74;
+    fdatasync = 83, 75;
     exit = 93, 60;
     exit_group = 94, 231;
     set_tid_address = 96, 218;
@@ -109,6 +134,7 @@ syscalls! {
     rt_sigreturn = 139, 15;
     rt_sigqueueinfo = 138, 129;
     rt_tgsigqueueinfo = 240, 297;
+    accept4 = 242, 288;
     uname = 160, 63;
     setpgid = 154, 109;
     getpgid = 155, 121;
@@ -128,7 +154,20 @@ syscalls! {
     gettid = 178, 186;
     sysinfo = 179, 99;
     socket = 198, 41;
+    socketpair = 199, 53;
+    bind = 200, 49;
+    listen = 201, 50;
+    accept = 202, 43;
     connect = 203, 42;
+    getsockname = 204, 51;
+    getpeername = 205, 52;
+    sendto = 206, 44;
+    recvfrom = 207, 45;
+    setsockopt = 208, 54;
+    getsockopt = 209, 55;
+    shutdown = 210, 48;
+    sendmsg = 211, 46;
+    recvmsg = 212, 47;
     brk = 214, 12;
     munmap = 215, 11;
     mremap = 216, 25;
@@ -139,7 +178,9 @@ syscalls! {
     madvise = 233, 28;
     wait4 = 260, 61;
     prlimit64 = 261, 302;
+    renameat2 = 276, 316;
     getrandom = 278, 318;
+    memfd_create = 279, 319;
     membarrier = 283, 324;
     statx = 291, 332;
     rseq = 293, 334;
@@ -167,6 +208,15 @@ impl Arch {
         match self {
             Arch::Aarch64 => (a[0], a[1], a[2], a[4], a[3]),
             Arch::X86_64 => (a[0], a[1], a[2], a[3], a[4]),
+        }
+    }
+
+    /// `struct epoll_event` as (size, offset of `data`): packed on x86_64,
+    /// naturally aligned on arm64.
+    pub fn epoll_event_layout(self) -> (usize, usize) {
+        match self {
+            Arch::Aarch64 => (16, 8),
+            Arch::X86_64 => (12, 4),
         }
     }
 

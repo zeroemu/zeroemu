@@ -19,7 +19,7 @@ use super::unix::{self, Service, Socket};
 use crate::vfs::Vfs;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 const LOG_ID_MAX: u8 = 8;
 /// Buffers with binary payloads (events, stats, security): kept, not printed.
@@ -63,24 +63,30 @@ impl Entry {
     /// since boot in place of the date.
     fn print(&self) {
         let (level, boot) = printer();
-        if BINARY & 1 << self.lid != 0 {
-            return;
+        if let Some(out) = self.text(level, boot.elapsed()) {
+            eprint!("{out}");
         }
-        let Some((&prio, rest)) = self.payload.split_first() else { return };
+    }
+
+    /// What `print` shows at time `t`: nothing for binary buffers or below `level`.
+    fn text(&self, level: u8, t: Duration) -> Option<String> {
+        if BINARY & 1 << self.lid != 0 {
+            return None;
+        }
+        let (&prio, rest) = self.payload.split_first()?;
         if prio < level {
-            return;
+            return None;
         }
         let (tag, rest) = cstr(rest);
         let (msg, _) = cstr(rest);
         let p = b"??VDIWEFS".get(prio as usize).copied().unwrap_or(b'?') as char;
         let tag = String::from_utf8_lossy(tag);
         let msg = String::from_utf8_lossy(msg);
-        let t = boot.elapsed();
         let mut out = String::new();
         for line in msg.trim_end_matches('\n').split('\n') {
             out += &format!("{:5}.{:03} {:5} {:5} {p} {tag}: {line}\n", t.as_secs(), t.subsec_millis(), self.pid, self.tid);
         }
-        eprint!("{out}");
+        Some(out)
     }
 
     fn packet(&self) -> Vec<u8> {
@@ -273,5 +279,44 @@ impl Service for Logd {
         let mut reply = self.control(&cmd).into_bytes();
         reply.push(0);
         Some(reply)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A liblog datagram: android_log_header_t, then priority, tag, message.
+    fn datagram(lid: u8, tid: u16, prio: u8, tag: &str, msg: &str) -> Vec<u8> {
+        let mut d = vec![lid];
+        d.extend_from_slice(&tid.to_le_bytes());
+        d.extend_from_slice(&[0; 8]);
+        d.push(prio);
+        d.extend_from_slice(tag.as_bytes());
+        d.push(0);
+        d.extend_from_slice(msg.as_bytes());
+        d.push(0);
+        d
+    }
+
+    #[test]
+    fn records_print_like_logcat_threadtime() {
+        let e = Entry::parse(&datagram(0, 9, 4, "tag", "one\ntwo\n"), 7).unwrap();
+        assert_eq!(e.text(4, Duration::from_millis(1234)).unwrap(), "    1.234     7     9 I tag: one\n    1.234     7     9 I tag: two\n");
+    }
+
+    #[test]
+    fn filtered_records_are_not_printed() {
+        let debug = Entry::parse(&datagram(0, 1, 3, "t", "m"), 1).unwrap();
+        assert!(debug.text(4, Duration::ZERO).is_none());
+        assert!(debug.text(2, Duration::ZERO).is_some());
+        let events = Entry::parse(&datagram(2, 1, 4, "t", "m"), 1).unwrap();
+        assert!(events.text(0, Duration::ZERO).is_none());
+    }
+
+    #[test]
+    fn malformed_datagrams_are_ignored() {
+        assert!(Entry::parse(&[0; HEADER], 1).is_none());
+        assert!(Entry::parse(&datagram(LOG_ID_MAX, 1, 4, "t", "m"), 1).is_none());
     }
 }

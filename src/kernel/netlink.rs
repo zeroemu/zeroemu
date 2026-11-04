@@ -691,3 +691,22 @@ fn write_nladdr(t: &Thread, addr: u64, len_p: u64, port: u32, groups: u32) -> Re
     mm.write(addr, &sa[..cap.min(12)])?;
     mm.write_u32(len_p, 12)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn messages_carry_unpadded_lengths_and_are_padded() {
+        let m = nlmsg(NLMSG_DONE, NLM_F_MULTI, 5, 77, &[1, 2, 3]);
+        assert_eq!(m.len(), 20);
+        assert_eq!(&m[..16], &[19, 0, 0, 0, 3, 0, 2, 0, 5, 0, 0, 0, 77, 0, 0, 0]);
+        assert_eq!(&m[16..], &[1, 2, 3, 0]);
+    }
+
+    #[test]
+    fn group_numbers_and_masks() {
+        assert_eq!((ffs(0), ffs(1), ffs(0x18)), (0, 1, 4));
+        assert_eq!((group_mask(0), group_mask(1), group_mask(32), group_mask(33)), (0, 1, 1 << 31, 0));
+    }
+}

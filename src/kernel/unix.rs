@@ -5,10 +5,9 @@
 //! ("\0name") live in a kernel table.
 
 use super::files::{File, Kind};
-use super::{logd, netlink};
 use super::signal::{SIGPIPE, SigInfo};
 use super::wait::EVENTS;
-use super::{ERESTARTSYS, Kernel, POLL, Thread, int};
+use super::{ERESTARTSYS, Kernel, POLL, Thread, int, logd, netlink};
 use crate::arch::Sysno;
 use crate::errno::*;
 use crate::vfs::{FileSystem, Node, S_IFMT, Vfs};
@@ -19,7 +18,7 @@ use std::sync::{Arc, Mutex, Weak};
 const AF_UNIX: u64 = 1;
 pub const S_IFSOCK: u32 = 0o140000;
 const AT_FDCWD: i64 = -100;
-/// What sockets are created with before the umask (Linux: S_IFSOCK | 0777).
+/// Sockets are created 0777 less the umask, which is fixed at 022 (as umask(2) reports).
 const UMASK: u32 = 0o022;
 pub const SOCK_STREAM: u32 = 1;
 pub const SOCK_DGRAM: u32 = 2;
@@ -191,7 +190,8 @@ static BOUND: Mutex<Bound> = Mutex::new(BTreeMap::new());
 
 /// Abstract names: (type, "\0name") -> socket. Linux hashes the type in, so
 /// each socket type has its own namespace.
-static ABSTRACT: Mutex<BTreeMap<(u32, Vec<u8>), Weak<Socket>>> = Mutex::new(BTreeMap::new());
+type Abstract = BTreeMap<(u32, Vec<u8>), Weak<Socket>>;
+static ABSTRACT: Mutex<Abstract> = Mutex::new(BTreeMap::new());
 
 /// Creates the S_IFSOCK node for binding `sock` to `path` and records the
 /// binding. EADDRINUSE if anything exists there (even a dangling symlink).

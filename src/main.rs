@@ -19,6 +19,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 const USAGE: &str = "usage: droidrt [--system <system.img>] [--strace] <program> [args...]
+       droidrt --system <system.img> --boot [init args...]
        droidrt --system <system.img> --ls <path> | --cat <path>";
 
 fn main() -> ExitCode {
@@ -37,6 +38,7 @@ fn run() -> Result<i32, String> {
     let mut system: Option<PathBuf> = None;
     let mut inspect: Option<(String, String)> = None;
     let mut strace = std::env::var_os("DROIDRT_STRACE").is_some();
+    let mut boot = false;
     while let Some(flag) = args.peek().filter(|a| a.starts_with("--")).cloned() {
         args.next();
         match flag.as_str() {
@@ -44,6 +46,10 @@ fn run() -> Result<i32, String> {
             "--system" => system = Some(args.next().ok_or(USAGE)?.into()),
             "--ls" | "--cat" => inspect = Some((flag.clone(), args.next().ok_or(USAGE)?)),
             "--strace" => strace = true,
+            // Android's init as pid 1. First-stage init's work (mounting
+            // partitions, loading SELinux policy) is done by droidrt itself,
+            // so init starts at its second stage.
+            "--boot" => boot = true,
             _ => return Err(format!("unknown flag {flag}\n{USAGE}")),
         }
     }
@@ -54,7 +60,16 @@ fn run() -> Result<i32, String> {
     if let Some((cmd, path)) = inspect {
         return inspect_image(vfs.as_ref().ok_or("--ls/--cat need --system")?, &cmd, &path);
     }
-    let argv: Vec<String> = args.collect();
+    let mut argv: Vec<String> = args.collect();
+    if boot {
+        if system.is_none() {
+            return Err(format!("--boot needs --system\n{USAGE}"));
+        }
+        if argv.is_empty() {
+            argv = vec!["second_stage".into()];
+        }
+        argv.insert(0, "/system/bin/init".into());
+    }
     let argv_copy = argv.clone();
     let program = argv.first().ok_or(USAGE)?.clone();
     let envp = vec![
@@ -64,7 +79,7 @@ fn run() -> Result<i32, String> {
         "HOME=/".to_string(),
     ];
 
-    let kernel = Kernel::new(hv::create()?, vfs, strace)?;
+    let kernel = Kernel::new(hv::create()?, vfs, strace, boot)?;
     let mut mm = kernel.new_address_space().map_err(|e| format!("address space: errno {e}"))?;
     let (state, exe) = if system.is_some() {
         kernel

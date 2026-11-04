@@ -40,6 +40,7 @@ typedef unsigned short u16;
 #define NR_recvfrom 207
 #define NR_setsockopt 208
 #define NR_getsockopt 209
+#define NR_sendmsg 211
 #define NR_recvmsg 212
 #define NR_accept4 242
 
@@ -278,6 +279,19 @@ static void unix_paths(void) {
     sys(NR_sendto, me, "abcdefgh", 8, 0, 0, 0);
     char tiny[3];
     check(sys(NR_recvfrom, dg, tiny, 3, 0x20 /* MSG_TRUNC */, 0, 0) == 8 && seq(tiny, "abc", 3), "MSG_TRUNC: return value is the real datagram length");
+
+    // A later cmsg length that wraps usize must be rejected, not panic.
+    int bad = (int)sys(NR_socket, 1, SOCK_DGRAM, 0);
+    char one[] = "x";
+    struct iovec biov = { one, 1 };
+    unsigned char bctl[40];
+    memset(bctl, 0, sizeof bctl);
+    bctl[0] = 16; // first header, skipped
+    memset(bctl + 16, 0xff, 8); // second cmsg len wraps
+    bctl[24] = 1; // SOL_SOCKET
+    bctl[28] = 1; // SCM_RIGHTS
+    struct msghdr bm = { 0, 0, 0, &biov, 1, bctl, sizeof bctl, 0, 0 };
+    check(sys(NR_sendmsg, bad, &bm, 0) == -EINVAL, "SCM_RIGHTS length that wraps is EINVAL");
 }
 
 // ---- netlink ----

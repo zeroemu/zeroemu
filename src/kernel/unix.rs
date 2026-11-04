@@ -901,7 +901,11 @@ impl Kernel {
                 let len = u64::from_le_bytes(ctl[off..off + 8].try_into().unwrap()) as usize;
                 let level = i32::from_le_bytes(ctl[off + 8..off + 12].try_into().unwrap());
                 let ty = i32::from_le_bytes(ctl[off + 12..off + 16].try_into().unwrap());
-                if len < 16 || off + len > ctl.len() {
+                // A crafted length can wrap `off + len` and panic on the slice.
+                let Some(end) = off.checked_add(len) else {
+                    return Err(EINVAL);
+                };
+                if len < 16 || end > ctl.len() {
                     return Err(EINVAL);
                 }
                 if level as u64 == SOL_SOCKET && ty == SCM_RIGHTS {

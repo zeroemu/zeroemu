@@ -187,6 +187,8 @@ pub struct Gfxstream {
     api: Api,
     live: Mutex<bool>,
     fences: Mutex<FenceSlot>,
+    /// The last scanout read back for the window.
+    frame: Mutex<Vec<u8>>,
     // Kept mapped for the process lifetime. dlclose races the renderer's threads.
     _lib: *mut c_void,
 }
@@ -324,6 +326,7 @@ pub fn open(width: u32, height: u32) -> Result<Arc<dyn GpuBackend>, String> {
         api,
         live: Mutex::new(false),
         fences: Mutex::new(FenceSlot { handler: None, pending: Vec::new() }),
+        frame: Mutex::new(Vec::new()),
         _lib: lib,
     });
     gfx.start(width, height, &win)?;
@@ -362,11 +365,10 @@ impl Gfxstream {
         *self.live.lock().unwrap_or_else(|p| p.into_inner()) = true;
         #[cfg(target_os = "macos")]
         install_window_ops(self._lib);
-        // macOS: NSWindow*. createSubWindow builds the GL/Metal subview itself.
-        // Windows: HWND (the window stub does not reach this call).
-        unsafe {
-            (self.api.setup_window)(win.handle, 0, 0, win.width, win.height, fb_w as i32, fb_h as i32);
-        }
+        // No gfxstream subwindow: it renders at a device pixel ratio of 1 (its
+        // C entry point takes none), so Retina screens showed a magnified
+        // corner. flush() reads frames back and the window shows them instead.
+        let _ = (win, fb_w, fb_h, self.api.setup_window);
         Ok(())
     }
 }
@@ -525,8 +527,22 @@ impl GpuBackend for Gfxstream {
         if r == 0 { Some(info) } else { None }
     }
 
+    /// Shows a scanout: reads it back into host memory and hands it to the
+    /// window, which draws it on the UI thread without blocking the guest.
     fn flush(&self, handle: u32) {
-        unsafe { (self.api.flush)(handle) };
+        let Some(info) = self.resource_info(handle) else { return };
+        let (w, h) = (info.width, info.height);
+        if w == 0 || h == 0 || w > 8192 || h > 8192 {
+            return;
+        }
+        let stride = w * 4;
+        let mut buf = self.frame.lock().unwrap_or_else(|p| p.into_inner());
+        buf.resize(stride as usize * h as usize, 0);
+        let iov = Iovec { iov_base: buf.as_mut_ptr() as *mut c_void, iov_len: buf.len() };
+        let b = CBox { x: 0, y: 0, z: 0, w, h, d: 1 };
+        if unsafe { (self.api.transfer_read)(handle, 0, 0, stride, 0, &b, 0, &iov, 1) } == 0 {
+            window::present(w, h, stride, info.drm_fourcc, &buf);
+        }
     }
 
     fn set_fence_handler(&self, handler: Arc<dyn Fn(Fence) + Send + Sync>) {

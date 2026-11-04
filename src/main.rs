@@ -28,6 +28,15 @@ const USAGE: &str = "usage: droidrt [--system <system.img>] [--strace] [--displa
        droidrt --gpu-selftest";
 
 fn main() -> ExitCode {
+    // A panic is a droidrt bug. Unhandled, it kills only the host thread that
+    // was running one guest thread, which then freezes without a trace; stop
+    // everything loudly instead.
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        default(info);
+        eprintln!("[droidrt] internal error in {}; stopping", std::thread::current().name().unwrap_or("?"));
+        std::process::exit(101);
+    }));
     match run() {
         Ok(code) => ExitCode::from(code as u8),
         Err(e) => {

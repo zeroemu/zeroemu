@@ -349,6 +349,38 @@ impl AddressSpace {
         for (_, v) in self.vmas.range_mut(start..end) {
             v.name = Some(name.clone());
         }
+        self.merge(start, end);
+    }
+
+    /// Rejoins mappings around [lo, hi] that became identical, as Linux does
+    /// after mprotect: mremap needs its source in one mapping, and bionic's
+    /// atexit array is mprotected page by page, then grown with mremap.
+    fn merge(&mut self, lo: u64, hi: u64) {
+        fn joins(a_start: u64, a: &Vma, b_start: u64, b: &Vma) -> bool {
+            let contiguous = |o1: &u64, o2: &u64| o1 + (a.end - a_start) == *o2;
+            a.end == b_start
+                && a.prot == b.prot
+                && a.name == b.name
+                && match (&a.backing, &b.backing) {
+                    (Backing::Anon, Backing::Anon) => true,
+                    (Backing::File { data: d1, offset: o1 }, Backing::File { data: d2, offset: o2 }) => Arc::ptr_eq(d1, d2) && contiguous(o1, o2),
+                    (Backing::Shared { obj: s1, offset: o1 }, Backing::Shared { obj: s2, offset: o2 }) => Arc::ptr_eq(s1, s2) && contiguous(o1, o2),
+                    _ => false,
+                }
+        }
+        let mut cur = self.vmas.range(..lo).next_back().or_else(|| self.vmas.range(lo..).next()).map(|(&s, _)| s);
+        while let Some(s) = cur {
+            let Some(n) = self.vmas.range(s + 1..).next().map(|(&n, _)| n) else { break };
+            if n > hi {
+                break;
+            }
+            if joins(s, &self.vmas[&s], n, &self.vmas[&n]) {
+                let right = self.vmas.remove(&n).unwrap();
+                self.vmas.get_mut(&s).unwrap().end = right.end;
+            } else {
+                cur = Some(n);
+            }
+        }
     }
 
     /// Every mapping, for /proc/<pid>/maps.
@@ -482,6 +514,7 @@ impl AddressSpace {
         for (_, v) in self.vmas.range_mut(start..end) {
             v.prot = prot;
         }
+        self.merge(start, end);
         let mut changed = false;
         self.visit(start, end, &mut |phys, slot, _va, e| {
             phys.write_u64(slot, paging::user_page(paging::addr(e), prot));

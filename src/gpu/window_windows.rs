@@ -20,6 +20,11 @@ pub fn open(fb_w: u32, fb_h: u32) -> Result<NativeWindow, String> {
     Err("gfxstream: Win32 window is not implemented (CreateWindowExW)".into())
 }
 
+/// TODO: draw frames once the Win32 window exists.
+pub fn present(w: u32, h: u32, stride: u32, fourcc: u32, pixels: &[u8]) {
+    let _ = (w, h, stride, fourcc, pixels);
+}
+
 pub fn window_id() -> Option<u64> {
     None
 }

@@ -247,6 +247,16 @@ int cmain(void) {
     if (ok) big[32ul << 30] = 1;
     check(ok && big[32ul << 30] == 1, "64 GiB PROT_NONE reservation, one page used");
 
+    // bionic's atexit array: mprotect one page read-only and back, which
+    // splits the mapping, then grow it with mremap. Linux rejoins the
+    // mapping, so the source is a single mapping again.
+    char *ax = (char *)sys(NR_mmap, 0, 8192, PROT_RW, MAP_PRIV_ANON, -1, 0);
+    ax[0] = 5;
+    sys(NR_mprotect, ax + 4096, 4096, 1 /* PROT_READ */);
+    sys(NR_mprotect, ax, 8192, PROT_RW);
+    char *ax2 = (char *)sys(NR_mremap, ax, 8192, 16384, 1 /* MREMAP_MAYMOVE */, 0);
+    check((i64)ax2 > 0 && ax2[0] == 5, "mremap after mprotect splits and rejoins");
+
     puts_(failures ? "SOME CHECKS FAILED\n" : "all checks passed\n");
     return failures;
 }

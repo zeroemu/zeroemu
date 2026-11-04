@@ -235,6 +235,25 @@ pub struct Thread {
     pub attrs: Mutex<control::ThreadAttrs>,
     /// SELinux exec/fscreate/keycreate/sockcreate contexts.
     pub sec: selinux::ThreadSec,
+    /// The syscall in progress, recorded only for DROIDRT_DUMP.
+    in_syscall: Mutex<Option<SyscallSnap>>,
+}
+
+/// Where a thread entered the kernel: what DROIDRT_DUMP prints for it.
+struct SyscallSnap {
+    nr: u64,
+    args: [u64; 6],
+    pc: u64,
+    lr: u64,
+    fp: u64,
+    since: Instant,
+}
+
+/// DROIDRT_DUMP=<secs>: every that many seconds, print every guest thread,
+/// the syscall it is in, and its backtrace (for diagnosing hangs).
+fn dump_after() -> Option<u64> {
+    static AFTER: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *AFTER.get_or_init(|| std::env::var("DROIDRT_DUMP").ok().and_then(|v| v.parse().ok()))
 }
 
 /// Locked access to a live process's address space.
@@ -272,6 +291,7 @@ impl Thread {
             dying: AtomicBool::new(false),
             attrs: Mutex::new(control::ThreadAttrs::default()),
             sec: Default::default(),
+            in_syscall: Mutex::new(None),
         })
     }
 
@@ -390,7 +410,56 @@ impl Kernel {
     }
 
     /// Starts the first process: `mm` already holds the program and its stack.
+    /// Prints every guest thread: comm, the syscall it is in, backtrace.
+    fn dump_threads(&self) {
+        let mut procs: Vec<Arc<Process>> = self.procs.lock().unwrap().values().cloned().collect();
+        procs.sort_by_key(|p| p.pid);
+        eprintln!("[droidrt] ---- thread dump: {} processes ----", procs.len());
+        for p in procs {
+            let threads: Vec<Arc<Thread>> = p.threads.lock().unwrap().clone();
+            let exe = p.exe.lock().unwrap().clone();
+            for t in threads {
+                let comm = t.attrs.lock().unwrap().comm.clone();
+                let snap = t.in_syscall.lock().unwrap().as_ref().map(|s| (s.nr, s.args, s.pc, s.lr, s.fp, s.since.elapsed()));
+                let Some((nr, a, pc, lr, mut fp, held)) = snap else {
+                    eprintln!("[droidrt] {} {} {comm} ({exe}): running", p.pid, t.tid);
+                    continue;
+                };
+                let name = self.arch.sysno(nr).map_or_else(|| format!("syscall_{nr}"), |s| format!("{s:?}"));
+                // What the first argument names, when it is a file descriptor.
+                let fd = match p.files.try_lock() {
+                    Ok(files) => files.get(a[0] as i32 as i64).map(|f| files::file_name(&f)).unwrap_or_default(),
+                    Err(_) => String::new(),
+                };
+                eprintln!("[droidrt] {} {} {comm} ({exe}): {name}({:#x}, {:#x}, {:#x}, {:#x}) for {:.1}s {fd}", p.pid, t.tid, a[0], a[1], a[2], a[3], held.as_secs_f64());
+                // The address space may be busy; skip rather than wait.
+                let Ok(mut guard) = p.mm.try_lock() else { continue };
+                let Some(mm) = guard.as_mut() else { continue };
+                eprintln!("[droidrt]     at {}", mm.symbolize(pc));
+                eprintln!("[droidrt]     lr {}", mm.symbolize(lr));
+                for _ in 0..12 {
+                    let (Ok(next), Ok(ret)) = (mm.read_u64(fp), mm.read_u64(fp + 8)) else { break };
+                    if ret == 0 {
+                        break;
+                    }
+                    eprintln!("[droidrt]     {}", mm.symbolize(ret));
+                    if next <= fp {
+                        break;
+                    }
+                    fp = next;
+                }
+            }
+        }
+    }
+
     pub fn start(self: &Arc<Self>, mm: AddressSpace, exe: String, argv: &[String], state: CpuState) -> Result<(), String> {
+        if let Some(secs) = dump_after() {
+            let k = self.clone();
+            std::thread::spawn(move || loop {
+                std::thread::sleep(std::time::Duration::from_secs(secs.max(1)));
+                k.dump_threads();
+            });
+        }
         let pid = self.next_id.fetch_add(1, Ordering::Relaxed);
         let proc = Arc::new(Process {
             pid,
@@ -513,10 +582,18 @@ impl Kernel {
     fn syscall(self: &Arc<Self>, t: &Arc<Thread>, vcpu: &mut dyn Vcpu, regs: &SyscallRegs) -> Ret {
         let sysno = self.arch.sysno(regs.nr);
         let a = regs.args;
+        if dump_after().is_some()
+            && let CpuState::Aarch64(st) = vcpu.state()
+        {
+            *t.in_syscall.lock().unwrap() = Some(SyscallSnap { nr: regs.nr, args: a, pc: st.pc, lr: st.x[30], fp: st.x[29], since: Instant::now() });
+        }
         let ret = match sysno {
             None => Ret::Value(-ENOSYS),
             Some(no) => self.dispatch(no, t, vcpu, a),
         };
+        if dump_after().is_some() {
+            *t.in_syscall.lock().unwrap() = None;
+        }
         if self.strace {
             let name = sysno.map_or_else(|| format!("syscall_{}", regs.nr), |s| format!("{s:?}"));
             let path = match sysno {

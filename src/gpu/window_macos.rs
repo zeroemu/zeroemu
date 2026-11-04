@@ -3,7 +3,7 @@
 //! repaint is dispatched back onto this thread.
 
 use std::ffi::{CString, c_void};
-use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -187,6 +187,82 @@ pub fn open(fb_w: u32, fb_h: u32) -> Result<NativeWindow, String> {
     }
 }
 
+#[link(name = "CoreGraphics", kind = "framework")]
+unsafe extern "C" {
+    fn CGColorSpaceCreateDeviceRGB() -> *mut c_void;
+    fn CGColorSpaceRelease(cs: *mut c_void);
+    fn CGDataProviderCreateWithCFData(data: *mut c_void) -> *mut c_void;
+    fn CGDataProviderRelease(p: *mut c_void);
+    fn CGImageCreate(w: usize, h: usize, bpc: usize, bpp: usize, bpr: usize, cs: *mut c_void, info: u32, provider: *mut c_void, decode: *const f64, interpolate: bool, intent: i32) -> *mut c_void;
+    fn CGImageRelease(img: *mut c_void);
+}
+
+#[link(name = "CoreFoundation", kind = "framework")]
+unsafe extern "C" {
+    fn CFDataCreate(alloc: *const c_void, bytes: *const u8, len: isize) -> *mut c_void;
+    fn CFRelease(obj: *const c_void);
+}
+
+struct Frame {
+    w: u32,
+    h: u32,
+    stride: u32,
+    fourcc: u32,
+    data: Vec<u8>,
+}
+
+/// The newest frame from the guest, shown by the UI thread when it pumps.
+static FRAME: Mutex<Option<Frame>> = Mutex::new(None);
+static FRAME_NEW: AtomicBool = AtomicBool::new(false);
+
+/// Called from any thread with a scanout's pixels.
+pub fn present(w: u32, h: u32, stride: u32, fourcc: u32, pixels: &[u8]) {
+    let mut slot = FRAME.lock().unwrap_or_else(|p| p.into_inner());
+    match slot.as_mut() {
+        Some(f) if f.data.len() == pixels.len() => {
+            f.data.copy_from_slice(pixels);
+            (f.w, f.h, f.stride, f.fourcc) = (w, h, stride, fourcc);
+        }
+        _ => *slot = Some(Frame { w, h, stride, fourcc, data: pixels.to_vec() }),
+    }
+    FRAME_NEW.store(true, Ordering::Release);
+}
+
+/// Puts the newest frame into the window's layer (UI thread only).
+fn show_frame() {
+    if !FRAME_NEW.swap(false, Ordering::AcqRel) {
+        return;
+    }
+    let window = WINDOW.load(Ordering::Acquire);
+    let slot = FRAME.lock().unwrap_or_else(|p| p.into_inner());
+    let (Some(f), false) = (slot.as_ref(), window.is_null()) else { return };
+    // DRM fourccs name the 32-bit word: ARGB8888/XRGB8888 are B,G,R,A bytes
+    // in memory; ABGR8888/XBGR8888 (and anything else) are R,G,B,A.
+    const BGRA: [u32; 2] = [0x3432_5241, 0x3432_5258];
+    let info = if BGRA.contains(&f.fourcc) { (2 << 12) | 6 } else { 5 }; // 32Little|NoneSkipFirst, or NoneSkipLast
+    unsafe {
+        let data = CFDataCreate(std::ptr::null(), f.data.as_ptr(), f.data.len() as isize);
+        let provider = CGDataProviderCreateWithCFData(data);
+        let cs = CGColorSpaceCreateDeviceRGB();
+        let img = CGImageCreate(f.w as usize, f.h as usize, 8, 32, f.stride as usize, cs, info, provider, std::ptr::null(), false, 0);
+        drop(slot);
+        let view = msg0(window, sel("contentView"));
+        msg_bool(view, sel("setWantsLayer:"), 1);
+        let layer = msg0(view, sel("layer"));
+        if !layer.is_null() && !img.is_null() {
+            msg_id(layer, sel("setContents:"), img);
+            msg_id(layer, sel("setContentsGravity:"), msg_cstr(cls("NSString"), sel("stringWithUTF8String:"), "resizeAspect"));
+            msg_void(cls("CATransaction"), sel("flush"));
+        }
+        if !img.is_null() {
+            CGImageRelease(img);
+        }
+        CGColorSpaceRelease(cs);
+        CGDataProviderRelease(provider);
+        CFRelease(data);
+    }
+}
+
 unsafe fn msg_cstr(obj: *mut c_void, sel: *mut c_void, s: &str) -> *mut c_void {
     let c = CString::new(s).unwrap();
     let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *const i8) -> *mut c_void = unsafe { std::mem::transmute(objc_msgSend as *const ()) };
@@ -239,6 +315,7 @@ fn drain_ui() {
 
 fn pump_once(wait_s: f64) {
     drain_ui();
+    show_frame();
     let app = APP.load(Ordering::Acquire);
     if app.is_null() {
         std::thread::sleep(Duration::from_secs_f64(wait_s));
@@ -258,7 +335,7 @@ fn pump_once(wait_s: f64) {
 
 pub fn pump_until(done: &std::sync::atomic::AtomicBool) {
     while !done.load(Ordering::Acquire) {
-        pump_once(0.05);
+        pump_once(0.008);
     }
 }
 

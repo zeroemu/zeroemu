@@ -399,6 +399,9 @@ impl Device {
 
     fn on_fence(&self, f: Fence) {
         let rec = self.inner.lock().unwrap().fences.remove(&f.fence_id);
+        if trace() {
+            eprintln!("[drm] fence {} ctx {} ring {} flags {:#x} signaled (known: {})", f.fence_id, f.ctx_id, f.ring_idx, f.flags, rec.is_some());
+        }
         let Some(rec) = rec else { return };
         rec.point.signal();
         let watch = self.inner.lock().unwrap().ctxs.get(&rec.ctx).map(|w| (w.ev.clone(), w.mask));
@@ -527,13 +530,21 @@ impl Open {
     }
 }
 
+/// DROIDRT_DRM_TRACE=1 logs every DRM ioctl and fence.
+fn trace() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("DROIDRT_DRM_TRACE").is_some())
+}
+
 pub fn ioctl(o: &Open, cmd: u64, arg: u64, io: &mut dyn Io) -> Result<i64, i64> {
     let r = dispatch(o, cmd, arg, io);
     let shown = match &r {
         Ok(v) => v.to_string(),
         Err(e) => format!("-{e}"),
     };
-    eprintln!("[drm] {} {} = {shown}", io.comm(), ioctl_name(cmd));
+    if trace() {
+        eprintln!("[drm] {} {} = {shown}", io.comm(), ioctl_name(cmd));
+    }
     r
 }
 
@@ -1070,6 +1081,9 @@ fn make_fence(dev: &Device, ctx: u32, ring: u8, io: &mut dyn Io, cloexec: bool) 
     let id = dev.alloc_fence();
     let point = SyncPoint::new(id);
     dev.inner.lock().unwrap().fences.insert(id, FenceRec { point: point.clone(), ctx, ring });
+    if trace() {
+        eprintln!("[drm] fence {id} ctx {ctx} ring {ring} created");
+    }
     if let Err(e) = dev.gpu.create_fence(Fence { flags: 0, fence_id: id, ctx_id: ctx, ring_idx: ring }) {
         dev.inner.lock().unwrap().fences.remove(&id);
         point.signal();
@@ -1573,12 +1587,29 @@ fn sync_merge(s: &SyncFile, arg: u64, io: &mut dyn Io) -> Result<i64, i64> {
     let mut b = io.read_mem(arg, 48)?;
     let fd2 = ru32(&b, 32) as i32;
     let other = io.sync_of(fd2 as i64)?;
-    let mut points = s.points.clone();
-    points.extend(other.points);
-    let fd = io.add_sync(SyncFile { points }, true)?;
+    let fd = io.add_sync(SyncFile { points: merged(&s.points, &other.points) }, true)?;
     wu32(&mut b, 36, fd as u32);
     store(io, arg, &b)?;
     Ok(0)
+}
+
+/// The points of a merged sync file. Like Linux, it stays bounded however
+/// often fences are merged (SurfaceFlinger merges every frame): duplicates
+/// go, signaled points add nothing while others are pending, and once all
+/// have signaled only the latest is kept, for the signal timestamp.
+fn merged(a: &[Arc<SyncPoint>], b: &[Arc<SyncPoint>]) -> Vec<Arc<SyncPoint>> {
+    let mut out: Vec<Arc<SyncPoint>> = Vec::new();
+    for p in a.iter().chain(b) {
+        if !p.ready() && !out.iter().any(|q| Arc::ptr_eq(p, q)) {
+            out.push(p.clone());
+        }
+    }
+    if out.is_empty()
+        && let Some(last) = a.iter().chain(b).max_by_key(|p| p.ns.load(Ordering::Relaxed))
+    {
+        out.push(last.clone());
+    }
+    out
 }
 
 fn sync_info(s: &SyncFile, arg: u64, io: &mut dyn Io) -> Result<i64, i64> {
@@ -1591,8 +1622,9 @@ fn sync_info(s: &SyncFile, arg: u64, io: &mut dyn Io) -> Result<i64, i64> {
         let mut raw = vec![0u8; s.points.len() * 80];
         for (i, p) in s.points.iter().enumerate() {
             let base = i * 80;
-            raw[base..base + 4].copy_from_slice(b"fence");
-            raw[base + 32..base + 32 + 8].copy_from_slice(b"virtio_g");
+            // struct sync_fence_info: obj_name[32], driver_name[32], status, flags, timestamp_ns
+            raw[base..base + 5].copy_from_slice(b"fence");
+            raw[base + 32..base + 32 + 10].copy_from_slice(b"virtio_gpu");
             let st: i32 = if p.ready() { 1 } else { 0 };
             wu32(&mut raw, base + 64, st as u32);
             wu64(&mut raw, base + 72, p.ns.load(Ordering::Relaxed));
@@ -1651,6 +1683,26 @@ fn link_new(fs: &dyn FileSystem, dir: &str, name: &str, target: &str) {
 
 #[cfg(test)]
 mod tests {
+    use super::{merged, SyncPoint};
+
+    #[test]
+    fn merging_sync_files_stays_bounded() {
+        let pending = SyncPoint::new(1);
+        let done = SyncPoint::new(2);
+        done.signal();
+        // Merging an accumulated fence with itself every frame must not grow.
+        let mut acc = vec![pending.clone(), done.clone()];
+        for _ in 0..64 {
+            acc = merged(&acc, &acc);
+        }
+        assert_eq!(acc.len(), 1);
+        assert!(std::sync::Arc::ptr_eq(&acc[0], &pending));
+        pending.signal();
+        let acc = merged(&acc, &[done.clone()]);
+        assert_eq!(acc.len(), 1, "all signaled: only the latest stays");
+        assert!(std::sync::Arc::ptr_eq(&acc[0], &pending));
+    }
+
     use super::*;
     use crate::hv::{CpuState, Hypervisor, KernelPage, PageTableRoot, Vcpu};
 
@@ -1711,6 +1763,25 @@ mod tests {
 
     fn ioc(dir: u32, nr: u32, size: u32) -> u64 {
         ((dir as u64) << 30) | ((size as u64) << 16) | ((b'd' as u64) << 8) | nr as u64
+    }
+
+    #[test]
+    fn sync_file_info_like_libsync() {
+        let done = SyncPoint::new(7);
+        done.signal();
+        let s = SyncFile { points: vec![done, SyncPoint::new(8)] };
+        let mut m = Mem { buf: vec![0u8; 4096], syncs: Vec::new(), dmas: Vec::new() };
+        let info = ((3u64) << 30) | (56 << 16) | ((b'>' as u64) << 8) | 4;
+        // First call: how many fences.
+        sync_ioctl(&s, info, 0, &mut m).unwrap();
+        assert_eq!((ru32(&m.buf, 32), ru32(&m.buf, 40)), (0, 2), "pending, two fences");
+        // Second call: the fence array, 80 bytes each.
+        wu64(&mut m.buf, 48, 0x100);
+        sync_ioctl(&s, info, 0, &mut m).unwrap();
+        assert_eq!(&m.buf[0x100..0x105], b"fence");
+        assert_eq!(&m.buf[0x100 + 32..0x100 + 42], b"virtio_gpu");
+        assert_eq!(ru32(&m.buf, 0x100 + 64), 1, "first fence signaled");
+        assert_eq!(ru32(&m.buf, 0x150 + 64), 0, "second pending");
     }
 
     #[test]

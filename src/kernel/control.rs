@@ -555,8 +555,7 @@ impl Kernel {
         if !Arc::ptr_eq(&target, &t.proc) {
             let me = self.creds(t);
             let c = target.creds.lock().unwrap().clone();
-            let same = [c.uid, c.euid, c.suid].contains(&me.uid) && [c.gid, c.egid, c.sgid].contains(&me.gid);
-            if !me.capable(CAP_SYS_PTRACE) && !(same && target.attrs.lock().unwrap().dumpable == 1) {
+            if !me.capable(CAP_SYS_PTRACE) && !(me.same_real_ids(&c) && target.attrs.lock().unwrap().dumpable == 1) {
                 return Err(EPERM);
             }
         }

@@ -126,6 +126,18 @@ impl Creds {
     pub fn may_kill(&self, target: &Creds) -> bool {
         [self.euid, self.uid].iter().any(|&u| u == target.suid || u == target.uid) || self.capable(CAP_KILL)
     }
+
+    /// __ptrace_may_access with PTRACE_MODE_REALCREDS: our real uid and gid
+    /// equal all three of the target's user ids and all three of its group ids.
+    pub fn same_real_ids(&self, target: &Creds) -> bool {
+        [target.uid, target.euid, target.suid].iter().all(|&u| u == self.uid) && [target.gid, target.egid, target.sgid].iter().all(|&g| g == self.gid)
+    }
+
+    /// cap_safe_nice: the target's permitted set must fit inside ours unless
+    /// we hold CAP_SYS_NICE. setpriority, ioprio_set and the schedulers share it.
+    pub fn safe_nice(&self, target: &Creds) -> bool {
+        target.prm & !self.prm == 0 || self.capable(CAP_SYS_NICE)
+    }
 }
 
 fn cap_valid(cap: u64) -> bool {
@@ -210,17 +222,19 @@ impl Kernel {
         t.proc.creds.lock().unwrap().clone()
     }
 
-    /// commit_creds: losing or changing identity makes the process
-    /// non-dumpable and clears the caller's parent-death signal.
+    /// commit_creds: gaining caps or changing identity makes the process
+    /// non-dumpable and clears the caller's parent-death signal. The
+    /// dumpable bit is stored before the new ids are published, so a
+    /// process_vm reader that observes the new ids also observes it
+    /// (a reader samples creds, then dumpable).
     fn commit(&self, t: &Thread, new: Creds) {
         let mut c = t.proc.creds.lock().unwrap();
         let changed = c.euid != new.euid || c.egid != new.egid || c.fsuid != new.fsuid || c.fsgid != new.fsgid || new.prm & !c.prm != 0;
-        *c = new;
-        drop(c);
         if changed {
             t.proc.attrs.lock().unwrap().dumpable = 0;
             t.attrs.lock().unwrap().pdeathsig = 0;
         }
+        *c = new;
     }
 
     fn set_id(&self, t: &Thread, user: bool, v: u32) -> Result<i64, i64> {
@@ -501,5 +515,14 @@ mod tests {
         assert!(a.may_kill(&a) && !a.may_kill(&b) && Creds::root().may_kill(&b));
         assert!(Creds { euid: 1001, ..a.clone() }.may_kill(&b));
         assert!(!a.may_kill(&Creds { euid: 1000, ..b.clone() }));
+    }
+
+    #[test]
+    fn ptrace_and_nice_follow_the_whole_set() {
+        let attacker = user(1000);
+        let mixed = Creds { euid: 1000, suid: 0, ..user(0) };
+        assert!(!attacker.same_real_ids(&mixed) && attacker.same_real_ids(&attacker));
+        let strong = Creds { prm: CAP_ALL, ..user(1000) };
+        assert!(!attacker.safe_nice(&strong) && strong.safe_nice(&attacker) && Creds::root().safe_nice(&strong));
     }
 }

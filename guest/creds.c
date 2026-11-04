@@ -714,6 +714,57 @@ static void process_tree(void) {
     check(reaped == 256, "pid 1 keeps at most 256 adopted zombies");
 }
 
+// Linux ptrace_may_access (REALCREDS) requires the caller's real uid and gid
+// to equal every one of the target's real, effective and saved ids. Matching
+// only the effective uid, while dumpable, must not allow process_vm.
+static void cross_cred(void) {
+    int p[2], q[2];
+    sys(NR_pipe2, p, 0);
+    sys(NR_pipe2, q, 0);
+    i64 mid = fork_();
+    if (mid == 0) {
+        failures = 0;
+        i64 v = fork_();
+        if (v == 0) {
+            sys(NR_setresuid, 0, 1000, 0);
+            prctl(PR_SET_DUMPABLE, 1, 0, 0, 0);
+            memcpy(vm_buf, "secret!", 8);
+            sys(NR_write, p[1], "v", 1);
+            char d;
+            sys(NR_read, q[0], &d, 1);
+            exit_(0);
+        }
+        char c;
+        sys(NR_read, p[0], &c, 1);
+        sys(NR_setresuid, 1000, 1000, 1000);
+        char got[8] = { 0 };
+        struct iovec lr = { got, 7 }, rr = { vm_buf, 7 };
+        check(sys(NR_process_vm_readv, v, &lr, 1, &rr, 1, 0) == -EPERM, "process_vm: one matching uid is not enough");
+        sys(NR_write, q[1], "d", 1);
+        wait_status(v);
+        i64 peer = fork_();
+        if (peer == 0) {
+            prctl(PR_SET_DUMPABLE, 1, 0, 0, 0);
+            memcpy(vm_buf, "peer-ok", 8);
+            sys(NR_write, p[1], "p", 1);
+            sys(NR_read, q[0], &c, 1);
+            exit_(0);
+        }
+        sys(NR_read, p[0], &c, 1);
+        char got2[8] = { 0 };
+        struct iovec l2 = { got2, 7 }, r2 = { vm_buf, 7 };
+        check(sys(NR_process_vm_readv, peer, &l2, 1, &r2, 1, 0) == 7 && seq(got2, "peer-ok", 7), "process_vm: equal ids and dumpable");
+        sys(NR_write, q[1], "d", 1);
+        wait_status(peer);
+        exit_(failures);
+    }
+    child_passed(mid);
+    sys(NR_close, p[0]);
+    sys(NR_close, p[1]);
+    sys(NR_close, q[0]);
+    sys(NR_close, q[1]);
+}
+
 static void vm_access(void) {
     char src[32] = "process_vm_readv works", dst[32] = { 0 };
     struct iovec l[2] = { { dst, 10 }, { dst + 10, 12 } }, r = { src, 22 };
@@ -751,6 +802,7 @@ int cmain(void) {
     groups_and_sessions();
     process_tree();
     vm_access();
+    cross_cred();
     check(sys(NR_reboot, MAGIC1, MAGIC2, 0 /* CAD_OFF */, 0) == 0, "reboot CAD_OFF");
     check(sys(NR_reboot, 0x12345678, MAGIC2, 0x4321fedc, 0) == -EINVAL && sys(NR_reboot, MAGIC1, MAGIC2, 0x11111111, 0) == -EINVAL, "reboot: bad magic or command: EINVAL");
     if (failures) {

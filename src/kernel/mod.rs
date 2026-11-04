@@ -618,9 +618,9 @@ impl Kernel {
         // Closing files first lets pipe readers see EOF.
         drop(std::mem::replace(&mut *proc.files.lock().unwrap(), FdTable::empty()));
         drop(proc.mm.lock().unwrap().take());
-        *proc.status.lock().unwrap() = Some(status);
-
+        // Children move before we become a zombie: whoever reaps us finds them in place.
         self.reparent_children(proc);
+        *proc.status.lock().unwrap() = Some(status);
         if proc.pid == self.root_pid.load(Ordering::Relaxed) {
             let (lock, cv) = &self.exit;
             lock.lock().unwrap().get_or_insert(status); // a reboot() may have decided already

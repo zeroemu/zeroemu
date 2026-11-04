@@ -10,7 +10,7 @@ use super::{Blob, Box3, Fence, GpuBackend, Iov, Resource3d, ResourceInfo, Transf
 use std::ffi::{CStr, CString, c_void};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 
 // This build's get_cap_set wrapper discards max_ver and only writes max_size
 // (VirtioGpuFrontend::getCapset). create_blob's wrapper ignores its iov and
@@ -179,6 +179,55 @@ struct Api {
     teardown: FnTeardown,
 }
 
+/// The renderer's one thread, like a VMM's virtio-gpu worker. The renderer
+/// makes its GL contexts current on whichever thread calls it, and ANGLE
+/// crashes when a context moves between threads. Calls must not come from
+/// the many host threads that run guest threads.
+struct Worker {
+    tx: Mutex<mpsc::Sender<Job>>,
+    id: std::thread::ThreadId,
+}
+
+type Job = Box<dyn FnOnce() + Send>;
+
+impl Worker {
+    fn spawn() -> Worker {
+        let (tx, rx) = mpsc::channel::<Job>();
+        let t = std::thread::Builder::new()
+            .name("virtio-gpu".into())
+            .spawn(move || {
+                for job in rx {
+                    job();
+                }
+            })
+            .expect("spawn the virtio-gpu thread");
+        Worker { tx: Mutex::new(tx), id: t.thread().id() }
+    }
+
+    /// Runs `f` on the worker and waits for it.
+    fn run<R>(&self, f: impl FnOnce() -> R) -> R {
+        if std::thread::current().id() == self.id {
+            return f();
+        }
+        let mut out = None;
+        let slot = &mut out;
+        let (done, wait) = mpsc::channel::<()>();
+        // The job owns the sender: the caller may return (and its frame go)
+        // while send() is still running on the worker.
+        let job: Box<dyn FnOnce() + '_> = Box::new(move || {
+            *slot = Some(f());
+            let _ = done.send(());
+        });
+        // SAFETY: this returns only after the job has run (or was dropped
+        // unrun), so what it borrows outlives it.
+        let job: Job = unsafe { std::mem::transmute::<Box<dyn FnOnce() + '_>, Job>(job) };
+        if self.tx.lock().unwrap_or_else(|p| p.into_inner()).send(job).is_ok() {
+            let _ = wait.recv();
+        }
+        out.expect("the virtio-gpu thread stopped")
+    }
+}
+
 struct FenceSlot {
     handler: Option<Arc<dyn Fn(Fence) + Send + Sync>>,
     pending: Vec<Fence>,
@@ -186,6 +235,7 @@ struct FenceSlot {
 
 pub struct Gfxstream {
     api: Api,
+    worker: Worker,
     live: Mutex<bool>,
     fences: Mutex<FenceSlot>,
     /// The last scanout read back for the window.
@@ -325,6 +375,7 @@ pub fn open(width: u32, height: u32) -> Result<Arc<dyn GpuBackend>, String> {
     let api = load_api(lib)?;
     let gfx = Arc::new(Gfxstream {
         api,
+        worker: Worker::spawn(),
         live: Mutex::new(false),
         fences: Mutex::new(FenceSlot { handler: None, pending: Vec::new() }),
         frame: Mutex::new(Vec::new()),
@@ -348,6 +399,13 @@ impl Gfxstream {
         {
             unsafe { std::env::set_var("ANDROID_EGL_ON_EGL", "1") };
         }
+        // ANGLE's default here is its OpenGL backend, which shares one CGL
+        // context across threads: guest draws then randomly miss frames. Its
+        // Metal backend keeps each context to itself.
+        #[cfg(target_os = "macos")]
+        if std::env::var_os("ANGLE_DEFAULT_PLATFORM").is_none() {
+            unsafe { std::env::set_var("ANGLE_DEFAULT_PLATFORM", "metal") };
+        }
         // The guest's gralloc is minigbm, as in the Android Emulator's
         // virtio-gpu mode; DROIDRT_GPU_FEATURES overrides ("Name:enabled,...").
         let features = std::ffi::CString::new(std::env::var("DROIDRT_GPU_FEATURES").unwrap_or_else(|_| "Minigbm:enabled".into())).unwrap_or_default();
@@ -363,7 +421,7 @@ impl Gfxstream {
             Param { key: PARAM_DEBUG_CALLBACK, value: on_debug as *const () as usize as u64 },
             Param { key: PARAM_RENDERER_FEATURES, value: features.as_ptr() as usize as u64 },
         ];
-        let r = unsafe { (self.api.init)(params.as_mut_ptr(), params.len() as u64) };
+        let r = self.worker.run(|| unsafe { (self.api.init)(params.as_mut_ptr(), params.len() as u64) });
         if r != 0 {
             return Err(format!("stream_renderer_init returned {r}"));
         }
@@ -387,7 +445,7 @@ impl Drop for Gfxstream {
             was
         };
         if live {
-            unsafe { (self.api.teardown)() };
+            self.worker.run(|| unsafe { (self.api.teardown)() });
         }
     }
 }
@@ -396,24 +454,24 @@ impl GpuBackend for Gfxstream {
     fn capset_info(&self, id: u32) -> Option<(u32, u32)> {
         let mut ver = 0u32;
         let mut size = 0u32;
-        unsafe { (self.api.get_cap_set)(id, &mut ver, &mut size) };
+        self.worker.run(|| unsafe { (self.api.get_cap_set)(id, &mut ver, &mut size) });
         if size == 0 { None } else { Some((ver, size)) }
     }
 
     fn capset(&self, id: u32, version: u32) -> Vec<u8> {
         let Some((_, size)) = self.capset_info(id) else { return Vec::new() };
         let mut buf = vec![0u8; size as usize];
-        unsafe { (self.api.fill_caps)(id, version, buf.as_mut_ptr() as *mut c_void) };
+        self.worker.run(|| unsafe { (self.api.fill_caps)(id, version, buf.as_mut_ptr() as *mut c_void) });
         buf
     }
 
     fn context_create(&self, ctx_id: u32, name: &str, context_init: u32) -> Result<(), i64> {
         let c = CString::new(name).map_err(|_| 22i64)?;
-        ck(unsafe { (self.api.context_create)(ctx_id, c.as_bytes().len() as u32, c.as_ptr(), context_init) })
+        ck(self.worker.run(|| unsafe { (self.api.context_create)(ctx_id, c.as_bytes().len() as u32, c.as_ptr(), context_init) }))
     }
 
     fn context_destroy(&self, ctx_id: u32) {
-        unsafe { (self.api.context_destroy)(ctx_id) };
+        self.worker.run(|| unsafe { (self.api.context_destroy)(ctx_id) });
     }
 
     fn submit(&self, ctx_id: u32, cmds: &[u8], in_fences: &[u64]) -> Result<(), i64> {
@@ -424,12 +482,12 @@ impl GpuBackend for Gfxstream {
             num_in_fences: in_fences.len() as u32,
             in_fences: if in_fences.is_empty() { std::ptr::null() } else { in_fences.as_ptr() },
         };
-        ck(unsafe { (self.api.submit_cmd)(&mut cmd) })
+        ck(self.worker.run(|| unsafe { (self.api.submit_cmd)(&mut cmd) }))
     }
 
     fn create_fence(&self, fence: Fence) -> Result<(), i64> {
         let c = CFence { flags: fence.flags, fence_id: fence.fence_id, ctx_id: fence.ctx_id, ring_idx: fence.ring_idx };
-        ck(unsafe { (self.api.create_fence)(&c) })
+        ck(self.worker.run(|| unsafe { (self.api.create_fence)(&c) }))
     }
 
     fn resource_create(&self, args: &Resource3d, iov: Iov) -> Result<(), i64> {
@@ -448,36 +506,36 @@ impl GpuBackend for Gfxstream {
         };
         let buf = iov_buf(&iov);
         let ptr = if buf.is_empty() { std::ptr::null() } else { buf.as_ptr() };
-        ck(unsafe { (self.api.resource_create)(&c, ptr, buf.len() as u32) })
+        ck(self.worker.run(|| unsafe { (self.api.resource_create)(&c, ptr, buf.len() as u32) }))
     }
 
     fn resource_create_blob(&self, ctx_id: u32, handle: u32, blob: &Blob, iov: Iov) -> Result<(), i64> {
         let c = CBlob { blob_mem: blob.blob_mem, blob_flags: blob.blob_flags, blob_id: blob.blob_id, size: blob.size };
         let buf = iov_buf(&iov);
         let ptr = if buf.is_empty() { std::ptr::null() } else { buf.as_ptr() };
-        ck(unsafe { (self.api.create_blob)(ctx_id, handle, &c, ptr, buf.len() as u32, std::ptr::null()) })
+        ck(self.worker.run(|| unsafe { (self.api.create_blob)(ctx_id, handle, &c, ptr, buf.len() as u32, std::ptr::null()) }))
     }
 
     fn resource_unref(&self, handle: u32) {
-        unsafe { (self.api.resource_unref)(handle) };
+        self.worker.run(|| unsafe { (self.api.resource_unref)(handle) });
     }
 
     fn attach_iov(&self, handle: u32, iov: Iov) -> Result<(), i64> {
         let buf = iov_buf(&iov);
         let ptr = if buf.is_empty() { std::ptr::null() } else { buf.as_ptr() };
-        ck(unsafe { (self.api.attach_iov)(handle as i32, ptr, buf.len() as i32) })
+        ck(self.worker.run(|| unsafe { (self.api.attach_iov)(handle as i32, ptr, buf.len() as i32) }))
     }
 
     fn detach_iov(&self, handle: u32) {
-        unsafe { (self.api.detach_iov)(handle as i32) };
+        self.worker.run(|| unsafe { (self.api.detach_iov)(handle as i32) });
     }
 
     fn ctx_attach_resource(&self, ctx_id: u32, handle: u32) {
-        unsafe { (self.api.ctx_attach)(ctx_id as i32, handle as i32) };
+        self.worker.run(|| unsafe { (self.api.ctx_attach)(ctx_id as i32, handle as i32) });
     }
 
     fn ctx_detach_resource(&self, ctx_id: u32, handle: u32) {
-        unsafe { (self.api.ctx_detach)(ctx_id as i32, handle as i32) };
+        self.worker.run(|| unsafe { (self.api.ctx_detach)(ctx_id as i32, handle as i32) });
     }
 
     fn transfer_write(&self, handle: u32, t: &Transfer) -> Result<(), i64> {
@@ -500,7 +558,7 @@ impl GpuBackend for Gfxstream {
             stride: 0,
             drm_fourcc: 0,
         };
-        let r = unsafe { (self.api.get_info)(handle as i32, &mut info) };
+        let r = self.worker.run(|| unsafe { (self.api.get_info)(handle as i32, &mut info) });
         if r != 0 {
             return None;
         }
@@ -518,17 +576,17 @@ impl GpuBackend for Gfxstream {
     fn resource_map(&self, handle: u32) -> Result<(*mut u8, u64), i64> {
         let mut ptr = std::ptr::null_mut();
         let mut size = 0u64;
-        ck(unsafe { (self.api.resource_map)(handle, &mut ptr, &mut size) })?;
+        ck(self.worker.run(|| unsafe { (self.api.resource_map)(handle, &mut ptr, &mut size) }))?;
         Ok((ptr as *mut u8, size))
     }
 
     fn resource_unmap(&self, handle: u32) {
-        unsafe { (self.api.resource_unmap)(handle) };
+        self.worker.run(|| unsafe { (self.api.resource_unmap)(handle) });
     }
 
     fn map_info(&self, handle: u32) -> Option<u32> {
         let mut info = 0u32;
-        let r = unsafe { (self.api.map_info)(handle, &mut info) };
+        let r = self.worker.run(|| unsafe { (self.api.map_info)(handle, &mut info) });
         if r == 0 { Some(info) } else { None }
     }
 
@@ -545,7 +603,7 @@ impl GpuBackend for Gfxstream {
         buf.resize(stride as usize * h as usize, 0);
         let iov = Iovec { iov_base: buf.as_mut_ptr() as *mut c_void, iov_len: buf.len() };
         let b = CBox { x: 0, y: 0, z: 0, w, h, d: 1 };
-        if unsafe { (self.api.transfer_read)(handle, 0, 0, stride, 0, &b, 0, &iov, 1) } == 0 {
+        if self.worker.run(|| unsafe { (self.api.transfer_read)(handle, 0, 0, stride, 0, &b, 0, &iov, 1) }) == 0 {
             window::present(w, h, stride, info.drm_fourcc, &buf);
         }
     }
@@ -559,7 +617,7 @@ impl GpuBackend for Gfxstream {
         let mut buf = vec![0u8; w as usize * h as usize * 4];
         let iov = Iovec { iov_base: buf.as_mut_ptr() as *mut c_void, iov_len: buf.len() };
         let b = CBox { x: 0, y: 0, z: 0, w, h, d: 1 };
-        (unsafe { (self.api.transfer_read)(handle, 0, 0, w * 4, 0, &b, 0, &iov, 1) } == 0).then_some((w, h, buf))
+        (self.worker.run(|| unsafe { (self.api.transfer_read)(handle, 0, 0, w * 4, 0, &b, 0, &iov, 1) }) == 0).then_some((w, h, buf))
     }
 
     fn set_fence_handler(&self, handler: Arc<dyn Fn(Fence) + Send + Sync>) {
@@ -578,7 +636,7 @@ impl Gfxstream {
     fn xfer(&self, f: FnXfer, handle: u32, t: &Transfer) -> Result<(), i64> {
         // Null iov: the renderer uses the iovec attached to the resource.
         let b = c_box(&t.bx);
-        ck(unsafe { f(handle, t.ctx_id, t.level, t.stride, t.layer_stride, &b, t.offset, std::ptr::null(), 0) })
+        ck(self.worker.run(|| unsafe { f(handle, t.ctx_id, t.level, t.stride, t.layer_stride, &b, t.offset, std::ptr::null(), 0) }))
     }
 }
 

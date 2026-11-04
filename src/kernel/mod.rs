@@ -126,8 +126,8 @@ fn mount_tmpfs(vfs: &mut Vfs, phys: &Arc<PhysMem>) -> Arc<crate::tmpfs::Tmpfs> {
     vfs.mount("/tmp", Tmpfs::new(phys.clone(), 0o1777));
     vfs.mount("/mnt", Tmpfs::new(phys.clone(), 0o755));
     vfs.mount("/cache", Tmpfs::new(phys.clone(), 0o770));
-    // sysfs: what bionic's sysconf and friends read. No /sys/fs/selinux, so
-    // libselinux sees SELinux as disabled.
+    // sysfs: what bionic's sysconf and friends read. (selinuxfs is mounted
+    // over /sys/fs/selinux once the kernel exists: it reads the policy lazily.)
     let sys = Tmpfs::with_type(phys.clone(), 0o755, "sysfs");
     let n = std::thread::available_parallelism().map_or(1, |n| n.get()).min(64);
     for f in ["online", "possible", "present"] {
@@ -160,6 +160,7 @@ pub struct Process {
     exiting: Mutex<Option<i32>>,
     /// Process-directed pending signals.
     pending: Mutex<HashMap<u32, SigInfo>>,
+    /// SELinux context (and the one before the last execve).
     pub sec: selinux::ProcSec,
 }
 
@@ -174,6 +175,7 @@ pub struct Thread {
     altstack: Mutex<(u64, u64, i32)>,
     kick: Mutex<Option<Arc<dyn Kick>>>,
     dying: AtomicBool,
+    /// SELinux exec/fscreate/keycreate/sockcreate contexts.
     pub sec: selinux::ThreadSec,
 }
 

@@ -60,7 +60,9 @@ Known gaps:
 - Binder never drops references, so nodes are never released.
 - No inet or netlink sockets yet; Unix socket names live in a kernel table
   rather than as filesystem nodes.
-- SELinux is present but policy-less and permissive.
+- SELinux is permissive: selinuxfs, process and socket contexts, and exec
+  domain transitions follow the image's CIL policy, but no access is ever
+  denied, and files are not labelled yet (no xattrs).
 - Images older than Android 10 (no `super` partition) aren't supported.
 - APEX mount names come from file names (`com.android.tzdata6` should be
   `com.android.tzdata`); reading `apex_manifest.pb` lazily would fix it.
@@ -70,8 +72,9 @@ Known gaps:
 M3 so far adds the IPC Android's system services stand on: `eventfd`,
 `epoll`, `timerfd`, `signalfd`, Unix sockets with `SCM_RIGHTS`, tmpfs
 (`/dev`, `/data`, `/tmp`, …) with `MAP_SHARED` and `memfd`, `/proc`, `/sys`,
-a permissive selinuxfs, the property area and property service (as init
-provides them), a binder driver, and logd's sockets. Android's own
+a permissive selinuxfs built from the image's CIL policy, the property area
+and property service (as init provides them), a binder driver, and logd's
+sockets. Android's own
 `servicemanager` runs, and `service list` / `service check` talk to it over
 binder. Every process's liblog output is printed to stderr, and Android's
 `logcat` (dump, stream, `-c`, `-g`) reads it back from the kernel's buffer.

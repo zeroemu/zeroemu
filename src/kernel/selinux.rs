@@ -19,22 +19,28 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, Weak};
 
 /// Interned contexts; SID 0 means "none" (an unset exec/fscreate attribute).
-static SIDS: LazyLock<Mutex<(Vec<Arc<str>>, HashMap<Arc<str>, u32>)>> = LazyLock::new(Default::default);
+#[derive(Default)]
+struct Sids {
+    contexts: Vec<Arc<str>>,
+    ids: HashMap<Arc<str>, u32>,
+}
+
+static SIDS: LazyLock<Mutex<Sids>> = LazyLock::new(Default::default);
 
 pub fn sid(ctx: &str) -> u32 {
     let mut t = SIDS.lock().unwrap();
-    if let Some(&s) = t.1.get(ctx) {
+    if let Some(&s) = t.ids.get(ctx) {
         return s;
     }
     let s: Arc<str> = ctx.into();
-    t.0.push(s.clone());
-    let n = t.0.len() as u32;
-    t.1.insert(s, n);
+    t.contexts.push(s.clone());
+    let n = t.contexts.len() as u32;
+    t.ids.insert(s, n);
     n
 }
 
 pub fn context(sid: u32) -> Option<Arc<str>> {
-    SIDS.lock().unwrap().0.get((sid as usize).checked_sub(1)?).cloned()
+    SIDS.lock().unwrap().contexts.get((sid as usize).checked_sub(1)?).cloned()
 }
 
 /// /proc/<pid>/attr files: current and prev are per process here (Linux
@@ -42,6 +48,8 @@ pub fn context(sid: u32) -> Option<Arc<str>> {
 /// per thread.
 pub const ATTRS: [&str; 6] = ["current", "prev", "exec", "fscreate", "keycreate", "sockcreate"];
 const EXEC: usize = 2;
+const FSCREATE: usize = 3;
+const SOCKCREATE: usize = 5;
 
 /// A process's context, and the one it had before its last execve.
 pub struct ProcSec {
@@ -50,9 +58,6 @@ pub struct ProcSec {
 }
 
 impl ProcSec {
-    pub fn new(sid: u32) -> ProcSec {
-        ProcSec { current: AtomicU32::new(sid), prev: AtomicU32::new(sid) }
-    }
     pub fn current(&self) -> u32 {
         self.current.load(Ordering::Relaxed)
     }
@@ -91,14 +96,14 @@ pub fn file_context(_vfs: &Vfs, _node: &Node) -> String {
 
 /// The label a socket created by `t` now gets: its sockcreate context, or its own.
 pub fn socket_sid(t: &Thread) -> u32 {
-    match t.sec.get(5) {
+    match t.sec.get(SOCKCREATE) {
         0 => t.proc.sec.current(),
         s => s,
     }
 }
 
-/// SO_PEERSEC's answer for a peer labelled `sid`: the context, NUL-terminated.
-pub fn peer_context(sid: u32) -> Option<Vec<u8>> {
+/// A context as the kernel hands it out (SO_PEERSEC, /proc attr files): NUL-terminated.
+pub fn context_bytes(sid: u32) -> Option<Vec<u8>> {
     context(sid).map(|c| [c.as_bytes(), b"\0"].concat())
 }
 
@@ -109,7 +114,7 @@ pub fn attr(p: &Process, tid: i32, which: usize) -> Vec<u8> {
         1 => p.sec.prev.load(Ordering::Relaxed),
         _ => p.threads.lock().unwrap().iter().find(|t| t.tid == tid).map_or(0, |t| t.sec.get(which)),
     };
-    peer_context(sid).unwrap_or_default()
+    context_bytes(sid).unwrap_or_default()
 }
 
 /// The kernel-side SELinux state; also the selinuxfs mounted at /sys/fs/selinux.
@@ -124,8 +129,9 @@ pub struct Selinux {
     seq: Mutex<(u32, u32)>,
     /// Booleans changed since the policy loaded: name -> (current, pending).
     bools: Mutex<HashMap<String, (bool, bool)>>,
-    /// The first process's context: init's in --boot mode, else a shell's.
-    pub initial: u32,
+    /// The first process's (current, prev): init's in --boot mode (it came
+    /// from the kernel domain by first-stage init's exec), else a shell's.
+    initial: (u32, u32),
 }
 
 // selinuxfs's fixed nodes as (name, parent directory, mode); inode = index + 2.
@@ -281,7 +287,7 @@ impl Selinux {
             status: MemFile::new(phys),
             seq: Mutex::new((0, 0)),
             bools: Mutex::new(HashMap::new()),
-            initial: sid(if boot { "u:r:init:s0" } else { "u:r:shell:s0" }),
+            initial: if boot { (sid("u:r:init:s0"), sid("u:r:kernel:s0")) } else { (sid("u:r:shell:s0"), sid("u:r:shell:s0")) },
         };
         se.update_status(|_| {});
         Arc::new(se)
@@ -311,14 +317,8 @@ impl Selinux {
         let _ = self.status.write_at(0, &fields.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>());
     }
 
-    /// The first process's contexts: init came from the kernel domain (by
-    /// first-stage init's exec); a shell's previous context is its own.
     pub fn initial_sec(&self) -> ProcSec {
-        let sec = ProcSec::new(self.initial);
-        if context(self.initial).as_deref() == Some("u:r:init:s0") {
-            sec.prev.store(sid("u:r:kernel:s0"), Ordering::Relaxed);
-        }
-        sec
+        ProcSec { current: AtomicU32::new(self.initial.0), prev: AtomicU32::new(self.initial.1) }
     }
 
     pub fn canonical(&self, ctx: &str) -> Result<String, i64> {
@@ -335,7 +335,7 @@ impl Selinux {
     /// ("file", "dir", "sock_file", …), else the directory's type.
     #[allow(dead_code)] // for tmpfs labels once the VFS has xattrs
     pub fn new_file_context(&self, t: &Thread, dir: &str, class: &str, name: &str) -> String {
-        if let Some(c) = context(t.sec.get(3)) {
+        if let Some(c) = context(t.sec.get(FSCREATE)) {
             return c.to_string();
         }
         let p = self.policy();

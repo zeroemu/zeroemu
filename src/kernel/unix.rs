@@ -660,7 +660,7 @@ impl Kernel {
                 if a[2] == SO_PEERSEC {
                     // The peer's label from connect/socketpair time; ERANGE says how much room it needs.
                     let sid = if sock.ty == SOCK_DGRAM { 0 } else { sock.st.lock().unwrap().peer_cred.sid };
-                    let ctx = super::selinux::peer_context(sid).ok_or(ENOPROTOOPT)?;
+                    let ctx = super::selinux::context_bytes(sid).ok_or(ENOPROTOOPT)?;
                     let mut mm = t.proc.mm();
                     let cap = mm.read_u32(a[4])? as usize;
                     mm.write_u32(a[4], ctx.len() as u32)?;

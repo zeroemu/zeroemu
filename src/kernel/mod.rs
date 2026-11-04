@@ -9,6 +9,8 @@
 
 mod binder;
 mod block;
+mod control;
+mod creds;
 mod epoll;
 mod files;
 mod futex;
@@ -18,6 +20,7 @@ mod misc;
 mod process;
 mod procfs;
 mod properties;
+mod sched;
 mod signal;
 mod specialfd;
 mod unix;
@@ -167,6 +170,9 @@ pub struct Process {
     exiting: Mutex<Option<i32>>,
     /// Process-directed pending signals.
     pending: Mutex<HashMap<u32, SigInfo>>,
+    pub creds: Mutex<creds::Creds>,
+    /// Process group, session, limits, and other process-wide control state.
+    pub attrs: Mutex<control::ProcAttrs>,
 }
 
 pub struct Thread {
@@ -180,6 +186,8 @@ pub struct Thread {
     altstack: Mutex<(u64, u64, i32)>,
     kick: Mutex<Option<Arc<dyn Kick>>>,
     dying: AtomicBool,
+    /// comm, prctl state, scheduling attributes.
+    pub attrs: Mutex<control::ThreadAttrs>,
 }
 
 /// Locked access to a live process's address space.
@@ -215,6 +223,7 @@ impl Thread {
             altstack: Mutex::new((0, 0, signal::SS_DISABLE)),
             kick: Mutex::new(None),
             dying: AtomicBool::new(false),
+            attrs: Mutex::new(control::ThreadAttrs::default()),
         })
     }
 
@@ -327,10 +336,13 @@ impl Kernel {
             status: Mutex::new(None),
             exiting: Mutex::new(None),
             pending: Mutex::new(HashMap::new()),
+            creds: Mutex::new(creds::Creds::root()),
+            attrs: Mutex::new(control::ProcAttrs::first(pid)),
         });
         self.root_pid.store(pid, Ordering::Relaxed);
         self.procs.lock().unwrap().insert(pid, proc.clone());
         let thread = Thread::new(pid, proc.clone(), 0);
+        thread.attrs.lock().unwrap().comm = control::comm_of(argv.first().map_or("", String::as_str));
         proc.threads.lock().unwrap().push(thread.clone());
         self.spawn(thread, state).map_err(|e| format!("cannot start the first thread: errno {e}"))
     }
@@ -477,7 +489,8 @@ impl Kernel {
                 self.exit_group(&t.proc, (a[0] as i32 & 0xff) << 8, Some(t.tid));
                 return Ret::ExitThread;
             }
-            wait4 => self.sys_wait4(t, int(a[0]) as i32, a[1], a[2]),
+            wait4 => self.sys_wait4(t, int(a[0]) as i32, a[1], a[2], a[3]),
+            waitid => self.sys_waitid(t, a[0], int(a[1]) as i32, a[2], a[3], a[4]),
             kill => self.sys_kill(int(a[0]) as i32, a[1] as u32, t),
             tgkill => self.sys_tgkill(int(a[0]) as i32, int(a[1]) as i32, a[2] as u32, t),
             tkill => self.sys_tgkill(-1, int(a[0]) as i32, a[1] as u32, t),
@@ -490,8 +503,11 @@ impl Kernel {
                 t.clear_child_tid.store(a[0], Ordering::Relaxed);
                 t.tid as i64
             }
-            getpgid | getsid => t.proc.pid as i64,
-            setpgid | setsid => 0,
+            // credentials, capabilities, prctl, limits, scheduling, process groups
+            n if creds::handles(n) => match self.creds_syscall(n, t, a) {
+                Ok(v) => v,
+                Err(e) => -e,
+            },
 
             // signals
             rt_sigaction => self.sys_rt_sigaction(t, a[0] as u32, a[1], a[2]),
@@ -575,6 +591,7 @@ impl Kernel {
             threads.retain(|x| x.tid != t.tid);
             threads.is_empty()
         };
+        self.parent_thread_gone(t);
         if last {
             let status = proc.exiting.lock().unwrap().unwrap_or(code);
             self.process_exit(proc, status);
@@ -603,32 +620,15 @@ impl Kernel {
         drop(proc.mm.lock().unwrap().take());
         *proc.status.lock().unwrap() = Some(status);
 
-        let root = self.root_pid.load(Ordering::Relaxed);
-        let orphans = std::mem::take(&mut *proc.children.lock().unwrap());
-        if let Some(r) = self.process(root).filter(|r| r.pid != proc.pid) {
-            for c in &orphans {
-                if let Some(child) = self.process(*c) {
-                    child.ppid.store(root, Ordering::Relaxed);
-                }
-            }
-            r.children.lock().unwrap().extend(orphans);
-            r.child_cv.notify_all();
-        }
-
-        if proc.pid == root {
+        self.reparent_children(proc);
+        if proc.pid == self.root_pid.load(Ordering::Relaxed) {
             let (lock, cv) = &self.exit;
-            *lock.lock().unwrap() = Some(status);
+            lock.lock().unwrap().get_or_insert(status); // a reboot() may have decided already
             cv.notify_all();
             return;
         }
-        let parent = self.process(proc.ppid.load(Ordering::Relaxed));
-        if let Some(parent) = parent {
-            {
-                let _children = parent.children.lock().unwrap();
-                parent.child_cv.notify_all();
-            }
-            let (code, value) = if status & 0x7f == 0 { (1, (status >> 8) & 0xff) } else { (2, status & 0x7f) };
-            self.send_process_signal(&parent, signal::SIGCHLD, SigInfo::child(code, proc.pid, value));
+        if let Some(parent) = self.process(proc.ppid.load(Ordering::Relaxed)) {
+            self.notify_parent(&parent, proc, status);
         }
     }
 }

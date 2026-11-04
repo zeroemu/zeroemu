@@ -16,6 +16,7 @@ pub const SIGKILL: u32 = 9;
 pub const SIGSEGV: u32 = 11;
 pub const SIGPIPE: u32 = 13;
 pub const SIGCHLD: u32 = 17;
+pub const SIGCONT: u32 = 18;
 pub const SIGSTOP: u32 = 19;
 pub const SS_ONSTACK: i32 = 1;
 
@@ -71,6 +72,12 @@ impl Actions {
     pub fn get(&self, sig: u32) -> SigAction {
         self.0[sig as usize]
     }
+    /// (SIGCHLD is SIG_IGN, SA_NOCLDWAIT is set): either way children are
+    /// reaped as they exit instead of becoming zombies.
+    pub fn child_ignore(&self) -> (bool, bool) {
+        let a = self.get(SIGCHLD);
+        (a.handler == SIG_IGN, a.flags & SA_NOCLDWAIT != 0)
+    }
     /// execve keeps ignored signals ignored and resets handlers to default.
     pub fn reset_on_exec(&mut self) {
         for a in self.0.iter_mut() {
@@ -109,11 +116,16 @@ impl SigInfo {
         b[8..12].copy_from_slice(&code.to_le_bytes());
         SigInfo(b)
     }
-    /// Sent by kill/tgkill (SI_USER) from `pid`, uid 0.
+    /// Sent by kill/tgkill (SI_USER) from `pid`, uid 0 unless `with_uid`.
     pub fn user(sig: u32, pid: i32) -> SigInfo {
         let mut s = SigInfo::base(sig, 0);
         s.0[16..20].copy_from_slice(&pid.to_le_bytes());
         s
+    }
+    /// Sets si_uid (the sender's, or for SIGCHLD the child's, real uid).
+    pub fn with_uid(mut self, uid: u32) -> SigInfo {
+        self.0[20..24].copy_from_slice(&uid.to_le_bytes());
+        self
     }
     /// SIGCHLD: `code` is CLD_EXITED (1) or CLD_KILLED (2).
     pub fn child(code: i32, pid: i32, status: i32) -> SigInfo {
@@ -371,9 +383,6 @@ impl Kernel {
                 for th in t.proc.threads.lock().unwrap().iter() {
                     th.pending.lock().unwrap().remove(&sig);
                 }
-            }
-            if sig == SIGCHLD && (w(0) == SIG_IGN || w(1) & SA_NOCLDWAIT != 0) && self.strace {
-                eprintln!("[droidrt] note: SIGCHLD auto-reaping is not implemented");
             }
         }
         0

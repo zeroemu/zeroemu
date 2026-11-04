@@ -133,19 +133,28 @@ struct Entry {
     cloexec: bool,
 }
 
+/// RLIMIT_NOFILE's initial soft limit.
+pub const NOFILE_DEFAULT: usize = 1024;
+
 #[derive(Clone)]
 pub struct FdTable {
     fds: Vec<Option<Entry>>,
+    /// The process's RLIMIT_NOFILE soft limit: fds must stay below it.
+    limit: usize,
 }
 
 impl FdTable {
     pub fn stdio() -> FdTable {
         let e = |k| Some(Entry { file: File::new(k, 0), cloexec: false });
-        FdTable { fds: vec![e(Kind::Stdin), e(Kind::Stdout), e(Kind::Stderr)] }
+        FdTable { fds: vec![e(Kind::Stdin), e(Kind::Stdout), e(Kind::Stderr)], limit: NOFILE_DEFAULT }
     }
 
     pub fn empty() -> FdTable {
-        FdTable { fds: Vec::new() }
+        FdTable { fds: Vec::new(), limit: NOFILE_DEFAULT }
+    }
+
+    pub(super) fn set_limit(&mut self, limit: usize) {
+        self.limit = limit;
     }
 
     pub(super) fn get(&self, fd: i64) -> Result<Arc<File>, i64> {
@@ -158,7 +167,7 @@ impl FdTable {
 
     pub(super) fn alloc(&mut self, file: Arc<File>, cloexec: bool, min: usize) -> Result<i64, i64> {
         let slot = (min..).find(|&i| self.fds.get(i).is_none_or(|s| s.is_none())).unwrap();
-        if slot >= 1024 {
+        if slot >= self.limit {
             return Err(EMFILE);
         }
         if self.fds.len() <= slot {
@@ -450,7 +459,7 @@ impl Kernel {
                 if old == new {
                     return if no == dup3 { Err(EINVAL) } else { Ok(new) };
                 }
-                if !(0..1024).contains(&new) {
+                if !(0..files.limit as i64).contains(&new) {
                     return Err(EBADF);
                 }
                 files.put(new as usize, f, flags & O_CLOEXEC != 0);

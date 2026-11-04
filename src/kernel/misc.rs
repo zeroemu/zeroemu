@@ -1,17 +1,13 @@
-//! Time, identity, limits, scheduling, and other small syscalls.
+//! Time, system information, affinity, and other small syscalls.
 
 use super::{Kernel, POLL, Thread};
 use crate::arch::{Arch, Sysno};
 use crate::errno::*;
 use crate::hv::Vcpu;
-use crate::mm::STACK_SIZE;
 use crate::phys;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const ARCH_SET_FS: u64 = 0x1002;
-const RLIMIT_STACK: u64 = 3;
-const RLIMIT_NOFILE: u64 = 7;
-const RLIM_INFINITY: u64 = u64::MAX;
 
 impl Kernel {
     pub(super) fn misc_syscall(&self, no: Sysno, t: &Thread, vcpu: &mut dyn Vcpu, a: [u64; 6]) -> Result<i64, i64> {
@@ -23,7 +19,8 @@ impl Kernel {
                     Arch::X86_64 => "x86_64",
                 };
                 let mut out = [0u8; 65 * 6];
-                for (i, f) in ["Linux", "localhost", "6.6.0-droidrt", "#1 SMP PREEMPT droidrt", machine, "(none)"].iter().enumerate() {
+                let (host, domain) = (super::control::hostname(), super::control::domainname());
+                for (i, f) in ["Linux", &host, "6.6.0-droidrt", "#1 SMP PREEMPT droidrt", machine, &domain].iter().enumerate() {
                     out[i * 65..i * 65 + f.len()].copy_from_slice(f.as_bytes());
                 }
                 t.proc.mm().write(a[0], &out)?;
@@ -83,11 +80,7 @@ impl Kernel {
                 t.proc.mm().write(a[0], &buf)?;
                 Ok(buf.len() as i64)
             }
-            getuid | geteuid | getgid | getegid => Ok(0),
-            getgroups => Ok(0), // no supplementary groups
-            prctl | sched_yield | sched_setaffinity => Ok(0),
-            sched_getscheduler => Ok(0), // SCHED_OTHER
-            sched_getparam => t.proc.mm().write_u32(a[1], 0).map(|_| 0),
+            sched_yield | sched_setaffinity => Ok(0),
             sched_getaffinity => {
                 // One CPU per vCPU slot would be truthful; report the host's
                 // core count so thread pools size themselves sensibly.
@@ -99,20 +92,6 @@ impl Kernel {
                 let len = a[1].min(8) as usize;
                 t.proc.mm().write(a[2], &mask[..len])?;
                 Ok(len as i64)
-            }
-            prlimit64 => {
-                if a[3] != 0 {
-                    let cur = match a[1] {
-                        RLIMIT_STACK => STACK_SIZE,
-                        RLIMIT_NOFILE => 1024,
-                        _ => RLIM_INFINITY,
-                    };
-                    let mut b = [0u8; 16];
-                    b[..8].copy_from_slice(&cur.to_le_bytes());
-                    b[8..].copy_from_slice(&(if a[1] == RLIMIT_NOFILE { 1024 } else { RLIM_INFINITY }).to_le_bytes());
-                    t.proc.mm().write(a[3], &b)?;
-                }
-                Ok(0)
             }
             getrusage => t.proc.mm().write(a[1], &[0u8; 144]).map(|_| 0),
             sysinfo => {

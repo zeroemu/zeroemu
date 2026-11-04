@@ -191,7 +191,7 @@ impl ProcFs {
             K::SysRandom => d(&[("boot_id", K::BootId), ("uuid", K::Uuid), ("entropy_avail", K::Entropy)]),
             K::Osrelease => text("6.6.0-droidrt\n".into()),
             K::Ostype => text("Linux\n".into()),
-            K::Hostname => text("localhost\n".into()),
+            K::Hostname => text(format!("{}\n", super::control::hostname())),
             K::PidMax => text("32768\n".into()),
             K::BootId => text(format!("{}\n", self.boot_id)),
             K::Uuid => {
@@ -223,7 +223,7 @@ impl ProcFs {
                 ])
             }
             K::PCmdline => Ok(Content::File(self.proc(pid)?.cmdline.lock().unwrap().clone())),
-            K::PComm => text(format!("{}\n", comm(&*self.proc(pid)?))),
+            K::PComm => text(format!("{}\n", comm(&*self.proc(pid)?, extra as i32))),
             K::PExe => Ok(Content::Link(self.proc(pid)?.exe.lock().unwrap().clone())),
             K::PCwd => Ok(Content::Link(self.proc(pid)?.cwd.lock().unwrap().clone())),
             K::PFd => {
@@ -262,18 +262,35 @@ impl ProcFs {
                 let threads = p.threads.lock().unwrap().len().max(1);
                 let (virt, rss) = p.mm.lock().unwrap().as_ref().map_or((0, 0), |m| m.usage());
                 let ppid = p.ppid.load(Ordering::Relaxed);
-                let name = comm(&p);
+                let name = comm(&p, extra as i32);
+                let c = p.creds.lock().unwrap().clone();
+                let (pgid, sid) = {
+                    let a = p.attrs.lock().unwrap();
+                    (a.pgid, a.sid)
+                };
+                let ta = thread_of(&p, extra as i32).map(|t| t.attrs.lock().unwrap().clone()).unwrap_or_default();
                 match k {
-                    K::PStatus => text(format!(
-                        "Name:\t{name}\nUmask:\t0022\nState:\tR (running)\nTgid:\t{pid}\nNgid:\t0\nPid:\t{pid}\nPPid:\t{ppid}\nTracerPid:\t0\nUid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\nFDSize:\t64\nGroups:\t\nVmPeak:\t{} kB\nVmSize:\t{} kB\nVmRSS:\t{} kB\nThreads:\t{threads}\nSigQ:\t0/0\nSigPnd:\t0000000000000000\nShdPnd:\t0000000000000000\nCapInh:\t0000000000000000\nCapPrm:\t000001ffffffffff\nCapEff:\t000001ffffffffff\nCapBnd:\t000001ffffffffff\nSeccomp:\t0\nCpus_allowed_list:\t0-{}\n",
-                        virt / 1024,
-                        virt / 1024,
-                        rss / 1024,
-                        cpus() - 1
-                    )),
+                    K::PStatus => {
+                        let groups: Vec<String> = c.groups.iter().map(|g| g.to_string()).collect();
+                        text(format!(
+                            "Name:\t{name}\nUmask:\t0022\nState:\tR (running)\nTgid:\t{pid}\nNgid:\t0\nPid:\t{pid}\nPPid:\t{ppid}\nTracerPid:\t0\nUid:\t{}\t{}\t{}\t{}\nGid:\t{}\t{}\t{}\t{}\nFDSize:\t64\nGroups:\t{}\nVmPeak:\t{} kB\nVmSize:\t{} kB\nVmRSS:\t{} kB\nThreads:\t{threads}\nSigQ:\t0/0\nSigPnd:\t0000000000000000\nShdPnd:\t0000000000000000\nCapInh:\t{:016x}\nCapPrm:\t{:016x}\nCapEff:\t{:016x}\nCapBnd:\t{:016x}\nCapAmb:\t{:016x}\nNoNewPrivs:\t{}\nSeccomp:\t{}\nSeccomp_filters:\t{}\nCpus_allowed_list:\t0-{}\n",
+                            c.uid, c.euid, c.suid, c.fsuid, c.gid, c.egid, c.sgid, c.fsgid,
+                            groups.join(" "),
+                            virt / 1024,
+                            virt / 1024,
+                            rss / 1024,
+                            c.inh, c.prm, c.eff, c.bnd, c.amb,
+                            ta.no_new_privs as u32, ta.seccomp, ta.filters,
+                            cpus() - 1
+                        ))
+                    }
                     K::PStat => text(format!(
-                        "{pid} ({name}) R {ppid} {pid} {pid} 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 {threads} 0 0 {virt} {} 18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
-                        rss / PAGE
+                        "{pid} ({name}) R {ppid} {pgid} {sid} 0 -1 4194560 0 0 0 0 0 0 0 0 {} {} {threads} 0 0 {virt} {} 18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 17 0 {} {} 0 0 0 0 0 0 0 0 0 0 0\n",
+                        ta.sched.proc_priority(),
+                        ta.sched.nice,
+                        rss / PAGE,
+                        ta.sched.prio,
+                        ta.sched.policy
                     )),
                     _ => text(format!("{} {} 0 0 0 0 0\n", virt / PAGE, rss / PAGE)),
                 }
@@ -283,8 +300,8 @@ impl ProcFs {
                 let tids: Vec<i32> = p.threads.lock().unwrap().iter().map(|t| t.tid).collect();
                 Ok(Content::Dir(tids.into_iter().map(|t| (t.to_string(), mk(K::Task, pid, t as u64))).collect()))
             }
-            // A thread directory: the process's view (good enough for comm/stat/status).
-            K::Task => d(&[("comm", K::PComm), ("stat", K::PStat), ("status", K::PStatus), ("attr", K::PAttr)]),
+            // A thread directory: the process's view, with the thread's comm and attributes.
+            K::Task => Ok(Content::Dir([("comm", K::PComm), ("stat", K::PStat), ("status", K::PStatus), ("attr", K::PAttr)].iter().map(|(n, k)| (n.to_string(), mk(*k, pid, extra))).collect())),
             K::PAttr => d(&[("current", K::PAttrCurrent)]),
             K::PAttrCurrent => Ok(Content::File(b"u:r:su:s0\0".to_vec())),
             K::POom => text("0\n".into()),
@@ -293,9 +310,18 @@ impl ProcFs {
     }
 }
 
-fn comm(p: &Process) -> String {
-    let exe = p.exe.lock().unwrap();
-    exe.rsplit('/').next().unwrap_or("").chars().take(15).collect()
+/// Thread `tid` of `p`, or its main thread for 0 (any thread if that one is gone).
+fn thread_of(p: &Process, tid: i32) -> Option<Arc<super::Thread>> {
+    let threads = p.threads.lock().unwrap();
+    let want = if tid == 0 { p.pid } else { tid };
+    threads.iter().find(|t| t.tid == want).or(threads.first()).cloned()
+}
+
+fn comm(p: &Process, tid: i32) -> String {
+    match thread_of(p, tid).map(|t| t.attrs.lock().unwrap().comm.clone()) {
+        Some(c) if !c.is_empty() => c,
+        _ => super::control::comm_of(&p.exe.lock().unwrap()),
+    }
 }
 
 fn cpus() -> usize {

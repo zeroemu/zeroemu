@@ -16,6 +16,7 @@ typedef unsigned int u32;
 #define NR_umount2 39
 #define NR_mount 40
 #define NR_statfs 43
+#define NR_truncate 45
 #define NR_openat 56
 #define NR_close 57
 #define NR_pipe2 59
@@ -24,6 +25,7 @@ typedef unsigned int u32;
 #define NR_readlinkat 78
 #define NR_newfstatat 79
 #define NR_fstat 80
+#define NR_utimensat 88
 #define NR_exit_group 94
 #define NR_unshare 97
 #define NR_setns 268
@@ -77,6 +79,7 @@ static void check(int cond, const char *name) {
 #define ENODEV 19
 #define EINVAL 22
 #define ENOSPC 28
+#define EROFS 30
 #define MS_RDONLY 1
 #define MS_NOSUID 2
 #define MS_REMOUNT 32
@@ -137,7 +140,10 @@ int cmain(void) {
     sys(NR_mkdirat, AT_FDCWD, "/tmp/dst", 0755);
     put("/tmp/src/hello", "bound\n");
     check(sys(NR_mount, "/tmp/src", "/tmp/dst", 0, MS_BIND, 0) == 0 && slurp("/tmp/dst/hello") == 6 && seq(buf, "bound", 5), "bind mount shows the source");
-    check(sys(NR_mount, 0, "/tmp/dst", 0, MS_REMOUNT | MS_BIND | MS_RDONLY, 0) == 0 && put("/tmp/dst/x", "no") == -30 && put("/tmp/src/x", "yes") == 3, "remount,bind,ro: read-only there only");
+    put("/tmp/dst/also", "bound\n");
+    int dfd = (int)sys(NR_openat, AT_FDCWD, "/tmp/dst/also", O_RDWR, 0);
+    check(dfd >= 0 && sys(NR_mount, 0, "/tmp/dst", 0, MS_REMOUNT | MS_BIND | MS_RDONLY, 0) == 0, "remount,bind,ro");
+    check(sys(NR_write, dfd, "no", 2) == -EROFS && put("/tmp/dst/x", "no") == -EROFS && put("/tmp/src/x", "yes") == 3, "read-only there only, including an fd opened before");
     check(sys(NR_mount, "", "/", 0, MS_SHARED | MS_REC, 0) == 0, "make / rshared");
     n = slurp("/proc/self/mountinfo");
     check(contains(buf, n, " shared:"), "mountinfo shows peer groups");
@@ -145,6 +151,15 @@ int cmain(void) {
     check(sys(NR_mount, "", "/tmp/dst", 0, MS_PRIVATE | MS_RDONLY, 0) == -EINVAL, "propagation flags with others: EINVAL");
     check(sys(NR_umount2, "/tmp/dst", 2 /* MNT_DETACH */) == 0, "umount2 MNT_DETACH");
     check(sys(NR_mkdirat, AT_FDCWD, "/tmp", 0755) == -17, "mkdir of a mount point: EEXIST");
+
+    // A remount to read-only covers descriptors opened while it was writable.
+    sys(NR_mkdirat, AT_FDCWD, "/tmp/ro", 0755);
+    check(sys(NR_mount, "tmpfs", "/tmp/ro", "tmpfs", 0, 0) == 0, "mount tmpfs to remount");
+    int wfd = (int)sys(NR_openat, AT_FDCWD, "/tmp/ro/f", O_RDWR | O_CREAT, 0644);
+    check(sys(NR_write, wfd, "ab", 2) == 2 && sys(NR_mount, 0, "/tmp/ro", 0, MS_REMOUNT | MS_RDONLY, 0) == 0, "remount the tmpfs read-only");
+    check(sys(NR_write, wfd, "cd", 2) == -EROFS, "write through a pre-opened fd: EROFS");
+    check(sys(NR_truncate, "/tmp/ro/f", 0) == -EROFS, "truncate on a read-only mount: EROFS");
+    check(sys(NR_utimensat, AT_FDCWD, "/tmp/ro/f", 0, 0) == -EROFS, "utimensat on a read-only tmpfs: EROFS");
 
     // ---- /proc/self/mounts notifies pollers of changes ----
     int mfd = (int)sys(NR_openat, AT_FDCWD, "/proc/self/mounts", O_RDONLY, 0);

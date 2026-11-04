@@ -895,7 +895,10 @@ impl Kernel {
                 if vfs.write_ok(&node) {
                     return Ok(0); // kernel files have no length to change
                 }
-                vfs.mem_file(&node).ok_or(if vfs.writable(&node) { EISDIR } else { EROFS })?.truncate(a[1]);
+                if vfs.readonly(&node) {
+                    return Err(EROFS);
+                }
+                vfs.mem_file(&node).ok_or(EISDIR)?.truncate(a[1]);
                 Ok(0)
             }
             ftruncate | fallocate => {
@@ -903,6 +906,11 @@ impl Kernel {
                 let Kind::Mem(m) = &f.kind else { unreachable!() };
                 if !m.writable {
                     return Err(EINVAL);
+                }
+                if let Some(n) = &m.node {
+                    if vfs.readonly(n) {
+                        return Err(EROFS);
+                    }
                 }
                 if no == ftruncate {
                     m.file.truncate(a[1]);
@@ -947,7 +955,8 @@ impl Kernel {
                     }
                 };
                 match vfs.set_attr(&node, None, None, Some(mtime)) {
-                    Err(EROFS) => Ok(0), // touching image files: accepted, not recorded
+                    // The image readers have no timestamps to update; a remounted tmpfs does.
+                    Err(EROFS) if matches!(vfs.fs_type(&node), "erofs" | "ext4") => Ok(0),
                     r => r.map(|_| 0),
                 }
             }
@@ -1138,6 +1147,12 @@ impl Kernel {
             Kind::Mem(m) => {
                 if !m.writable {
                     return Err(EBADF);
+                }
+                // Remount,ro applies to descriptors already open, as mnt_want_write does.
+                if let Some(n) = &m.node {
+                    if self.vfs()?.readonly(n) {
+                        return Err(EROFS);
+                    }
                 }
                 let mut pos = m.pos.lock().unwrap();
                 let append = f.flags.load(Ordering::Relaxed) & O_APPEND != 0;

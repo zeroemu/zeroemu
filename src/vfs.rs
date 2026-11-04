@@ -759,6 +759,17 @@ impl Vfs {
         &*node.mnt.sb.fs
     }
 
+    /// The mount `node` is on, as the table has it now. An open file keeps the
+    /// arc it was resolved with, and MS_MOVE publishes a replacement, so flag
+    /// changes (a remount) are read from the table.
+    fn live(&self, node: &Node) -> Arc<Mount> {
+        self.table().mounts.iter().find(|m| m.id == node.mnt.id).cloned().unwrap_or_else(|| node.mnt.clone())
+    }
+
+    pub fn readonly(&self, node: &Node) -> bool {
+        self.live(node).readonly()
+    }
+
     pub fn fs_arc(&self, node: &Node) -> Arc<dyn FileSystem> {
         node.mnt.sb.fs.clone()
     }
@@ -857,16 +868,16 @@ impl Vfs {
 
     /// Whether writes can land: a writable filesystem or kernel file, on a read-write mount.
     pub fn writable(&self, node: &Node) -> bool {
-        !node.mnt.readonly() && (self.fs(node).writable() || self.fs(node).write_ok(node.ino))
+        !self.readonly(node) && (self.fs(node).writable() || self.fs(node).write_ok(node.ino))
     }
 
     /// A kernel file that interprets writes (see FileSystem::write_ok).
     pub fn write_ok(&self, node: &Node) -> bool {
-        !node.mnt.readonly() && self.fs(node).write_ok(node.ino)
+        !self.readonly(node) && self.fs(node).write_ok(node.ino)
     }
 
     pub fn write(&self, node: &Node, data: &[u8]) -> Result<usize, i64> {
-        if node.mnt.readonly() {
+        if self.readonly(node) {
             return Err(EROFS);
         }
         self.fs(node).write(node.ino, data)
@@ -913,7 +924,7 @@ impl Vfs {
         if self.is_mount_point(dir, name) || self.fs(dir).lookup(dir.ino, name).map_err(io_errno)?.is_some() {
             return Err(EEXIST);
         }
-        if dir.mnt.readonly() {
+        if self.readonly(dir) {
             return Err(EROFS);
         }
         Ok(())
@@ -921,7 +932,7 @@ impl Vfs {
 
     /// For unlink, rmdir and rename: mount points are EBUSY.
     fn removable(&self, dir: &Node, name: &str) -> Result<(), i64> {
-        if dir.mnt.readonly() {
+        if self.readonly(dir) {
             return Err(EROFS);
         }
         if self.is_mount_point(dir, name) {
@@ -974,7 +985,7 @@ impl Vfs {
     }
 
     pub fn set_attr(&self, node: &Node, mode: Option<u32>, owner: Option<(u32, u32)>, mtime: Option<u64>) -> Result<(), i64> {
-        if node.mnt.readonly() {
+        if self.readonly(node) {
             return Err(EROFS);
         }
         self.fs(node).set_attr(node.ino, mode, owner, mtime)

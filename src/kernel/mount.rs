@@ -681,8 +681,15 @@ mod tests {
         vfs.mkdir(&at("/b").unwrap(), "sub", 0o755).unwrap();
         vfs.mount_at(&at("/b/sub").unwrap(), sb(tmpfs()), 0).unwrap();
         assert_eq!(vfs.umount(&at("/b").unwrap(), false).err(), Some(EBUSY));
+        let held = at("/b/f").unwrap();
         vfs.move_mount(&at("/b").unwrap(), &at("/c").unwrap()).unwrap();
         assert!(at("/c/f").is_ok() && at("/c/sub").unwrap().is_mount_root() && at("/b/f").is_err());
+        // MS_MOVE publishes a new mount arc; a remount must still reach a node resolved before it.
+        let live = vfs.mount_root(&at("/c").unwrap()).unwrap();
+        let saved = live.flags.load(Ordering::Relaxed);
+        live.flags.store(saved | MS_RDONLY, Ordering::Relaxed);
+        assert!(vfs.readonly(&held));
+        live.flags.store(saved, Ordering::Relaxed);
         assert_eq!(vfs.move_mount(&at("/c").unwrap(), &at("/c/sub").unwrap()).err(), Some(ELOOP));
         let info = mountinfo(&vfs);
         assert!(info.contains(" / /a rw,relatime - tmpfs tmpfs rw,seclabel\n"), "{info}");

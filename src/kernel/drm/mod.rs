@@ -243,10 +243,7 @@ impl Resource {
         }
         let (ptr, reported) = self.gpu.resource_map(self.id)?;
         self.mapped_once.store(true, Ordering::Release);
-        let gpa = match self.phys.map_external(ptr, reported) {
-            Ok(g) => g,
-            Err(e) => return Err(e),
-        };
+        let gpa = self.phys.map_external(ptr, reported)?;
         let len = reported.div_ceil(phys::DEV_ALIGN) * phys::DEV_ALIGN;
         let keep = self.clone();
         let phys = self.phys.clone();
@@ -779,7 +776,7 @@ fn virt_getparam(o: &Open, arg: u64, io: &mut dyn Io) -> Result<i64, i64> {
     let mask = o.dev.capsets;
     let value = match param {
         1 => u64::from(mask & (1 << 1 | 1 << 3 | 1 << 8) != 0), // 3D_FEATURES
-        2 | 3 | 4 | 5 | 6 => 1,                                 // capset fix, blob, host visible, cross device, context init
+        2..=6 => 1, // capset fix, blob, host visible, cross device, context init
         7 => mask,                                              // SUPPORTED_CAPSET_IDs
         _ => return Err(EINVAL),
     };
@@ -915,9 +912,7 @@ fn virt_res_create(o: &Open, arg: u64, io: &mut dyn Io) -> Result<i64, i64> {
         nr_samples: ru32(&b, 32),
         flags: ru32(&b, 36),
     };
-    if let Err(e) = o.dev.gpu.resource_create(&args, iov) {
-        return Err(e);
-    }
+    o.dev.gpu.resource_create(&args, iov)?;
     // Opening a handle attaches the object to the file's context (drm_gem_handle_create).
     let ctx = o.st.lock().unwrap().ctx;
     if ctx != 0 {
@@ -963,9 +958,7 @@ fn virt_create_blob(o: &Open, arg: u64, io: &mut dyn Io) -> Result<i64, i64> {
     let blob = Blob { blob_mem: mem, blob_flags: flags, blob_id, size };
     // This gfxstream build's create_blob wrapper ignores the iov, so a guest
     // blob is attached again explicitly. Host blobs have no guest pages.
-    if let Err(e) =     o.dev.gpu.resource_create_blob(ctx, id, &blob, iov.clone()) {
-        return Err(e);
-    }
+    o.dev.gpu.resource_create_blob(ctx, id, &blob, iov.clone())?;
     if !iov.is_empty() && let Err(e) = o.dev.gpu.attach_iov(id, iov) {
         o.dev.gpu.resource_unref(id);
         return Err(e);
@@ -1438,9 +1431,7 @@ fn mode_create_dumb(o: &Open, arg: u64, io: &mut dyn Io) -> Result<i64, i64> {
         nr_samples: 0,
         flags: 0,
     };
-    if let Err(e) = o.dev.gpu.resource_create(&args, iov) {
-        return Err(e);
-    }
+    o.dev.gpu.resource_create(&args, iov)?;
     let res = new_res(&o.dev, id, size, stride, 0, Some(guest));
     o.dev.track_res(res.clone());
     let (handle, _) = o.gems.lock().unwrap().insert(res);
@@ -1482,8 +1473,8 @@ fn mode_atomic(o: &Open, arg: u64, io: &mut dyn Io) -> Result<i64, i64> {
     let mut fb = None;
     let mut out_ptr = 0u64;
     let mut in_fd = -1i32;
-    for i in 0..nobj {
-        let n = counts[i] as usize;
+    for &count in counts.iter().take(nobj) {
+        let n = count as usize;
         for (&p, &v) in props[cursor..cursor + n].iter().zip(&values[cursor..cursor + n]) {
             match p {
                 P_FB_ID => fb = Some(v as u32),

@@ -189,7 +189,8 @@ pub fn open(fb_w: u32, fb_h: u32) -> Result<NativeWindow, String> {
 
 #[link(name = "CoreGraphics", kind = "framework")]
 unsafe extern "C" {
-    fn CGColorSpaceCreateDeviceRGB() -> *mut c_void;
+    static kCGColorSpaceSRGB: *const c_void;
+    fn CGColorSpaceCreateWithName(name: *const c_void) -> *mut c_void;
     fn CGColorSpaceRelease(cs: *mut c_void);
     fn CGDataProviderCreateWithCFData(data: *mut c_void) -> *mut c_void;
     fn CGDataProviderRelease(p: *mut c_void);
@@ -254,7 +255,9 @@ fn show_frame() {
     unsafe {
         let data = CFDataCreate(std::ptr::null(), f.data.as_ptr(), f.data.len() as isize);
         let provider = CGDataProviderCreateWithCFData(data);
-        let cs = CGColorSpaceCreateDeviceRGB();
+        // Android composes in sRGB; device RGB would skip the display's
+        // color matching and shift every color.
+        let cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
         let img = CGImageCreate(f.w as usize, f.h as usize, 8, 32, f.stride as usize, cs, info, provider, std::ptr::null(), false, 0);
         drop(slot);
         let view = msg0(window, sel("contentView"));

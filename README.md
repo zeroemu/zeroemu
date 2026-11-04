@@ -56,7 +56,6 @@ Known gaps:
   VM and threads map 1:1 onto them. Android's `system_server` alone runs 100+,
   so M5 needs threads multiplexed onto vCPUs (CPU state is already saved and
   restored in full, which that scheduler builds on).
-- `fork` copies memory eagerly; copy-on-write comes before zygote (M5).
 - Binder never drops references, so nodes are never released.
 - No inet sockets yet. Netlink answers like a machine with no network
   interfaces: `ip link` and `ss` dumps come back empty, and uevents arrive

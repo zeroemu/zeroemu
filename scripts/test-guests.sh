@@ -8,7 +8,7 @@ case "$(uname -s)" in
 esac
 scripts/build-guests.sh >/dev/null 2>&1 || { echo "guest build failed"; exit 1; }
 bad=0
-for t in m2 m3 shm binder binder_nested mounts creds sock selinux pty threads bpf drm locks ashmem inotify tun openrace xattr smoke clonefiles timers misc_syscalls; do
+for t in m2 m3 shm binder binder_nested mounts creds sock selinux pty threads bpf drm locks ashmem inotify tun openrace xattr smoke clonefiles timers misc_syscalls cow; do
     bin="target/guest/${t}_aarch64"
     [ -x "$bin" ] || continue
     out=$(DROIDRT_GPU=fake perl -e 'alarm 90; exec @ARGV' target/release/droidrt "$bin" alpha beta 2>&1)

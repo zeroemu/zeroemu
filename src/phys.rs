@@ -5,6 +5,7 @@
 use crate::errno::ENOMEM;
 use crate::hv::Hypervisor;
 use std::ptr::NonNull;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 pub const PAGE: u64 = 4096;
@@ -23,6 +24,10 @@ pub struct PhysMem {
     alloc: Mutex<Alloc>,
     /// Host mappings installed above `PHYS_MAX` (not frames of `base`).
     ext: Mutex<Ext>,
+    /// Per frame: how many owners beyond the first (copy-on-write sharing
+    /// after fork). Zeroed lazily by the OS; a frame only ever pays for this
+    /// when its page of counters is touched.
+    extra_refs: Box<[AtomicU32]>,
 }
 
 struct Alloc {
@@ -60,6 +65,7 @@ impl PhysMem {
             // Frame 0 is never handed out, so 0 can mean "no frame".
             alloc: Mutex::new(Alloc { mapped: 0, bump: PAGE, free: Vec::new() }),
             ext: Mutex::new(Ext { bump: PHYS_MAX, free: Vec::new(), live: Vec::new() }),
+            extra_refs: zeroed_counters((PHYS_MAX / PAGE) as usize),
         })
     }
 
@@ -128,9 +134,24 @@ impl PhysMem {
         Ok(gpa)
     }
 
+    /// Gives up one owner's hold on a frame; the last one frees it.
     pub fn free(&self, gpa: u64) {
         debug_assert!(gpa != 0 && gpa.is_multiple_of(PAGE));
+        let others = &self.extra_refs[(gpa / PAGE) as usize];
+        if others.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1)).is_ok() {
+            return;
+        }
         self.alloc.lock().unwrap().free.push(gpa);
+    }
+
+    /// One more owner of a frame (fork's copy-on-write).
+    pub fn share(&self, gpa: u64) {
+        self.extra_refs[(gpa / PAGE) as usize].fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Whether the caller is the frame's only owner.
+    pub fn is_sole_owner(&self, gpa: u64) -> bool {
+        self.extra_refs[(gpa / PAGE) as usize].load(Ordering::Acquire) == 0
     }
 
     /// Host address of guest-physical `gpa` (a RAM frame, or a device mapping).
@@ -156,6 +177,14 @@ impl PhysMem {
         let a = self.alloc.lock().unwrap();
         a.bump / PAGE - 1 - a.free.len() as u64
     }
+}
+
+/// A big zeroed array: the allocator takes fresh pages from the OS, so the
+/// parts never touched cost nothing.
+fn zeroed_counters(n: usize) -> Box<[AtomicU32]> {
+    let v: Box<[u32]> = vec![0u32; n].into_boxed_slice();
+    // SAFETY: AtomicU32 has u32's size and alignment.
+    unsafe { Box::from_raw(Box::into_raw(v) as *mut [AtomicU32]) }
 }
 
 pub fn random_bytes(buf: &mut [u8]) {

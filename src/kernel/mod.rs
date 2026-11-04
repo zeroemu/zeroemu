@@ -682,6 +682,8 @@ impl Kernel {
         let mut vcpu: Box<dyn Vcpu> = Box::new(vcpus::LazyVcpu::new(self.hv.clone(), self.vcpus.clone(), t.clone(), root, state));
         let mut stale = crate::mm::Stale::default();
         let mut restart: Option<SyscallRegs> = None;
+        // The copy-on-write epoch a requested TLB flush will cover.
+        let mut flushing: Option<u64> = None;
         let mut exit_code = 0;
 
         loop {
@@ -695,6 +697,13 @@ impl Kernel {
             let exit = vcpu.run();
             // The flush requested last time ran on entry; now frames are safe to reuse.
             stale.release(&self.phys);
+            // (Interrupted: the vCPU may not have reached the flush yet.)
+            if !matches!(exit, Exit::Interrupted)
+                && let Some(epoch) = flushing.take()
+            {
+                let mut mm = t.proc.mm();
+                mm.flushed_epoch = mm.flushed_epoch.max(epoch);
+            }
             match exit {
                 Exit::Syscall => {
                     let regs = vcpu.syscall_regs();
@@ -734,6 +743,7 @@ impl Kernel {
                 mm.tlb_dirty = false;
                 stale = mm.take_stale();
                 vcpu.flush_tlb();
+                flushing = Some(mm.cow_epoch);
             }
         }
         drop(vcpu); // destroyed on the thread that owns it

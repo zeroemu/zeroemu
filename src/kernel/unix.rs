@@ -105,6 +105,7 @@ struct Queue {
 }
 
 /// SOL_SOCKET options that read back as they were set, whatever the family.
+#[derive(Default)]
 pub(super) struct SockOpts {
     rcvtimeo: Option<Duration>,
     sndtimeo: Option<Duration>,
@@ -132,11 +133,6 @@ const SO_BUSY_POLL: u64 = 46;
 const SO_RCVTIMEO_NEW: u64 = 66;
 const SO_SNDTIMEO_NEW: u64 = 67;
 
-impl Default for SockOpts {
-    fn default() -> SockOpts {
-        SockOpts { rcvtimeo: None, sndtimeo: None, linger: [0; 8], ints: BTreeMap::new() }
-    }
-}
 
 impl SockOpts {
     fn int_default(opt: u64) -> Option<u32> {
@@ -699,6 +695,9 @@ impl Kernel {
         match no {
             socket if a[0] == netlink::AF_NETLINK => self.netlink_socket(t, a),
             socket if a[0] == super::inet::AF_INET || a[0] == super::inet::AF_INET6 => self.inet_socket(t, a),
+            // Closing a PF_KEY socket waits for RCU on Linux; netd's stats map
+            // swap opens and closes one for that alone. Nothing here needs it.
+            socket if a[0] == super::inet::AF_KEY => self.inet_socket(t, a),
             socket if a[0] == super::vsock::AF_VSOCK => {
                 if a[1] & 0xf != SOCK_STREAM as u64 {
                     return Err(ESOCKTNOSUPPORT);

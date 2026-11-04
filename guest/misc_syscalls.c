@@ -13,6 +13,11 @@ typedef unsigned int u32;
 #define NR_write 64
 #define NR_sendfile 71
 #define NR_exit_group 94
+#define NR_epoll_create1 20
+#define NR_epoll_ctl 21
+#define NR_epoll_pwait 22
+#define NR_socket 198
+#define NR_connect 203
 #define NR_munmap 215
 #define NR_mmap 222
 #define NR_msync 227
@@ -95,6 +100,28 @@ int cmain(void) {
     check(sys(NR_copy_file_range, in, &a, to, &b, 5, 1) == -EINVAL, "copy_file_range: flags EINVAL");
 
     check(sys(NR_quotactl, 0, "/dev/x", 0, 0) == -ESRCH, "quotactl: quotas off");
+
+    // netd's synchronizeKernelRCU opens and closes one of these.
+    int key = (int)sys(NR_socket, 15 /* AF_KEY */, 3 /* SOCK_RAW */ | 02000000, 2 /* PF_KEY_V2 */);
+    check(key >= 0 && sys(NR_close, key) == 0, "AF_KEY socket");
+
+    // lmkd watches a PSI trigger: EPOLLPRI, and it must not fire on its own.
+    int psi = (int)sys(NR_openat, -100, "/proc/pressure/memory", 2 /* O_RDWR */, 0);
+    static const char trigger[] = "some 70000 1000000";
+    check(psi >= 0 && sys(NR_write, psi, trigger, sizeof trigger) == sizeof trigger, "write a PSI trigger");
+    int ep = (int)sys(NR_epoll_create1, 0);
+    u64 ev[2] = {2 /* EPOLLPRI */, 7};
+    check(sys(NR_epoll_ctl, ep, 1, psi, ev) == 0, "epoll watches the PSI file");
+    check(sys(NR_epoll_pwait, ep, ev, 1, 0, 0, 8) == 0, "an idle trigger does not fire");
+
+    // The clipboard monitor blocks reading the host: no EOF.
+    int cb = (int)sys(NR_socket, 40 /* AF_VSOCK */, 1 | 04000 /* SOCK_STREAM | SOCK_NONBLOCK */, 0);
+    unsigned vm[4] = {40, 5000, 2, 0};
+    check(sys(NR_connect, cb, vm, 16) == 0, "connect to the host pipe");
+    check(sys(NR_write, cb, "pipe:clipboard", 15) == 15, "open the clipboard pipe");
+    unsigned empty = 0;
+    check(sys(NR_write, cb, &empty, 4) == 4, "and send it a message");
+    check(sys(NR_read, cb, buf, 4) == -11, "it stays open, with nothing to read");
 
     puts_(failures ? "SOME CHECKS FAILED\n" : "all checks passed\n");
     return failures;

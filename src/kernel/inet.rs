@@ -13,6 +13,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 
 pub const AF_INET: u64 = 2;
 pub const AF_INET6: u64 = 10;
+pub const AF_KEY: u64 = 15;
 const SOCK_RAW: u32 = 3;
 const SOCK_NONBLOCK: u64 = 0o4000;
 const SOCK_CLOEXEC: u64 = 0o2000000;

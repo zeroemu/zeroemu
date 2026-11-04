@@ -5,6 +5,8 @@
 //! the connection, as the emulator does.
 //!
 //! qemud services frame each message with its length in four hex digits.
+//! The clipboard pipe has binary framing, but droidrt has nothing to say on
+//! it and drops what it hears.
 
 use super::wait::EVENTS;
 use super::{ERESTARTSYS, Thread};
@@ -37,6 +39,9 @@ struct State {
 
 enum Service {
     Sensors(Sensors),
+    /// Stays open and silent: the guest's monitor blocks reading the host's
+    /// clipboard, and hammers the connection if it is closed.
+    Clipboard,
 }
 
 #[derive(Default)]
@@ -113,12 +118,17 @@ impl Vsock {
             let name = String::from_utf8_lossy(&st.name).into_owned();
             match name.as_str() {
                 "pipe:qemud:sensors" => st.service = Some(Service::Sensors(Sensors { delay_ms: 200, ..Default::default() })),
+                "pipe:clipboard" => st.service = Some(Service::Clipboard),
                 _ => {
+                    eprintln!("droidrt: no host service {name}");
                     st.closed = true;
                     EVENTS.bump();
                     return Ok(data.len());
                 }
             }
+        }
+        if matches!(st.service, Some(Service::Clipboard)) {
+            return Ok(data.len());
         }
         st.inbuf.extend_from_slice(rest);
         let mut start_stream = false;

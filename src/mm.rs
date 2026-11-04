@@ -245,6 +245,12 @@ pub struct AddressSpace {
     /// re-entering the guest, and `stale` frames may be freed only after that.
     pub tlb_dirty: bool,
     stale: Stale,
+    /// Bumped when fork makes writable pages read-only; `flushed_epoch` catches
+    /// up once a TLB flush has actually run in the guest. Until then a sibling
+    /// thread may still write through a stale entry, so a copy-on-write fault
+    /// must not copy yet: the write would land in the old frame and be lost.
+    pub cow_epoch: u64,
+    pub flushed_epoch: u64,
 }
 
 impl AddressSpace {
@@ -269,6 +275,8 @@ impl AddressSpace {
             start_stack: 0,
             brk: 0,
             tlb_dirty: false,
+            cow_epoch: 0,
+            flushed_epoch: 0,
             stale: Stale::default(),
         })
     }
@@ -552,6 +560,24 @@ impl AddressSpace {
         out
     }
 
+    /// The page-table entry for `frame` under `prot`: not writable while a
+    /// private frame still has other owners, so the first write copies it.
+    fn entry_for(&self, frame: u64, prot: u32, shared: bool) -> u64 {
+        let prot = if !shared && !self.phys.is_sole_owner(frame) { prot & !PROT_WRITE } else { prot };
+        paging::user_page(frame, prot)
+    }
+
+    /// Replaces a private frame still shared with other owners by a private copy.
+    fn break_cow(&mut self, slot: u64, frame: u64, prot: u32) -> Result<u64, i64> {
+        let copy = self.phys.alloc()?;
+        unsafe { std::ptr::copy_nonoverlapping(self.phys.host(frame), self.phys.host(copy), PAGE as usize) };
+        let e = paging::user_page(copy, prot);
+        self.phys.write_u64(slot, e);
+        self.phys.free(frame);
+        self.tlb_dirty = true;
+        Ok(e)
+    }
+
     pub fn protect(&mut self, start: u64, len: u64, prot: u32) -> Result<(), i64> {
         let end = start.saturating_add(page_up(len));
         if !start.is_multiple_of(PAGE) || end > USER_TOP {
@@ -568,8 +594,8 @@ impl AddressSpace {
         }
         self.merge(start, end);
         let mut changed = false;
-        self.visit(start, end, &mut |phys, slot, _va, e| {
-            phys.write_u64(slot, paging::user_page(paging::addr(e), prot));
+        self.visit(start, end, &mut |phys, slot, va, e| {
+            phys.write_u64(slot, self.entry_for(paging::addr(e), prot, self.is_shared(va)));
             changed = true;
         });
         self.tlb_dirty |= changed;
@@ -697,8 +723,19 @@ impl AddressSpace {
         let slot = walk(&self.phys, &mut self.tables, self.root.root, 0, page, true).map_err(|_| SEGV_MAPERR)?.unwrap();
         let e = self.phys.read_u64(slot);
         if paging::is_valid(e) {
+            let (frame, shared) = (paging::addr(e), matches!(vma.backing, Backing::Shared { .. } | Backing::Dev { .. }));
             if !paging::permits(e, write, exec) {
-                self.phys.write_u64(slot, paging::user_page(paging::addr(e), prot));
+                if write && !shared && !self.phys.is_sole_owner(frame) {
+                    // Copy-on-write, once no stale writable entry can exist. If
+                    // one may, flush and retry: this fault will come back.
+                    if self.cow_epoch != self.flushed_epoch {
+                        self.tlb_dirty = true;
+                        return Ok(());
+                    }
+                    self.break_cow(slot, frame, prot).map_err(|_| SEGV_MAPERR)?;
+                    return Ok(());
+                }
+                self.phys.write_u64(slot, self.entry_for(frame, prot, shared));
             }
             // Either way the entry now allows it; a stale TLB entry caused the fault.
             self.tlb_dirty = true;
@@ -750,6 +787,10 @@ impl AddressSpace {
             let frame = self.populate(start, &vma, page)?;
             e = paging::user_page(frame, vma.prot);
             self.phys.write_u64(slot, e);
+        } else if write && !matches!(vma.backing, Backing::Shared { .. } | Backing::Dev { .. }) && !self.phys.is_sole_owner(paging::addr(e)) {
+            // The kernel writes past the page tables: it must not reach a frame
+            // another process still shares.
+            e = self.break_cow(slot, paging::addr(e), vma.prot)?;
         }
         Ok(unsafe { self.phys.host(paging::addr(e)).add((va - page) as usize) })
     }
@@ -845,24 +886,37 @@ impl AddressSpace {
 
     /// fork(): private pages are copied (eagerly; copy-on-write comes later),
     /// shared ones stay shared.
-    pub fn fork(&self, kernel: &KernelWindow, asid: u16) -> Result<AddressSpace, i64> {
+    /// A copy of this address space. Shared mappings keep their frames;
+    /// private frames are shared too, read-only in both spaces, until one
+    /// writes (fault and host_ptr copy them then).
+    pub fn fork(&mut self, kernel: &KernelWindow, asid: u16) -> Result<AddressSpace, i64> {
         let mut child = AddressSpace::new(self.phys.clone(), kernel, asid)?;
         child.vmas = self.vmas.clone();
         child.brk_start = self.brk_start;
         child.start_stack = self.start_stack;
         child.brk = self.brk;
         let mut pages = Vec::new();
-        self.visit(0, USER_TOP, &mut |_, _, va, e| pages.push((va, e)));
-        for (va, e) in pages {
-            let frame = if self.is_shared(va) {
-                paging::addr(e) // MAP_SHARED: both processes see the same frame
-            } else {
-                let f = self.phys.alloc()?;
-                unsafe { std::ptr::copy_nonoverlapping(self.phys.host(paging::addr(e)), self.phys.host(f), PAGE as usize) };
-                f
-            };
-            let slot = walk(&self.phys, &mut child.tables, child.root.root, 0, va, true)?.unwrap();
-            self.phys.write_u64(slot, (e & !paging::addr(u64::MAX)) | frame);
+        self.visit(0, USER_TOP, &mut |_, slot, va, e| pages.push((slot, va, e)));
+        let mut downgraded = false;
+        for (slot, va, e) in pages {
+            let mut entry = e;
+            if !self.is_shared(va) {
+                let frame = paging::addr(e);
+                self.phys.share(frame);
+                if paging::permits(e, true, false) {
+                    // Both copies read-only: the parent's entry changes under its threads.
+                    let prot = self.find(va).map_or(0, |(_, v)| v.prot);
+                    entry = paging::user_page(frame, prot & !PROT_WRITE);
+                    self.phys.write_u64(slot, entry);
+                    downgraded = true;
+                }
+            }
+            let child_slot = walk(&self.phys, &mut child.tables, child.root.root, 0, va, true)?.unwrap();
+            self.phys.write_u64(child_slot, entry);
+        }
+        if downgraded {
+            self.tlb_dirty = true;
+            self.cow_epoch += 1;
         }
         Ok(child)
     }

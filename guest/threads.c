@@ -12,6 +12,8 @@ typedef long i64;
 #define NR_exit_group 94
 #define NR_clone 220
 #define NR_gettid 178
+#define NR_openat 56
+#define NR_close 57
 
 static i64 sys6(i64 n, i64 a, i64 b, i64 c, i64 d, i64 e, i64 f) {
     register i64 x8 __asm__("x8") = n;
@@ -175,6 +177,17 @@ int cmain(void) {
     while (__atomic_load_n(&pi_held, __ATOMIC_ACQUIRE) == 0) {}
     check(sys(NR_futex, &pi_word, 8 | 128 /* TRYLOCK_PI */, 0, 0) == -11, "PI trylock on a held lock is EAGAIN");
     check(sys(NR_futex, &pi_word, 7 | 128, 0, 0) == -1, "PI unlock by a non-owner is EPERM");
+
+    // libprocessgroup reads /proc/<tid>/cgroup for any thread, not just a leader.
+    static char path[32] = "/proc/";
+    unsigned v = pi_word, digits = 0;
+    for (unsigned w = v; w; w /= 10) digits++;
+    for (unsigned i = digits; i > 0; i--, v /= 10) path[6 + i - 1] = '0' + v % 10;
+    const char *leaf = "/cgroup";
+    for (unsigned i = 0; i < 8; i++) path[6 + digits + i] = leaf[i];
+    int fd = (int)sys(NR_openat, -100, path, 0, 0);
+    check(fd >= 0 && sys(NR_close, fd) == 0, "a non-leader thread has a /proc/<tid>");
+
     __atomic_store_n(&pi_release, 1, __ATOMIC_RELEASE);
     join(&tids[0]);
 

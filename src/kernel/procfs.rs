@@ -180,6 +180,7 @@ enum Content {
 
 pub struct ProcFs {
     kernel: Weak<Kernel>,
+    psi_events: Arc<std::sync::atomic::AtomicU64>,
 }
 
 fn err(e: i64) -> io::Error {
@@ -199,7 +200,7 @@ androidboot.hardware.cpu.pagesize=4096 androidboot.qemu.avd_name=droidrt";
 
 impl ProcFs {
     pub fn new(kernel: Weak<Kernel>) -> Arc<ProcFs> {
-        Arc::new(ProcFs { kernel })
+        Arc::new(ProcFs { kernel, psi_events: Arc::default() })
     }
 
     fn kernel(&self) -> io::Result<Arc<Kernel>> {
@@ -560,6 +561,8 @@ impl FileSystem for ProcFs {
     fn changes(&self, ino: u64) -> Option<Arc<std::sync::atomic::AtomicU64>> {
         match decode(ino)? {
             (K::Mounts | K::PMounts | K::PMountinfo, _, _) => Some(self.kernel.upgrade()?.vfs.as_ref()?.events()),
+            // A PSI trigger: droidrt keeps no stall accounting, so it never fires.
+            (K::PressureFile, _, _) => Some(self.psi_events.clone()),
             _ => None,
         }
     }
@@ -584,6 +587,14 @@ impl FileSystem for ProcFs {
                 Some((K::Sysctl, _, i)) if i as u16 != Sysctl::root() => mk(K::Sysctl, 0, Sysctl::parent(i as u16) as u64),
                 _ => ROOT,
             }));
+        }
+        // Any thread has a /proc/<tid>, though readdir lists only group leaders.
+        if dir == ROOT
+            && let Ok(tid) = name.parse::<i32>()
+            && let Some(th) = self.kernel()?.task(tid)
+        {
+            let pid = th.proc.pid;
+            return Ok(Some(mk(K::Pid, pid, if tid == pid { 0 } else { tid as u64 })));
         }
         match self.content(dir)? {
             Content::Dir(entries) => Ok(entries.into_iter().find(|(n, _)| n == name).map(|(_, i)| i)),

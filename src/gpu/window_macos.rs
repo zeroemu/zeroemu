@@ -1,0 +1,204 @@
+//! AppKit window the gfxstream renderer draws into. Every call here runs on
+//! the process main thread: AppKit is not safe anywhere else, and gfxstream's
+//! repaint is dispatched back onto this thread.
+
+use std::ffi::{CString, c_void};
+use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct NSPoint {
+    x: f64,
+    y: f64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct NSSize {
+    width: f64,
+    height: f64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct NSRect {
+    origin: NSPoint,
+    size: NSSize,
+}
+
+pub struct NativeWindow {
+    pub handle: *mut c_void,
+    pub width: i32,
+    pub height: i32,
+}
+
+static APP: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+static WINDOW: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+static WINDOW_ID: AtomicU64 = AtomicU64::new(0);
+
+#[link(name = "objc")]
+unsafe extern "C" {
+    fn objc_getClass(name: *const i8) -> *mut c_void;
+    fn sel_registerName(name: *const i8) -> *mut c_void;
+    fn objc_msgSend();
+}
+
+#[link(name = "AppKit", kind = "framework")]
+unsafe extern "C" {
+    static NSDefaultRunLoopMode: *mut c_void;
+}
+
+fn cls(name: &str) -> *mut c_void {
+    let c = CString::new(name).unwrap();
+    unsafe { objc_getClass(c.as_ptr()) }
+}
+
+fn sel(name: &str) -> *mut c_void {
+    let c = CString::new(name).unwrap();
+    unsafe { sel_registerName(c.as_ptr()) }
+}
+
+unsafe fn msg0(obj: *mut c_void, sel: *mut c_void) -> *mut c_void {
+    let f: unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void = unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+    unsafe { f(obj, sel) }
+}
+
+unsafe fn msg_void(obj: *mut c_void, sel: *mut c_void) {
+    let f: unsafe extern "C" fn(*mut c_void, *mut c_void) = unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+    unsafe { f(obj, sel) }
+}
+
+unsafe fn msg_id(obj: *mut c_void, sel: *mut c_void, a: *mut c_void) {
+    let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) = unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+    unsafe { f(obj, sel, a) }
+}
+
+unsafe fn msg_i64(obj: *mut c_void, sel: *mut c_void, a: i64) {
+    let f: unsafe extern "C" fn(*mut c_void, *mut c_void, i64) = unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+    unsafe { f(obj, sel, a) }
+}
+
+unsafe fn msg_bool(obj: *mut c_void, sel: *mut c_void, a: i8) {
+    let f: unsafe extern "C" fn(*mut c_void, *mut c_void, i8) = unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+    unsafe { f(obj, sel, a) }
+}
+
+unsafe fn msg_f64_id(obj: *mut c_void, sel: *mut c_void, a: f64) -> *mut c_void {
+    let f: unsafe extern "C" fn(*mut c_void, *mut c_void, f64) -> *mut c_void = unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+    unsafe { f(obj, sel, a) }
+}
+
+unsafe fn msg_i64_ret(obj: *mut c_void, sel: *mut c_void) -> i64 {
+    let f: unsafe extern "C" fn(*mut c_void, *mut c_void) -> i64 = unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+    unsafe { f(obj, sel) }
+}
+
+unsafe fn msg_rect(obj: *mut c_void, sel: *mut c_void) -> NSRect {
+    let f: unsafe extern "C" fn(*mut c_void, *mut c_void) -> NSRect = unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+    unsafe { f(obj, sel) }
+}
+
+unsafe fn msg_init_window(obj: *mut c_void, sel: *mut c_void, rect: NSRect, style: u64, backing: u64, defer: i8) -> *mut c_void {
+    let f: unsafe extern "C" fn(*mut c_void, *mut c_void, NSRect, u64, u64, i8) -> *mut c_void = unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+    unsafe { f(obj, sel, rect, style, backing, defer) }
+}
+
+unsafe fn msg_next_event(app: *mut c_void, sel: *mut c_void, mask: u64, until: *mut c_void, mode: *mut c_void, dequeue: i8) -> *mut c_void {
+    let f: unsafe extern "C" fn(*mut c_void, *mut c_void, u64, *mut c_void, *mut c_void, i8) -> *mut c_void =
+        unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+    unsafe { f(app, sel, mask, until, mode, dequeue) }
+}
+
+pub fn open(fb_w: u32, fb_h: u32) -> Result<NativeWindow, String> {
+    if unsafe { libc::pthread_main_np() } == 0 {
+        return Err("gfxstream window must be created on the main thread".into());
+    }
+    unsafe {
+        let app = msg0(cls("NSApplication"), sel("sharedApplication"));
+        if app.is_null() {
+            return Err("NSApplication sharedApplication failed".into());
+        }
+        // NSApplicationActivationPolicyRegular = 0, so the process can come forward.
+        msg_i64(app, sel("setActivationPolicy:"), 0);
+        APP.store(app, Ordering::Release);
+
+        let screen = msg0(cls("NSScreen"), sel("mainScreen"));
+        let vis = if screen.is_null() {
+            NSRect { origin: NSPoint { x: 0.0, y: 0.0 }, size: NSSize { width: fb_w as f64, height: fb_h as f64 } }
+        } else {
+            msg_rect(screen, sel("visibleFrame"))
+        };
+        let max_w = (vis.size.width - 48.0).max(320.0);
+        let max_h = (vis.size.height - 48.0).max(320.0);
+        let scale = (max_w / fb_w as f64).min(max_h / fb_h as f64).min(1.0);
+        let win_w = (fb_w as f64 * scale).floor().max(1.0);
+        let win_h = (fb_h as f64 * scale).floor().max(1.0);
+        let rect = NSRect { origin: NSPoint { x: 0.0, y: 0.0 }, size: NSSize { width: win_w, height: win_h } };
+        // titled | closable | miniaturizable | resizable, buffered, don't defer.
+        let window = msg_init_window(msg0(cls("NSWindow"), sel("alloc")), sel("initWithContentRect:styleMask:backing:defer:"), rect, 15, 2, 0);
+        if window.is_null() {
+            return Err("NSWindow init failed".into());
+        }
+        let title = msg_cstr(cls("NSString"), sel("stringWithUTF8String:"), "droidrt");
+        msg_id(window, sel("setTitle:"), title);
+        msg_void(window, sel("center"));
+        msg_id(window, sel("makeKeyAndOrderFront:"), std::ptr::null_mut());
+        msg_bool(app, sel("activateIgnoringOtherApps:"), 1);
+        msg_void(app, sel("finishLaunching"));
+        let view = msg0(window, sel("contentView"));
+        if view.is_null() {
+            return Err("NSWindow contentView is null".into());
+        }
+        let number = msg_i64_ret(window, sel("windowNumber"));
+        WINDOW.store(window, Ordering::Release);
+        if number > 0 {
+            WINDOW_ID.store(number as u64, Ordering::Release);
+        }
+        eprintln!("droidrt: window {win_w:.0}x{win_h:.0} points for {fb_w}x{fb_h} (id {number})");
+        Ok(NativeWindow { handle: view, width: win_w as i32, height: win_h as i32 })
+    }
+}
+
+unsafe fn msg_cstr(obj: *mut c_void, sel: *mut c_void, s: &str) -> *mut c_void {
+    let c = CString::new(s).unwrap();
+    let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *const i8) -> *mut c_void = unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+    unsafe { f(obj, sel, c.as_ptr()) }
+}
+
+pub fn window_id() -> Option<u64> {
+    let id = WINDOW_ID.load(Ordering::Acquire);
+    if id == 0 { None } else { Some(id) }
+}
+
+fn pump_once(wait_s: f64) {
+    let app = APP.load(Ordering::Acquire);
+    if app.is_null() {
+        std::thread::sleep(Duration::from_secs_f64(wait_s));
+        return;
+    }
+    unsafe {
+        let until = msg_f64_id(cls("NSDate"), sel("dateWithTimeIntervalSinceNow:"), wait_s);
+        let mode = NSDefaultRunLoopMode;
+        let event = msg_next_event(app, sel("nextEventMatchingMask:untilDate:inMode:dequeue:"), u64::MAX, until, mode, 1);
+        if !event.is_null() {
+            msg_id(app, sel("sendEvent:"), event);
+            msg_void(app, sel("updateWindows"));
+        }
+    }
+}
+
+pub fn pump_until(done: &std::sync::atomic::AtomicBool) {
+    while !done.load(Ordering::Acquire) {
+        pump_once(0.05);
+    }
+}
+
+pub fn pump_for(secs: f64) {
+    let start = Instant::now();
+    let total = Duration::from_secs_f64(secs);
+    while start.elapsed() < total {
+        let left = total.saturating_sub(start.elapsed()).as_secs_f64().min(0.05);
+        pump_once(left.max(0.001));
+    }
+}

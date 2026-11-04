@@ -19,10 +19,13 @@ mod vfs;
 use kernel::Kernel;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
-const USAGE: &str = "usage: droidrt [--system <system.img>] [--strace] <program> [args...]
-       droidrt --system <system.img> --boot [init args...]
-       droidrt --system <system.img> --ls <path> | --cat <path>";
+const USAGE: &str = "usage: droidrt [--system <system.img>] [--strace] [--display] <program> [args...]
+       droidrt --system <system.img> --boot [--headless] [init args...]
+       droidrt --system <system.img> --ls <path> | --cat <path>
+       droidrt --gpu-selftest";
 
 fn main() -> ExitCode {
     match run() {
@@ -41,6 +44,9 @@ fn run() -> Result<i32, String> {
     let mut inspect: Option<(String, String)> = None;
     let mut strace = std::env::var_os("DROIDRT_STRACE").is_some();
     let mut boot = false;
+    let mut display = false;
+    let mut headless = false;
+    let mut gpu_selftest = false;
     while let Some(flag) = args.peek().filter(|a| a.starts_with("--")).cloned() {
         args.next();
         match flag.as_str() {
@@ -50,10 +56,17 @@ fn run() -> Result<i32, String> {
             "--strace" => strace = true,
             // Android's init as pid 1. First-stage init's work (mounting
             // partitions, loading SELinux policy) is done by droidrt itself,
-            // so init starts at its second stage.
+            // so init starts at its second stage. A window comes with it
+            // unless --headless is also given.
             "--boot" => boot = true,
+            "--display" => display = true,
+            "--headless" => headless = true,
+            "--gpu-selftest" => gpu_selftest = true,
             _ => return Err(format!("unknown flag {flag}\n{USAGE}")),
         }
+    }
+    if gpu_selftest {
+        return gpu::selftest();
     }
     let vfs = match &system {
         Some(img) => Some(android::open_system_image(img, !boot).map_err(|e| format!("{}: {e}", img.display()))?),
@@ -73,6 +86,50 @@ fn run() -> Result<i32, String> {
         argv.insert(0, "/system/bin/init".into());
     }
     let argv_copy = argv.clone();
+    // --headless wins over both --display and the window --boot implies.
+    let show = !headless && (display || boot);
+    let gpu: Option<Arc<dyn gpu::GpuBackend>> = if show { Some(gpu::open(1080, 2400)?) } else { None };
+    if show {
+        let gpu_guest = gpu.clone();
+        let done = Arc::new(AtomicBool::new(false));
+        let done_thr = done.clone();
+        let slot: Arc<Mutex<Option<Result<i32, String>>>> = Arc::new(Mutex::new(None));
+        let slot_thr = slot.clone();
+        let root = root.clone();
+        let system = system.clone();
+        std::thread::spawn(move || {
+            let _stop = Stop(done_thr);
+            let code = boot_guest(root, system, vfs, strace, boot, argv, argv_copy, gpu_guest);
+            *slot_thr.lock().unwrap_or_else(|p| p.into_inner()) = Some(code);
+        });
+        gpu::pump_until(&done);
+        // Last owner: tear the renderer down on the main thread.
+        drop(gpu);
+        return slot.lock().unwrap_or_else(|p| p.into_inner()).take().unwrap_or_else(|| Err("guest thread panicked".into()));
+    }
+    boot_guest(root, system, vfs, strace, boot, argv, argv_copy, gpu)
+}
+
+struct Stop(Arc<AtomicBool>);
+impl Drop for Stop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn boot_guest(
+    root: PathBuf,
+    system: Option<PathBuf>,
+    vfs: Option<vfs::Vfs>,
+    strace: bool,
+    boot: bool,
+    argv: Vec<String>,
+    argv_copy: Vec<String>,
+    gpu: Option<Arc<dyn gpu::GpuBackend>>,
+) -> Result<i32, String> {
+    // Held until the guest exits. Kernel::new grows a gpu argument at merge.
+    let _gpu = &gpu;
     let program = argv.first().ok_or(USAGE)?.clone();
     let envp = vec![
         "PATH=/product/bin:/apex/com.android.runtime/bin:/system/bin:/system_ext/bin:/vendor/bin".to_string(),

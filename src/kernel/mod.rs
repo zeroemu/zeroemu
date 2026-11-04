@@ -8,7 +8,6 @@
 //! syscalls simply block that host thread.
 
 mod binder;
-#[allow(dead_code)] // wired into files.rs and mount(2) next
 mod block;
 mod epoll;
 mod files;
@@ -77,6 +76,8 @@ pub struct Kernel {
     futex: futex::Futexes,
     root_pid: AtomicI32,
     pub props: Arc<properties::Properties>,
+    /// Loop and device-mapper devices.
+    blocks: Arc<block::Blocks>,
     /// Kernel-side socket services (kept alive here; looked up by name).
     _services: Vec<Arc<unix::Socket>>,
     /// The root process's wait status once it exits; droidrt then exits.
@@ -247,6 +248,8 @@ impl Kernel {
             v
         });
         let dev = mount_tmpfs(&mut v, &phys);
+        let sys = v.resolve("/", "/sys", true).map(|n| v.fs_arc(&n)).map_err(|e| format!("/sys: errno {e}"))?;
+        let blocks = block::Blocks::new(dev.clone(), sys);
         // Properties, as init would set them up: defaults from build.prop,
         // shared read-only with every process at /dev/__properties__.
         let props = properties::Properties::new(phys.clone());
@@ -282,6 +285,7 @@ impl Kernel {
             futex: futex::Futexes::default(),
             root_pid: AtomicI32::new(0),
             props,
+            blocks,
             _services: services,
             exit: (Mutex::new(None), Condvar::new()),
             }

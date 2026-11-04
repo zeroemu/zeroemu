@@ -2,6 +2,7 @@
 //! directory syscalls over the read-only VFS.
 
 use super::binder::{self, BinderFile};
+use super::block;
 use super::epoll::Epoll;
 use super::specialfd::{EventFd, SignalFd, TimerFd};
 use super::unix::{self, Socket};
@@ -31,6 +32,7 @@ const O_TRUNC: u64 = 0o1000;
 const O_TMPFILE: u64 = 0o20000000;
 const AT_REMOVEDIR: u64 = 0x200;
 const S_IFCHR: u32 = 0o020000;
+const S_IFBLK: u32 = 0o060000;
 const O_APPEND: u32 = 0o2000;
 const O_NONBLOCK: u32 = 0o4000;
 const O_CLOEXEC: u64 = 0o2000000;
@@ -81,6 +83,15 @@ pub enum Kind {
     Epoll(Epoll),
     Socket(Arc<Socket>),
     Binder(BinderFile),
+    /// A loop or device-mapper device (block.rs).
+    Block(BlockOpen),
+    LoopControl,
+    DmControl,
+}
+
+pub struct BlockOpen {
+    devt: u64,
+    pos: Mutex<u64>,
 }
 
 /// An open file description, shared by dup'd and inherited descriptors.
@@ -289,7 +300,7 @@ pub(super) fn poll_ready(f: &File, t: &Thread, depth: u32) -> u16 {
         }
         Kind::Stdin => POLLIN,
         Kind::Stdout | Kind::Stderr => POLLOUT,
-        Kind::Null | Kind::Zero | Kind::Random | Kind::Node(_) | Kind::Mem(_) => POLLIN | POLLOUT,
+        Kind::Null | Kind::Zero | Kind::Random | Kind::Node(_) | Kind::Mem(_) | Kind::Block(_) | Kind::LoopControl | Kind::DmControl => POLLIN | POLLOUT,
         Kind::Kmsg => POLLOUT,
         Kind::Pipe(end) => {
             let st = end.pipe.st.lock().unwrap();
@@ -350,6 +361,19 @@ impl Kernel {
                         0 => 0,
                         1 => *pos as i64,
                         2 => m.file.size() as i64,
+                        _ => return Err(EINVAL),
+                    };
+                    let new = base.checked_add(a[1] as i64).filter(|&n| n >= 0).ok_or(EINVAL)?;
+                    *pos = new as u64;
+                    return Ok(new);
+                }
+                if let Kind::Block(b) = &f.kind {
+                    let len = self.blocks.device(b.devt).map_or(0, |d| d.len());
+                    let mut pos = b.pos.lock().unwrap();
+                    let base = match a[2] {
+                        0 => 0,
+                        1 => *pos as i64,
+                        2 => len as i64,
                         _ => return Err(EINVAL),
                     };
                     let new = base.checked_add(a[1] as i64).filter(|&n| n >= 0).ok_or(EINVAL)?;
@@ -466,8 +490,13 @@ impl Kernel {
             }
             ioctl => {
                 let f = t.proc.files.lock().unwrap().get(int(a[0]))?;
-                if let Kind::Binder(b) = &f.kind {
-                    return self.binder_ioctl(t, &f, b, a[1] as u32 as u64, a[2]);
+                let cmd = a[1] as u32 as u64;
+                match &f.kind {
+                    Kind::Binder(b) => return self.binder_ioctl(t, &f, b, cmd, a[2]),
+                    Kind::Block(b) => return self.blocks.ioctl(b.devt, cmd, a[2], &mut BlockCaller { k: self, t }),
+                    Kind::LoopControl => return self.blocks.loop_control(cmd, a[2]),
+                    Kind::DmControl => return self.blocks.dm_ioctl(cmd, a[2], &mut BlockCaller { k: self, t }),
+                    _ => {}
                 }
                 const FIONCLEX: u64 = 0x5450;
                 const FIOCLEX: u64 = 0x5451;
@@ -683,8 +712,12 @@ impl Kernel {
                 0x105 => Kind::Zero,
                 0x108 | 0x109 => Kind::Random,
                 0x10b => Kind::Kmsg,
+                r if r == block::makedev(block::MISC_MAJOR, block::LOOP_CONTROL_MINOR) => Kind::LoopControl,
+                r if r == block::makedev(block::MISC_MAJOR, block::DM_CONTROL_MINOR) => Kind::DmControl,
                 rdev => binder::file_for(t, rdev).ok_or(ENXIO)?,
             },
+            S_IFBLK if self.blocks.device(stat.rdev).is_some() => Kind::Block(BlockOpen { devt: stat.rdev, pos: Mutex::new(0) }),
+            S_IFBLK => return Err(ENXIO),
             S_IFDIR if access != 0 => return Err(EISDIR),
             _ if flags & of.directory != 0 && stat.mode & S_IFMT != S_IFDIR => return Err(ENOTDIR),
             S_IFREG if vfs.writable(&node) => {
@@ -951,6 +984,17 @@ impl Kernel {
                 data
             }
             Kind::Socket(sock) => unix::read(sock, t, count, f.nonblock())?,
+            Kind::Block(b) => {
+                let dev = self.blocks.device(b.devt).ok_or(ENXIO)?;
+                let mut pos = b.pos.lock().unwrap();
+                let off = at.unwrap_or(*pos);
+                let n = dev.len().saturating_sub(off).min(count as u64) as usize;
+                let data = dev.read_vec(off, n).map_err(|_| EIO)?;
+                if at.is_none() {
+                    *pos += n as u64;
+                }
+                data
+            }
             Kind::Node(nf) => {
                 let mut nf = nf.lock().unwrap();
                 let data = self.node_data(&mut nf)?;
@@ -1045,6 +1089,9 @@ impl Kernel {
             Kind::Socket(_) => Stat { mode: 0o140777, nlink: 1, ..Default::default() },
             Kind::Event(_) | Kind::Timer(_) | Kind::Signal(_) | Kind::Epoll(_) => Stat { mode: 0o600, nlink: 1, ..Default::default() }, // anon_inode
             Kind::Binder(_) => Stat { mode: 0o020666, nlink: 1, rdev: 0xa36, ..Default::default() },
+            Kind::Block(b) => Stat { mode: S_IFBLK | 0o600, nlink: 1, rdev: b.devt, ..Default::default() },
+            Kind::LoopControl => chr(block::makedev(block::MISC_MAJOR, block::LOOP_CONTROL_MINOR)),
+            Kind::DmControl => chr(block::makedev(block::MISC_MAJOR, block::DM_CONTROL_MINOR)),
             Kind::Node(nf) => nf.lock().unwrap().stat.clone(),
             Kind::Mem(m) => match &m.node {
                 Some(n) => self.vfs()?.stat(n)?,
@@ -1265,7 +1312,43 @@ pub(super) fn file_name(f: &File) -> String {
         Kind::Signal(_) => "anon_inode:[signalfd]".into(),
         Kind::Epoll(_) => "anon_inode:[eventpoll]".into(),
         Kind::Binder(_) => "/dev/binder".into(),
+        Kind::Block(b) => format!("/dev/block/{}", block::name(b.devt)),
+        Kind::LoopControl => "/dev/loop-control".into(),
+        Kind::DmControl => "/dev/device-mapper".into(),
         Kind::Stdin | Kind::Stdout | Kind::Stderr => "/dev/pts/0".into(),
+    }
+}
+
+/// Guest memory and open files, for block.rs's ioctls.
+struct BlockCaller<'a> {
+    k: &'a Kernel,
+    t: &'a Thread,
+}
+
+impl block::Caller for BlockCaller<'_> {
+    fn read(&mut self, addr: u64, len: usize) -> Result<Vec<u8>, i64> {
+        self.t.proc.mm().read_vec(addr, len)
+    }
+    fn write(&mut self, addr: u64, data: &[u8]) -> Result<(), i64> {
+        self.t.proc.mm().write(addr, data)
+    }
+    fn backing(&mut self, fd: i32) -> Result<(crate::image::Dev, String), i64> {
+        let f = self.t.proc.files.lock().unwrap().get(fd as i64)?;
+        match &f.kind {
+            Kind::Node(nf) => {
+                let node = nf.lock().unwrap().node.clone();
+                let data = self.k.vfs()?.read_all(&node)?;
+                Ok((Arc::new(crate::image::MemDev(data)), node.path))
+            }
+            Kind::Mem(m) => Ok((Arc::new(block::MemFileDev(m.file.clone())), m.name.clone())),
+            Kind::Block(b) => Ok((self.k.blocks.device(b.devt).ok_or(ENXIO)?, file_name(&f))),
+            _ => Err(EINVAL),
+        }
+    }
+    fn dev_of_path(&mut self, path: &str) -> Option<u64> {
+        let node = self.k.resolve(self.t, AT_FDCWD, path, true).ok()?;
+        let st = self.k.vfs().ok()?.stat(&node).ok()?;
+        (st.mode & S_IFMT == S_IFBLK).then_some(st.rdev)
     }
 }
 

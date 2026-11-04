@@ -11,8 +11,8 @@
 
 use crate::errno::*;
 use crate::image::{Dev, ReadAt};
-use crate::tmpfs::{MemFile, Tmpfs};
-use crate::vfs::{FileSystem, S_IFDIR, S_IFMT};
+use crate::tmpfs::MemFile;
+use crate::vfs::{FileSystem, S_IFDIR, S_IFMT, S_IFREG};
 use std::collections::BTreeMap;
 use std::io;
 use std::sync::{Arc, Mutex};
@@ -33,6 +33,15 @@ const S_IFBLK: u32 = 0o060000;
 pub fn makedev(major: u32, minor: u32) -> u64 {
     let (ma, mi) = (major as u64, minor as u64);
     ((ma & 0xffff_f000) << 32) | ((ma & 0xfff) << 8) | ((mi & 0xffff_ff00) << 12) | (mi & 0xff)
+}
+
+/// The /dev/block name of a device.
+pub fn name(devt: u64) -> String {
+    match major(devt) {
+        LOOP_MAJOR => format!("loop{}", minor(devt)),
+        DM_MAJOR => format!("dm-{}", minor(devt)),
+        ma => format!("{ma}:{}", minor(devt)),
+    }
 }
 
 pub fn major(dev: u64) -> u32 {
@@ -263,44 +272,60 @@ struct Devices {
 pub struct Blocks {
     devs: Mutex<Devices>,
     /// /dev and /sys, where the device nodes and attributes appear.
-    dev: Arc<Tmpfs>,
-    sys: Arc<Tmpfs>,
+    dev: Arc<dyn FileSystem>,
+    sys: Arc<dyn FileSystem>,
 }
 
-/// Creates or replaces a small attribute file in a tmpfs tree.
-fn put_file(fs: &Tmpfs, path: &str, content: &str) {
-    let (dir, name) = path.rsplit_once('/').unwrap_or(("", path));
-    let d = fs.mkdir_p(dir, 0o755);
-    match fs.lookup(d, name).ok().flatten().and_then(|ino| fs.mem_file(ino)) {
-        Some(f) => {
-            f.truncate(0);
-            let _ = f.write_at(0, content.as_bytes());
-        }
-        None => fs.write_file(path, 0o644, content),
-    }
-}
-
-fn remove(fs: &Tmpfs, path: &str) {
-    let (dir, name) = path.rsplit_once('/').unwrap_or(("", path));
-    let mut d = fs.root().unwrap_or(1);
-    for part in dir.split('/').filter(|p| !p.is_empty()) {
-        match fs.lookup(d, part).ok().flatten() {
-            Some(i) => d = i,
-            None => return,
-        }
-    }
-    let _ = fs.unlink(d, name, false);
-}
-
-fn remove_tree(fs: &Tmpfs, path: &str) {
+/// mkdir -p on any writable filesystem; returns the directory's inode.
+fn mkdir_p(fs: &dyn FileSystem, path: &str) -> u64 {
     let mut d = fs.root().unwrap_or(1);
     for part in path.split('/').filter(|p| !p.is_empty()) {
-        match fs.lookup(d, part).ok().flatten() {
-            Some(i) => d = i,
-            None => return,
-        }
+        d = match fs.lookup(d, part).ok().flatten() {
+            Some(i) => i,
+            None => match fs.mkdir(d, part, 0o755) {
+                Ok(i) => i,
+                Err(_) => return d,
+            },
+        };
     }
-    fn rm(fs: &Tmpfs, dir: u64) {
+    d
+}
+
+/// The inode at `path`, if it exists.
+fn walk(fs: &dyn FileSystem, path: &str) -> Option<u64> {
+    let mut d = fs.root().ok()?;
+    for part in path.split('/').filter(|p| !p.is_empty()) {
+        d = fs.lookup(d, part).ok().flatten()?;
+    }
+    Some(d)
+}
+
+/// Creates or replaces a small attribute file.
+fn put_file(fs: &dyn FileSystem, path: &str, content: &str) {
+    let (dir, name) = path.rsplit_once('/').unwrap_or(("", path));
+    let d = mkdir_p(fs, dir);
+    let ino = match fs.lookup(d, name).ok().flatten() {
+        Some(i) => i,
+        None => match fs.create(d, name, S_IFREG | 0o644, 0) {
+            Ok(i) => i,
+            Err(_) => return,
+        },
+    };
+    if let Some(f) = fs.mem_file(ino) {
+        f.truncate(0);
+        let _ = f.write_at(0, content.as_bytes());
+    }
+}
+
+fn remove(fs: &dyn FileSystem, path: &str) {
+    let (dir, name) = path.rsplit_once('/').unwrap_or(("", path));
+    if let Some(d) = walk(fs, dir) {
+        let _ = fs.unlink(d, name, false);
+    }
+}
+
+fn remove_tree(fs: &dyn FileSystem, path: &str) {
+    fn rm(fs: &dyn FileSystem, dir: u64) {
         for e in fs.readdir(dir).unwrap_or_default() {
             if e.name == "." || e.name == ".." {
                 continue;
@@ -314,25 +339,22 @@ fn remove_tree(fs: &Tmpfs, path: &str) {
             }
         }
     }
+    let Some(d) = walk(fs, path) else { return };
     rm(fs, d);
     let (parent, name) = path.rsplit_once('/').unwrap_or(("", path));
-    let mut p = fs.root().unwrap_or(1);
-    for part in parent.split('/').filter(|p| !p.is_empty()) {
-        match fs.lookup(p, part).ok().flatten() {
-            Some(i) => p = i,
-            None => return,
-        }
+    if let Some(p) = walk(fs, parent) {
+        let _ = fs.unlink(p, name, true);
     }
-    let _ = fs.unlink(p, name, true);
 }
 
 impl Blocks {
-    pub fn new(dev: Arc<Tmpfs>, sys: Arc<Tmpfs>) -> Arc<Blocks> {
+    /// `dev` and `sys` are the writable filesystems mounted at /dev and /sys.
+    pub fn new(dev: Arc<dyn FileSystem>, sys: Arc<dyn FileSystem>) -> Arc<Blocks> {
         let b = Arc::new(Blocks { devs: Mutex::default(), dev, sys });
         let root = b.dev.root().unwrap_or(1);
         let _ = b.dev.create(root, "loop-control", S_IFCHR | 0o660, makedev(MISC_MAJOR, LOOP_CONTROL_MINOR));
         let _ = b.dev.create(root, "device-mapper", S_IFCHR | 0o600, makedev(MISC_MAJOR, DM_CONTROL_MINOR));
-        b.dev.mkdir_p("block/mapper/by-uuid", 0o755);
+        mkdir_p(&*b.dev, "block/mapper/by-uuid");
         let mut devs = b.devs.lock().unwrap();
         for n in 0..LOOP_MIN_COUNT {
             b.add_loop(&mut devs, n);
@@ -351,14 +373,10 @@ impl Blocks {
         }
     }
 
-    pub fn is_block(&self, devt: u64) -> bool {
-        matches!(major(devt), LOOP_MAJOR | DM_MAJOR)
-    }
-
     fn add_loop(&self, devs: &mut Devices, n: u32) -> Arc<Loop> {
         let lp = Arc::new(Loop { number: n, st: Mutex::new(None) });
         devs.loops.insert(n, lp.clone());
-        let block = self.dev.mkdir_p("block", 0o755);
+        let block = mkdir_p(&*self.dev, "block");
         let _ = self.dev.create(block, &format!("loop{n}"), S_IFBLK | 0o600, makedev(LOOP_MAJOR, n));
         self.loop_sysfs(&lp, None);
         lp
@@ -366,22 +384,22 @@ impl Blocks {
 
     fn loop_sysfs(&self, lp: &Loop, b: Option<&Bound>) {
         let base = format!("block/loop{}", lp.number);
-        put_file(&self.sys, &format!("{base}/size"), &format!("{}\n", b.map_or(0, |b| b.size() / SECTOR)));
-        put_file(&self.sys, &format!("{base}/ro"), if b.is_some_and(|b| b.flags & LO_FLAGS_READ_ONLY != 0) { "1\n" } else { "0\n" });
-        put_file(&self.sys, &format!("{base}/dev"), &format!("{LOOP_MAJOR}:{}\n", lp.number));
-        put_file(&self.sys, &format!("{base}/queue/read_ahead_kb"), "128\n");
-        put_file(&self.sys, &format!("{base}/queue/logical_block_size"), &format!("{}\n", b.map_or(512, |b| b.block_size)));
-        put_file(&self.sys, &format!("{base}/queue/nr_requests"), "128\n");
-        put_file(&self.sys, &format!("{base}/queue/scheduler"), "[none]\n");
+        put_file(&*self.sys, &format!("{base}/size"), &format!("{}\n", b.map_or(0, |b| b.size() / SECTOR)));
+        put_file(&*self.sys, &format!("{base}/ro"), if b.is_some_and(|b| b.flags & LO_FLAGS_READ_ONLY != 0) { "1\n" } else { "0\n" });
+        put_file(&*self.sys, &format!("{base}/dev"), &format!("{LOOP_MAJOR}:{}\n", lp.number));
+        put_file(&*self.sys, &format!("{base}/queue/read_ahead_kb"), "128\n");
+        put_file(&*self.sys, &format!("{base}/queue/logical_block_size"), &format!("{}\n", b.map_or(512, |b| b.block_size)));
+        put_file(&*self.sys, &format!("{base}/queue/nr_requests"), "128\n");
+        put_file(&*self.sys, &format!("{base}/queue/scheduler"), "[none]\n");
         match b {
             Some(b) => {
-                put_file(&self.sys, &format!("{base}/loop/backing_file"), &format!("{}\n", b.name));
-                put_file(&self.sys, &format!("{base}/loop/offset"), &format!("{}\n", b.offset));
-                put_file(&self.sys, &format!("{base}/loop/sizelimit"), &format!("{}\n", b.sizelimit));
-                put_file(&self.sys, &format!("{base}/loop/autoclear"), if b.flags & LO_FLAGS_AUTOCLEAR != 0 { "1\n" } else { "0\n" });
-                put_file(&self.sys, &format!("{base}/loop/dio"), if b.flags & LO_FLAGS_DIRECT_IO != 0 { "1\n" } else { "0\n" });
+                put_file(&*self.sys, &format!("{base}/loop/backing_file"), &format!("{}\n", b.name));
+                put_file(&*self.sys, &format!("{base}/loop/offset"), &format!("{}\n", b.offset));
+                put_file(&*self.sys, &format!("{base}/loop/sizelimit"), &format!("{}\n", b.sizelimit));
+                put_file(&*self.sys, &format!("{base}/loop/autoclear"), if b.flags & LO_FLAGS_AUTOCLEAR != 0 { "1\n" } else { "0\n" });
+                put_file(&*self.sys, &format!("{base}/loop/dio"), if b.flags & LO_FLAGS_DIRECT_IO != 0 { "1\n" } else { "0\n" });
             }
-            None => remove_tree(&self.sys, &format!("{base}/loop")),
+            None => remove_tree(&*self.sys, &format!("{base}/loop")),
         }
     }
 
@@ -419,8 +437,8 @@ impl Blocks {
                     return Err(EBUSY);
                 }
                 devs.loops.remove(&n);
-                remove(&self.dev, &format!("block/loop{n}"));
-                remove_tree(&self.sys, &format!("block/loop{n}"));
+                remove(&*self.dev, &format!("block/loop{n}"));
+                remove_tree(&*self.sys, &format!("block/loop{n}"));
                 Ok(n as i64)
             }
             _ => Err(ENOTTY),
@@ -613,15 +631,15 @@ impl Blocks {
     fn dm_links(&self, d: &DmDevice, add: bool) {
         let (name, uuid) = d.ids.lock().unwrap().clone();
         let target = format!("dm-{}", d.minor);
-        let mapper = self.dev.mkdir_p("block/mapper", 0o755);
-        let by_uuid = self.dev.mkdir_p("block/mapper/by-uuid", 0o755);
+        let mapper = mkdir_p(&*self.dev, "block/mapper");
+        let by_uuid = mkdir_p(&*self.dev, "block/mapper/by-uuid");
         if add {
             let _ = self.dev.symlink(mapper, &name, &format!("../{target}"));
             if !uuid.is_empty() {
                 let _ = self.dev.symlink(by_uuid, &uuid, &format!("../../{target}"));
             }
-            put_file(&self.sys, &format!("block/{target}/dm/name"), &format!("{name}\n"));
-            put_file(&self.sys, &format!("block/{target}/dm/uuid"), &format!("{uuid}\n"));
+            put_file(&*self.sys, &format!("block/{target}/dm/name"), &format!("{name}\n"));
+            put_file(&*self.sys, &format!("block/{target}/dm/uuid"), &format!("{uuid}\n"));
         } else {
             let _ = self.dev.unlink(mapper, &name, false);
             if !uuid.is_empty() {
@@ -634,12 +652,12 @@ impl Blocks {
         let base = format!("block/dm-{}", d.minor);
         let st = d.st.lock().unwrap();
         let size = st.active.as_ref().and_then(|t| t.last()).map_or(0, |t| t.start + t.len);
-        put_file(&self.sys, &format!("{base}/size"), &format!("{size}\n"));
-        put_file(&self.sys, &format!("{base}/ro"), if st.readonly { "1\n" } else { "0\n" });
-        put_file(&self.sys, &format!("{base}/dev"), &format!("{DM_MAJOR}:{}\n", d.minor));
-        put_file(&self.sys, &format!("{base}/dm/suspended"), if st.suspended { "1\n" } else { "0\n" });
-        put_file(&self.sys, &format!("{base}/queue/read_ahead_kb"), "128\n");
-        put_file(&self.sys, &format!("{base}/queue/logical_block_size"), "512\n");
+        put_file(&*self.sys, &format!("{base}/size"), &format!("{size}\n"));
+        put_file(&*self.sys, &format!("{base}/ro"), if st.readonly { "1\n" } else { "0\n" });
+        put_file(&*self.sys, &format!("{base}/dev"), &format!("{DM_MAJOR}:{}\n", d.minor));
+        put_file(&*self.sys, &format!("{base}/dm/suspended"), if st.suspended { "1\n" } else { "0\n" });
+        put_file(&*self.sys, &format!("{base}/queue/read_ahead_kb"), "128\n");
+        put_file(&*self.sys, &format!("{base}/queue/logical_block_size"), "512\n");
     }
 
     /// Resolves a table's device reference: "major:minor" or a path.
@@ -749,7 +767,7 @@ impl Blocks {
                 let d = Arc::new(DmDevice { minor, ids: Mutex::new((name.clone(), uuid.clone())), st: Mutex::default() });
                 devs.dms.push(d.clone());
                 drop(devs);
-                let block = self.dev.mkdir_p("block", 0o755);
+                let block = mkdir_p(&*self.dev, "block");
                 let _ = self.dev.create(block, &format!("dm-{minor}"), S_IFBLK | 0o600, makedev(DM_MAJOR, minor));
                 self.dm_links(&d, true);
                 self.dm_sysfs(&d);
@@ -960,8 +978,8 @@ impl Blocks {
 
     fn dm_unregister(&self, d: &DmDevice) {
         self.dm_links(d, false);
-        remove(&self.dev, &format!("block/dm-{}", d.minor));
-        remove_tree(&self.sys, &format!("block/dm-{}", d.minor));
+        remove(&*self.dev, &format!("block/dm-{}", d.minor));
+        remove_tree(&*self.sys, &format!("block/dm-{}", d.minor));
     }
 }
 
@@ -977,6 +995,7 @@ mod tests {
     use crate::hv::{CpuState, Hypervisor, KernelPage, PageTableRoot, Vcpu};
     use crate::image::MemDev;
     use crate::phys::PhysMem;
+    use crate::tmpfs::Tmpfs;
 
     /// Enough of a hypervisor for tmpfs: memory, no vCPUs.
     struct NoHv;
@@ -1134,7 +1153,7 @@ mod tests {
         assert_eq!(cstr_field(&c.mem[spec + DM_SPEC..spec + DM_SPEC + 8]), "V");
 
         // The mapper links exist, then go away with the device.
-        let mapper = b.dev.mkdir_p("block/mapper", 0o755);
+        let mapper = mkdir_p(&*b.dev, "block/mapper");
         assert!(b.dev.lookup(mapper, "com.android.test").unwrap().is_some());
         assert_eq!(b.dm_ioctl(dm_cmd(dm::DEV_REMOVE), 0x1000, &mut c), Ok(0));
         assert!(b.dev.lookup(mapper, "com.android.test").unwrap().is_none());

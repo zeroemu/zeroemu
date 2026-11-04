@@ -5,6 +5,8 @@ mod android;
 mod arch;
 mod elf;
 mod errno;
+#[allow(dead_code)] // implemented by the gfxstream host backend, called by the DRM driver
+mod gpu;
 mod hv;
 mod image;
 mod kernel;

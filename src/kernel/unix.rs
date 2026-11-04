@@ -125,6 +125,8 @@ struct State {
 
 pub struct Socket {
     ty: u32,
+    /// Credentials of the process that created the socket (SO_PEERCRED).
+    cred: Cred,
     rx: Mutex<Queue>,
     st: Mutex<State>,
     /// Answered inside the kernel (e.g. the property service), not by a process.
@@ -146,7 +148,7 @@ pub trait Service: Send + Sync {
 }
 
 fn service_socket(vfs: &Vfs, path: &str, ty: u32, perm: u32, owner: (u32, u32), service: Arc<dyn Service>, listening: bool) -> Arc<Socket> {
-    let sock = Arc::new(Socket { ty, rx: Mutex::new(Queue::default()), st: Mutex::new(State::default()), service: Some(service), svc_buf: Mutex::new(Vec::new()) });
+    let sock = Arc::new(Socket { ty, cred: Cred { pid: 1, uid: 0, gid: 0 }, rx: Mutex::new(Queue::default()), st: Mutex::new(State::default()), service: Some(service), svc_buf: Mutex::new(Vec::new()) });
     {
         let mut st = sock.st.lock().unwrap();
         st.name = Some(path.as_bytes().to_vec());
@@ -239,8 +241,8 @@ impl Drop for Socket {
 }
 
 impl Socket {
-    fn new(ty: u32) -> Arc<Socket> {
-        Arc::new(Socket { ty, rx: Mutex::new(Queue::default()), st: Mutex::new(State::default()), service: None, svc_buf: Mutex::new(Vec::new()) })
+    fn new(ty: u32, cred: Cred) -> Arc<Socket> {
+        Arc::new(Socket { ty, cred, rx: Mutex::new(Queue::default()), st: Mutex::new(State::default()), service: None, svc_buf: Mutex::new(Vec::new()) })
     }
 
     /// Sends a packet to the client of a kernel-service connection.
@@ -397,6 +399,7 @@ impl Socket {
                         let mut st = self.st.lock().unwrap();
                         st.connected = false;
                         st.peer = None;
+                        st.peer_cred = Cred::default();
                         return Err(ECONNREFUSED);
                     }
                 },
@@ -540,7 +543,7 @@ impl Kernel {
                     return Err(EAFNOSUPPORT); // inet sockets: not yet
                 }
                 let ty = sock_type(a[1])?;
-                let file = File::new(Kind::Socket(Socket::new(ty)), (a[1] & SOCK_NONBLOCK) as u32);
+                let file = File::new(Kind::Socket(Socket::new(ty, Cred::of(t))), (a[1] & SOCK_NONBLOCK) as u32);
                 t.proc.files.lock().unwrap().alloc(file, a[1] & SOCK_CLOEXEC != 0, 0)
             }
             socketpair => {
@@ -548,7 +551,8 @@ impl Kernel {
                     return Err(if a[0] == netlink::AF_NETLINK { EOPNOTSUPP } else { EAFNOSUPPORT });
                 }
                 let ty = sock_type(a[1])?;
-                let (x, y) = (Socket::new(ty), Socket::new(ty));
+                let cred = Cred::of(t);
+                let (x, y) = (Socket::new(ty, cred), Socket::new(ty, cred));
                 Socket::connect_pair(&x, &y, Cred::of(t), Cred::of(t));
                 let flags = (a[1] & SOCK_NONBLOCK) as u32;
                 let cloexec = a[1] & SOCK_CLOEXEC != 0;
@@ -646,13 +650,16 @@ impl Kernel {
                     let mut st = sock.st.lock().unwrap();
                     st.connected = false;
                     st.peer = None;
+                    st.peer_cred = Cred::default();
                     return Ok(0);
                 }
                 let name = self.read_addr(t, a[1], a[2])?.ok_or(EINVAL)?;
                 let target = self.find(t, &name, sock.ty)?;
                 if sock.ty == SOCK_DGRAM {
+                    let peer_cred = target.cred;
                     let mut st = sock.st.lock().unwrap();
                     st.peer = Some(Arc::downgrade(&target));
+                    st.peer_cred = peer_cred;
                     st.connected = true;
                     return Ok(0);
                 }
@@ -662,15 +669,15 @@ impl Kernel {
                 let listener = target;
                 if let Some(svc) = &listener.service {
                     // A kernel-side service answers on its own; nothing to accept.
-                    let server = Arc::new(Socket { ty: sock.ty, rx: Mutex::new(Queue::default()), st: Mutex::new(State::default()), service: Some(svc.clone()), svc_buf: Mutex::new(Vec::new()) });
+                    let server = Arc::new(Socket { ty: sock.ty, cred: Cred { pid: 1, uid: 0, gid: 0 }, rx: Mutex::new(Queue::default()), st: Mutex::new(State::default()), service: Some(svc.clone()), svc_buf: Mutex::new(Vec::new()) });
                     server.st.lock().unwrap().name = listener.st.lock().unwrap().name.clone();
                     Socket::connect_pair(&sock, &server, Cred::of(t), Cred { pid: 1, uid: 0, gid: 0 });
                     sock.st.lock().unwrap().peer_server = Some(server);
                     return Ok(0);
                 }
-                let server = Socket::new(sock.ty);
                 let mut lst = listener.st.lock().unwrap();
                 let (listen_cred, listen_name) = (lst.listen_cred, lst.name.clone());
+                let server = Socket::new(sock.ty, listen_cred);
                 let backlog = lst.backlog.as_mut().ok_or(ECONNREFUSED)?;
                 if backlog.len() >= 4096 {
                     return Err(EAGAIN);

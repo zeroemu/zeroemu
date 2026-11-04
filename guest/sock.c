@@ -266,6 +266,15 @@ static void unix_paths(void) {
     sys(NR_close, sys(NR_openat, AT_FDCWD, "/tmp/u/other", 0101, 0644));
     sys(NR_renameat, AT_FDCWD, "/tmp/u/other", AT_FDCWD, "/tmp/u/hl");
     check(reaches(hl, "/tmp/u/hl2"), "rename over one hard link leaves the other bound");
+
+    // connect(2) on a datagram records the peer for SO_PEERCRED.
+    int dg = (int)sys(NR_socket, 1, SOCK_DGRAM, 0);
+    int me = (int)sys(NR_socket, 1, SOCK_DGRAM, 0);
+    bind_path(dg, "/tmp/u/cred");
+    connect_path(me, "/tmp/u/cred");
+    struct { int pid; u32 uid, gid; } pc;
+    u32 pcl = sizeof pc;
+    check(sys(NR_getsockopt, me, 1, 17 /* SO_PEERCRED */, &pc, &pcl) == 0 && pc.pid == (int)sys(NR_getpid, 0), "datagram SO_PEERCRED: the peer's pid");
 }
 
 // ---- netlink ----

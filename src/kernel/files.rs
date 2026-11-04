@@ -93,6 +93,8 @@ pub enum Kind {
     LoopControl,
     DmControl,
     Special(SpecialOpen),
+    /// A pseudo-terminal master or slave (pty.rs).
+    Pty(super::pty::End),
 }
 
 /// A file whose contents a kernel subsystem computes (selinuxfs,
@@ -348,6 +350,7 @@ pub(super) fn poll_ready(f: &File, t: &Thread, depth: u32) -> u16 {
         Kind::Signal(sf) => if sf.ready_in(t) { POLLIN } else { 0 },
         Kind::Epoll(ep) => if ep.is_ready(t, depth) { POLLIN } else { 0 },
         Kind::Socket(s) => s.poll(),
+        Kind::Pty(p) => p.poll(),
         Kind::Netlink(n) => n.poll(),
         Kind::Binder(b) => {
             (if binder::readable(b, t.tid) { POLLIN } else { 0 }) | POLLOUT
@@ -593,6 +596,11 @@ impl Kernel {
                     Kind::Block(b) => return self.blocks.ioctl(b.devt, cmd, a[2], &mut BlockCaller { k: self, t }),
                     Kind::LoopControl => return self.blocks.loop_control(cmd, a[2]),
                     Kind::DmControl => return self.blocks.dm_ioctl(cmd, a[2], &mut BlockCaller { k: self, t }),
+                    Kind::Pty(p) if cmd == super::pty::TIOCGPTPEER => {
+                        let file = File::new(Kind::Pty(p.peer()?), (a[2] & O_NONBLOCK as u64) as u32);
+                        return t.proc.files.lock().unwrap().alloc(file, a[2] & O_CLOEXEC != 0, 0);
+                    }
+                    Kind::Pty(p) if !matches!(a[1], 0x5450 | 0x5451 | 0x5421) => return p.ioctl(t, cmd, a[2]),
                     _ => {}
                 }
                 const FIONCLEX: u64 = 0x5450;
@@ -811,6 +819,8 @@ impl Kernel {
                 0x105 => Kind::Zero,
                 0x108 | 0x109 => Kind::Random,
                 0x10b => Kind::Kmsg,
+                super::pty::PTMX => Kind::Pty(super::pty::open_master(self.vfs.clone())?),
+                r if super::pty::is_slave(r) => Kind::Pty(super::pty::open_slave(r)?),
                 r if r == block::makedev(block::MISC_MAJOR, block::LOOP_CONTROL_MINOR) => Kind::LoopControl,
                 r if r == block::makedev(block::MISC_MAJOR, block::DM_CONTROL_MINOR) => Kind::DmControl,
                 rdev => binder::file_for(t, rdev).ok_or(ENXIO)?,
@@ -1096,6 +1106,7 @@ impl Kernel {
                 v
             }
             Kind::Pipe(end) if !end.write => end.pipe.read(t, count, f.nonblock())?,
+            Kind::Pty(p) => p.read(t, count, f.nonblock())?,
             Kind::Event(e) => {
                 if count < 8 {
                     return Err(EINVAL);
@@ -1203,6 +1214,7 @@ impl Kernel {
                 r => r?,
             },
             Kind::Netlink(nl) => netlink::write(nl, t, data, f.nonblock())?,
+            Kind::Pty(p) => p.write(t, &data, f.nonblock())?,
             Kind::Mem(m) => {
                 if !m.writable {
                     return Err(EBADF);
@@ -1256,6 +1268,7 @@ impl Kernel {
             Kind::Block(b) => Stat { mode: S_IFBLK | 0o600, nlink: 1, rdev: b.devt, ..Default::default() },
             Kind::LoopControl => chr(block::makedev(block::MISC_MAJOR, block::LOOP_CONTROL_MINOR)),
             Kind::DmControl => chr(block::makedev(block::MISC_MAJOR, block::DM_CONTROL_MINOR)),
+            Kind::Pty(p) => Stat { mode: if p.master { 0o020666 } else { 0o020620 }, rdev: p.rdev(), nlink: 1, ..Default::default() },
             Kind::Node(nf) => nf.lock().unwrap().stat.clone(),
             Kind::Special(s) => self.vfs()?.stat(&s.node)?,
             Kind::Mem(m) => match &m.node {
@@ -1488,6 +1501,8 @@ pub(super) fn file_name(f: &File) -> String {
         Kind::Signal(_) => "anon_inode:[signalfd]".into(),
         Kind::Epoll(_) => "anon_inode:[eventpoll]".into(),
         Kind::Binder(_) => "/dev/binder".into(),
+        Kind::Pty(p) if p.master => "/dev/ptmx".into(),
+        Kind::Pty(p) => format!("/dev/pts/{}", p.pty.index),
         Kind::Block(b) => format!("/dev/block/{}", block::name(b.devt)),
         Kind::LoopControl => "/dev/loop-control".into(),
         Kind::DmControl => "/dev/device-mapper".into(),

@@ -23,6 +23,7 @@ mod netlink;
 mod process;
 mod procfs;
 mod properties;
+mod pty;
 mod sched;
 mod selinux;
 mod signal;
@@ -120,7 +121,7 @@ fn mount_tmpfs(vfs: &mut Vfs, phys: &Arc<PhysMem>) -> Arc<crate::tmpfs::Tmpfs> {
     use crate::vfs::FileSystem;
     let dev = Tmpfs::new(phys.clone(), 0o755);
     let dev_handle = dev.clone();
-    for (name, rdev) in [("null", 0x103), ("zero", 0x105), ("random", 0x108), ("urandom", 0x109), ("kmsg", 0x10b)] {
+    for (name, rdev) in [("null", 0x103), ("zero", 0x105), ("random", 0x108), ("urandom", 0x109), ("kmsg", 0x10b), ("ptmx", 0x502)] {
         dev.create(1, name, 0o020666, rdev).expect("tmpfs /dev");
     }
     for (name, rdev) in binder::DEVICES {

@@ -10,7 +10,8 @@ use super::{Blob, Box3, Fence, GpuBackend, Iov, Resource3d, ResourceInfo, Transf
 use std::ffi::{CStr, CString, c_void};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Mutex, OnceLock, mpsc};
+use std::time::{Duration, Instant};
 
 // This build's get_cap_set wrapper discards max_ver and only writes max_size
 // (VirtioGpuFrontend::getCapset). create_blob's wrapper ignores its iov and
@@ -338,6 +339,37 @@ extern "C" fn on_debug(_user: *mut c_void, dbg: *const CDebug) {
     eprintln!("gfxstream: {msg}");
 }
 
+/// DROIDRT_GPU_STATS=1: every five seconds, how many frames went to the window and
+/// what reading them back cost. A frame's budget is 16 ms.
+fn flush_stats(took: Duration) {
+    struct Window {
+        since: Instant,
+        frames: u32,
+        total: Duration,
+        worst: Duration,
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    static STATS: Mutex<Option<Window>> = Mutex::new(None);
+    if !*ON.get_or_init(|| std::env::var_os("DROIDRT_GPU_STATS").is_some()) {
+        return;
+    }
+    let mut g = STATS.lock().unwrap_or_else(|p| p.into_inner());
+    let w = g.get_or_insert_with(|| Window { since: Instant::now(), frames: 0, total: Duration::ZERO, worst: Duration::ZERO });
+    w.frames += 1;
+    w.total += took;
+    w.worst = w.worst.max(took);
+    let elapsed = w.since.elapsed();
+    if elapsed >= Duration::from_secs(5) {
+        eprintln!(
+            "droidrt: display {:.1} fps, readback avg {:.1} ms, worst {:.1} ms",
+            w.frames as f64 / elapsed.as_secs_f64(),
+            w.total.as_secs_f64() * 1000.0 / w.frames as f64,
+            w.worst.as_secs_f64() * 1000.0
+        );
+        *g = None;
+    }
+}
+
 extern "C" fn on_fence(user: *mut c_void, fence: *const CFence) {
     if user.is_null() || fence.is_null() {
         return;
@@ -603,9 +635,11 @@ impl GpuBackend for Gfxstream {
         buf.resize(stride as usize * h as usize, 0);
         let iov = Iovec { iov_base: buf.as_mut_ptr() as *mut c_void, iov_len: buf.len() };
         let b = CBox { x: 0, y: 0, z: 0, w, h, d: 1 };
+        let started = Instant::now();
         if self.worker.run(|| unsafe { (self.api.transfer_read)(handle, 0, 0, stride, 0, &b, 0, &iov, 1) }) == 0 {
             window::present(w, h, stride, info.drm_fourcc, &buf);
         }
+        flush_stats(started.elapsed());
     }
 
     fn read_pixels(&self, handle: u32) -> Option<(u32, u32, Vec<u8>)> {

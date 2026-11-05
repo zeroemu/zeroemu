@@ -294,6 +294,7 @@ pub struct Process {
 pub struct Thread {
     pub tid: i32,
     pub proc: Arc<Process>,
+    last_fault: Mutex<Option<FaultRegs>>,
     /// The condvar this thread sleeps on, for a kick to wake it.
     sleeping_on: Mutex<Option<SleepOn>>,
     /// The signals an rt_sigtimedwait is waiting for: they are blocked, so
@@ -391,6 +392,15 @@ fn guest_tid() -> i32 {
     GUEST_TID.with(|t| t.get())
 }
 
+#[derive(Clone, Copy)]
+struct FaultRegs {
+    pc: u64,
+    lr: u64,
+    fp: u64,
+    addr: u64,
+    write: bool,
+}
+
 struct SleepOn(*const Condvar);
 // The pointer is only used under Thread::sleeping_on, and the sleeper clears
 // it under that lock before the condvar can go away.
@@ -422,6 +432,7 @@ impl Process {
 impl Thread {
     fn new(tid: i32, proc: Arc<Process>, mask: u64, own_files: Option<Arc<Mutex<FdTable>>>) -> Arc<Thread> {
         Arc::new(Thread {
+            last_fault: Mutex::new(None),
             sleeping_on: Mutex::new(None),
             sigwait_set: AtomicU64::new(0),
             nap_lock: Mutex::new(()),
@@ -561,6 +572,8 @@ impl Kernel {
         if !boot {
             props.load_defaults(&v);
             props.set(None, "logd.ready", "true"); // logd is answered in the kernel (logd.rs)
+            // The emulator's answer to a busy host: Watchdog and ANR timeouts scale by this.
+            props.set(None, "ro.hw_timeout_multiplier", "5");
             dev.add_file("__properties__", 0o444, props.file.clone());
         }
         xattr::label_mounts(&v);
@@ -859,6 +872,9 @@ impl Kernel {
                 Exit::PageFault { pc, addr, write, exec } => {
                     let faulted = t.proc.mm().fault(addr, write, exec);
                     if let Err(code) = faulted {
+                        if let CpuState::Aarch64(s) = vcpu.state() {
+                            *t.last_fault.lock().unwrap() = Some(FaultRegs { pc, lr: s.x[30], fp: s.x[29], addr, write });
+                        }
                         // ART takes these all the time (implicit null and suspend
                         // checks) and handles them. Only one that kills is a crash:
                         // a real one comes back here once its handler gives up.
@@ -1052,6 +1068,30 @@ impl Kernel {
                 }
                 fp = next;
             }
+        }
+    }
+
+    /// For a process about to die of a signal: where its last fault was. crash_dump
+    /// needs ptrace, so this is the only report such a crash gets. Faults are recorded
+    /// when they happen, as ART takes and handles them all the time.
+    fn report_last_fault(&self, t: &Thread) {
+        let Some(f) = t.last_fault.lock().unwrap().take() else { return };
+        let mut guard = t.proc.mm.lock().unwrap();
+        let Some(mm) = guard.as_mut() else { return };
+        eprintln!("[droidrt]   last fault: tid {} {} {:#x} at {}", t.tid, if f.write { "writing" } else { "reading" }, f.addr, mm.symbolize(f.pc));
+        eprintln!("[droidrt]   in {}", mm.describe(f.addr));
+        eprintln!("[droidrt]   lr {}", mm.symbolize(f.lr));
+        let mut fp = f.fp;
+        for i in 0..24 {
+            let (Ok(next), Ok(ret)) = (mm.read_u64(fp), mm.read_u64(fp + 8)) else { break };
+            if ret == 0 {
+                break;
+            }
+            eprintln!("[droidrt]   #{i:02} {}", mm.symbolize(ret));
+            if next <= fp {
+                break;
+            }
+            fp = next;
         }
     }
 

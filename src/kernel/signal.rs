@@ -362,6 +362,7 @@ impl Kernel {
                                 t.proc.exe.lock().unwrap(),
                                 sig_name(sig)
                             );
+                            self.report_last_fault(t);
                         }
                         let core = if d == Default_::Core { 0x80 } else { 0 };
                         self.exit_group(&t.proc, sig as i32 | core, None);

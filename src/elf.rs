@@ -183,6 +183,8 @@ pub fn build_stack(mm: &mut AddressSpace, main: &Image, interp_base: u64, argv: 
         block.push(0);
     }
     let strings = push_bytes(mm, &block)?;
+    mm.arg_start = strings;
+    mm.arg_end = strings + offsets.get(argv.len()).copied().unwrap_or(block.len() as u64);
     let argv_ptrs: Vec<u64> = offsets[..argv.len()].iter().map(|o| strings + o).collect();
     let envp_ptrs: Vec<u64> = offsets[argv.len()..].iter().map(|o| strings + o).collect();
     let execfn = argv_ptrs.first().copied().unwrap_or(0);

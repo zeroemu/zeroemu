@@ -52,6 +52,7 @@ static void check(int cond, const char *name) {
 #define BC_TRANSACTION 0x40406300
 #define BC_REPLY 0x40406301
 #define BC_FREE_BUFFER 0x40086303
+#define BC_ACQUIRE 0x40046305
 #define BC_ENTER_LOOPER 0x630c
 #define BC_REQUEST_DEATH_NOTIFICATION 0x400c630e
 #define BR_TRANSACTION 0x80407202
@@ -168,6 +169,10 @@ int cmain(void) {
         check(fdo->type == TYPE_FD && sys(NR_write, passed, "via binder fd", 13) == 13, "fd translated into the receiver");
         sys(NR_close, passed);
         u32 handle = (u32)obj->binder_or_handle;
+
+        // Keep the handle: freeing the buffer drops the reference it holds.
+        struct { u32 cmd; u32 handle; } __attribute__((packed)) acq = { BC_ACQUIRE, handle };
+        bw(mgr, &acq, sizeof acq, 0, 0, 0);
 
         // Reply, then free the buffer.
         send_txn(mgr, BC_REPLY, 0, 0, 0, "pong", 4, 0, 0);

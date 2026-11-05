@@ -265,6 +265,10 @@ pub struct AddressSpace {
     /// The stack pointer exec started the program with (/proc/<pid>/stat
     /// startstack: bionic finds the main thread's stack mapping by it).
     pub start_stack: u64,
+    /// Where argv's strings are: /proc/<pid>/cmdline reads them from here, so
+    /// that a process that overwrites them (app_process) is seen renamed.
+    pub arg_start: u64,
+    pub arg_end: u64,
     pub brk: u64,
     /// Bumped when entries are removed or downgraded. `flushed_gen` catches up
     /// once a TLB flush has run in the guest. A thread behind on this flushes
@@ -296,6 +300,8 @@ impl AddressSpace {
             tables,
             brk_start: 0,
             start_stack: 0,
+            arg_start: 0,
+            arg_end: 0,
             brk: 0,
             tlb_gen: 0,
             flushed_gen: 0,
@@ -946,6 +952,7 @@ impl AddressSpace {
         child.vmas = self.vmas.iter().filter(|(_, v)| v.on_fork != OnFork::Drop).map(|(&s, v)| (s, v.clone())).collect();
         child.brk_start = self.brk_start;
         child.start_stack = self.start_stack;
+        (child.arg_start, child.arg_end) = (self.arg_start, self.arg_end);
         child.brk = self.brk;
         let mut pages = Vec::new();
         self.visit(0, USER_TOP, &mut |_, slot, va, e| pages.push((slot, va, e)));

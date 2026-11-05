@@ -6,8 +6,14 @@
 //!
 //! All binder state sits behind one lock (as Linux's binder once did);
 //! blocking waits release it. Lock order: binder → address spaces → fd
-//! tables. Simplification: references are never dropped, so nodes get
-//! BR_INCREFS/BR_ACQUIRE once and are never released.
+//! tables.
+//!
+//! References follow Linux's driver. A node counts the references other
+//! processes hold and those held locally: by buffers in flight, and by its owner
+//! between BR_ACQUIRE and BC_ACQUIRE_DONE. The owner hears BR_INCREFS/BR_ACQUIRE
+//! when the first appears and BR_RELEASE/BR_DECREFS when the last goes, which is
+//! when its object can be destroyed. A receive buffer holds what its transaction
+//! carried until BC_FREE_BUFFER, and a dying process lets go of everything.
 
 use super::files::{File, Kind};
 use super::wait::EVENTS;
@@ -57,6 +63,8 @@ const BR_DEAD_REPLY: u32 = 0x7205;
 const BR_TRANSACTION_COMPLETE: u32 = 0x7206;
 const BR_INCREFS: u32 = 0x8010_7207;
 const BR_ACQUIRE: u32 = 0x8010_7208;
+const BR_RELEASE: u32 = 0x8010_7209;
+const BR_DECREFS: u32 = 0x8010_720a;
 const BR_NOOP: u32 = 0x720c;
 const BR_SPAWN_LOOPER: u32 = 0x720d;
 const BR_DEAD_BINDER: u32 = 0x8008_720f;
@@ -96,9 +104,28 @@ enum Work {
     Complete,
     DeadReply,
     FailedReply,
-    Acquire(NodeId),
+    /// Tell the owner what changed about this node.
+    Node(NodeId),
     DeadBinder(u64),
     ClearDeathDone(u64),
+}
+
+/// What a receive buffer holds until it is freed.
+enum Held {
+    Ref { handle: u32, strong: bool },
+    Node { node: NodeId, strong: bool },
+}
+
+/// One allocation in a process's receive area.
+struct Alloc {
+    size: u64,
+    /// The node whose next one-way call starts when this is freed.
+    async_node: Option<NodeId>,
+    /// The node this transaction was sent to: held strong while it is in flight.
+    target: Option<NodeId>,
+    held: Vec<Held>,
+    /// Descriptors from fd arrays. They live as long as the buffer.
+    fda_fds: Vec<i32>,
 }
 
 struct Node {
@@ -106,8 +133,17 @@ struct Node {
     ptr: u64,
     cookie: u64,
     flags: u32,
-    /// BR_INCREFS/BR_ACQUIRE sent to the owner.
-    acquired: bool,
+    /// References from other processes: those with a strong count, and all.
+    refs_strong: u32,
+    refs: u32,
+    /// Held by buffers, and by the owner until it acknowledges.
+    local_strong: u32,
+    local_weak: u32,
+    /// What the owner has been told it holds.
+    has_strong: bool,
+    has_weak: bool,
+    /// A Work::Node is on the process's list.
+    queued: bool,
     async_busy: bool,
     async_todo: VecDeque<TxnId>,
     deaths: Vec<(ProcId, u64)>,
@@ -159,7 +195,7 @@ struct BProc {
     nodes: HashMap<u64, NodeId>,
     /// mmap'd receive area (user VA, size) and its allocations offset → (len, async node).
     area: Option<(u64, u64)>,
-    allocs: BTreeMap<u64, (u64, Option<NodeId>)>,
+    allocs: BTreeMap<u64, Alloc>,
     max_threads: u32,
     requested: u32,
     started: u32,
@@ -355,46 +391,181 @@ impl World {
             return n;
         }
         let n = self.id();
-        self.nodes.insert(n, Node { owner: p, ptr, cookie, flags, acquired: false, async_busy: false, async_todo: VecDeque::new(), deaths: Vec::new(), dead: false });
+        self.nodes.insert(
+            n,
+            Node {
+                owner: p,
+                ptr,
+                cookie,
+                flags,
+                refs_strong: 0,
+                refs: 0,
+                local_strong: 0,
+                local_weak: 0,
+                has_strong: false,
+                has_weak: false,
+                queued: false,
+                async_busy: false,
+                async_todo: VecDeque::new(),
+                deaths: Vec::new(),
+                dead: false,
+            },
+        );
         self.procs.get_mut(&p).unwrap().nodes.insert(ptr, n);
         n
     }
 
-    /// The handle process `p` uses for `node`, created (and the owner told) on
-    /// first use. When the owner's thread `by` is the one handing the object
-    /// out, BR_INCREFS/BR_ACQUIRE go on that thread's own list, as Linux's
-    /// binder_translate_binder does: it reads them before its transaction
-    /// completes, while its Parcel still holds the object alive. Queued on the
-    /// process, another thread could get them after the object is gone.
-    fn handle_for(&mut self, p: ProcId, node: NodeId, strong: bool, by: Option<(ProcId, i32)>) -> u32 {
+    /// Process `p`'s handle for `node`, created on first use with no counts.
+    fn ref_for(&mut self, p: ProcId, node: NodeId) -> u32 {
         let proc = self.procs.get_mut(&p).unwrap();
-        let h = match proc.node_refs.get(&node) {
-            Some(&h) => h,
-            None => {
-                let is_mgr = self.mgr[proc.ctx] == Some(node);
-                let h = if is_mgr { 0 } else { proc.refs.keys().next_back().map_or(1, |&k| k + 1) };
-                proc.refs.insert(h, Ref { node, strong: 0, weak: 0 });
-                proc.node_refs.insert(node, h);
-                h
+        if let Some(&h) = proc.node_refs.get(&node) {
+            return h;
+        }
+        let is_mgr = self.mgr[proc.ctx] == Some(node);
+        let h = if is_mgr { 0 } else { proc.refs.keys().next_back().map_or(1, |&k| (k + 1).max(1)) };
+        proc.refs.insert(h, Ref { node, strong: 0, weak: 0 });
+        proc.node_refs.insert(node, h);
+        self.nodes.get_mut(&node).unwrap().refs += 1;
+        h
+    }
+
+    /// A counted handle for `node` in process `p`. When the owner's thread `by`
+    /// is the one handing the object out, BR_INCREFS/BR_ACQUIRE go on that thread's
+    /// own list, as Linux's binder_translate_binder does: it reads them before its
+    /// transaction completes, while its Parcel still holds the object alive. Queued
+    /// on the process, another thread could get them after the object is gone.
+    fn handle_for(&mut self, p: ProcId, node: NodeId, strong: bool, by: Option<(ProcId, i32)>) -> u32 {
+        let h = self.ref_for(p, node);
+        self.inc_ref(p, h, strong, by);
+        h
+    }
+
+    fn inc_ref(&mut self, p: ProcId, handle: u32, strong: bool, by: Option<(ProcId, i32)>) {
+        let Some(r) = self.procs.get_mut(&p).and_then(|proc| proc.refs.get_mut(&handle)) else { return };
+        let node = r.node;
+        let first = if strong { r.strong == 0 } else { r.weak == 0 };
+        if strong {
+            r.strong += 1;
+        } else {
+            r.weak += 1;
+        }
+        if first {
+            self.inc_node(node, strong, true, by);
+        }
+    }
+
+    /// binder_dec_ref: the last count on a handle gives it up.
+    fn dec_ref(&mut self, p: ProcId, handle: u32, strong: bool) {
+        let Some(proc) = self.procs.get_mut(&p) else { return };
+        let Some(r) = proc.refs.get_mut(&handle) else { return };
+        let node = r.node;
+        let count = if strong { &mut r.strong } else { &mut r.weak };
+        if *count == 0 {
+            return;
+        }
+        *count -= 1;
+        let (now, gone) = (*count, r.strong == 0 && r.weak == 0);
+        if gone {
+            proc.refs.remove(&handle);
+            proc.node_refs.remove(&node);
+        }
+        if strong && now == 0 {
+            self.dec_node(node, true, true);
+        }
+        if gone {
+            self.drop_ref(p, node);
+        }
+    }
+
+    /// A reference of process `p` to `node` no longer exists.
+    fn drop_ref(&mut self, p: ProcId, node: NodeId) {
+        if let Some(n) = self.nodes.get_mut(&node) {
+            n.refs = n.refs.saturating_sub(1);
+            n.deaths.retain(|&(watcher, _)| watcher != p);
+        }
+        self.dec_node(node, false, true);
+    }
+
+    /// binder_inc_node. `internal`: for a reference in another process, which
+    /// `refs` already counts when weak.
+    fn inc_node(&mut self, node: NodeId, strong: bool, internal: bool, by: Option<(ProcId, i32)>) {
+        let Some(n) = self.nodes.get_mut(&node) else { return };
+        match (strong, internal) {
+            (true, true) => n.refs_strong += 1,
+            (true, false) => n.local_strong += 1,
+            (false, true) => {}
+            (false, false) => n.local_weak += 1,
+        }
+        let unannounced = if strong { !n.has_strong } else { !n.has_weak };
+        if !unannounced || n.dead {
+            return;
+        }
+        let owner = n.owner;
+        match by {
+            Some((bp, tid)) if bp == owner => self.thread(owner, tid).todo.push_back(Work::Node(node)),
+            _ => self.queue_node(node),
+        }
+    }
+
+    /// binder_dec_node: when nothing of a kind is left, the owner hears of it; a
+    /// node nobody holds and nobody has been told about is gone.
+    fn dec_node(&mut self, node: NodeId, strong: bool, internal: bool) {
+        let Some(n) = self.nodes.get_mut(&node) else { return };
+        if strong {
+            if internal {
+                n.refs_strong = n.refs_strong.saturating_sub(1);
+            } else {
+                n.local_strong = n.local_strong.saturating_sub(1);
             }
-        };
-        let r = self.procs.get_mut(&p).unwrap().refs.get_mut(&h).unwrap();
-        if strong { r.strong += 1 } else { r.weak += 1 }
-        let n = self.nodes.get_mut(&node).unwrap();
-        if !n.acquired && !n.dead {
-            n.acquired = true;
-            let owner = n.owner;
-            match by {
-                Some((bp, tid)) if bp == owner => self.thread(owner, tid).todo.push_back(Work::Acquire(node)),
-                _ => {
-                    if let Some(op) = self.procs.get_mut(&owner) {
-                        op.todo.push_back(Work::Acquire(node));
-                    }
-                    self.wake(owner);
-                }
+            if n.local_strong > 0 || n.refs_strong > 0 {
+                return;
+            }
+        } else {
+            if !internal {
+                n.local_weak = n.local_weak.saturating_sub(1);
+            }
+            if n.local_weak > 0 || n.refs > 0 {
+                return;
             }
         }
-        h
+        if !n.dead && (n.has_strong || n.has_weak) {
+            self.queue_node(node);
+        } else if n.refs == 0 && n.local_strong == 0 && n.local_weak == 0 {
+            self.remove_node(node);
+        }
+    }
+
+    /// Puts a node's news on its owner's list, once.
+    fn queue_node(&mut self, node: NodeId) {
+        let Some(n) = self.nodes.get_mut(&node) else { return };
+        if n.queued {
+            return;
+        }
+        n.queued = true;
+        let owner = n.owner;
+        if let Some(p) = self.procs.get_mut(&owner) {
+            p.todo.push_back(Work::Node(node));
+        }
+        self.wake(owner);
+    }
+
+    fn remove_node(&mut self, node: NodeId) {
+        let Some(n) = self.nodes.remove(&node) else { return };
+        if let Some(p) = self.procs.get_mut(&n.owner)
+            && p.nodes.get(&n.ptr) == Some(&node)
+        {
+            p.nodes.remove(&n.ptr);
+        }
+    }
+
+    /// What a freed buffer held, or a failed transaction had taken.
+    fn release_held(&mut self, p: ProcId, held: Vec<Held>) {
+        for h in held {
+            match h {
+                Held::Ref { handle, strong } => self.dec_ref(p, handle, strong),
+                Held::Node { node, strong } => self.dec_node(node, strong, false),
+            }
+        }
     }
 
     /// Carves space for `size` bytes out of `p`'s receive area.
@@ -403,23 +574,23 @@ impl World {
         let (start, total) = proc.area?;
         let size = align8(size.max(8));
         let mut cursor = 0;
-        for (&off, &(len, _)) in &proc.allocs {
+        for (&off, a) in &proc.allocs {
             if off - cursor >= size {
                 break;
             }
-            cursor = off + len;
+            cursor = off + a.size;
         }
         if cursor + size > total {
             return None;
         }
-        proc.allocs.insert(cursor, (size, None));
+        proc.allocs.insert(cursor, Alloc { size, async_node: None, target: None, held: Vec::new(), fda_fds: Vec::new() });
         Some(start + cursor)
     }
 
-    fn free(&mut self, p: ProcId, addr: u64) -> Option<NodeId> {
+    fn free(&mut self, p: ProcId, addr: u64) -> Option<Alloc> {
         let proc = self.procs.get_mut(&p)?;
         let (start, _) = proc.area?;
-        proc.allocs.remove(&addr.checked_sub(start)?)?.1
+        proc.allocs.remove(&addr.checked_sub(start)?)
     }
 
     /// A process (its binder fd) went away: fail what waits on it, tell death
@@ -434,6 +605,7 @@ impl World {
         for n in owned {
             let Some(node) = self.nodes.get_mut(&n) else { continue };
             node.dead = true;
+            let unreferenced = node.refs == 0;
             for (watcher, cookie) in std::mem::take(&mut node.deaths) {
                 if let Some(w) = self.procs.get_mut(&watcher) {
                     w.todo.push_back(Work::DeadBinder(cookie));
@@ -442,6 +614,18 @@ impl World {
             if self.mgr[p.ctx] == Some(n) {
                 self.mgr[p.ctx] = None;
             }
+            // Whatever it held locally went with it. Others' references keep the
+            // node, dead, until they let go.
+            if unreferenced {
+                self.remove_node(n);
+            }
+        }
+        // Everything it held of others: their owners can now destroy those objects.
+        for r in p.refs.values() {
+            if r.strong > 0 {
+                self.dec_node(r.node, true, true);
+            }
+            self.drop_ref(id, r.node);
         }
         // Callers blocked on this process get BR_DEAD_REPLY.
         let pending: Vec<TxnId> = self.txns.iter().filter(|(_, t)| t.to == id && !t.reply && t.flags & TF_ONE_WAY == 0).map(|(&k, _)| k).collect();
@@ -486,7 +670,8 @@ impl Kernel {
                 // Like Linux, the context manager's node starts out referenced:
                 // its owner is never sent BR_INCREFS/BR_ACQUIRE (ptr 0 has no
                 // RefBase behind it to take them).
-                w.nodes.get_mut(&n).unwrap().acquired = true;
+                let node = w.nodes.get_mut(&n).unwrap();
+                (node.has_strong, node.has_weak, node.local_strong, node.local_weak) = (true, true, 1, 1);
                 w.mgr[ctx] = Some(n);
                 Ok(0)
             }
@@ -561,19 +746,28 @@ impl Kernel {
             BC_FREE_BUFFER => {
                 let mut g = world();
                 let w = g.as_mut().unwrap();
-                if let Some(node) = w.free(b.id, u64_at(a, 0)) {
+                if let Some(alloc) = w.free(b.id, u64_at(a, 0)) {
                     // An async transaction finished: start the node's next one.
-                    let n = w.nodes.get_mut(&node).unwrap();
-                    n.async_busy = false;
-                    if let Some(next) = n.async_todo.pop_front() {
-                        n.async_busy = true;
-                        let owner = n.owner;
-                        if let Some(p) = w.procs.get_mut(&owner) {
-                            p.todo.push_back(Work::Txn(next));
+                    if let Some(n) = alloc.async_node.and_then(|node| w.nodes.get_mut(&node)) {
+                        n.async_busy = false;
+                        if let Some(next) = n.async_todo.pop_front() {
+                            n.async_busy = true;
+                            let owner = n.owner;
+                            if let Some(p) = w.procs.get_mut(&owner) {
+                                p.todo.push_back(Work::Txn(next));
+                            }
+                            w.wake(owner);
                         }
-                        w.wake(owner);
+                    }
+                    w.release_held(b.id, alloc.held);
+                    if let Some(target) = alloc.target {
+                        w.dec_node(target, true, false);
                     }
                     drop(g);
+                    let mut files = t.files();
+                    for fd in alloc.fda_fds {
+                        files.close(fd as i64);
+                    }
                 }
             }
             BC_INCREFS | BC_ACQUIRE | BC_RELEASE | BC_DECREFS => {
@@ -584,18 +778,26 @@ impl Kernel {
                 if handle == 0 && !w.procs[&b.id].refs.contains_key(&0) {
                     // First use of the context manager's handle.
                     let Some(mgr) = w.mgr[ctx] else { return Ok(()) };
-                    w.handle_for(b.id, mgr, false, None);
+                    w.ref_for(b.id, mgr);
                 }
-                if let Some(r) = w.procs.get_mut(&b.id).unwrap().refs.get_mut(&handle) {
-                    match cmd {
-                        BC_INCREFS => r.weak += 1,
-                        BC_ACQUIRE => r.strong += 1,
-                        BC_RELEASE => r.strong = r.strong.saturating_sub(1),
-                        _ => r.weak = r.weak.saturating_sub(1),
-                    }
+                match cmd {
+                    BC_INCREFS => w.inc_ref(b.id, handle, false, None),
+                    BC_ACQUIRE => w.inc_ref(b.id, handle, true, None),
+                    BC_RELEASE => w.dec_ref(b.id, handle, true),
+                    _ => w.dec_ref(b.id, handle, false),
                 }
             }
-            BC_INCREFS_DONE | BC_ACQUIRE_DONE | BC_DEAD_BINDER_DONE => {}
+            BC_INCREFS_DONE | BC_ACQUIRE_DONE => {
+                // The owner has taken the reference it was told about, so the one
+                // standing in for it until now can go.
+                let ptr = u64_at(a, 0);
+                let mut g = world();
+                let w = g.as_mut().unwrap();
+                if let Some(&n) = w.procs.get(&b.id).and_then(|p| p.nodes.get(&ptr)) {
+                    w.dec_node(n, cmd == BC_ACQUIRE_DONE, false);
+                }
+            }
+            BC_DEAD_BINDER_DONE => {}
             BC_REGISTER_LOOPER | BC_ENTER_LOOPER | BC_EXIT_LOOPER => {
                 let mut g = world();
                 let w = g.as_mut().unwrap();
@@ -746,6 +948,7 @@ impl Kernel {
         let mut fda_work: Vec<(u64, u64, usize)> = Vec::new(); // (parent object offset, byte offset in parent, count)
         let offsets = out.offsets.clone();
         let mut failed = false;
+        let mut held: Vec<Held> = Vec::new();
         for &o in &offsets {
             let o = o as usize;
             if o + 8 > out.data.len() {
@@ -757,6 +960,7 @@ impl Kernel {
                     let (flags, ptr, cookie) = (u32_at(&out.data, o + 4), u64_at(&out.data, o + 8), u64_at(&out.data, o + 16));
                     let n = w.node_for(me, ptr, cookie, flags);
                     let h = w.handle_for(to, n, ty == TYPE_BINDER, Some((me, t.tid)));
+                    held.push(Held::Ref { handle: h, strong: ty == TYPE_BINDER });
                     out.data[o..o + 4].copy_from_slice(&(if ty == TYPE_BINDER { TYPE_HANDLE } else { TYPE_WEAK_HANDLE }).to_le_bytes());
                     out.data[o + 8..o + 16].copy_from_slice(&(h as u64).to_le_bytes());
                     out.data[o + 16..o + 24].fill(0);
@@ -775,9 +979,12 @@ impl Kernel {
                         out.data[o..o + 4].copy_from_slice(&(if ty == TYPE_HANDLE { TYPE_BINDER } else { TYPE_WEAK_BINDER }).to_le_bytes());
                         out.data[o + 8..o + 16].copy_from_slice(&ptr.to_le_bytes());
                         out.data[o + 16..o + 24].copy_from_slice(&cookie.to_le_bytes());
+                        w.inc_node(n, ty == TYPE_HANDLE, false, None);
+                        held.push(Held::Node { node: n, strong: ty == TYPE_HANDLE });
                     } else {
                         let h = w.handle_for(to, n, ty == TYPE_HANDLE, None);
                         out.data[o + 8..o + 16].copy_from_slice(&(h as u64).to_le_bytes());
+                        held.push(Held::Ref { handle: h, strong: ty == TYPE_HANDLE });
                     }
                 }
                 TYPE_FD if o + 24 <= out.data.len() => match t.files().get(u32_at(&out.data, o + 8) as i64) {
@@ -824,6 +1031,7 @@ impl Kernel {
             Some(r) if !failed => r,
             _ => {
                 w.free(to, buffer);
+                w.release_held(to, held);
                 w.thread(me, t.tid).todo.push_back(Work::FailedReply);
                 // The caller is waiting for this reply: it fails too, rather than hang.
                 if let (true, Some(ft)) = (out.reply, to_thread) {
@@ -837,6 +1045,7 @@ impl Kernel {
         // File descriptors land in the receiver's table. The sender's are looked
         // up first: a process may be sending to itself.
         let mut fda_files = Vec::new();
+        let mut fda_fds = Vec::new();
         {
             let senders = t.files();
             for &(po, off, n) in &fda_work {
@@ -864,7 +1073,10 @@ impl Kernel {
             }
             for (po, at, f) in fda_files {
                 match files.alloc(f, true, 0) {
-                    Ok(fd) => out.sg.get_mut(&po).unwrap()[at..at + 4].copy_from_slice(&(fd as u32).to_le_bytes()),
+                    Ok(fd) => {
+                        out.sg.get_mut(&po).unwrap()[at..at + 4].copy_from_slice(&(fd as u32).to_le_bytes());
+                        fda_fds.push(fd as i32);
+                    }
                     Err(_) => failed = true,
                 }
             }
@@ -889,6 +1101,7 @@ impl Kernel {
         })();
         if copied.is_err() || failed {
             w.free(to, buffer);
+            w.release_held(to, held);
             w.thread(me, t.tid).todo.push_back(Work::FailedReply);
             // The caller is waiting for this reply: it fails too, rather than hang.
             if let (true, Some(ft)) = (out.reply, to_thread) {
@@ -897,6 +1110,19 @@ impl Kernel {
             w.wake(to);
             drop(g);
             return;
+        }
+
+        // From here the buffer holds what it carries, and the node it is for.
+        if let Some(n) = node {
+            w.inc_node(n, true, false, None);
+        }
+        if let Some(p) = w.procs.get_mut(&to)
+            && let Some(area) = p.area
+            && let Some(a) = p.allocs.get_mut(&(buffer - area.0))
+        {
+            a.held = held;
+            a.target = node;
+            a.fda_fds = fda_fds;
         }
 
         let txn = w.id();
@@ -954,7 +1180,7 @@ impl Kernel {
             // buffer starts the next.
             let p = w.procs.get_mut(&to).unwrap();
             if let Some(a) = p.allocs.get_mut(&(buffer - p.area.unwrap().0)) {
-                a.1 = node;
+                a.async_node = node;
             }
             let n = w.nodes.get_mut(&node.unwrap()).unwrap();
             if n.async_busy {
@@ -1060,13 +1286,40 @@ impl Kernel {
                 put32(out, BR_FAILED_REPLY);
                 return true;
             }
-            Work::Acquire(n) => {
-                if let Some(node) = w.nodes.get(&n) {
-                    for cmd in [BR_INCREFS, BR_ACQUIRE] {
-                        put32(out, cmd);
-                        put64(out, node.ptr);
-                        put64(out, node.cookie);
-                    }
+            Work::Node(n) => {
+                // As Linux's BINDER_WORK_NODE: say what changed since last time. A
+                // reference announced is held locally until BC_*_DONE.
+                let Some(node) = w.nodes.get_mut(&n) else { return false };
+                node.queued = false;
+                let strong = node.refs_strong > 0 || node.local_strong > 0;
+                let weak = strong || node.refs > 0 || node.local_weak > 0;
+                let (had_strong, had_weak, ptr, cookie) = (node.has_strong, node.has_weak, node.ptr, node.cookie);
+                if weak && !had_weak {
+                    node.local_weak += 1;
+                }
+                if strong && !had_strong {
+                    node.local_strong += 1;
+                }
+                (node.has_strong, node.has_weak) = (strong, weak);
+                if !weak {
+                    w.remove_node(n);
+                }
+                let mut say = |cmd| {
+                    put32(out, cmd);
+                    put64(out, ptr);
+                    put64(out, cookie);
+                };
+                if weak && !had_weak {
+                    say(BR_INCREFS);
+                }
+                if strong && !had_strong {
+                    say(BR_ACQUIRE);
+                }
+                if !strong && had_strong {
+                    say(BR_RELEASE);
+                }
+                if !weak && had_weak {
+                    say(BR_DECREFS);
                 }
             }
             Work::DeadBinder(cookie) => {

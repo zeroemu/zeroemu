@@ -380,7 +380,13 @@ impl ProcFs {
                     ("environ", K::PEnviron),
                 ])
             }
-            K::PCmdline => Ok(Content::File(self.proc(pid)?.cmdline.lock().unwrap().clone())),
+            K::PCmdline => {
+                let p = self.proc(pid)?;
+                // Read from the process, as on Linux: app_process renames itself
+                // by overwriting argv, and its children are all found that way.
+                let live = p.mm.lock().unwrap().as_mut().filter(|m| m.arg_end > m.arg_start).and_then(|m| m.read_vec(m.arg_start, (m.arg_end - m.arg_start) as usize).ok());
+                Ok(Content::File(live.unwrap_or_else(|| p.cmdline.lock().unwrap().clone())))
+            }
             K::PComm => text(format!("{}\n", comm(&*self.proc(pid)?, extra as i32))),
             K::PExe => Ok(Content::Link(self.proc(pid)?.exe.lock().unwrap().clone())),
             K::PCwd => Ok(Content::Link(self.proc(pid)?.cwd.lock().unwrap().clone())),

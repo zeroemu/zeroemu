@@ -91,9 +91,15 @@ pub fn offer(port: u32, io: Arc<Io>) -> Result<(), Arc<Io>> {
 
 enum Service {
     Sensors(Sensors),
-    /// Stays open and silent: the guest's monitor blocks reading the host's
-    /// clipboard, and hammers the connection if it is closed.
-    Clipboard,
+    /// Answers a list request with an empty list.
+    BootProperties,
+    /// QemuMiscPipe: each message, a length and then its bytes, gets "OK" the same way.
+    /// qemu-props says "heartbeat" every few seconds, and waits for the answer.
+    Misc,
+    /// Stays open and says nothing: a client reads until it gets what it came for,
+    /// and hammers a connection that's closed. These only speak when the host has news,
+    /// a change to the clipboard or a touch on the fingerprint sensor, and never does.
+    Silent,
 }
 
 #[derive(Default)]
@@ -202,7 +208,9 @@ impl Vsock {
             let name = String::from_utf8_lossy(&st.name).into_owned();
             match name.as_str() {
                 "pipe:qemud:sensors" => st.service = Some(Service::Sensors(Sensors { delay_ms: 200, ..Default::default() })),
-                "pipe:clipboard" => st.service = Some(Service::Clipboard),
+                "pipe:qemud:boot-properties" => st.service = Some(Service::BootProperties),
+                "pipe:QemuMiscPipe" => st.service = Some(Service::Misc),
+                "pipe:clipboard" | "pipe:qemud:fingerprintlisten" => st.service = Some(Service::Silent),
                 _ => {
                     eprintln!("droidrt: no host service {name}");
                     st.closed = true;
@@ -211,10 +219,24 @@ impl Vsock {
                 }
             }
         }
-        if matches!(st.service, Some(Service::Clipboard)) {
+        if matches!(st.service, Some(Service::Silent)) {
             return Ok(data.len());
         }
         st.inbuf.extend_from_slice(rest);
+        if matches!(st.service, Some(Service::Misc)) {
+            while st.inbuf.len() >= 4 {
+                let len = u32::from_le_bytes(st.inbuf[..4].try_into().unwrap()) as usize;
+                if st.inbuf.len() - 4 < len {
+                    break;
+                }
+                st.inbuf.drain(..4 + len);
+                st.out.extend(3u32.to_le_bytes());
+                st.out.extend(b"OK\0");
+            }
+            drop(st);
+            EVENTS.bump_key(Arc::as_ptr(self) as usize);
+            return Ok(data.len());
+        }
         let mut start_stream = false;
         while st.inbuf.len() >= 4 {
             let len = std::str::from_utf8(&st.inbuf[..4]).ok().and_then(|h| usize::from_str_radix(h, 16).ok());
@@ -228,8 +250,11 @@ impl Vsock {
             let msg = String::from_utf8_lossy(&st.inbuf[4..4 + len]).into_owned();
             st.inbuf.drain(..4 + len);
             let State { service, out, .. } = &mut *st;
-            if let Some(Service::Sensors(s)) = service {
-                start_stream |= sensors_message(s, out, &msg);
+            match service {
+                Some(Service::Sensors(s)) => start_stream |= sensors_message(s, out, &msg),
+                // A lone NUL ends the list of properties, and there are none to add.
+                Some(Service::BootProperties) => out.extend(b"0001\0"),
+                _ => {}
             }
         }
         drop(st);

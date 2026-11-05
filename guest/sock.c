@@ -9,6 +9,7 @@ typedef unsigned int u32;
 typedef unsigned short u16;
 
 #define NR_epoll_create1 20
+#define NR_shutdown 210
 #define NR_epoll_ctl 21
 #define NR_epoll_pwait 22
 #define NR_mknodat 33
@@ -253,6 +254,24 @@ static void unix_paths(void) {
     sys(NR_close, d);
     check(sys(NR_write, dc, "x", 1) == -ECONNREFUSED && sys(NR_write, dc, "x", 1) == -107 /* ENOTCONN */, "the peer closed: ECONNREFUSED once, then unconnected");
     check(sys(NR_sendto, srv2, "x", 1, 0, &to, tlen) == -95 /* EOPNOTSUPP */ && sys(NR_sendto, c, "x", 1, 0, &to, tlen) == -EISCONN, "a stream socket refuses a destination");
+
+    // A datagram server's clients come and go. logd and statsd have thousands.
+    {
+        int server_d = (int)sys(NR_socket, 1, SOCK_DGRAM, 0), one = (int)sys(NR_socket, 1, SOCK_DGRAM, 0), two = (int)sys(NR_socket, 1, SOCK_DGRAM, 0);
+        bind_path(server_d, "/tmp/u/logdw");
+        connect_path(one, "/tmp/u/logdw");
+        connect_path(two, "/tmp/u/logdw");
+        sys(NR_write, one, "first", 5);
+        sys(NR_close, one);
+        check(sys(NR_read, server_d, b, 8) == 5, "a closed client's datagram still arrives");
+        check(sys(NR_recvfrom, server_d, b, 8, 0x40, 0, 0) == -EAGAIN, "and its going isn't the end of the server's input");
+        struct { int fd; short events, revents; } pd = { server_d, 1, 0 };
+        u64 none[2] = { 0, 0 };
+        check(sys(NR_ppoll, &pd, 1, none, 0, 8) == 0, "poll: nothing to read");
+        check(sys(NR_shutdown, two, 1) == 0 && sys(NR_recvfrom, server_d, b, 8, 0x40, 0, 0) == -EAGAIN, "nor is a client's shutdown");
+        sys(NR_close, two);
+        sys(NR_close, server_d);
+    }
 
     // Autobind: an empty address picks an abstract name.
     int ab = stream();

@@ -484,6 +484,12 @@ pub struct Thread {
     own_files: Option<Arc<Mutex<FdTable>>>,
 }
 
+/// DROIDRT_SYSCOUNT=1: what threads have called since the last thread dump, and what
+/// came of it: (tid, number, an error, or 0, or 1 for more) -> times. Finds a thread in
+/// a loop.
+static SYSCALL_COUNTS: std::sync::LazyLock<Option<Mutex<HashMap<(i32, u64, i64), u64>>>> =
+    std::sync::LazyLock::new(|| (std::env::var("DROIDRT_SYSCOUNT").as_deref() == Ok("1")).then(Mutex::default));
+
 /// Where a thread entered the kernel: what a thread dump prints for it. The
 /// registers for its backtrace are read only under DROIDRT_DUMP (they cost a
 /// trip to the hypervisor on every syscall).
@@ -971,6 +977,13 @@ impl Kernel {
         };
         procs.sort_by_key(|p| p.pid);
         eprintln!("[droidrt] ---- thread dump: {} processes ----", procs.len());
+        if let Some(counts) = &*SYSCALL_COUNTS {
+            let mut busiest: Vec<_> = counts.lock().unwrap().drain().collect();
+            busiest.sort_by_key(|&(_, n)| std::cmp::Reverse(n));
+            for ((tid, nr, result), n) in busiest.into_iter().take(40) {
+                eprintln!("[syscount] {n} tid {tid} {:?} ({nr}) -> {result}", self.arch.sysno(nr));
+            }
+        }
         if let Some(tid) = binder::lock_taker() {
             eprintln!("[droidrt] binder lock held by tid {tid}");
         }
@@ -1261,6 +1274,10 @@ impl Kernel {
             Some(no) => self.dispatch(no, t, vcpu, a),
         };
         *t.in_syscall.lock().unwrap() = None;
+        if let Some(counts) = &*SYSCALL_COUNTS {
+            let result = if let Ret::Value(v) = ret { v.min(1) } else { 1 };
+            *counts.lock().unwrap().entry((t.tid, regs.nr, result)).or_default() += 1;
+        }
         if self.strace && strace_wanted(t) {
             let name = sysno.map_or_else(|| format!("syscall_{}", regs.nr), |s| format!("{s:?}"));
             let path = match sysno {

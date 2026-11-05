@@ -48,10 +48,13 @@ pub struct Events {
     /// Slots at or above this have never been used.
     high: AtomicUsize,
     free: Mutex<Vec<usize>>,
+    /// How many times each bit has been announced, for `generation`.
+    announced: [AtomicU64; 64],
 }
 
 pub static EVENTS: Events = Events {
     masks: [const { AtomicU64::new(0) }; SLOTS],
+    announced: [const { AtomicU64::new(0) }; 64],
     slots: [const { Slot { seq: Mutex::new(0), cv: Condvar::new() } }; SLOTS],
     high: AtomicUsize::new(0),
     free: Mutex::new(Vec::new()),
@@ -112,13 +115,24 @@ impl Events {
     /// Something changed that nothing keeps a key for: wakes everyone.
     pub fn bump(&self) {
         BUMPS_PLAIN.fetch_add(1, Ordering::Relaxed);
+        self.announced[0].fetch_add(1, Ordering::SeqCst);
         self.wake_bits(u64::MAX);
     }
 
     /// The thing `key` stands for changed.
     pub fn bump_key(&self, key: usize) {
         BUMPS_KEYED.fetch_add(1, Ordering::Relaxed);
-        self.wake_bits(key_bit(key));
+        let bit = key_bit(key);
+        self.announced[bit.trailing_zeros() as usize].fetch_add(1, Ordering::SeqCst);
+        self.wake_bits(bit);
+    }
+
+    /// A number that moves whenever something a waiter on `mask` would be woken for is
+    /// announced, and sometimes when it isn't. A plain bump wakes everyone, so it counts
+    /// for everyone.
+    pub fn generation(&self, mask: u64) -> u64 {
+        let mask = mask | PLAIN;
+        (0..64).filter(|i| mask & 1 << i != 0).map(|i| self.announced[i].load(Ordering::SeqCst)).fold(0, u64::wrapping_add)
     }
 
     /// Before checking: this thread is about to care about `mask`. What to pass to `wait`.

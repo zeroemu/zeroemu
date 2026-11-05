@@ -358,7 +358,11 @@ pub fn unlinked(vfs: &Vfs, node: &Node) {
 impl Drop for Socket {
     fn drop(&mut self) {
         let st = self.st.get_mut().unwrap();
-        if let Some(peer) = st.peer.as_ref().and_then(Weak::upgrade) {
+        // A datagram socket's peer is only where it sends. Its going means nothing to a
+        // server with other clients, whose reads would all be EOF from then on.
+        if self.ty != SOCK_DGRAM
+            && let Some(peer) = st.peer.as_ref().and_then(Weak::upgrade)
+        {
             peer.rx.lock().unwrap().write_closed = true;
         }
         if let Some(key) = st.node {
@@ -921,7 +925,9 @@ impl Kernel {
                 }
                 if a[1] != SHUT_RD {
                     st.shut_wr = true;
-                    if let Some(p) = st.peer.as_ref().and_then(Weak::upgrade) {
+                    if sock.ty != SOCK_DGRAM
+                        && let Some(p) = st.peer.as_ref().and_then(Weak::upgrade)
+                    {
                         p.rx.lock().unwrap().write_closed = true;
                         EVENTS.bump_key(p.key());
                     }

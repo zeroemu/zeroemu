@@ -13,6 +13,7 @@ typedef unsigned int u32;
 #define NR_write 64
 #define NR_sendfile 71
 #define NR_exit_group 94
+#define NR_eventfd2 19
 #define NR_epoll_create1 20
 #define NR_epoll_ctl 21
 #define NR_epoll_pwait 22
@@ -28,6 +29,7 @@ typedef unsigned int u32;
 #define NR_memfd_create 279
 #define NR_splice 76
 #define NR_pipe2 59
+#define NR_ppoll 73
 #define NR_mlock2 284
 #define NR_copy_file_range 285
 
@@ -148,6 +150,48 @@ int cmain(void) {
         sys(NR_close, sp[0]);
         sys(NR_close, m);
         sys(NR_close, m2);
+    }
+
+    // ---- edge-triggered epoll, as mio and Tokio use it
+    {
+        struct { u32 events; u32 pad; u64 data; } in = { 1u | 1u << 31, 0, 77 }, out[2];
+        int e = (int)sys(NR_epoll_create1, 0);
+        int efd = (int)sys(NR_eventfd2, 0, 0);
+        u64 one = 1;
+        check(sys(NR_epoll_ctl, e, 1, efd, &in) == 0, "EPOLLET on an eventfd");
+        check(sys(NR_epoll_pwait, e, out, 2, 0, 0, 8) == 0, "not ready: no report");
+        sys(NR_write, efd, &one, 8);
+        check(sys(NR_epoll_pwait, e, out, 2, 0, 0, 8) == 1 && out[0].data == 77, "a write: one report");
+        check(sys(NR_epoll_pwait, e, out, 2, 0, 0, 8) == 0, "still readable, and nothing new: no report, or mio spins");
+        check(sys(NR_epoll_pwait, e, out, 2, 20, 0, 8) == 0, "nor does waiting bring one");
+        sys(NR_write, efd, &one, 8);
+        check(sys(NR_epoll_pwait, e, out, 2, 0, 0, 8) == 1, "never read, another write: another report");
+        check(sys(NR_epoll_pwait, e, out, 2, 0, 0, 8) == 0, "and only one");
+        check(sys(NR_epoll_ctl, e, 3, efd, &in) == 0 && sys(NR_epoll_pwait, e, out, 2, 0, 0, 8) == 1, "EPOLL_CTL_MOD reports what's ready again");
+
+        int pe = (int)sys(NR_epoll_create1, 0);
+        int pfd[2];
+        sys(NR_pipe2, pfd, 0);
+        char b[8];
+        struct { u32 events; u32 pad; u64 data; } pin = { 1u | 1u << 31, 0, 88 };
+        sys(NR_epoll_ctl, pe, 1, pfd[0], &pin);
+        sys(NR_write, pfd[1], "x", 1);
+        check(sys(NR_epoll_pwait, pe, out, 2, 0, 0, 8) == 1, "a pipe: reported");
+        sys(NR_read, pfd[0], b, 8);
+        sys(NR_write, pfd[1], "y", 1);
+        check(sys(NR_epoll_pwait, pe, out, 2, 0, 0, 8) == 1, "read to empty and filled between waits: reported, though it looks unchanged");
+        check(sys(NR_epoll_pwait, pe, out, 2, 0, 0, 8) == 0, "once");
+        struct { int fd; short ev, rev; } pollep = { pe, 1, 0 };
+        struct { i64 s, ns; } zero = { 0, 0 };
+        check(sys(NR_ppoll, &pollep, 1, &zero, 0, 8) == 0, "polling the epoll itself agrees");
+        sys(NR_write, pfd[1], "z", 1);
+        check(sys(NR_ppoll, &pollep, 1, &zero, 0, 8) == 1, "until there's news");
+        check(sys(NR_epoll_pwait, pe, out, 2, 0, 0, 8) == 1, "which polling didn't use up");
+
+        struct { u32 events; u32 pad; u64 data; } lvl = { 1, 0, 99 };
+        int le = (int)sys(NR_epoll_create1, 0);
+        sys(NR_epoll_ctl, le, 1, pfd[0], &lvl);
+        check(sys(NR_epoll_pwait, le, out, 2, 0, 0, 8) == 1 && sys(NR_epoll_pwait, le, out, 2, 0, 0, 8) == 1, "without EPOLLET: every time");
     }
 
     puts_(failures ? "SOME CHECKS FAILED\n" : "all checks passed\n");

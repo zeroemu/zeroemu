@@ -34,6 +34,8 @@ fn main() -> ExitCode {
     // was running one guest thread, which then freezes without a trace; stop
     // everything loudly instead.
     kernel::reserve_dump_signal();
+    #[cfg(unix)]
+    raise_fd_limit();
     let default = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         default(info);
@@ -233,6 +235,27 @@ fn boot_guest(
 }
 
 /// A file for this image's device in the user's application data.
+/// Each host connection is a descriptor, and launchd's default allows 256.
+#[cfg(unix)]
+fn raise_fd_limit() {
+    unsafe {
+        let mut r: libc::rlimit = std::mem::zeroed();
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut r) != 0 {
+            return;
+        }
+        // macOS refuses its own "infinity" as a limit, so try something less.
+        for want in [r.rlim_max, 65536, 10240] {
+            let want = want.min(r.rlim_max);
+            if want <= r.rlim_cur {
+                return;
+            }
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &libc::rlimit { rlim_cur: want, rlim_max: r.rlim_max }) == 0 {
+                return;
+            }
+        }
+    }
+}
+
 fn default_data_image(system: &std::path::Path) -> Option<PathBuf> {
     let base = if cfg!(windows) {
         PathBuf::from(std::env::var_os("LOCALAPPDATA")?)

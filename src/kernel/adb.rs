@@ -16,6 +16,17 @@ pub const GUEST_PORT: u32 = 5555;
 const FIRST_CONSOLE: u16 = 5554;
 const LAST_CONSOLE: u16 = 5584;
 
+/// Ports the guest's alias for the host's loopback won't reach: the adb server takes
+/// commands for any device from anyone who can connect, with the host's key, and
+/// these are devices' own ports.
+pub fn reserved_host_port(port: u16) -> bool {
+    port == server_port() || (FIRST_CONSOLE..=LAST_CONSOLE + 1).contains(&port) || port == HOST_PORT.load(Ordering::Relaxed)
+}
+
+fn server_port() -> u16 {
+    std::env::var("ANDROID_ADB_SERVER_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(5037)
+}
+
 /// The host port, once listening.
 static HOST_PORT: AtomicU16 = AtomicU16::new(0);
 
@@ -88,8 +99,7 @@ fn notify_server() {
     if port == 0 {
         return;
     }
-    let server: u16 = std::env::var("ANDROID_ADB_SERVER_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(5037);
-    if let Ok(mut s) = TcpStream::connect_timeout(&SocketAddr::from(([127, 0, 0, 1], server)), Duration::from_secs(1)) {
+    if let Ok(mut s) = TcpStream::connect_timeout(&SocketAddr::from(([127, 0, 0, 1], server_port())), Duration::from_secs(1)) {
         let request = format!("host:emulator:{port}");
         let _ = write!(s, "{:04x}{request}", request.len());
     }

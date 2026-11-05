@@ -22,6 +22,7 @@ mod uffd;
 mod epoll;
 mod files;
 mod futex;
+mod dns;
 mod inet;
 mod inotify;
 mod locks;

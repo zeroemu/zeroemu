@@ -108,7 +108,7 @@ struct Queue {
 #[derive(Default)]
 pub(super) struct SockOpts {
     pub(super) rcvtimeo: Option<Duration>,
-    sndtimeo: Option<Duration>,
+    pub(super) sndtimeo: Option<Duration>,
     linger: [u8; 8],
     ints: BTreeMap<u64, u32>,
 }
@@ -142,6 +142,11 @@ impl SockOpts {
             SO_REUSEADDR | SO_DONTROUTE | SO_BROADCAST | SO_KEEPALIVE | SO_OOBINLINE | SO_NO_CHECK | SO_PRIORITY | SO_REUSEPORT | SO_TIMESTAMP | SO_MARK | SO_BUSY_POLL => Some(0),
             _ => None,
         }
+    }
+
+    /// SO_LINGER on with no time at all: a close drops what's unsent.
+    pub(super) fn closes_at_once(&self) -> bool {
+        self.linger == [1, 0, 0, 0, 0, 0, 0, 0]
     }
 
     /// setsockopt: the option's raw value (Ok(false): not one of these).

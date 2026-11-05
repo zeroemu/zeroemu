@@ -69,3 +69,10 @@ pub fn io_err(e: i64) -> std::io::Error {
 }
 pub const EBADFD: i64 = 77;
 pub const EADDRNOTAVAIL: i64 = 99;
+pub const EDESTADDRREQ: i64 = 89;
+pub const ENETDOWN: i64 = 100;
+pub const ECONNABORTED: i64 = 103;
+pub const ECONNRESET: i64 = 104;
+pub const EHOSTUNREACH: i64 = 113;
+pub const EALREADY: i64 = 114;
+pub const EINPROGRESS: i64 = 115;

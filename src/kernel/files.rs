@@ -8,6 +8,7 @@ use super::netlink::{self, Netlink};
 use super::specialfd::{EventFd, SignalFd, TimerFd};
 use super::unix::{self, Socket};
 use super::wait::EVENTS;
+use super::inet;
 use super::inotify;
 use super::{ERESTARTSYS, IDLE, Kernel, Thread, int};
 use crate::arch::Sysno;
@@ -458,6 +459,7 @@ pub(super) fn poll_mask(f: &File, t: &Thread, depth: u32) -> u64 {
         Kind::Binder(b) => key_bit(binder::poll_key(b.id)),
         Kind::Evdev(c) => key_bit(Arc::as_ptr(c) as usize),
         Kind::Vsock(v) => v.mask(),
+        Kind::Inet(s) => key_bit(s.key()),
         Kind::Inotify(i) => key_bit(Arc::as_ptr(i) as usize),
         Kind::Drm(_) | Kind::DmaBuf(_) | Kind::Sync(_) => key_bit(super::drm::GPU_KEY),
         _ => plain_bit(),
@@ -475,7 +477,7 @@ pub(super) fn poll_ready(f: &File, t: &Thread, depth: u32) -> u16 {
         Kind::Pty(p) => p.poll(),
         Kind::Bpf(_) => 0,
         Kind::Netlink(n) => n.poll(),
-        Kind::Inet(_) => POLLOUT,
+        Kind::Inet(s) => s.poll(),
         Kind::Inotify(i) => if i.pending() > 0 { POLLIN } else { 0 },
         Kind::Vsock(v) => v.poll(),
         Kind::Tun(_) => POLLOUT,
@@ -800,9 +802,14 @@ impl Kernel {
                     }
                     F_GETFL => {
                         let f = files.get(fd)?;
+                        // bionic's fdopen goes by this: it refuses "r+" on a descriptor
+                        // that's not O_RDWR, and a socket always is. getaddrinfo needs that.
                         let acc = match &f.kind {
                             Kind::Stdout | Kind::Stderr => O_WRONLY,
                             Kind::Pipe(p) if p.write => O_WRONLY,
+                            Kind::Mem(m) if m.readable && m.writable => O_RDWR,
+                            Kind::Mem(m) if m.writable => O_WRONLY,
+                            Kind::Socket(_) | Kind::Netlink(_) | Kind::Inet(_) | Kind::Vsock(_) | Kind::Event(_) | Kind::Timer(_) | Kind::Signal(_) | Kind::Epoll(_) | Kind::Pty(_) | Kind::Binder(_) => O_RDWR,
                             _ => 0,
                         };
                         Ok((acc | f.flags.load(Ordering::Relaxed)) as i64)
@@ -873,6 +880,8 @@ impl Kernel {
                         return t.files().alloc(file, a[2] & O_CLOEXEC != 0, 0);
                     }
                     Kind::Pty(p) if !matches!(a[1], 0x5450 | 0x5451 | 0x5421) => return p.ioctl(t, cmd, a[2]),
+                    // FIONREAD, SIOCOUTQ, SIOCATMARK, SIOCGSTAMP: its own queues.
+                    Kind::Inet(s) if matches!(cmd, 0x541b | 0x5411 | 0x8905 | 0x8906) => return self.inet_queue_ioctl(t, s, cmd, a[2]),
                     // Socket ioctls (SIOC*): the interfaces.
                     Kind::Inet(_) if (0x8900..0x89ff).contains(&cmd) => return self.inet_ioctl(t, cmd, a[2]),
                     _ => {}
@@ -1388,6 +1397,12 @@ impl Kernel {
                 Ok(0)
             }
             fchmod | fchown => {
+                // A socket has an inode too, whose owner nothing here reads. The resolver
+                // gives each probe socket to its caller, and treats failure as no network.
+                let fd_kind = t.files().get(int(a[0]))?;
+                if matches!(fd_kind.kind, Kind::Socket(_) | Kind::Netlink(_) | Kind::Inet(_) | Kind::Vsock(_)) {
+                    return Ok(0);
+                }
                 let node = self.target(t, int(a[0]), 0, 0)?;
                 if no == fchmod {
                     vfs.set_attr(&node, Some(a[1] as u32), None, None)?;
@@ -1549,7 +1564,7 @@ impl Kernel {
             }
             Kind::Socket(sock) => unix::read(sock, t, count, f.nonblock())?,
             Kind::Netlink(nl) => netlink::read(nl, t, count, f.nonblock())?,
-            Kind::Inet(_) => return Err(ENOTCONN),
+            Kind::Inet(s) => inet::read(s, t, count, f.nonblock())?,
             Kind::Inotify(i) => i.read(t, count, f.nonblock())?,
             Kind::Vsock(v) => v.read(t, count, f.nonblock())?,
             Kind::Evdev(c) => c.read(t, count, f.nonblock())?,
@@ -1647,7 +1662,13 @@ impl Kernel {
                 r => r?,
             },
             Kind::Netlink(nl) => netlink::write(nl, t, data, f.nonblock())?,
-            Kind::Inet(_) => return Err(ENETUNREACH),
+            Kind::Inet(s) => match inet::write(self, s, t, &data, f.nonblock()) {
+                Err(EPIPE) if s.is_stream() => {
+                    self.send_thread_signal(t, super::signal::SIGPIPE, super::signal::SigInfo::user(super::signal::SIGPIPE, t.proc.pid));
+                    return Err(EPIPE);
+                }
+                r => r?,
+            },
             Kind::Vsock(v) => match v.write(t, &data, f.nonblock()) {
                 Err(EPIPE) if v.is_stream() => {
                     self.send_thread_signal(t, super::signal::SIGPIPE, super::signal::SigInfo::user(super::signal::SIGPIPE, t.proc.pid));

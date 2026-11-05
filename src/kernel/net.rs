@@ -64,6 +64,10 @@ fn all() -> Vec<Iface> {
     v
 }
 
+pub fn exists(name: &str) -> bool {
+    by_name(name).is_some()
+}
+
 fn by_name(name: &str) -> Option<Iface> {
     all().into_iter().find(|i| i.name == name)
 }

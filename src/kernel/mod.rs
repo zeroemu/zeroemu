@@ -73,8 +73,10 @@ pub(super) const ERESTARTSYS: i64 = 512;
 /// Properties for a booted device. The emulator's answer to a busy host: Watchdog and
 /// ANR timeouts scale by the multiplier. SurfaceFlinger composes layers with a blur
 /// itself rather than through the composer HAL, and those frames come out black on this
-/// GPU path; blurs also cost a lot.
-const BOOT_PROPS: &str = "ro.hw_timeout_multiplier=5\nro.surface_flinger.supports_background_blur=0\n";
+/// GPU path; blurs also cost a lot. Compiling SurfaceFlinger's shader cache took 14 s
+/// of every boot, holding up SystemUI and so the boot animation, for layers that
+/// nearly always go through the composer HAL instead.
+const BOOT_PROPS: &str = "ro.hw_timeout_multiplier=5\nro.surface_flinger.supports_background_blur=0\nservice.sf.prime_shader_cache=0\n";
 const NO_BLUETOOTH: &str = "<config>\n  <unavailable-feature name=\"android.hardware.bluetooth\" />\n  <unavailable-feature name=\"android.hardware.bluetooth_le\" />\n</config>\n";
 
 pub(super) const POLL: Duration = Duration::from_millis(200);

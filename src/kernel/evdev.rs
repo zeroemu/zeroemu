@@ -85,7 +85,7 @@ static TOUCH: LazyLock<Device> = LazyLock::new(|| Device {
     ev_bits: 1 << EV_SYN | 1 << EV_KEY | 1 << EV_ABS,
     key_bits: bits([BTN_TOUCH]),
     abs_bits: bits([ABS_X, ABS_Y, ABS_MT_SLOT, ABS_MT_POSITION_X, ABS_MT_POSITION_Y, ABS_MT_TRACKING_ID]),
-    abs: vec![(ABS_X, 0, ABS_MAX), (ABS_Y, 0, ABS_MAX), (ABS_MT_SLOT, 0, 0), (ABS_MT_POSITION_X, 0, ABS_MAX), (ABS_MT_POSITION_Y, 0, ABS_MAX), (ABS_MT_TRACKING_ID, 0, 65535)],
+    abs: vec![(ABS_X, 0, ABS_MAX), (ABS_Y, 0, ABS_MAX), (ABS_MT_SLOT, 0, 9), (ABS_MT_POSITION_X, 0, ABS_MAX), (ABS_MT_POSITION_Y, 0, ABS_MAX), (ABS_MT_TRACKING_ID, 0, 65535)],
     props: 1 << INPUT_PROP_DIRECT,
     clients: Mutex::default(),
     state: Mutex::default(),
@@ -329,7 +329,8 @@ impl Client {
                 for v in [value, min, max, 0, 0, 0] {
                     b.extend_from_slice(&v.to_le_bytes());
                 }
-                sized(&b)
+                b.truncate(size);
+                exact(b) // unlike the string and bitmap reads, it returns 0
             }
             (READ, 0x84) => exact(0u32.to_le_bytes().to_vec()), // EVIOCGEFFECTS
             (_, 0x90 | 0x91) => Ok((0, Vec::new())),            // EVIOCGRAB, EVIOCREVOKE

@@ -11,6 +11,8 @@ typedef unsigned int u32;
 #define NR_ioctl 29
 #define NR_openat 56
 #define NR_close 57
+#define NR_pipe2 59
+#define NR_read 63
 #define NR_write 64
 #define NR_exit_group 94
 #define NR_nanosleep 101
@@ -72,6 +74,8 @@ static void check(int cond, const char *name) {
 #define CODE_X 1
 #define CODE_Y 2
 #define CODE_Z 3
+#define CODE_X2 4
+#define CODE_X3 5
 #define CODE_CALL_X 10
 #define CODE_CALLBACK 11
 #define CODE_PLAIN 20
@@ -105,16 +109,17 @@ static void write_cmds(int fd, void *w, u64 n) {
     sys(NR_ioctl, fd, BINDER_WRITE_READ, &b);
 }
 
-// The next command worth looking at, 0 after seconds of silence. Reads like
-// libbinder: one 256-byte buffer, consumed before the next read.
+// The next command worth looking at, 0 after `ms` of silence. Reads like libbinder:
+// one 256-byte buffer, consumed before the next read.
 static u32 in[64];
 static u64 in_len, in_pos;
-static u32 next_cmd(int fd, struct txn **t) {
-    for (int waited = 0; waited < 5000;) {
+static u32 next_within(int fd, struct txn **t, int ms) {
+    for (int waited = 0; waited < ms;) {
         if (in_pos >= in_len) {
             struct bwr b = { 0, 0, 0, sizeof in, 0, (u64)in };
             in_pos = in_len = 0;
-            if (sys(NR_ioctl, fd, BINDER_WRITE_READ, &b) == 0) in_len = b.rcons;
+            // A read with nothing to say still says BR_NOOP.
+            if (sys(NR_ioctl, fd, BINDER_WRITE_READ, &b) == 0 && !(b.rcons == 4 && in[0] == BR_NOOP)) in_len = b.rcons;
         }
         if (in_pos >= in_len) {
             nap(2);
@@ -130,6 +135,7 @@ static u32 next_cmd(int fd, struct txn **t) {
     }
     return 0;
 }
+static u32 next_cmd(int fd, struct txn **t) { return next_within(fd, t, 5000); }
 
 static void send_txn(int fd, u32 cmd, u32 target, u32 code, void *data, u64 dsize, u64 *offs, u64 osize) {
     struct { u32 cmd; struct txn t; } __attribute__((packed)) w;
@@ -170,13 +176,17 @@ static int serve_start(u32 code) {
     return fd;
 }
 
-// Calls back to the test from inside its call, and stays there until killed.
-static void __attribute__((noreturn)) dies_in_callback(void) {
-    int fd = serve_start(CODE_X);
+// Calls back to the test from inside whatever call it gets, says so, and stays
+// there until killed.
+static int sent[2];
+static void __attribute__((noreturn)) dies_in_callback(u32 code) {
+    int fd = serve_start(code);
     for (;;) {
         struct txn *t = 0;
-        if (next_cmd(fd, &t) == BR_TRANSACTION && t->code == CODE_CALL_X)
+        if (next_cmd(fd, &t) == BR_TRANSACTION) {
             send_txn(fd, BC_TRANSACTION, 0, CODE_CALLBACK, 0, 0, 0, 0);
+            sys(NR_write, sent[1], "x", 1);
+        }
     }
 }
 
@@ -212,15 +222,20 @@ int cmain(void) {
     u32 enter = BC_ENTER_LOOPER;
     write_cmds(mgr, &enter, 4);
 
+    sys(NR_pipe2, sent, 0);
     i64 x = sys(NR_clone, 17, 0, 0, 0, 0);
-    if (x == 0) dies_in_callback();
+    if (x == 0) dies_in_callback(CODE_X);
+    i64 x2 = sys(NR_clone, 17, 0, 0, 0, 0);
+    if (x2 == 0) dies_in_callback(CODE_X2);
+    i64 x3 = sys(NR_clone, 17, 0, 0, 0, 0);
+    if (x3 == 0) dies_in_callback(CODE_X3);
     i64 y = sys(NR_clone, 17, 0, 0, 0, 0);
     if (y == 0) third_party();
     i64 z = sys(NR_clone, 17, 0, 0, 0, 0);
     if (z == 0) chain_end();
 
-    u32 handles[4] = { 0 };
-    for (int i = 0; i < 3; i++) {
+    u32 handles[6] = { 0 };
+    for (int i = 0; i < 5; i++) {
         struct txn *t = 0;
         if (next_cmd(mgr, &t) != BR_TRANSACTION) break;
         u32 h = (u32)((struct flat *)t->buffer)->binder_or_handle;
@@ -230,14 +245,16 @@ int cmain(void) {
         reply(mgr, 0, 0);
         check(next_cmd(mgr, 0) == BR_TRANSACTION_COMPLETE, "server registered");
     }
-    u32 hx = handles[CODE_X], hy = handles[CODE_Y], hz = handles[CODE_Z];
-    check(hx && hy && hz, "have all three servers");
+    u32 hx = handles[CODE_X], hy = handles[CODE_Y], hz = handles[CODE_Z], hx2 = handles[CODE_X2], hx3 = handles[CODE_X3];
+    check(hx && hy && hz && hx2 && hx3, "have all the servers");
+    char said;
 
     // Calling X, which calls back: the callback is on top of the call to X.
     send_txn(mgr, BC_TRANSACTION, hx, CODE_CALL_X, 0, 0, 0, 0);
     check(next_cmd(mgr, 0) == BR_TRANSACTION_COMPLETE, "call to X accepted");
     struct txn *t = 0;
     check(next_cmd(mgr, &t) == BR_TRANSACTION && t->code == CODE_CALLBACK, "X's callback comes to the thread calling X");
+    sys(NR_read, sent[0], &said, 1);
 
     sys(NR_kill, x, 9);
     sys(NR_wait4, x, 0, 0, 0);
@@ -249,6 +266,39 @@ int cmain(void) {
     check(next_cmd(mgr, 0) == BR_TRANSACTION_COMPLETE, "the callback's reply completes");
     check(next_cmd(mgr, 0) == BR_DEAD_REPLY, "only now does the call to X end, in BR_DEAD_REPLY");
     check(call_for_reply(mgr, hy, CODE_PLAIN, 4), "the thread's stack is clean afterwards");
+
+    // The same, killed before this thread has read a thing: the callback is in its
+    // queue, and BR_DEAD_REPLY must not overtake the reply to it.
+    send_txn(mgr, BC_TRANSACTION, hx2, CODE_CALL_X, 0, 0, 0, 0);
+    sys(NR_read, sent[0], &said, 1);
+    sys(NR_kill, x2, 9);
+    sys(NR_wait4, x2, 0, 0, 0);
+    nap(200);
+    check(next_cmd(mgr, 0) == BR_TRANSACTION_COMPLETE, "call to a process that died accepted before it did");
+    t = 0;
+    check(next_cmd(mgr, &t) == BR_TRANSACTION && t->code == CODE_CALLBACK, "its callback still arrives");
+    reply(mgr, 0, 0);
+    check(next_cmd(mgr, 0) == BR_TRANSACTION_COMPLETE, "the reply to it completes");
+    check(next_cmd(mgr, 0) == BR_DEAD_REPLY, "then the call ends in BR_DEAD_REPLY");
+    check(call_for_reply(mgr, hy, CODE_PLAIN, 4), "the thread's stack is clean again");
+
+    // test -> Y -> X3 -> test, with X3 killed during the callback. Y can't answer the
+    // test until the test has answered X3: its answer would slip under the callback.
+    struct flat to_x3 = { TYPE_HANDLE, 0, hx3, 0 };
+    u64 at0 = 0;
+    send_txn(mgr, BC_TRANSACTION, hy, CODE_RELAY, &to_x3, sizeof to_x3, &at0, 8);
+    check(next_cmd(mgr, 0) == BR_TRANSACTION_COMPLETE, "call to Y accepted");
+    t = 0;
+    check(next_cmd(mgr, &t) == BR_TRANSACTION && t->code == CODE_CALLBACK, "a chain's callback reaches its head");
+    sys(NR_read, sent[0], &said, 1);
+    sys(NR_kill, x3, 9);
+    sys(NR_wait4, x3, 0, 0, 0);
+    nap(200);
+    check(next_within(mgr, 0, 300) == 0, "X3 died: nothing arrives while its callback is being handled");
+    reply(mgr, 0, 0);
+    check(next_cmd(mgr, 0) == BR_TRANSACTION_COMPLETE, "the callback's reply finds no one and completes");
+    struct txn *y_said = 0;
+    check(next_cmd(mgr, &y_said) == BR_REPLY && y_said->data_size == 4, "Y hears of the death, and answers");
 
     // test -> Y -> Z -> test: the last call belongs on the thread at the head of
     // the chain, though Z's own stack never mentions this process. Elsewhere it

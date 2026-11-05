@@ -33,9 +33,12 @@ arm64 Android on Apple Silicon and Windows on ARM, x86_64 Android on x86_64 PCs.
 | M0: Windows Hypervisor Platform backend (x86_64) | ported to paged memory; builds clean, **not yet run on Windows** |
 | M1: Android's own `linker64`, `toybox`, and `mksh` straight from an SDK `system.img` | done (macOS, Android 16 image) |
 | M2: demand paging, threads, futex, `fork`/`execve`/`wait4`, pipes, signals | done on macOS; x86_64 written (signal frames, TLB shootdown), untested |
-| M3: binder, `servicemanager`, property service, `logd` | binder, properties, `servicemanager`, logd done (macOS); `init` next |
-| M4: SurfaceFlinger with a composer HAL that renders to Metal / D3D12 | in progress: Android's graphics stack runs unmodified on a virtio-gpu device backed by the Android Emulator's gfxstream renderer; Android's boot animation plays in the window (macOS) |
-| M5: zygote, ART, `system_server`, launcher, apps | in progress: Zygote preloads and forks `system_server`, which starts its services (macOS) |
+| M3: binder, `servicemanager`, property service, `logd`, `init` | done (macOS) |
+| M4: SurfaceFlinger, with Android's graphics stack unmodified on a virtio-gpu device backed by the Android Emulator's gfxstream renderer | done (macOS) |
+| M5: zygote, ART, `system_server`, launcher, apps | done (macOS): Android 16's Pixel launcher in the window about 35 s after start, `boot_completed` by about 50 s on a quiet host |
+| M6: input from the window | done (macOS): mouse as touch, scroll as a finger drag, keyboard; Chrome and Play Store open and draw from a tap |
+| Smoothness | in progress: see below |
+| Windows | no window and never run; compiles (`cargo check --target x86_64-pc-windows-msvc`) |
 
 M1 reads the image directly; nothing is extracted to disk. The chain is
 `system.img` (GPT) → `super` (dynamic partitions) → EROFS with LZ4 → `.apex`
@@ -52,14 +55,12 @@ jobs, `trap`, and `kill` all work. 40 rounds of `$(ls /system/bin | wc -l)`
 
 Known gaps:
 
-- At most 64 guest threads in total: Hypervisor.framework allows 64 vCPUs per
-  VM and threads map 1:1 onto them. Android's `system_server` alone runs 100+,
-  so M5 needs threads multiplexed onto vCPUs (CPU state is already saved and
-  restored in full, which that scheduler builds on).
-- Binder never drops references, so nodes are never released.
-- No inet sockets yet. Netlink answers like a machine with no network
-  interfaces: `ip link` and `ss` dumps come back empty, and uevents arrive
-  only when something broadcasts one.
+- No network: AF_INET sockets exist, for netd's iptables, but connecting fails as
+  on a device with no route. Netlink answers like a machine with no interfaces.
+- `/data` lives in memory, so every boot is a first boot: ART compiles its boot
+  image and dex2oat runs over the installed apps, for minutes, in the background.
+- Display frames are read back from the renderer into host memory, which limits
+  the frame rate.
 - SELinux is permissive: selinuxfs, process and socket contexts, and exec
   domain transitions follow the image's CIL policy (with file labels from
   the images' xattrs), but no access is ever denied.
@@ -113,6 +114,15 @@ underneath (`ANGLE_DEFAULT_PLATFORM` overrides). For development, `--push
 is up, its output on stderr. `droidrt --gpu-selftest` checks the renderer and
 window alone.
 
+In the window, the mouse is a finger and scrolling drags one (a person's flick
+becomes a fling). F1 is Home, Escape is Back, F2 is recent apps.
+
+Guest threads take their host priority from what Android says about them: real-time
+policies and nice -4 or better count as display work, the `top-app` cgroup as
+foreground, nice 10 or worse and the `background` and `dex2oat` cgroups as
+background. Background threads take turns on half the host's cores, as a phone
+would keep them to its little ones.
+
 `DROIDRT_STRACE=1` (or `--strace`) logs every syscall (`DROIDRT_STRACE=<name>`:
 only of programs whose path contains it); `DROIDRT_BINDER_TRACE=1`
 logs every binder transaction; `DROIDRT_WATCHDOG=<secs>` forces a stuck guest
@@ -123,6 +133,12 @@ each guest thread with the syscall it is in, for how long, and its backtrace;
 `kill -USR1` on droidrt prints one such dump at any time (without backtraces
 unless `DROIDRT_DUMP` is set). `DROIDRT_FD_TRACE=<name>` logs every descriptor
 added to or removed from the tables of programs whose path contains it.
+`DROIDRT_INPUT_FIFO=<path>` takes lines from a host FIFO as if from the window,
+for tests that must not touch the host's mouse: `down X Y`, `move X Y`, `up X Y`,
+`wheel X Y DX DY` (0 to 1 across the display), `key CODE 1|0` (Linux key codes), and
+`shot PATH`, which writes the frame on show as a BMP. `DROIDRT_GPU_STATS=1` prints
+the display's frame rate and black frames every five seconds, and
+`DROIDRT_SCHED_TRACE=1` each change in a thread's host priority.
 `DROIDRT_DRM_TRACE=1` logs GPU ioctls, transfers and fences;
 `DROIDRT_GPU_LOG=<E|W|I|D>` shows the renderer's own log; `DROIDRT_SAVE_FRAMES=<dir>`
 and `DROIDRT_DUMP_RES=<dir>` save displayed frames and GPU buffers as raw pixels.

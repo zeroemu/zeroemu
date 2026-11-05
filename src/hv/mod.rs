@@ -172,6 +172,54 @@ pub trait Vcpu {
     fn kicker(&self) -> Arc<dyn Kick>;
 }
 
+/// How urgently the host should run the calling thread.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Urgency {
+    /// Late work shows: compositing, drawing, input, audio.
+    Display,
+    /// What the user is looking at.
+    Foreground,
+    Normal,
+    /// Work nobody is waiting for.
+    Background,
+}
+
+/// Tells the host's scheduler how urgent the calling thread is. Only ever about the
+/// thread itself: that is all macOS's QoS allows.
+pub fn set_thread_urgency(u: Urgency) {
+    #[cfg(target_os = "macos")]
+    {
+        unsafe extern "C" {
+            fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: i32) -> i32;
+        }
+        let class = match u {
+            Urgency::Display => 0x21,    // QOS_CLASS_USER_INTERACTIVE
+            Urgency::Foreground => 0x19, // QOS_CLASS_USER_INITIATED
+            Urgency::Normal => 0x15,     // QOS_CLASS_DEFAULT
+            // UTILITY, not BACKGROUND: that is confined to the efficiency cores and
+            // can wait so long that a kernel lock this thread holds stalls the rest.
+            Urgency::Background => 0x11,
+        };
+        unsafe { pthread_set_qos_class_self_np(class, 0) };
+    }
+    #[cfg(windows)]
+    {
+        unsafe extern "system" {
+            fn GetCurrentThread() -> *mut std::ffi::c_void;
+            fn SetThreadPriority(thread: *mut std::ffi::c_void, priority: i32) -> i32;
+        }
+        let priority = match u {
+            Urgency::Display => 2,    // THREAD_PRIORITY_HIGHEST
+            Urgency::Foreground => 1, // THREAD_PRIORITY_ABOVE_NORMAL
+            Urgency::Normal => 0,
+            Urgency::Background => -1, // THREAD_PRIORITY_BELOW_NORMAL
+        };
+        unsafe { SetThreadPriority(GetCurrentThread(), priority) };
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
+    let _ = u;
+}
+
 pub trait Hypervisor: Send + Sync {
     /// Makes `size` bytes of host memory visible to the guest at `gpa`.
     fn map_ram(&self, host: *mut u8, gpa: u64, size: u64) -> Result<(), String>;

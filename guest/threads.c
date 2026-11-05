@@ -11,6 +11,8 @@ typedef long i64;
 #define NR_write 64
 #define NR_exit_group 94
 #define NR_clone 220
+#define NR_setpriority 140
+#define NR_getpid 172
 #define NR_gettid 178
 #define NR_openat 56
 #define NR_clock_gettime 113
@@ -99,6 +101,22 @@ static void spinner(void *arg) {
     }
 }
 
+// As spinner, at a background priority: more of them than the host lets into the
+// guest at once, so they only all arrive if the ones inside are made to take turns.
+static volatile int bg_spinning, bg_release;
+
+static void bg_spinner(void *arg) {
+    (void)arg;
+    sys(NR_setpriority, 0, 0, 10);
+    __atomic_fetch_add(&bg_spinning, 1, __ATOMIC_SEQ_CST);
+    while (__atomic_load_n(&bg_release, __ATOMIC_ACQUIRE) == 0) {
+        if (__atomic_load_n(&bg_spinning, __ATOMIC_ACQUIRE) == N_SPIN) __atomic_store_n(&bg_release, 1, __ATOMIC_RELEASE);
+    }
+    // And back: a place in the small pool must not outlive the reason for it.
+    sys(NR_setpriority, 0, 0, 0);
+    sys(NR_getpid, 0);
+}
+
 // A priority-inheritance mutex, as bionic and libc++ use it: the word holds
 // the owner's tid; contended paths go through FUTEX_LOCK_PI / UNLOCK_PI.
 #define N_PI 8
@@ -178,6 +196,14 @@ int cmain(void) {
     }
     for (int i = 0; i < N_SPIN; i++) join(&tids[i]);
     check(started == N_SPIN && spinning == N_SPIN, "100 threads spinning at once all ran");
+
+    started = 0;
+    for (int i = 0; i < N_SPIN; i++) {
+        tids[i] = 1;
+        if (spawn(stacks + (u64)STACK * (i + 1), bg_spinner, 0, &tids[i]) > 0) started++;
+    }
+    for (int i = 0; i < N_SPIN; i++) join(&tids[i]);
+    check(started == N_SPIN && bg_spinning == N_SPIN, "100 background threads spinning at once all ran");
 
     unsigned me = (unsigned)sys(NR_gettid, 0);
     pi_lock(me);

@@ -22,6 +22,37 @@ use window_macos as window;
 #[cfg(windows)]
 use window_windows as window;
 
+/// Writes the frame the window is showing to a BMP file, for tests: what Android
+/// sent, with no window system in between.
+#[cfg(any(target_os = "macos", windows))]
+pub fn save_shown_frame(path: &str) -> std::io::Result<()> {
+    let Some((w, h, pixels)) = window::shown_frame() else {
+        return Err(std::io::Error::other("no frame yet"));
+    };
+    let size = pixels.len() as u32;
+    let mut bmp = Vec::with_capacity(54 + pixels.len());
+    bmp.extend_from_slice(b"BM");
+    for v in [54 + size, 0, 54, 40, w] {
+        bmp.extend_from_slice(&v.to_le_bytes());
+    }
+    bmp.extend_from_slice(&h.to_le_bytes());
+    bmp.extend_from_slice(&1u16.to_le_bytes()); // planes
+    bmp.extend_from_slice(&32u16.to_le_bytes()); // bits per pixel
+    for v in [0, size, 2835, 2835, 0, 0u32] {
+        bmp.extend_from_slice(&v.to_le_bytes());
+    }
+    // BMP rows go from the bottom up.
+    for row in pixels.chunks_exact(w as usize * 4).rev() {
+        bmp.extend_from_slice(row);
+    }
+    std::fs::write(path, bmp)
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
+pub fn save_shown_frame(_path: &str) -> std::io::Result<()> {
+    Err(std::io::Error::other("no window on this host"))
+}
+
 /// virtio-gpu capability set ids.
 pub const CAPSET_VIRGL: u32 = 1;
 pub const CAPSET_VIRGL2: u32 = 2;

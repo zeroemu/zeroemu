@@ -234,6 +234,7 @@ pub fn present(w: u32, h: u32, stride: u32, fourcc: u32, pixels: &[u8]) {
             let _ = std::fs::write(format!("{dir}/f{n:04}_{t:06}ms_{w}x{h}_{stride}_{fourcc:x}.raw"), pixels);
         }
     }
+    SHOWN_SIZE.store((w as u64) << 32 | h as u64, Ordering::Relaxed);
     let mut slot = FRAME.lock().unwrap_or_else(|p| p.into_inner());
     match slot.as_mut() {
         Some(f) if f.data.len() == pixels.len() => {
@@ -243,6 +244,20 @@ pub fn present(w: u32, h: u32, stride: u32, fourcc: u32, pixels: &[u8]) {
         _ => *slot = Some(Frame { w, h, stride, fourcc, data: pixels.to_vec() }),
     }
     FRAME_NEW.store(true, Ordering::Release);
+}
+
+/// The newest frame as top-down B,G,R,A rows, and its size.
+pub fn shown_frame() -> Option<(u32, u32, Vec<u8>)> {
+    let slot = FRAME.lock().unwrap_or_else(|p| p.into_inner());
+    let f = slot.as_ref()?;
+    const BGRA: [u32; 2] = [0x3432_5241, 0x3432_5258];
+    let mut out = Vec::with_capacity(f.w as usize * f.h as usize * 4);
+    for row in f.data.chunks_exact(f.stride as usize).take(f.h as usize) {
+        for p in row.chunks_exact(4).take(f.w as usize) {
+            out.extend_from_slice(&if BGRA.contains(&f.fourcc) { [p[0], p[1], p[2], 255] } else { [p[2], p[1], p[0], 255] });
+        }
+    }
+    Some((f.w, f.h, out))
 }
 
 /// Puts the newest frame into the window's layer (UI thread only).
@@ -336,7 +351,10 @@ fn drain_ui() {
 /// belong to it wherever they happen.
 static TOUCHING: AtomicBool = AtomicBool::new(false);
 /// NSEventModifierFlags seen last, to tell a modifier's press from its release.
-static MODIFIERS: AtomicU64 = AtomicU64::new(0);
+/// Whether the window had the keyboard, when last looked at.
+static WAS_KEY: AtomicBool = AtomicBool::new(false);
+/// The frame's size, for mapping the pointer onto the frame.
+static SHOWN_SIZE: AtomicU64 = AtomicU64::new(0);
 
 /// Android's keys for a Mac's virtual key codes (kVK_*). Escape is BACK and F1 HOME,
 /// as there is no other way to reach them; F2 is the recent apps list.
@@ -391,7 +409,7 @@ fn linux_key(mac: u16) -> Option<u16> {
         0x2f => 52,  // .
         0x30 => 15,  // Tab
         0x31 => 57,  // Space
-        0x32 => 41,  // `
+        0x32 => 399, // `, which qwerty2.kl has here
         0x33 => 14,  // Delete (backspace)
         0x35 => 158, // Escape: BACK
         0x37 => 125, // Command: META
@@ -403,11 +421,11 @@ fn linux_key(mac: u16) -> Option<u16> {
         0x3d => 100, // right Option
         0x3e => 97,  // right Control
         0x75 => 111, // Forward Delete
-        0x73 => 102, // Home
-        0x77 => 107, // End
+        0x73 => 452, // Home and End, as qwerty2.kl has them: for its layout, 102 is
+        0x77 => 453, // the home screen and 107 hangs up, which puts Android to sleep.
         0x74 => 104, // Page Up
         0x79 => 109, // Page Down
-        0x7a => 172, // F1: HOME
+        0x7a => 102, // F1: HOME, as qwerty2.kl has it
         0x78 => 580, // F2: APP_SWITCH
         0x7b => 105, // Left
         0x7c => 106, // Right
@@ -427,6 +445,21 @@ unsafe fn forward_input(event: *mut c_void) -> bool {
     const KEY_DOWN: i64 = 10;
     const KEY_UP: i64 = 11;
     const FLAGS_CHANGED: i64 = 12;
+    const SCROLL_WHEEL: i64 = 22;
+    /// Each modifier's device-dependent bit: says which of a left and right pair moved.
+    const fn modifier_bit(key: i64) -> Option<u64> {
+        Some(match key {
+            0x37 => 0x8,    // Command
+            0x38 => 0x2,    // Shift
+            0x3a => 0x20,   // Option
+            0x3b => 0x1,    // Control
+            0x3c => 0x4,    // right Shift
+            0x3d => 0x40,   // right Option
+            0x3e => 0x2000, // right Control
+            _ => return None,
+        })
+    }
+    const CAPS_LOCK: i64 = 0x39;
     let window = WINDOW.load(Ordering::Acquire);
     unsafe {
         if window.is_null() || msg0(event, sel("window")) != window {
@@ -435,11 +468,12 @@ unsafe fn forward_input(event: *mut c_void) -> bool {
         match msg_i64_ret(event, sel("type")) {
             ty @ (LEFT_DOWN | LEFT_UP | LEFT_DRAGGED) => {
                 let at = msg_point(event, sel("locationInWindow"));
-                let bounds = msg_rect(msg0(window, sel("contentView")), sel("bounds"));
-                let (x, y) = (at.x / bounds.size.width, 1.0 - at.y / bounds.size.height);
+                let shown = shown_rect(msg_rect(msg0(window, sel("contentView")), sel("bounds")));
+                let (x, y) = shown.place(at);
                 let inside = (0.0..=1.0).contains(&x) && (0.0..=1.0).contains(&y);
                 match ty {
                     LEFT_DOWN if inside => {
+                        evdev::scroll_cancel(); // the slot's a finger's at a time
                         TOUCHING.store(true, Ordering::Relaxed);
                         evdev::touch(Touch::Down, x, y);
                     }
@@ -448,6 +482,41 @@ unsafe fn forward_input(event: *mut c_void) -> bool {
                     _ => {}
                 }
                 false // the window still handles its title bar and resizing
+            }
+            SCROLL_WHEEL => {
+                // NSEventPhase. A mouse wheel has none; a trackpad's fingers do, then
+                // momentum, which Android works out for itself when they lift.
+                const BEGAN: i64 = 1;
+                const CHANGED: i64 = 4;
+                const ENDED: i64 = 8;
+                const CANCELLED: i64 = 16;
+                /// How far one line of a mouse wheel goes, across the display.
+                const LINE: f64 = 0.03;
+                let (phase, momentum) = (msg_i64_ret(event, sel("phase")), msg_i64_ret(event, sel("momentumPhase")));
+                let phase = match phase {
+                    0 if momentum == 0 => evdev::Scroll::Wheel,
+                    BEGAN => evdev::Scroll::Begin,
+                    CHANGED => evdev::Scroll::Change,
+                    ENDED | CANCELLED => {
+                        // Wherever the pointer has got to by now.
+                        evdev::scroll(evdev::Scroll::End, 0.0, 0.0, 0.0, 0.0);
+                        return true;
+                    }
+                    _ => return true,
+                };
+                let at = msg_point(event, sel("locationInWindow"));
+                let shown = shown_rect(msg_rect(msg0(window, sel("contentView")), sel("bounds")));
+                let (x, y) = shown.place(at);
+                let (dx, dy) = (msg_f64_ret(event, sel("scrollingDeltaX")), msg_f64_ret(event, sel("scrollingDeltaY")));
+                let (dx, dy) = if msg_i64_ret(event, sel("hasPreciseScrollingDeltas")) & 1 != 0 {
+                    (dx / shown.w, dy / shown.h)
+                } else {
+                    (dx * LINE, dy * LINE)
+                };
+                if !TOUCHING.load(Ordering::Relaxed) && (0.0..=1.0).contains(&x) && (0.0..=1.0).contains(&y) {
+                    evdev::scroll(phase, x, y, dx, dy);
+                }
+                true
             }
             ty @ (KEY_DOWN | KEY_UP) => {
                 // Android repeats held keys itself.
@@ -459,12 +528,14 @@ unsafe fn forward_input(event: *mut c_void) -> bool {
             }
             FLAGS_CHANGED => {
                 let flags = msg_i64_ret(event, sel("modifierFlags")) as u64;
-                let before = MODIFIERS.swap(flags, Ordering::Relaxed);
-                if let Some(code) = linux_key(msg_i64_ret(event, sel("keyCode")) as u16) {
-                    // The device-independent modifier bits: one changed.
-                    const DEVICE_INDEPENDENT: u64 = 0xffff_0000;
-                    let down = (flags & DEVICE_INDEPENDENT).count_ones() > (before & DEVICE_INDEPENDENT).count_ones();
-                    evdev::key(code, down);
+                let key = msg_i64_ret(event, sel("keyCode"));
+                if key == CAPS_LOCK {
+                    // The Mac reports the lock, not the key, and Android toggles on
+                    // release: a press and release for each change keeps them together.
+                    evdev::key(58, true);
+                    evdev::key(58, false);
+                } else if let (Some(bit), Some(code)) = (modifier_bit(key), linux_key(key as u16)) {
+                    evdev::key(code, flags & bit != 0);
                 }
                 true
             }
@@ -473,9 +544,60 @@ unsafe fn forward_input(event: *mut c_void) -> bool {
     }
 }
 
+/// Where the frame is in the window's content view: it keeps its shape (resizeAspect),
+/// whatever the window's.
+struct ShownRect {
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+}
+
+impl ShownRect {
+    /// A point in the view as a fraction of the frame, from its top left.
+    fn place(&self, at: NSPoint) -> (f64, f64) {
+        ((at.x - self.x) / self.w, 1.0 - (at.y - self.y) / self.h)
+    }
+}
+
+fn shown_rect(bounds: NSRect) -> ShownRect {
+    let (bw, bh) = (bounds.size.width, bounds.size.height);
+    let size = SHOWN_SIZE.load(Ordering::Relaxed);
+    let (fw, fh) = ((size >> 32) as f64, (size & 0xffff_ffff) as f64);
+    if fw == 0.0 || fh == 0.0 {
+        return ShownRect { x: 0.0, y: 0.0, w: bw, h: bh };
+    }
+    let scale = (bw / fw).min(bh / fh);
+    let (w, h) = (fw * scale, fh * scale);
+    ShownRect { x: (bw - w) / 2.0, y: (bh - h) / 2.0, w, h }
+}
+
+/// What the window can no longer be told about: releases that went elsewhere, when
+/// another app took the keyboard or AppKit took the mouse (its resize loop, say).
+fn check_lost_input() {
+    use crate::kernel::evdev::{self, Touch};
+    let window = WINDOW.load(Ordering::Acquire);
+    if window.is_null() {
+        return;
+    }
+    unsafe {
+        let is_key = msg_i64_ret(window, sel("isKeyWindow")) & 1 != 0;
+        if WAS_KEY.swap(is_key, Ordering::Relaxed) && !is_key {
+            evdev::release_keys();
+            evdev::scroll_cancel();
+        }
+        if TOUCHING.load(Ordering::Relaxed) && msg_i64_ret(cls("NSEvent"), sel("pressedMouseButtons")) & 1 == 0 {
+            TOUCHING.store(false, Ordering::Relaxed);
+            evdev::touch(Touch::Up, 0.0, 0.0);
+        }
+    }
+}
+
 fn pump_once(wait_s: f64) {
     drain_ui();
     show_frame();
+    crate::kernel::evdev::scroll_idle(Duration::from_millis(100));
+    check_lost_input();
     let app = APP.load(Ordering::Acquire);
     if app.is_null() {
         std::thread::sleep(Duration::from_secs_f64(wait_s));

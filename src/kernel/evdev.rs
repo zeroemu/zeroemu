@@ -5,7 +5,8 @@
 //!
 //! DROIDRT_INPUT_FIFO=<path>: lines from this host FIFO are injected as if they
 //! came from the window, for testing without the host's mouse: `down X Y`,
-//! `move X Y` and `up X Y` with X and Y from 0 to 1, and `key CODE 1|0`.
+//! `move X Y` and `up X Y` with X and Y from 0 to 1, `wheel X Y DX DY` with the
+//! same scale, `key CODE 1|0`, and `shot PATH`, which writes the frame on show.
 
 use super::wait::EVENTS;
 use super::{ERESTARTSYS, IDLE, Thread};
@@ -29,6 +30,10 @@ const ABS_MT_SLOT: u16 = 0x2f;
 const ABS_MT_POSITION_X: u16 = 0x35;
 const ABS_MT_POSITION_Y: u16 = 0x36;
 const ABS_MT_TRACKING_ID: u16 = 0x39;
+const ABS_MT_FIRST: u16 = 0x30;
+const ABS_MT_LAST: u16 = 0x3d;
+/// ABS_MT_SLOT's range is 0 to this less one.
+const SLOTS: i32 = 10;
 /// Positions are scaled to this. Android maps the axis range onto the display.
 const ABS_MAX: i32 = 32767;
 
@@ -60,8 +65,23 @@ struct Device {
 #[derive(Default)]
 struct State {
     keys: Vec<u8>,
+    /// Absolute axes' values. MT axes hold slot 0's, the only slot in use so far.
     abs: Vec<(u16, i32)>,
-    tracking_id: i32,
+    /// The last tracking id given out; the finger's own is in `abs`.
+    last_id: i32,
+}
+
+impl State {
+    fn abs(&self, axis: u16) -> Option<i32> {
+        self.abs.iter().find(|a| a.0 == axis).map(|a| a.1)
+    }
+
+    fn set_abs(&mut self, axis: u16, value: i32) {
+        match self.abs.iter_mut().find(|a| a.0 == axis) {
+            Some(a) => a.1 = value,
+            None => self.abs.push((axis, value)),
+        }
+    }
 }
 
 /// One open of a device.
@@ -85,7 +105,7 @@ static TOUCH: LazyLock<Device> = LazyLock::new(|| Device {
     ev_bits: 1 << EV_SYN | 1 << EV_KEY | 1 << EV_ABS,
     key_bits: bits([BTN_TOUCH]),
     abs_bits: bits([ABS_X, ABS_Y, ABS_MT_SLOT, ABS_MT_POSITION_X, ABS_MT_POSITION_Y, ABS_MT_TRACKING_ID]),
-    abs: vec![(ABS_X, 0, ABS_MAX), (ABS_Y, 0, ABS_MAX), (ABS_MT_SLOT, 0, 9), (ABS_MT_POSITION_X, 0, ABS_MAX), (ABS_MT_POSITION_Y, 0, ABS_MAX), (ABS_MT_TRACKING_ID, 0, 65535)],
+    abs: vec![(ABS_X, 0, ABS_MAX), (ABS_Y, 0, ABS_MAX), (ABS_MT_SLOT, 0, SLOTS - 1), (ABS_MT_POSITION_X, 0, ABS_MAX), (ABS_MT_POSITION_Y, 0, ABS_MAX), (ABS_MT_TRACKING_ID, 0, 65535)],
     props: 1 << INPUT_PROP_DIRECT,
     clients: Mutex::default(),
     state: Mutex::default(),
@@ -95,7 +115,8 @@ static KEYBOARD: LazyLock<Device> = LazyLock::new(|| Device {
     minor: FIRST_MINOR + 1,
     name: "qwerty2",
     ev_bits: 1 << EV_SYN | 1 << EV_KEY,
-    key_bits: bits(1..=248),
+    // What a keyboard has, and what qwerty2.kl gives meaning to beyond that.
+    key_bits: bits((1..=248).chain([399, 452, 453, 580])),
     abs_bits: bits([]),
     abs: Vec::new(),
     props: 0,
@@ -170,10 +191,10 @@ pub fn touch(phase: Touch, x: f64, y: f64) {
     let mut st = d.state.lock().unwrap();
     let events: Vec<(u16, u16, i32)> = match phase {
         Touch::Down => {
-            st.tracking_id = st.tracking_id.wrapping_add(1) & 0xffff;
+            st.last_id = st.last_id.wrapping_add(1) & 0xffff;
             vec![
                 (EV_ABS, ABS_MT_SLOT, 0),
-                (EV_ABS, ABS_MT_TRACKING_ID, st.tracking_id),
+                (EV_ABS, ABS_MT_TRACKING_ID, st.last_id),
                 (EV_KEY, BTN_TOUCH, 1),
                 (EV_ABS, ABS_MT_POSITION_X, x),
                 (EV_ABS, ABS_MT_POSITION_Y, y),
@@ -184,6 +205,13 @@ pub fn touch(phase: Touch, x: f64, y: f64) {
         Touch::Move => vec![(EV_ABS, ABS_MT_POSITION_X, x), (EV_ABS, ABS_MT_POSITION_Y, y), (EV_ABS, ABS_X, x), (EV_ABS, ABS_Y, y)],
         Touch::Up => vec![(EV_ABS, ABS_MT_TRACKING_ID, -1), (EV_KEY, BTN_TOUCH, 0)],
     };
+    // What a reader asks for after resetting (InputReader does, when the display
+    // changes): without it a finger that is down looks like it is not.
+    for &(ty, code, value) in &events {
+        if ty == EV_ABS {
+            st.set_abs(code, value);
+        }
+    }
     st.keys.resize(96, 0);
     if phase != Touch::Move {
         let b = BTN_TOUCH as usize;
@@ -195,6 +223,124 @@ pub fn touch(phase: Touch, x: f64, y: f64) {
     }
     drop(st);
     d.post(&events);
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Scroll {
+    /// A trackpad gesture's fingers landed.
+    Begin,
+    /// A trackpad gesture moved.
+    Change,
+    /// A trackpad gesture's fingers lifted.
+    End,
+    /// A mouse wheel, whose gestures have no end but silence.
+    Wheel,
+}
+
+/// The finger a scroll is being played as.
+struct ScrollFinger {
+    /// Where it lands, and lands again when it runs out of screen.
+    start: (f64, f64),
+    /// Where it is, if it has landed.
+    at: Option<(f64, f64)>,
+    /// Travel before landing.
+    pending: (f64, f64),
+    last: Instant,
+    wheel: bool,
+}
+
+static SCROLLING: Mutex<Option<ScrollFinger>> = Mutex::new(None);
+
+/// How far a scroll must go before there is a finger: less would be a tap, or at
+/// rest a long press, on whatever is under the pointer. Android's own touch slop is
+/// a third of this on a phone-sized display.
+const SCROLL_SLOP: f64 = 0.01;
+/// A finger keeps out of the screen's edges, where gestures of their own start.
+const SCROLL_INSET: f64 = 0.1;
+/// A trackpad gesture that never said it ended.
+const SCROLL_LOST: Duration = Duration::from_secs(1);
+
+fn clamp_to_screen(p: (f64, f64)) -> (f64, f64) {
+    (p.0.clamp(0.0, 1.0), p.1.clamp(0.0, 1.0))
+}
+
+/// Android has no scrolling on a touchscreen but a finger dragging, so a scroll at
+/// (x, y) by (dx, dy), all from 0 to 1 across the display, is played as one. Lifting
+/// at the gesture's speed flings, so the host's own momentum events aren't needed.
+pub fn scroll(phase: Scroll, x: f64, y: f64, dx: f64, dy: f64) {
+    let mut held = SCROLLING.lock().unwrap();
+    if phase == Scroll::End {
+        lift(&mut held);
+        return;
+    }
+    if phase == Scroll::Begin {
+        lift(&mut held); // the last gesture never said it ended
+    }
+    let f = held.get_or_insert_with(|| ScrollFinger {
+        start: (x.clamp(SCROLL_INSET, 1.0 - SCROLL_INSET), y.clamp(SCROLL_INSET, 1.0 - SCROLL_INSET)),
+        at: None,
+        pending: (0.0, 0.0),
+        last: Instant::now(),
+        wheel: phase == Scroll::Wheel,
+    });
+    f.last = Instant::now();
+    match f.at {
+        None => {
+            f.pending = (f.pending.0 + dx, f.pending.1 + dy);
+            if f.pending.0.abs().max(f.pending.1.abs()) >= SCROLL_SLOP {
+                let to = clamp_to_screen((f.start.0 + f.pending.0, f.start.1 + f.pending.1));
+                touch(Touch::Down, f.start.0, f.start.1);
+                touch(Touch::Move, to.0, to.1);
+                f.at = Some(to);
+            }
+        }
+        Some(at) => {
+            let to = (at.0 + dx, at.1 + dy);
+            if (0.0..=1.0).contains(&to.0) && (0.0..=1.0).contains(&to.1) {
+                touch(Touch::Move, to.0, to.1);
+                f.at = Some(to);
+            } else {
+                // Out of screen: a person would pick their finger up and start again.
+                touch(Touch::Up, at.0, at.1);
+                touch(Touch::Down, f.start.0, f.start.1);
+                let to = clamp_to_screen((f.start.0 + dx, f.start.1 + dy));
+                touch(Touch::Move, to.0, to.1);
+                f.at = Some(to);
+            }
+        }
+    }
+}
+
+fn lift(held: &mut Option<ScrollFinger>) {
+    if let Some(ScrollFinger { at: Some(at), .. }) = held.take() {
+        touch(Touch::Up, at.0, at.1);
+    }
+}
+
+/// Lifts a scroll's finger now: something else is about to use the slot, or the
+/// window is no longer in charge.
+pub fn scroll_cancel() {
+    lift(&mut SCROLLING.lock().unwrap());
+}
+
+/// Lifts a mouse wheel's finger once the wheel has been still for `after`.
+pub fn scroll_idle(after: Duration) {
+    let mut held = SCROLLING.lock().unwrap();
+    if held.as_ref().is_some_and(|f| f.last.elapsed() >= if f.wheel { after } else { SCROLL_LOST }) {
+        lift(&mut held);
+    }
+}
+
+/// Lets go of every key that is down: the window will not see them released.
+pub fn release_keys() {
+    let d = &*KEYBOARD;
+    let down: Vec<u16> = {
+        let st = d.state.lock().unwrap();
+        (0..st.keys.len() * 8).filter(|c| st.keys[c / 8] & 1 << (c % 8) != 0).map(|c| c as u16).collect()
+    };
+    for code in down {
+        key(code, false);
+    }
 }
 
 /// A key, by Linux KEY_* code.
@@ -233,6 +379,16 @@ pub fn start_input_fifo() {
                         };
                         if let (Ok(x), Ok(y)) = (x.parse(), y.parse()) {
                             touch(phase, x, y);
+                        }
+                    }
+                    ["wheel", x, y, dx, dy] => {
+                        if let (Ok(x), Ok(y), Ok(dx), Ok(dy)) = (x.parse(), y.parse(), dx.parse(), dy.parse()) {
+                            scroll(Scroll::Wheel, x, y, dx, dy);
+                        }
+                    }
+                    ["shot", path] => {
+                        if let Err(e) = crate::gpu::save_shown_frame(path) {
+                            eprintln!("droidrt: shot {path}: {e}");
                         }
                     }
                     ["key", code, state] => {
@@ -322,6 +478,22 @@ impl Client {
             (READ, 0x07) => sized(format!("virtio{}/input0\0", d.minor - FIRST_MINOR).as_bytes()),
             (READ, 0x08) => sized(b"\0"),
             (READ, 0x09) => sized(&d.props.to_le_bytes()),
+            // EVIOCGMTSLOTS: the axis asked about, then its value in each slot.
+            (READ, 0x0a) => {
+                let axis = input()?;
+                if !(ABS_MT_FIRST as i32..=ABS_MT_LAST as i32).contains(&axis) || !d.abs.iter().any(|a| a.0 == ABS_MT_SLOT) {
+                    return Err(EINVAL);
+                }
+                let idle = if axis == ABS_MT_TRACKING_ID as i32 { -1 } else { 0 };
+                let slot0 = d.state.lock().unwrap().abs(axis as u16).unwrap_or(idle);
+                let mut b = axis.to_le_bytes().to_vec();
+                b.extend_from_slice(&slot0.to_le_bytes());
+                for _ in 1..SLOTS {
+                    b.extend_from_slice(&idle.to_le_bytes());
+                }
+                b.truncate(size);
+                exact(b)
+            }
             (READ, 0x18) => {
                 let st = d.state.lock().unwrap();
                 sized(&st.keys)
@@ -334,7 +506,7 @@ impl Client {
             (READ, 0x40..=0x7f) => {
                 let axis = (nr - 0x40) as u16;
                 let &(_, min, max) = d.abs.iter().find(|a| a.0 == axis).ok_or(EINVAL)?;
-                let value = d.state.lock().unwrap().abs.iter().find(|a| a.0 == axis).map_or(0, |a| a.1);
+                let value = d.state.lock().unwrap().abs(axis).unwrap_or(if axis == ABS_MT_TRACKING_ID { -1 } else { 0 });
                 let mut b = Vec::new();
                 for v in [value, min, max, 0, 0, 0] {
                     b.extend_from_slice(&v.to_le_bytes());
@@ -355,5 +527,104 @@ impl Client {
             (_, 0x03 | 0x92 | 0x93) => Ok((0, Vec::new())), // EVIOCSREP, EVIOCGMASK, EVIOCSMASK
             _ => Err(EINVAL),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The devices are global, so these can't run at once.
+    static SERIAL: Mutex<()> = Mutex::new(());
+
+    fn drain(c: &Client) -> Vec<(u16, u16, i32)> {
+        c.queue.lock().unwrap().drain(..).map(|e| (e.1, e.2, e.3)).filter(|e| e.0 != EV_SYN).collect()
+    }
+
+    fn slots(c: &Client, axis: u16) -> Vec<i32> {
+        let cmd = 2u64 << 30 | 44 << 16 | (b'E' as u64) << 8 | 0x0a;
+        let (ret, bytes) = c.ioctl(cmd, || Ok(axis as i32)).unwrap();
+        assert_eq!(ret, 0);
+        bytes.chunks_exact(4).map(|b| i32::from_le_bytes(b.try_into().unwrap())).collect()
+    }
+
+    #[test]
+    fn slots_report_the_finger() {
+        let _g = SERIAL.lock().unwrap();
+        let c = open(rdev(FIRST_MINOR)).unwrap();
+        touch(Touch::Down, 0.5, 0.25);
+        let got = slots(&c, ABS_MT_TRACKING_ID);
+        assert_eq!(got.len(), 11);
+        assert_eq!(got[0], ABS_MT_TRACKING_ID as i32, "the axis stays where it was");
+        assert!(got[1] >= 0, "the finger's id in slot 0");
+        assert!(got[2..].iter().all(|&v| v == -1), "the rest are free: {got:?}");
+        assert_eq!(slots(&c, ABS_MT_POSITION_Y)[1], scale(0.25));
+        touch(Touch::Up, 0.5, 0.25);
+        assert_eq!(slots(&c, ABS_MT_TRACKING_ID)[1], -1);
+        let unknown = c.ioctl(2u64 << 30 | 44 << 16 | (b'E' as u64) << 8 | 0x0a, || Ok(ABS_X as i32));
+        assert_eq!(unknown.err(), Some(EINVAL), "not an MT axis");
+    }
+
+    #[test]
+    fn a_wheel_is_a_drag_that_lifts_when_still() {
+        let _g = SERIAL.lock().unwrap();
+        let c = open(rdev(FIRST_MINOR)).unwrap();
+        scroll(Scroll::Wheel, 0.5, 0.5, 0.0, 0.1);
+        scroll(Scroll::Wheel, 0.5, 0.5, 0.0, 0.1);
+        let got = drain(&c);
+        assert!(got.contains(&(EV_KEY, BTN_TOUCH, 1)), "landed: {got:?}");
+        assert_eq!(got.iter().filter(|e| e.1 == ABS_MT_TRACKING_ID).count(), 1, "one gesture");
+        assert!(got.contains(&(EV_ABS, ABS_MT_POSITION_Y, scale(0.7))), "moved by both: {got:?}");
+        scroll_idle(Duration::from_secs(60));
+        assert!(drain(&c).is_empty(), "the wheel hasn't been still that long");
+        scroll_idle(Duration::ZERO);
+        assert!(drain(&c).contains(&(EV_KEY, BTN_TOUCH, 0)), "lifted");
+    }
+
+    #[test]
+    fn a_scroll_too_small_to_be_one_touches_nothing() {
+        let _g = SERIAL.lock().unwrap();
+        let c = open(rdev(FIRST_MINOR)).unwrap();
+        scroll(Scroll::Begin, 0.5, 0.5, 0.0, 0.0);
+        scroll(Scroll::Change, 0.5, 0.5, 0.0, SCROLL_SLOP / 4.0);
+        scroll(Scroll::End, 0.5, 0.5, 0.0, 0.0);
+        assert!(drain(&c).is_empty(), "no tap on what's under the pointer");
+        scroll(Scroll::Wheel, 0.5, 0.5, 0.0, 0.0);
+        scroll_idle(Duration::ZERO);
+        assert!(drain(&c).is_empty(), "nor from a wheel that didn't move");
+    }
+
+    #[test]
+    fn every_landing_is_followed_by_travel() {
+        let _g = SERIAL.lock().unwrap();
+        let c = open(rdev(FIRST_MINOR)).unwrap();
+        // Low on the screen, moving off it: never a press and release in one place.
+        scroll(Scroll::Wheel, 0.5, 0.98, 0.0, 0.03);
+        let got = drain(&c);
+        assert!(got.contains(&(EV_ABS, ABS_MT_POSITION_Y, scale(0.9))), "kept out of the edge: {got:?}");
+        assert_eq!(got.last(), Some(&(EV_ABS, ABS_Y, scale(0.93))), "moved: {got:?}");
+        scroll(Scroll::Wheel, 0.5, 0.98, 0.0, 0.2);
+        let got = drain(&c);
+        assert!(got.contains(&(EV_KEY, BTN_TOUCH, 0)) && got.contains(&(EV_KEY, BTN_TOUCH, 1)), "lifted and landed: {got:?}");
+        assert!(got.contains(&(EV_ABS, ABS_MT_POSITION_Y, scale(0.9))), "back at the start: {got:?}");
+        assert_eq!(got.last(), Some(&(EV_ABS, ABS_Y, scale(1.0))), "and moved from it: {got:?}");
+        scroll_cancel();
+        assert!(drain(&c).contains(&(EV_KEY, BTN_TOUCH, 0)), "cancelling lifts");
+        scroll_cancel();
+        assert!(drain(&c).is_empty(), "nothing left to lift");
+    }
+
+    #[test]
+    fn held_keys_are_let_go() {
+        let _g = SERIAL.lock().unwrap();
+        let c = open(rdev(FIRST_MINOR + 1)).unwrap();
+        key(30, true);
+        key(42, true);
+        key(30, false);
+        drain(&c);
+        release_keys();
+        assert_eq!(drain(&c), vec![(EV_KEY, 42, 0)]);
+        release_keys();
+        assert!(drain(&c).is_empty());
     }
 }

@@ -197,6 +197,9 @@ impl Worker {
         let t = std::thread::Builder::new()
             .name("virtio-gpu".into())
             .spawn(move || {
+                // Everything on screen waits for this thread, and the renderer's own
+                // threads start out as urgent as whoever creates them: here.
+                crate::hv::set_thread_urgency(crate::hv::Urgency::Display);
                 for job in rx {
                     job();
                 }
@@ -341,10 +344,11 @@ extern "C" fn on_debug(_user: *mut c_void, dbg: *const CDebug) {
 
 /// DROIDRT_GPU_STATS=1: every five seconds, how many frames went to the window and
 /// what reading them back cost. A frame's budget is 16 ms.
-fn flush_stats(took: Duration) {
+fn flush_stats(took: Duration, frame: &[u8]) {
     struct Window {
         since: Instant,
         frames: u32,
+        black: u32,
         total: Duration,
         worst: Duration,
     }
@@ -354,15 +358,20 @@ fn flush_stats(took: Duration) {
         return;
     }
     let mut g = STATS.lock().unwrap_or_else(|p| p.into_inner());
-    let w = g.get_or_insert_with(|| Window { since: Instant::now(), frames: 0, total: Duration::ZERO, worst: Duration::ZERO });
+    let w = g.get_or_insert_with(|| Window { since: Instant::now(), frames: 0, black: 0, total: Duration::ZERO, worst: Duration::ZERO });
     w.frames += 1;
+    // A sample is plenty, as a frame is either wholly black or it isn't. Alpha aside.
+    if frame.chunks_exact(4).step_by(1009).all(|p| p[..3] == [0, 0, 0] || p[1..] == [0, 0, 0]) {
+        w.black += 1;
+    }
     w.total += took;
     w.worst = w.worst.max(took);
     let elapsed = w.since.elapsed();
     if elapsed >= Duration::from_secs(5) {
         eprintln!(
-            "droidrt: display {:.1} fps, readback avg {:.1} ms, worst {:.1} ms",
+            "droidrt: display {:.1} fps, {} black, readback avg {:.1} ms, worst {:.1} ms",
             w.frames as f64 / elapsed.as_secs_f64(),
+            w.black,
             w.total.as_secs_f64() * 1000.0 / w.frames as f64,
             w.worst.as_secs_f64() * 1000.0
         );
@@ -639,7 +648,7 @@ impl GpuBackend for Gfxstream {
         if self.worker.run(|| unsafe { (self.api.transfer_read)(handle, 0, 0, stride, 0, &b, 0, &iov, 1) }) == 0 {
             window::present(w, h, stride, info.drm_fourcc, &buf);
         }
-        flush_stats(started.elapsed());
+        flush_stats(started.elapsed(), &buf);
     }
 
     fn read_pixels(&self, handle: u32) -> Option<(u32, u32, Vec<u8>)> {

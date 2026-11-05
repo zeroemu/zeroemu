@@ -696,8 +696,11 @@ impl Kernel {
             faccessat | faccessat2 => {
                 const AT_EACCESS: u64 = 0x200;
                 let flags = if no == faccessat2 { a[3] } else { 0 };
-                if a[2] & !7 != 0 {
+                if a[2] & !7 != 0 || flags & !(AT_EACCESS | AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
                     return Err(EINVAL);
+                }
+                if a[1] == 0 {
+                    return Err(EFAULT); // target() would take this to mean the descriptor
                 }
                 let node = self.target(t, int(a[0]), a[1], flags)?;
                 let vfs = self.vfs()?;

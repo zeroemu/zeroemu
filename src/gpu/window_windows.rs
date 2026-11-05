@@ -25,6 +25,11 @@ pub fn present(w: u32, h: u32, stride: u32, fourcc: u32, pixels: &[u8]) {
     let _ = (w, h, stride, fourcc, pixels);
 }
 
+/// TODO: the newest frame, once there is a window to give one to.
+pub fn shown_frame() -> Option<(u32, u32, Vec<u8>)> {
+    None
+}
+
 pub fn window_id() -> Option<u64> {
     None
 }

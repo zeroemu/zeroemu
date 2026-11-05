@@ -88,6 +88,7 @@ impl Kernel {
         };
         let th = Thread::new(tid, t.proc.clone(), t.mask.load(Ordering::Relaxed), own_files);
         *th.attrs.lock().unwrap() = t.attrs.lock().unwrap().fork();
+        th.inherit_sched(t);
         th.sec.inherit(&t.sec);
         {
             let mut mm = t.proc.mm();
@@ -159,6 +160,7 @@ impl Kernel {
         th.sec.inherit(&t.sec);
         *th.altstack.lock().unwrap() = *t.altstack.lock().unwrap();
         *th.attrs.lock().unwrap() = t.attrs.lock().unwrap().fork();
+        th.inherit_sched(t);
         if flags & CLONE_CHILD_CLEARTID != 0 {
             th.clear_child_tid.store(ctid, Ordering::Relaxed);
         }

@@ -362,17 +362,33 @@ impl CgroupFs {
             let id: i32 = word.parse().map_err(|_| EINVAL)?;
             let live = Self::live(&k);
             let Some((pid, tids)) = live.iter().find(|(p, t)| *p == id || (thread && t.contains(&id))) else { return Err(ESRCH) };
-            if thread && id != *pid {
-                st.member.insert(id, dir);
-            } else {
+            let whole = !(thread && id != *pid);
+            if whole {
                 // The whole process moves, its threads with it.
                 for t in tids {
                     st.member.remove(t);
                 }
                 st.member.insert(*pid, dir);
+            } else {
+                st.member.insert(id, dir);
+            }
+            if self.controllers.contains(&"cpu")
+                && let Some(p) = k.process(*pid)
+            {
+                let group = super::sched::CpuGroup::named(Self::name_of(st, dir));
+                for th in p.threads.lock().unwrap().iter().filter(|th| whole || th.tid == id) {
+                    th.set_cpu_group(group);
+                }
             }
         }
         Ok(())
+    }
+
+    /// A cgroup's name within its parent; the root has none.
+    fn name_of(st: &State, dir: u64) -> &str {
+        let Some(Kind::Dir { parent, .. }) = st.nodes.get(&dir).map(|n| &n.kind) else { return "" };
+        let Some(Kind::Dir { entries, .. }) = st.nodes.get(parent).map(|n| &n.kind) else { return "" };
+        entries.iter().find(|&(_, &ino)| ino == dir).map_or("", |(name, _)| name.as_str())
     }
 
     /// The cgroup and all cgroups beneath it.

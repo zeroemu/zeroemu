@@ -174,9 +174,6 @@ struct Txn {
     from: Option<(ProcId, i32)>,
     /// What the calling thread was itself answering, when it made this call.
     from_parent: Option<TxnId>,
-    /// The target died; the caller is told when it is back down to this call.
-    dead: bool,
-    to: ProcId,
     node: Option<NodeId>,
     code: u32,
     flags: u32,
@@ -411,35 +408,81 @@ impl World {
         self.procs.get_mut(&p).unwrap().threads.entry(tid).or_default()
     }
 
-    /// The reply to `call` cannot be delivered: the caller's wait is over and the
-    /// call leaves its stack, or its own reply to whoever called it would pop this
-    /// one instead and be lost.
-    fn fail_reply(&mut self, caller: ProcId, tid: i32, call: TxnId) {
-        let th = self.thread(caller, tid);
-        th.stack.retain(|&x| x != call);
-        th.todo.push_back(Work::FailedReply);
+    /// A transaction from `me` could not go through. As in Linux, if it was a reply
+    /// then that is the caller's failure: the replier has done all it can.
+    fn transaction_failed(&mut self, me: ProcId, tid: i32, answering: Option<TxnId>, to: ProcId, to_thread: Option<i32>) {
+        match (answering, to_thread) {
+            (Some(call), Some(caller)) => {
+                self.thread(me, tid).todo.push_back(Work::Complete);
+                let th = self.thread(to, caller);
+                th.stack.retain(|&x| x != call);
+                th.todo.push_back(Work::FailedReply);
+            }
+            _ => self.thread(me, tid).todo.push_back(Work::FailedReply),
+        }
+        self.wake(to);
     }
 
-    /// `call`'s target is gone, so no answer will come.
-    fn call_dead(&mut self, call: TxnId) {
-        let Some(txn) = self.txns.get_mut(&call) else { return };
-        txn.dead = true;
-        if let Some((p, tid)) = txn.from {
-            self.unwind(p, tid);
+    /// As binder_send_failed_reply: `call` will never be answered. Its caller is told,
+    /// or if it has gone too, whoever called it, up the chain.
+    ///
+    /// Every caller of this is sure the call is on top of its caller's stack, or that
+    /// there is no caller. A call lower down can't be failed yet: the thread is answering a
+    /// callback above it, and BR_DEAD_REPLY would end whichever wait it is in now, whose
+    /// own reply would then reach a thread waiting for nothing. libbinder takes that
+    /// as fatal.
+    fn send_dead_reply(&mut self, mut call: TxnId) {
+        while let Some(txn) = self.txns.remove(&call) {
+            if let Some((p, tid)) = txn.from
+                && let Some(th) = self.procs.get_mut(&p).and_then(|x| x.threads.get_mut(&tid))
+            {
+                th.stack.retain(|&x| x != call);
+                th.todo.push_back(Work::DeadReply);
+                self.wake(p);
+                return;
+            }
+            let Some(next) = txn.from_parent else { return };
+            call = next;
         }
     }
 
-    /// Ends the call on top of a thread's stack if its target died. As in Linux,
-    /// a dead call lower down waits for what is above it: the thread is answering a
-    /// callback there, and BR_DEAD_REPLY would end whichever wait it is in now.
-    /// That wait's own reply would then reach a thread waiting for nothing, which
-    /// libbinder treats as fatal.
-    fn unwind(&mut self, p: ProcId, tid: i32) {
-        let Some(th) = self.procs.get_mut(&p).and_then(|x| x.threads.get_mut(&tid)) else { return };
-        if th.stack.last().is_some_and(|c| self.txns.get(c).is_some_and(|x| x.dead)) {
-            let call = th.stack.pop().unwrap();
-            self.txns.remove(&call);
-            th.todo.push_back(Work::DeadReply);
+    /// As binder_thread_release, for a thread that has already left its process: its own
+    /// calls have no one to answer, the call it was handling fails now, and what it
+    /// never read fails too. Calls below an outgoing one on its stack wait for that
+    /// one's reply to find no one here, and walk up from it.
+    fn release_thread(&mut self, id: ProcId, tid: i32, th: BThread) {
+        let me = Some((id, tid));
+        let top = th.stack.last().copied().filter(|c| self.txns.get(c).is_some_and(|x| x.from != me));
+        for c in &th.stack {
+            if let Some(x) = self.txns.get_mut(c)
+                && x.from == me
+            {
+                x.from = None;
+                x.sender_pid = 0;
+            }
+        }
+        if let Some(call) = top {
+            self.send_dead_reply(call);
+        }
+        self.release_work(th.todo);
+    }
+
+    /// As binder_release_work: what was queued for a thread or process that is gone.
+    fn release_work(&mut self, todo: VecDeque<Work>) {
+        for w in todo {
+            match w {
+                Work::Txn(c) => {
+                    if self.txns.get(&c).is_some_and(|x| x.flags & TF_ONE_WAY == 0) {
+                        self.send_dead_reply(c);
+                    } else {
+                        self.txns.remove(&c);
+                    }
+                }
+                Work::Reply(r) => {
+                    self.txns.remove(&r);
+                }
+                _ => {}
+            }
         }
     }
 
@@ -716,22 +759,13 @@ impl World {
             }
             self.drop_ref(id, r.node);
         }
-        // Callers blocked on this process get BR_DEAD_REPLY.
-        let pending: Vec<TxnId> = self.txns.iter().filter(|(_, t)| t.to == id && !t.reply && t.flags & TF_ONE_WAY == 0).map(|(&k, _)| k).collect();
-        let stacks: Vec<TxnId> = p.threads.values().flat_map(|t| t.stack.iter().copied()).collect();
-        for t in pending.into_iter().chain(stacks) {
-            // Its own call to a live process is still delivered: only the receiver
-            // can free that buffer. Its reply will find the caller gone.
-            let Some(txn) = self.txns.get_mut(&t) else { continue };
-            let caller = txn.from.map(|(fp, _)| fp);
-            if !txn.reply && caller == Some(id) && self.procs.contains_key(&txn.to) {
-                txn.sender_pid = 0;
-            } else if !txn.reply && caller.is_some_and(|fp| fp != id && self.procs.contains_key(&fp)) {
-                self.call_dead(t);
-            } else {
-                self.txns.remove(&t);
-            }
+        // Callers blocked on this process get BR_DEAD_REPLY, each in its turn. Its own
+        // calls to live processes are still delivered, as only the receiver can free that
+        // buffer; their replies will find no one here.
+        for (tid, th) in std::mem::take(&mut p.threads) {
+            self.release_thread(id, tid, th);
         }
+        self.release_work(std::mem::take(&mut p.todo));
     }
 }
 
@@ -767,8 +801,9 @@ impl Kernel {
             }
             BINDER_THREAD_EXIT => {
                 let mut g = world();
-                if let Some(p) = g.as_mut().unwrap().procs.get_mut(&b.id) {
-                    p.threads.remove(&t.tid);
+                let w = g.as_mut().unwrap();
+                if let Some(th) = w.procs.get_mut(&b.id).and_then(|p| p.threads.remove(&t.tid)) {
+                    w.release_thread(b.id, t.tid, th);
                 }
                 Ok(0)
             }
@@ -835,14 +870,8 @@ impl Kernel {
         match cmd {
             BC_TRANSACTION | BC_REPLY | BC_TRANSACTION_SG | BC_REPLY_SG => {
                 let sg = cmd == BC_TRANSACTION_SG || cmd == BC_REPLY_SG;
-                let reply = cmd == BC_REPLY || cmd == BC_REPLY_SG;
-                let out = self.read_outgoing(t, reply, a, sg)?;
+                let out = self.read_outgoing(t, cmd == BC_REPLY || cmd == BC_REPLY_SG, a, sg)?;
                 self.binder_transact(t, b, out);
-                if reply {
-                    // That answered what was on top of this thread's stack, which may
-                    // uncover a call of its own that died meanwhile.
-                    world().as_mut().unwrap().unwind(b.id, t.tid);
-                }
             }
             BC_FREE_BUFFER => {
                 let mut g = world();
@@ -1018,10 +1047,22 @@ impl Kernel {
             }
             w.thread(me, t.tid).stack.pop();
             answering = Some(txn);
-            match w.txns.remove(&txn).and_then(|x| x.from) {
-                Some((fp, ft)) if w.procs.contains_key(&fp) => (fp, Some(ft), None),
-                _ => {
-                    w.thread(me, t.tid).todo.push_back(Work::Complete); // the caller is gone
+            match w.txns.get(&txn).and_then(|x| x.from).filter(|(fp, _)| w.procs.contains_key(fp)) {
+                Some((fp, ft)) => {
+                    // Whoever waits for this has it on top of its stack, or something is
+                    // badly wrong, and nothing good would come of answering it.
+                    if w.procs[&fp].threads.get(&ft).and_then(|th| th.stack.last()) != Some(&txn) {
+                        w.thread(me, t.tid).todo.push_back(Work::FailedReply);
+                        return;
+                    }
+                    w.txns.remove(&txn);
+                    (fp, Some(ft), None)
+                }
+                None => {
+                    // The caller is gone. The replier is done, and whoever is waiting up
+                    // the chain has been kept waiting only for this.
+                    w.thread(me, t.tid).todo.push_back(Work::Complete);
+                    w.send_dead_reply(txn);
                     return;
                 }
             }
@@ -1080,12 +1121,7 @@ impl Kernel {
         let buffer = if out.too_big { None } else { w.alloc(to, total) };
         let Some(buffer) = buffer else {
             eprintln!("[droidrt] binder: no receive buffer space in pid {}", w.procs[&to].pid);
-            w.thread(me, t.tid).todo.push_back(Work::FailedReply);
-            // The caller is waiting for this reply: it fails too, rather than hang.
-            if let (Some(call), Some(ft)) = (answering, to_thread) {
-                w.fail_reply(to, ft, call);
-            }
-            w.wake(to);
+            w.transaction_failed(me, t.tid, answering, to, to_thread);
             drop(g);
             return;
         };
@@ -1191,12 +1227,7 @@ impl Kernel {
             _ => {
                 w.free(to, buffer);
                 w.release_held(to, held);
-                w.thread(me, t.tid).todo.push_back(Work::FailedReply);
-                // The caller is waiting for this reply: it fails too, rather than hang.
-                if let (Some(call), Some(ft)) = (answering, to_thread) {
-                    w.fail_reply(to, ft, call);
-                }
-                w.wake(to);
+                w.transaction_failed(me, t.tid, answering, to, to_thread);
                 drop(g);
                 return;
             }
@@ -1264,12 +1295,7 @@ impl Kernel {
         if copied.is_err() || failed {
             w.free(to, buffer);
             w.release_held(to, held);
-            w.thread(me, t.tid).todo.push_back(Work::FailedReply);
-            // The caller is waiting for this reply: it fails too, rather than hang.
-            if let (Some(call), Some(ft)) = (answering, to_thread) {
-                w.fail_reply(to, ft, call);
-            }
-            w.wake(to);
+            w.transaction_failed(me, t.tid, answering, to, to_thread);
             drop(g);
             return;
         }
@@ -1323,8 +1349,6 @@ impl Kernel {
             Txn {
                 from: (!out.reply && !oneway).then_some((me, t.tid)),
                 from_parent,
-                dead: false,
-                to,
                 node,
                 code: out.code,
                 flags: out.flags,
@@ -1526,10 +1550,10 @@ impl Kernel {
                 if sec {
                     put64(out, x.secctx);
                 }
-                let (sync, oneway) = (x.from.is_some(), x.flags & TF_ONE_WAY != 0);
+                let oneway = x.flags & TF_ONE_WAY != 0;
                 if reply {
                     w.txns.remove(&id);
-                } else if sync && !oneway {
+                } else if !oneway {
                     w.thread(me, tid).stack.push(id); // answered by this thread's BC_REPLY
                 } else {
                     w.txns.remove(&id);

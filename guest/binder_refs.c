@@ -142,6 +142,7 @@ static int find(u32 cmd, u64 ptr) {
 }
 
 // Waits for a command; -1 if it does not come.
+static char data_for_self[32];
 static int await(int fd, u32 cmd, u64 ptr) {
     for (int tries = 0; tries < 200; tries++) {
         int i = find(cmd, ptr);
@@ -340,10 +341,20 @@ int cmain(void) {
     // An offset near the top of the address space must fail, not take down binder.
     nsaid = 0;
     {
-        char data[32] = {0};
-        u64 bad[1] = { 0xfffffffffffffff8ul };
-        send_txn(mgr, BC_TRANSACTION, 0, 3, data, sizeof data, bad, sizeof bad);
-        check(await(mgr, BR_FAILED_REPLY, 0) >= 0, "a wild object offset fails the call");
+        i64 wild = sys(NR_clone, 17, 0, 0, 0, 0);
+        if (wild == 0) {
+            int fd = open_binder();
+            char data[32] = {0};
+            u64 bad[1] = { 0xfffffffffffffff8ul };
+            send_txn(fd, BC_TRANSACTION, 0, 3, data, sizeof data, bad, sizeof bad);
+            sys(NR_exit_group, await(fd, BR_FAILED_REPLY, 0) >= 0 ? 0 : 1);
+        }
+        int st = -1;
+        sys(NR_wait4, wild, &st, 0, 0);
+        check(st == 0, "a wild object offset fails the call");
+        nsaid = 0;
+        send_txn(mgr, BC_TRANSACTION, 0, 3, data_for_self, sizeof data_for_self, 0, 0);
+        check(await(mgr, BR_FAILED_REPLY, 0) >= 0, "a process can't call itself");
     }
 
     // An obituary must arrive before the DONE of a clear sent while it was on its

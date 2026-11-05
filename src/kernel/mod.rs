@@ -47,7 +47,7 @@ mod xattr;
 
 use crate::arch::{Arch, Sysno};
 use crate::errno::*;
-use crate::hv::{CpuState, Exit, Hypervisor, Kick, SyscallRegs, Vcpu};
+use crate::hv::{CpuState, Exit, Hypervisor, Kick, SyscallRegs, Urgency, Vcpu};
 use crate::mm::{AddressSpace, Backing, KernelWindow, Placement};
 use crate::paging::{PROT_EXEC, PROT_READ};
 use crate::phys::PAGE;
@@ -55,8 +55,8 @@ use crate::phys::PhysMem;
 use crate::vfs::Vfs;
 use std::collections::HashMap;
 use std::ops::{Deref, DerefMut};
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 pub use files::FdTable;
@@ -69,6 +69,11 @@ pub(super) const ERESTARTSYS: i64 = 512;
 /// How often blocked threads re-check for signals and process exit.
 /// Hardware the image declares and droidrt has no driver behind. SystemConfig
 /// applies these last, whichever file declared the feature.
+/// Properties for a booted device. The emulator's answer to a busy host: Watchdog and
+/// ANR timeouts scale by the multiplier. SurfaceFlinger composes layers with a blur
+/// itself rather than through the composer HAL, and those frames come out black on this
+/// GPU path; blurs also cost a lot.
+const BOOT_PROPS: &str = "ro.hw_timeout_multiplier=5\nro.surface_flinger.supports_background_blur=0\n";
 const NO_BLUETOOTH: &str = "<config>\n  <unavailable-feature name=\"android.hardware.bluetooth\" />\n  <unavailable-feature name=\"android.hardware.bluetooth_le\" />\n</config>\n";
 
 pub(super) const POLL: Duration = Duration::from_millis(200);
@@ -312,6 +317,10 @@ pub struct Thread {
     dying: AtomicBool,
     /// comm, prctl state, scheduling attributes.
     pub attrs: Mutex<control::ThreadAttrs>,
+    /// sched::CpuGroup, kept here for its readers on every guest entry.
+    cpu_group: AtomicU8,
+    /// hv::Urgency as computed from the attributes and the group.
+    urgency: AtomicU8,
     /// SELinux exec/fscreate/keycreate/sockcreate contexts.
     pub sec: selinux::ThreadSec,
     /// The syscall in progress, for thread dumps.
@@ -429,6 +438,12 @@ impl Process {
     }
 }
 
+/// DROIDRT_SCHED_TRACE=1: every change in what the host is told about a thread.
+fn sched_tracing() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("DROIDRT_SCHED_TRACE").is_some())
+}
+
 impl Thread {
     fn new(tid: i32, proc: Arc<Process>, mask: u64, own_files: Option<Arc<Mutex<FdTable>>>) -> Arc<Thread> {
         Arc::new(Thread {
@@ -448,9 +463,41 @@ impl Thread {
             kick: Mutex::new(None),
             dying: AtomicBool::new(false),
             attrs: Mutex::new(control::ThreadAttrs::default()),
+            cpu_group: AtomicU8::new(sched::CpuGroup::Other as u8),
+            urgency: AtomicU8::new(Urgency::Normal as u8),
             sec: Default::default(),
             in_syscall: Mutex::new(None),
         })
+    }
+
+    /// What the host should make of this thread (see sched::urgency).
+    pub(super) fn urgency(&self) -> Urgency {
+        match self.urgency.load(Ordering::Relaxed) {
+            0 => Urgency::Display,
+            1 => Urgency::Foreground,
+            3 => Urgency::Background,
+            _ => Urgency::Normal,
+        }
+    }
+
+    /// `attrs` is this thread's, held by the caller.
+    pub(super) fn update_urgency(&self, attrs: &control::ThreadAttrs) {
+        let group = sched::CpuGroup::from_u8(self.cpu_group.load(Ordering::Relaxed));
+        let u = sched::urgency(attrs.sched.policy, attrs.sched.nice, group);
+        if self.urgency.swap(u as u8, Ordering::Relaxed) != u as u8 && sched_tracing() {
+            eprintln!("[sched] {} tid {}: {u:?} (nice {}, policy {}, {group:?})", attrs.comm, self.tid, attrs.sched.nice, attrs.sched.policy);
+        }
+    }
+
+    pub(super) fn set_cpu_group(&self, group: sched::CpuGroup) {
+        self.cpu_group.store(group as u8, Ordering::Relaxed);
+        self.update_urgency(&self.attrs.lock().unwrap());
+    }
+
+    /// A new thread is where its creator is, and as urgent.
+    fn inherit_sched(&self, from: &Thread) {
+        self.cpu_group.store(from.cpu_group.load(Ordering::Relaxed), Ordering::Relaxed);
+        self.update_urgency(&self.attrs.lock().unwrap());
     }
 
     /// Whether a blocking wait should give up now (signal or exit).
@@ -534,6 +581,10 @@ impl Kernel {
             let oem = crate::tmpfs::Tmpfs::new(phys.clone(), 0o755);
             oem.write_file("etc/sysconfig/droidrt.xml", 0o644, NO_BLUETOOTH);
             v.mount("/oem", oem);
+            // The last file init reads properties from, so these override the image's.
+            let debug_ramdisk = crate::tmpfs::Tmpfs::new(phys.clone(), 0o755);
+            debug_ramdisk.write_file("adb_debug.prop", 0o644, BOOT_PROPS);
+            v.mount("/debug_ramdisk", debug_ramdisk);
         }
         let sys = v.resolve("/", "/sys", true).map(|n| v.fs_arc(&n)).map_err(|e| format!("/sys: errno {e}"))?;
         let blocks = block::Blocks::new(dev.clone(), sys.clone());

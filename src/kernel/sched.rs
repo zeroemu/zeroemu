@@ -8,6 +8,7 @@ use super::creds::{CAP_SYS_ADMIN, CAP_SYS_NICE, Creds};
 use super::{Kernel, Thread};
 use crate::arch::Sysno;
 use crate::errno::*;
+use crate::hv::Urgency;
 use std::sync::Arc;
 
 const SCHED_OTHER: u32 = 0;
@@ -31,6 +32,54 @@ const IOPRIO_CLASS_NONE: u32 = 0;
 const IOPRIO_CLASS_RT: u32 = 1;
 const IOPRIO_CLASS_BE: u32 = 2;
 const IOPRIO_CLASS_IDLE: u32 = 3;
+
+/// The `cpu` cgroup a thread is in, which is how Android says what it is for
+/// (task_profiles.json). libprocessgroup writes tids into /dev/cpuctl/<group>/tasks.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u8)]
+pub enum CpuGroup {
+    Other,
+    TopApp,
+    Background,
+}
+
+impl CpuGroup {
+    pub fn named(name: &str) -> CpuGroup {
+        match name {
+            "top-app" | "foreground_window" | "rt" => CpuGroup::TopApp,
+            "background" | "dex2oat" => CpuGroup::Background,
+            _ => CpuGroup::Other,
+        }
+    }
+
+    pub fn from_u8(v: u8) -> CpuGroup {
+        match v {
+            1 => CpuGroup::TopApp,
+            2 => CpuGroup::Background,
+            _ => CpuGroup::Other,
+        }
+    }
+}
+
+/// What the host should make of Android's view of a thread. A phone has its own
+/// cores to keep these apart (background on the little ones, shares in cgroups);
+/// here they all compete with everything else on the Mac.
+pub fn urgency(policy: u32, nice: i32, group: CpuGroup) -> Urgency {
+    /// ANDROID_PRIORITY_DISPLAY. SurfaceFlinger, HWUI's RenderThread, input and
+    /// audio run here or above; so do an on-screen app's UI thread when boosted.
+    const DISPLAY: i32 = -4;
+    /// ANDROID_PRIORITY_BACKGROUND.
+    const BACKGROUND: i32 = 10;
+    if rt_or_dl(policy) || nice <= DISPLAY {
+        Urgency::Display
+    } else if nice >= BACKGROUND || policy == SCHED_IDLE || (group == CpuGroup::Background && nice >= 0) {
+        Urgency::Background
+    } else if nice < 0 || group == CpuGroup::TopApp {
+        Urgency::Foreground
+    } else {
+        Urgency::Normal
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct Sched {
@@ -127,6 +176,7 @@ impl Kernel {
                         err = Some(EACCES);
                     } else {
                         ta.sched.nice = nice;
+                        th.update_urgency(&ta);
                     }
                 }
                 err.map_or(Ok(0), Err)
@@ -378,6 +428,42 @@ impl Kernel {
         if policy == SCHED_DEADLINE {
             s.dl = dl;
         }
+        th.update_urgency(&ta);
         Ok(0)
+    }
+}
+
+#[cfg(test)]
+mod urgency_tests {
+    use super::*;
+
+    #[test]
+    fn android_priorities_become_urgency() {
+        use CpuGroup::{Background as Bg, Other, TopApp};
+        // SurfaceFlinger's main thread, RenderThread, a boosted UI thread.
+        assert_eq!(urgency(SCHED_FIFO, 0, Other), Urgency::Display);
+        assert_eq!(urgency(SCHED_OTHER, -8, Other), Urgency::Display);
+        assert_eq!(urgency(SCHED_OTHER, -4, TopApp), Urgency::Display);
+        // An app on screen, and system_server's own slightly raised threads.
+        assert_eq!(urgency(SCHED_OTHER, 0, TopApp), Urgency::Foreground);
+        assert_eq!(urgency(SCHED_OTHER, -2, Other), Urgency::Foreground);
+        assert_eq!(urgency(SCHED_OTHER, 0, Other), Urgency::Normal);
+        // dex2oat, a cached app, Java's background executors even in an app on screen.
+        assert_eq!(urgency(SCHED_OTHER, 0, Bg), Urgency::Background);
+        assert_eq!(urgency(SCHED_OTHER, 10, TopApp), Urgency::Background);
+        assert_eq!(urgency(SCHED_IDLE, 0, Other), Urgency::Background);
+        // Raised above its group: whoever did that means it.
+        assert_eq!(urgency(SCHED_OTHER, -2, Bg), Urgency::Foreground);
+    }
+
+    #[test]
+    fn group_names_follow_task_profiles() {
+        assert_eq!(CpuGroup::named("top-app"), CpuGroup::TopApp);
+        assert_eq!(CpuGroup::named("dex2oat"), CpuGroup::Background);
+        assert_eq!(CpuGroup::named("foreground"), CpuGroup::Other);
+        assert_eq!(CpuGroup::named(""), CpuGroup::Other);
+        for g in [CpuGroup::Other, CpuGroup::TopApp, CpuGroup::Background] {
+            assert_eq!(CpuGroup::from_u8(g as u8), g);
+        }
     }
 }

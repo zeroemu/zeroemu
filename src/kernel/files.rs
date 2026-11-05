@@ -71,7 +71,7 @@ pub fn handles(no: Sysno) -> bool {
             | fstatfs | umask | pipe2 | ppoll | eventfd2 | epoll_create1 | epoll_ctl | epoll_pwait | epoll_pwait2 | timerfd_create | userfaultfd
             | timerfd_settime | timerfd_gettime | signalfd4 | mknodat | mkdirat | unlinkat | symlinkat | linkat | renameat
             | renameat2 | truncate | ftruncate | fallocate | fchmod | fchmodat | fchown | fchownat | sync | fsync | fdatasync
-            | utimensat | memfd_create | flock | pselect6 | sendfile | copy_file_range | inotify_init1 | inotify_add_watch | inotify_rm_watch
+            | utimensat | memfd_create | flock | pselect6 | sendfile | copy_file_range | splice | inotify_init1 | inotify_add_watch | inotify_rm_watch
     )
 }
 
@@ -457,7 +457,7 @@ pub(super) fn poll_mask(f: &File, t: &Thread, depth: u32) -> u64 {
         Kind::Pipe(end) => key_bit(Arc::as_ptr(&end.pipe) as usize),
         Kind::Binder(b) => key_bit(binder::poll_key(b.id)),
         Kind::Evdev(c) => key_bit(Arc::as_ptr(c) as usize),
-        Kind::Vsock(v) => key_bit(Arc::as_ptr(v) as usize),
+        Kind::Vsock(v) => v.mask(),
         Kind::Inotify(i) => key_bit(Arc::as_ptr(i) as usize),
         Kind::Drm(_) | Kind::DmaBuf(_) | Kind::Sync(_) => key_bit(super::drm::GPU_KEY),
         _ => plain_bit(),
@@ -477,7 +477,7 @@ pub(super) fn poll_ready(f: &File, t: &Thread, depth: u32) -> u16 {
         Kind::Netlink(n) => n.poll(),
         Kind::Inet(_) => POLLOUT,
         Kind::Inotify(i) => if i.pending() > 0 { POLLIN } else { 0 },
-        Kind::Vsock(v) => POLLOUT | if v.readable() { POLLIN } else { 0 },
+        Kind::Vsock(v) => v.poll(),
         Kind::Tun(_) => POLLOUT,
         Kind::Evdev(c) => POLLOUT | if c.readable() { POLLIN } else { 0 },
         Kind::Uffd(_) => 0, // no events: it works in SIGBUS mode
@@ -956,6 +956,35 @@ impl Kernel {
                 }
                 let at = if off == 0 { None } else { Some(t.proc.mm().read_u64(off)?) };
                 self.copy_between(t, in_fd, at, out_fd, None, count, off)
+            }
+            // Android copies into install sessions with this. No page moves, which
+            // nothing can tell apart from a copy but for the time it takes.
+            splice => {
+                const SPLICE_F_ALL: u64 = 0xf; // MOVE, NONBLOCK, MORE, GIFT
+                let (fd_in, off_in, fd_out, off_out, count, flags) = (int(a[0]), a[1], int(a[2]), a[3], a[4], a[5]);
+                if flags & !SPLICE_F_ALL != 0 {
+                    return Err(EINVAL);
+                }
+                let is_pipe = |f: &File| matches!(f.kind, Kind::Pipe(_));
+                let input = t.files().get(fd_in)?;
+                let output = t.files().get(fd_out)?;
+                // One end must be a pipe, and pipes have no offsets.
+                if !is_pipe(&input) && !is_pipe(&output) {
+                    return Err(EINVAL);
+                }
+                if (off_in != 0 && is_pipe(&input)) || (off_out != 0 && is_pipe(&output)) {
+                    return Err(ESPIPE);
+                }
+                if output.flags.load(Ordering::Relaxed) & O_APPEND != 0 && off_out != 0 {
+                    return Err(EINVAL);
+                }
+                let at = if off_in == 0 { None } else { Some(t.proc.mm().read_u64(off_in)?) };
+                let to = if off_out == 0 { None } else { Some(t.proc.mm().read_u64(off_out)?) };
+                let n = self.copy_between(t, fd_in, at, fd_out, to, count, off_in)?;
+                if let Some(o) = to {
+                    t.proc.mm().write_u64(off_out, o + n as u64)?;
+                }
+                Ok(n)
             }
             copy_file_range => {
                 if a[5] != 0 {
@@ -1619,7 +1648,13 @@ impl Kernel {
             },
             Kind::Netlink(nl) => netlink::write(nl, t, data, f.nonblock())?,
             Kind::Inet(_) => return Err(ENETUNREACH),
-            Kind::Vsock(v) => v.write(&data)?,
+            Kind::Vsock(v) => match v.write(t, &data, f.nonblock()) {
+                Err(EPIPE) if v.is_stream() => {
+                    self.send_thread_signal(t, super::signal::SIGPIPE, super::signal::SigInfo::user(super::signal::SIGPIPE, t.proc.pid));
+                    return Err(EPIPE);
+                }
+                r => r?,
+            },
             Kind::Tun(_) => data.len(), // sent nowhere
             Kind::Evdev(_) => data.len(), // LEDs and the like: there are none
             Kind::Uffd(_) => return Err(EINVAL),

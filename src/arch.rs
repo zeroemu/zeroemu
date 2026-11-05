@@ -260,6 +260,7 @@ syscalls! {
     quotactl = 60, 179;
     sendfile = 71, 40;
     copy_file_range = 285, 326;
+    splice = 76, 275;
     init_module = 105, 175;
     delete_module = 106, 176;
     finit_module = 273, 313;

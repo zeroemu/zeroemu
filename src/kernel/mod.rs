@@ -15,7 +15,9 @@ mod cgroup;
 mod control;
 mod creds;
 mod drm;
+pub mod adb;
 pub mod evdev;
+mod hostio;
 mod uffd;
 mod epoll;
 mod files;
@@ -76,7 +78,7 @@ pub(super) const ERESTARTSYS: i64 = 512;
 /// GPU path; blurs also cost a lot. Compiling SurfaceFlinger's shader cache took 14 s
 /// of every boot, holding up SystemUI and so the boot animation, for layers that
 /// nearly always go through the composer HAL instead.
-const BOOT_PROPS: &str = "ro.hw_timeout_multiplier=5\nro.surface_flinger.supports_background_blur=0\nservice.sf.prime_shader_cache=0\n";
+const BOOT_PROPS: &str = "ro.hw_timeout_multiplier=5\nro.surface_flinger.supports_background_blur=0\nservice.sf.prime_shader_cache=0\nservice.adb.listen_addrs=vsock:5555\n";
 const NO_BLUETOOTH: &str = "<config>\n  <unavailable-feature name=\"android.hardware.bluetooth\" />\n  <unavailable-feature name=\"android.hardware.bluetooth_le\" />\n</config>\n";
 
 pub(super) const POLL: Duration = Duration::from_millis(200);
@@ -266,6 +268,15 @@ fn first_stage_mounts(v: &Vfs, metadata: &Arc<crate::tmpfs::Tmpfs>, dev: &crate:
     if let Ok(node) = v.resolve("/", "/metadata", true) {
         let sb = v.new_super(metadata.clone(), "tmpfs", None, 0, "mode=0755");
         let _ = v.mount_at(&node, sb, 0);
+    }
+    // The host's adb key, as /adb_keys: outside /data, so it doesn't expire or depend on
+    // what a saved /data holds. This overlays the image's link to its own (empty) file.
+    dev.write_file(".droidrt/adb_keys", 0o644, "");
+    if let (Ok(src), Ok(target)) = (v.resolve("/", "/dev/.droidrt/adb_keys", true), v.resolve("/", "/adb_keys", false)) {
+        let _ = v.bind(&src, &target, false);
+        if let Some(file) = v.mem_file(&src) {
+            adb::set_key_file(file);
+        }
     }
     let Ok(hw_fstab) = v.resolve("/", "/vendor/etc/fstab.ranchu", true) else { return };
     let mut fstab = String::from("# Written by droidrt, which plays first-stage init.\n");

@@ -24,6 +24,7 @@ use std::sync::{Arc, Mutex};
 
 const USAGE: &str = "usage: droidrt [--system <system.img>] [--strace] [--display] <program> [args...]
        droidrt --system <system.img> --boot [--headless] [--data <file> | --ephemeral] [--wipe-data]
+               [--adb-port <port> | --no-adb]
                [--push <host>:<guest>]... [--run <cmd>] [init args...]
        droidrt --system <system.img> --ls <path> | --cat <path>
        droidrt --gpu-selftest";
@@ -63,6 +64,8 @@ fn run() -> Result<i32, String> {
     let mut data: Option<PathBuf> = None;
     let mut ephemeral = false;
     let mut wipe_data = false;
+    let mut adb_port: Option<u16> = None;
+    let mut no_adb = false;
     while let Some(flag) = args.peek().filter(|a| a.starts_with("--")).cloned() {
         args.next();
         match flag.as_str() {
@@ -89,6 +92,9 @@ fn run() -> Result<i32, String> {
             "--data" => data = Some(args.next().ok_or(USAGE)?.into()),
             "--ephemeral" => ephemeral = true,
             "--wipe-data" => wipe_data = true,
+            // Host adb: normally found on the first port pair free for an emulator.
+            "--adb-port" => adb_port = Some(args.next().ok_or(USAGE)?.parse().map_err(|_| USAGE)?),
+            "--no-adb" => no_adb = true,
             "--display" => display = true,
             "--headless" => headless = true,
             "--gpu-selftest" => gpu_selftest = true,
@@ -129,6 +135,9 @@ fn run() -> Result<i32, String> {
         kernel::reserve_exit_signals();
     }
     let extras = boot.then_some(kernel::BootExtras { push, run, data });
+    if (boot && !no_adb) || adb_port.is_some() {
+        kernel::adb::start(adb_port);
+    }
     // --headless wins over both --display and the window --boot implies.
     // DROIDRT_GPU=fake is the in-memory virtio-gpu (guest tests, no window).
     let show = !headless && (display || boot);

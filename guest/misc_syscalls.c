@@ -26,6 +26,8 @@ typedef unsigned int u32;
 #define NR_mlockall 230
 #define NR_mincore 232
 #define NR_memfd_create 279
+#define NR_splice 76
+#define NR_pipe2 59
 #define NR_mlock2 284
 #define NR_copy_file_range 285
 
@@ -122,6 +124,31 @@ int cmain(void) {
     unsigned empty = 0;
     check(sys(NR_write, cb, &empty, 4) == 4, "and send it a message");
     check(sys(NR_read, cb, buf, 4) == -11, "it stays open, with nothing to read");
+
+    // splice: Android copies into install sessions with it.
+    {
+        int sp[2];
+        char sbuf[16];
+        sys(NR_pipe2, sp, 0);
+        int m = (int)sys(NR_memfd_create, "splice", 0);
+        int m2 = (int)sys(NR_memfd_create, "splice2", 0);
+        sys(NR_write, sp[1], "hello pipe", 10);
+        check(sys(NR_splice, sp[0], 0, m, 0, 5, 0) == 5, "splice from a pipe to a file");
+        check(sys(NR_lseek, m, 0, 1) == 5, "moves the file's position");
+        sys(NR_lseek, m, 0, 0);
+        check(sys(NR_read, m, sbuf, 16) == 5 && sbuf[0] == 'h' && sbuf[4] == 'o', "the bytes arrive");
+        check(sys(NR_read, sp[0], sbuf, 5) == 5 && sbuf[1] == 'p', "and the rest stay in the pipe");
+        u64 where = 1;
+        check(sys(NR_splice, m, &where, sp[1], 0, 3, 0) == 3 && where == 4, "from a file at an offset to a pipe, advancing it");
+        check(sys(NR_read, sp[0], sbuf, 3) == 3 && sbuf[0] == 'e' && sbuf[2] == 'l', "those bytes");
+        check(sys(NR_splice, m, 0, m2, 0, 3, 0) == -22, "with no pipe at either end: EINVAL");
+        check(sys(NR_splice, sp[0], &where, m, 0, 3, 0) == -29, "an offset on a pipe: ESPIPE");
+        sys(NR_close, sp[1]);
+        check(sys(NR_splice, sp[0], 0, m, 0, 3, 0) == 0, "from a pipe with no writers: 0");
+        sys(NR_close, sp[0]);
+        sys(NR_close, m);
+        sys(NR_close, m2);
+    }
 
     puts_(failures ? "SOME CHECKS FAILED\n" : "all checks passed\n");
     return failures;

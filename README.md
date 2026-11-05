@@ -100,6 +100,8 @@ cargo run --release -- --system $IMG /system/bin/toybox ls -l /apex/com.android.
 cargo run --release -- --system $IMG /system/bin/sh      # Android's mksh, reading stdin
 cargo run --release -- --system $IMG --ls /system/bin    # inspect the image without running anything
 ./scripts/test-android.sh                                # end-to-end checks against the image
+./scripts/test-net.py                                    # host connections, from the host side
+./scripts/test-adb.sh                                    # boots, and uses real adb against it
 ```
 
 Android log records (`liblog`, i.e. `ALOGI` and friends) print to stderr as
@@ -119,6 +121,11 @@ underneath (`ANGLE_DEFAULT_PLATFORM` overrides). For development, `--push
 `/data/local/tmp`) and `--run "<cmd>"` runs a shell command once SurfaceFlinger
 is up, its output on stderr. `droidrt --gpu-selftest` checks the renderer and
 window alone.
+
+Host `adb` finds a booted device as it finds an emulator, as `emulator-5554` or the
+next pair of ports free. adbd keeps its RSA check, and the key in `~/.android/adbkey.pub`
+is offered as `/adb_keys`, so the user's own adb is authorized and no other is. Guest
+networking isn't involved. `--adb-port <port>` picks the port and `--no-adb` turns this off.
 
 In the window, the mouse is a finger and scrolling drags one (a person's flick
 becomes a fling). F1 is Home, Escape is Back, F2 is recent apps.

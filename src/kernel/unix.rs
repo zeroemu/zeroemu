@@ -7,7 +7,7 @@
 use super::files::{File, Kind};
 use super::signal::{SIGPIPE, SigInfo};
 use super::wait::EVENTS;
-use super::{ERESTARTSYS, Kernel, POLL, Thread, int, logd, netlink};
+use super::{ERESTARTSYS, IDLE, Kernel, Thread, int, logd, netlink};
 use crate::arch::Sysno;
 use crate::errno::*;
 use crate::vfs::{FileSystem, Node, S_IFMT, Vfs};
@@ -107,7 +107,7 @@ struct Queue {
 /// SOL_SOCKET options that read back as they were set, whatever the family.
 #[derive(Default)]
 pub(super) struct SockOpts {
-    rcvtimeo: Option<Duration>,
+    pub(super) rcvtimeo: Option<Duration>,
     sndtimeo: Option<Duration>,
     linger: [u8; 8],
     ints: BTreeMap<u64, u32>,
@@ -206,13 +206,13 @@ pub(super) fn sockopt_bytes(t: &Thread, val: u64, len: u64) -> Result<Vec<u8>, i
 }
 
 /// When a blocking call with this SO_RCVTIMEO / SO_SNDTIMEO gives up.
-fn deadline(timeout: Option<Duration>) -> Option<Instant> {
+pub(super) fn deadline(timeout: Option<Duration>) -> Option<Instant> {
     timeout.map(super::wait::instant_after)
 }
 
 /// One sleep of a blocking socket call. A timeout ran out: EAGAIN. Signals
 /// restart a call with no timeout, and end one that has (sock_intr_errno).
-fn wait_or_give_up(t: &Thread, seen: u64, until: Option<Instant>) -> Result<(), i64> {
+pub(super) fn wait_or_give_up(t: &Thread, seen: u64, until: Option<Instant>) -> Result<(), i64> {
     if t.interrupted() {
         return Err(if until.is_some() { EINTR } else { ERESTARTSYS });
     }
@@ -222,9 +222,9 @@ fn wait_or_give_up(t: &Thread, seen: u64, until: Option<Instant>) -> Result<(), 
             if left.is_zero() {
                 return Err(EAGAIN);
             }
-            left.min(POLL)
+            left.min(IDLE)
         }
-        None => POLL,
+        None => IDLE,
     };
     EVENTS.wait(seen, nap);
     Ok(())
@@ -682,26 +682,10 @@ impl Kernel {
                 return self.netlink_syscall(no, t, nl, &f, a);
             }
             if let Kind::Inet(s) = &f.kind {
-                return self.inet_syscall(no, t, s, a);
+                return self.inet_syscall(no, t, s, &f, a);
             }
             if let Kind::Vsock(v) = &f.kind {
-                return match no {
-                    connect => {
-                        let addr = t.proc.mm().read_vec(a[1], (a[2] as usize).min(128))?;
-                        v.connect(&addr).map(|_| 0)
-                    }
-                    sendto | sendmsg if no == sendto => {
-                        let data = t.proc.mm().read_vec(a[1], a[2].min(IO_MAX) as usize)?;
-                        v.write(&data).map(|n| n as i64)
-                    }
-                    recvfrom if a[4] == 0 => {
-                        let data = v.read(t, a[2] as usize, f.nonblock() || a[3] & 0x40 != 0)?;
-                        t.proc.mm().write(a[1], &data)?;
-                        Ok(data.len() as i64)
-                    }
-                    shutdown | setsockopt => Ok(0),
-                    _ => Err(EOPNOTSUPP),
-                };
+                return self.vsock_syscall(no, t, &f, v, a);
             }
         }
         match no {

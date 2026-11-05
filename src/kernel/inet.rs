@@ -18,6 +18,7 @@ pub const AF_KEY: u64 = 15;
 const SOCK_DGRAM: u32 = 2;
 const SOCK_RAW: u32 = 3;
 const SOCK_NONBLOCK: u64 = 0o4000;
+const MSG_DONTWAIT: u64 = 0x40;
 const SOCK_CLOEXEC: u64 = 0o2000000;
 
 const SOL_SOCKET: u64 = 1;
@@ -41,6 +42,8 @@ pub struct Inet {
     opts: Mutex<super::unix::SockOpts>,
     /// connect() named a loopback or multicast address.
     connected_local: AtomicBool,
+    /// listen() was called.
+    listening: AtomicBool,
 }
 
 /// Loopback, multicast, and the wildcard, which Linux routes to loopback.
@@ -139,7 +142,7 @@ impl Kernel {
         if !(1..=3).contains(&ty) && ty != 5 {
             return Err(EINVAL);
         }
-        let sock = Inet { family: a[0], ty, proto: a[2] as u32, opts: Mutex::default(), connected_local: AtomicBool::new(false) };
+        let sock = Inet { family: a[0], ty, proto: a[2] as u32, opts: Mutex::default(), connected_local: AtomicBool::new(false), listening: AtomicBool::new(false) };
         let file = File::new(Kind::Inet(Arc::new(sock)), (a[1] & SOCK_NONBLOCK) as u32);
         t.files().alloc(file, a[1] & SOCK_CLOEXEC != 0, 0)
     }
@@ -182,13 +185,31 @@ impl Kernel {
         Ok(sent)
     }
 
-    pub(super) fn inet_syscall(&self, no: Sysno, t: &Arc<Thread>, s: &Inet, a: [u64; 6]) -> Result<i64, i64> {
+    /// Nothing can arrive on these yet. A blocking call waits for what will not come
+    /// like any other: until a signal, an exit or its timeout. Returning at once would
+    /// have a server's accept loop spinning for the life of the device.
+    fn inet_wait_forever(&self, t: &Arc<Thread>, s: &Inet, f: &File, dontwait: bool) -> Result<i64, i64> {
+        if f.nonblock() || dontwait {
+            return Err(EAGAIN);
+        }
+        let until = super::unix::deadline(s.opts.lock().unwrap().rcvtimeo);
+        loop {
+            let seen = super::wait::EVENTS.current();
+            super::unix::wait_or_give_up(t, seen, until)?;
+        }
+    }
+
+    pub(super) fn inet_syscall(&self, no: Sysno, t: &Arc<Thread>, s: &Inet, f: &File, a: [u64; 6]) -> Result<i64, i64> {
         use Sysno::*;
         match no {
             getsockopt => self.inet_getsockopt(t, s, a),
             setsockopt => self.inet_setsockopt(t, s, a),
             // Options, binds and listens succeed; nothing can reach the socket.
-            bind | listen | shutdown => Ok(0),
+            bind | shutdown => Ok(0),
+            listen => {
+                s.listening.store(true, Ordering::Relaxed);
+                Ok(0)
+            }
             connect | sendto | sendmsg => self.inet_send(no, t, s, a),
             getsockname => {
                 let len = if s.v6() { 28 } else { 16 };
@@ -201,7 +222,14 @@ impl Kernel {
                 Ok(0)
             }
             getpeername => Err(ENOTCONN),
-            recvfrom | recvmsg | accept | accept4 => Err(EAGAIN),
+            accept | accept4 => {
+                if !s.listening.load(Ordering::Relaxed) {
+                    return Err(EINVAL);
+                }
+                self.inet_wait_forever(t, s, f, false)
+            }
+            recvfrom => self.inet_wait_forever(t, s, f, a[3] & MSG_DONTWAIT != 0),
+            recvmsg => self.inet_wait_forever(t, s, f, a[2] & MSG_DONTWAIT != 0),
             _ => Err(EOPNOTSUPP),
         }
     }

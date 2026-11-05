@@ -219,6 +219,41 @@ fn first_stage_mounts(v: &Vfs, phys: &Arc<PhysMem>, dev: &crate::tmpfs::Tmpfs, p
     }
 }
 
+/// Adds BOOT_PROPS to the ODM partition's build.prop, which init reads after the
+/// vendor's so they override it. The image is read-only, so a copy of that (small)
+/// directory goes over it. /odm/etc is a link to here.
+fn add_boot_props(v: &mut Vfs, phys: &Arc<PhysMem>) {
+    const DIR: &str = "/vendor/odm/etc";
+    fn copy(v: &Vfs, to: &crate::tmpfs::Tmpfs, from: &str, rel: &str) -> Result<(), i64> {
+        let dir = v.resolve("/", from, true)?;
+        for e in v.readdir(&dir)? {
+            if e.name == "." || e.name == ".." {
+                continue;
+            }
+            let (path, rel) = (format!("{from}/{}", e.name), format!("{rel}{}", e.name));
+            let node = v.resolve("/", &path, false)?;
+            let st = v.stat(&node)?;
+            if st.mode & crate::vfs::S_IFMT == crate::vfs::S_IFDIR {
+                to.mkdir_p(&rel, st.mode & 0o7777);
+                copy(v, to, &path, &format!("{rel}/"))?;
+            } else {
+                let content = v.read_all(&node)?;
+                let mut text = String::from_utf8_lossy(&content).into_owned();
+                if rel == "build.prop" {
+                    text.push_str(BOOT_PROPS);
+                }
+                to.write_file(&rel, st.mode & 0o7777, &text);
+            }
+        }
+        Ok(())
+    }
+    let etc = crate::tmpfs::Tmpfs::new(phys.clone(), 0o755);
+    match copy(v, &etc, DIR, "") {
+        Ok(()) => v.mount(DIR, etc),
+        Err(e) => eprintln!("droidrt: {DIR}: errno {e}: boot properties not set"),
+    }
+}
+
 fn mount_tmpfs(vfs: &mut Vfs, phys: &Arc<PhysMem>) -> Arc<crate::tmpfs::Tmpfs> {
     use crate::tmpfs::Tmpfs;
     use crate::vfs::FileSystem;
@@ -581,10 +616,7 @@ impl Kernel {
             let oem = crate::tmpfs::Tmpfs::new(phys.clone(), 0o755);
             oem.write_file("etc/sysconfig/droidrt.xml", 0o644, NO_BLUETOOTH);
             v.mount("/oem", oem);
-            // The last file init reads properties from, so these override the image's.
-            let debug_ramdisk = crate::tmpfs::Tmpfs::new(phys.clone(), 0o755);
-            debug_ramdisk.write_file("adb_debug.prop", 0o644, BOOT_PROPS);
-            v.mount("/debug_ramdisk", debug_ramdisk);
+            add_boot_props(&mut v, &phys);
         }
         let sys = v.resolve("/", "/sys", true).map(|n| v.fs_arc(&n)).map_err(|e| format!("/sys: errno {e}"))?;
         let blocks = block::Blocks::new(dev.clone(), sys.clone());

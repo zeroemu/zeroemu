@@ -11,7 +11,7 @@ use super::wait::EVENTS;
 use super::{ERESTARTSYS, IDLE, Thread};
 use crate::errno::*;
 use std::collections::VecDeque;
-use std::sync::{Arc, LazyLock, Mutex, Weak};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub const INPUT_MAJOR: u32 = 13;
@@ -121,12 +121,22 @@ pub fn open(devt: u64) -> Option<Arc<Client>> {
     Some(c)
 }
 
-static BOOT: LazyLock<Instant> = LazyLock::new(Instant::now);
+/// CLOCK_MONOTONIC's zero. Event times must be on that clock: InputDispatcher drops
+/// anything it thinks is more than ten seconds old.
+static BOOT: OnceLock<Instant> = OnceLock::new();
+
+pub fn set_boot(at: Instant) {
+    let _ = BOOT.set(at);
+}
+
+fn since_boot() -> Duration {
+    BOOT.get_or_init(Instant::now).elapsed()
+}
 
 impl Device {
     /// Queues one packet of events, ending in SYN_REPORT, for every reader.
     fn post(&self, events: &[(u16, u16, i32)]) {
-        let now = BOOT.elapsed();
+        let now = since_boot();
         let clients = self.clients.lock().unwrap();
         for c in clients.iter().filter_map(Weak::upgrade) {
             let mut q = c.queue.lock().unwrap();
@@ -246,8 +256,8 @@ impl Client {
         let t = if *self.clock.lock().unwrap() == CLOCK_MONOTONIC {
             at
         } else {
-            let since_boot = BOOT.elapsed().saturating_sub(at);
-            SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().saturating_sub(since_boot)
+            let ago = since_boot().saturating_sub(at);
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().saturating_sub(ago)
         };
         out.extend_from_slice(&t.as_secs().to_le_bytes());
         out.extend_from_slice(&(t.subsec_micros() as u64).to_le_bytes());

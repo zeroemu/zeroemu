@@ -586,7 +586,11 @@ impl Kernel {
             phys,
             kwin,
             strace,
-            boot: Instant::now(),
+            boot: {
+                let now = Instant::now();
+                evdev::set_boot(now);
+                now
+            },
             timers: timers::TimerQueue::new(me.clone()),
             procs: Mutex::new(HashMap::new()),
             next_id: AtomicI32::new(1),

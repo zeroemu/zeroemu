@@ -35,9 +35,9 @@ arm64 Android on Apple Silicon and Windows on ARM, x86_64 Android on x86_64 PCs.
 | M2: demand paging, threads, futex, `fork`/`execve`/`wait4`, pipes, signals | done on macOS; x86_64 written (signal frames, TLB shootdown), untested |
 | M3: binder, `servicemanager`, property service, `logd`, `init` | done (macOS) |
 | M4: SurfaceFlinger, with Android's graphics stack unmodified on a virtio-gpu device backed by the Android Emulator's gfxstream renderer | done (macOS) |
-| M5: zygote, ART, `system_server`, launcher, apps | done (macOS): Android 16's Pixel launcher in the window about 24 s after start on a first boot and about 11 s after that |
+| M5: zygote, ART, `system_server`, launcher, apps | done (macOS): Android 16's Pixel launcher in the window, and boot complete about 20 s after start on a first boot and about 12 s after that |
 | M6: input from the window | done (macOS): mouse as touch, scroll as a finger drag, keyboard; Chrome and Play Store open and draw from a tap |
-| Network | done for what a browser needs (macOS): Android validates the network, Chrome loads HTTP and HTTPS sites. No UDP beyond DNS yet: see below |
+| Network | done (macOS): Android validates the network, Chrome loads sites over HTTP, HTTPS and QUIC, and `adb forward` and `reverse` work. See below for what a network with no packets can't do |
 | Smoothness | in progress: see below |
 | Windows | no window and never run; compiles (`cargo check --target x86_64-pc-windows-msvc`) |
 
@@ -63,9 +63,8 @@ Known gaps:
   restriction can block an app's DNS while its TCP still works.
 - 10.0.2.2 is the host's loopback for every app on the device, as on the emulator,
   except for the adb server and devices' own ports.
-- UDP only reaches the name server for now, so sites offering QUIC use TCP; sockets on
-  the device can't yet reach each other over loopback; and there's no IPv6, no ICMP
-  (`ping` resolves and never hears back) and no incoming connections.
+- There's no IPv6, no ICMP (`ping` resolves and never hears back) and no incoming
+  connections except through `adb forward`.
 - The name server answers from the host's resolver: A records only, with a made-up TTL,
   no CNAMEs or HTTPS records, and every failure is SERVFAIL.
 - Android thinks eth1 is unmetered, so Google's services download what they like once

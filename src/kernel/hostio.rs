@@ -320,6 +320,7 @@ impl Io {
             // reset it provokes fails the next.
             None => {
                 self.st.lock().unwrap().dead = true;
+                self.changed();
                 Ok(data.len())
             }
         }

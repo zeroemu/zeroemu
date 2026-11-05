@@ -23,6 +23,9 @@ const ROOT: u64 = 1;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum K {
     Root,
+    /// /proc/net, and in it the interfaces' counters, which `ifconfig` starts from.
+    Net,
+    NetDev,
     Self_,
     ThreadSelf,
     Meminfo,
@@ -78,14 +81,14 @@ enum K {
     AttrSockcreate,
 }
 
-const ALL: [K; 48] = [
+const ALL: [K; 50] = [
     K::Root, K::Self_, K::ThreadSelf, K::Meminfo, K::Cpuinfo, K::Stat, K::Uptime, K::Loadavg, K::Version, K::Filesystems,
     K::Cmdline, K::Mounts, K::Sysctl, K::Pid, K::PCmdline, K::PComm, K::PExe, K::PCwd, K::PFd, K::PFdLink,
     K::PMaps, K::PStatus, K::PStat, K::PStatm, K::PTask, K::PAttr, K::PMounts, K::POom, K::PEnviron,
     K::Task, K::PMountinfo, K::POomAdj, K::POomScore, K::PTimerslack, K::PNs, K::PNsLink, K::NsFile,
     K::Cgroups, K::PCgroup, K::Pressure, K::PressureFile,
     K::AttrCurrent, K::AttrPrev, K::AttrExec, K::AttrFscreate, K::AttrKeycreate, K::AttrSockcreate,
-    K::ConfigGz,
+    K::ConfigGz, K::Net, K::NetDev,
 ];
 const ATTR_K: [K; 6] = [K::AttrCurrent, K::AttrPrev, K::AttrExec, K::AttrFscreate, K::AttrKeycreate, K::AttrSockcreate];
 
@@ -297,6 +300,7 @@ impl ProcFs {
                     ("mounts", K::Mounts),
                     ("cgroups", K::Cgroups),
                     ("config.gz", K::ConfigGz),
+                    ("net", K::Net),
                 ]
                 .iter()
                 .map(|(n, k)| (n.to_string(), mk(*k, 0, 0)))
@@ -504,6 +508,8 @@ impl ProcFs {
             }
             K::NsFile => Ok(Content::File(Vec::new())),
             K::Cgroups => text(super::cgroup::proc_cgroups(&kernel)),
+            K::Net => Ok(Content::Dir(vec![("dev".to_string(), mk(K::NetDev, 0, 0))])),
+            K::NetDev => text(super::net::proc_net_dev()),
             K::ConfigGz => Ok(Content::File(gzip_stored(kernel_config().as_bytes()))),
             K::PCgroup => {
                 self.proc(pid)?;
@@ -701,5 +707,16 @@ impl FileSystem for ProcFs {
             Content::File(_) if matches!(decode(ino), Some((K::NsFile, _, _))) => Err(err(EINVAL)),
             Content::File(b) => Ok(b.into()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_root_is_where_the_constant_says() {
+        // /proc/<tid> depends on this, and a process that can't read its cgroup there dies.
+        assert_eq!(mk(K::Root, 0, 0), ROOT);
     }
 }

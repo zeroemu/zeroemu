@@ -137,10 +137,16 @@ struct Datagram {
 }
 
 /// Each host datagram socket has a thread reading it.
-static UDP_READERS: hostio::Quota = hostio::Quota::new(512, 1024);
+static UDP_READERS: hostio::Quota = hostio::Quota::new(256, 1024);
 /// Connections waiting to be accepted on a listener. Nothing's dropping SYNs here to make
 /// a client wait for room, so this is only so a stuck server can't hold unlimited memory.
 const MAX_BACKLOG: usize = 4096;
+/// And in all, by whoever's connecting: each can hold a full queue with nobody reading,
+/// after its client has gone.
+static UNACCEPTED: hostio::Quota = hostio::Quota::new(256, 4096);
+/// What a datagram costs on a queue besides its bytes, as Linux counts a whole skb. An
+/// empty one still takes memory.
+const DATAGRAM_OVERHEAD: usize = 256;
 
 #[derive(Default)]
 struct State {
@@ -164,6 +170,8 @@ struct State {
     queued: usize,
     /// Connections to accept, on a listener.
     backlog: VecDeque<Arc<Inet>>,
+    /// An accepted socket's place among those waiting, until it's taken.
+    unaccepted: Option<hostio::QuotaPlace>,
     /// A datagram socket's way to the world, once it has sent there, and where that's
     /// connected, if it is. Connected, the host tells of a closed port.
     host_udp: Option<Arc<UdpSocket>>,
@@ -353,6 +361,8 @@ fn bound_at(proto: u32, dest: SocketAddr, listening: bool) -> Vec<Arc<Inet>> {
             })
             .collect()
     };
+    // Newest first among equals, as Linux's hash chains have it.
+    found.reverse();
     found.sort_by_key(|&(score, _)| std::cmp::Reverse(score));
     found.into_iter().filter_map(|(_, sock)| sock.upgrade()).collect()
 }
@@ -463,6 +473,33 @@ fn push_cmsg(out: &mut Vec<u8>, level: u64, ty: u64, data: &[u8]) {
     out.resize(out.len().next_multiple_of(8), 0);
 }
 
+/// As put_cmsg: what fits in `room`, and whether any of it didn't. A message cut short
+/// says how long it now is, and the padding after the last one needn't fit.
+fn fit_control(control: &[u8], room: usize) -> (Vec<u8>, bool) {
+    const HEADER: usize = 16;
+    let mut out = Vec::with_capacity(room.min(control.len()));
+    let mut at = 0;
+    while at + HEADER <= control.len() {
+        let len = u64::from_le_bytes(control[at..at + 8].try_into().unwrap()) as usize;
+        let left = room.saturating_sub(out.len());
+        if left < HEADER {
+            return (out, true);
+        }
+        let shown = len.min(left);
+        out.extend_from_slice(&(shown as u64).to_le_bytes());
+        out.extend_from_slice(&control[at + 8..at + shown]);
+        if shown < len {
+            return (out, true);
+        }
+        let padded = len.next_multiple_of(8);
+        if room.saturating_sub(out.len()) >= padded - len {
+            out.resize(out.len() + padded - len, 0);
+        }
+        at += padded;
+    }
+    (out, false)
+}
+
 fn is_on(v: Option<&Vec<u8>>) -> bool {
     v.is_some_and(|v| v.iter().any(|&b| b != 0))
 }
@@ -489,10 +526,19 @@ fn read_host_datagrams(owner: Weak<Inet>, sock: Arc<UdpSocket>, _place: hostio::
                 }
                 heard += 1;
                 let Some(s) = owner.upgrade() else { return };
-                if !s.st.lock().unwrap().host_udp.as_ref().is_some_and(|h| Arc::ptr_eq(h, &sock)) {
-                    return;
+                let from = guest_view(from);
+                let wanted = {
+                    let st = s.st.lock().unwrap();
+                    if !st.host_udp.as_ref().is_some_and(|h| Arc::ptr_eq(h, &sock)) {
+                        return;
+                    }
+                    // Connected since this came, or the host socket isn't connected yet:
+                    // a connected socket only hears from its peer.
+                    st.peer.is_none_or(|peer| peer == from)
+                };
+                if wanted {
+                    s.deliver(from, buf[..n].to_vec());
                 }
-                s.deliver(guest_view(from), buf[..n].to_vec());
             }
             Err(e) if matches!(e.kind(), WouldBlock | TimedOut | Interrupted) => {
                 if owner.strong_count() == 0 || Arc::strong_count(&sock) == 1 {
@@ -504,11 +550,16 @@ fn read_host_datagrams(owner: Weak<Inet>, sock: Arc<UdpSocket>, _place: hostio::
                 // call to report. Windows calls that a reset.
                 let Some(s) = owner.upgrade() else { return };
                 let mut st = s.st.lock().unwrap();
+                // It's about whoever this socket was talking to, which may be old news.
+                if !st.host_udp.as_ref().is_some_and(|h| Arc::ptr_eq(h, &sock)) {
+                    return;
+                }
                 if st.host_peer.is_some() {
                     st.err = if e.kind() == ConnectionReset { ECONNREFUSED } else { hostio::linux_errno(&e) };
                 }
                 drop(st);
                 EVENTS.bump_key(s.key);
+                drop(s); // not to hold its port through the nap
                 std::thread::sleep(Duration::from_millis(10)); // nothing hot, whatever this was
             }
         }
@@ -611,6 +662,14 @@ impl Inet {
         Binding { owner: self.key, ip, v6only: Self::v6only(st), reuse_addr: flag(SO_REUSEADDR), reuse_port: flag(SO_REUSEPORT), uid, listening: false, sock: Arc::downgrade(self) }
     }
 
+    /// An error that came up while a call had something else to return, for the next.
+    pub(super) fn put_back_err(&self, e: i64) {
+        if !self.is_stream() && !self.raw() {
+            self.st.lock().unwrap().err = e;
+            EVENTS.bump_key(self.key);
+        }
+    }
+
     /// What it's connected to is told it's been reset: nobody ever accepted this.
     fn abandon(&self) {
         if let Some(io) = self.st.lock().unwrap().io.take() {
@@ -680,12 +739,13 @@ impl Inet {
     /// A datagram arrives. Too many waiting and it's dropped, as on any host.
     pub fn deliver(&self, from: SocketAddr, data: Vec<u8>) {
         let mut st = self.st.lock().unwrap();
-        // QUIC asks for more than the default, and bursts.
-        let limit = st.stored.get(&(SOL_SOCKET, SO_RCVBUF)).map_or(UDP_QUEUE, |v| i32::from_le_bytes(v[..4].try_into().unwrap()) as usize);
-        if st.queued + data.len() > limit {
+        // QUIC asks for more than the default, and bursts. A datagram is only dropped for
+        // a full queue, not for being bigger than the buffer, as Linux has it.
+        let limit = st.stored.get(&(SOL_SOCKET, SO_RCVBUF)).map_or(UDP_QUEUE, |v| u32::from_le_bytes(v[..4].try_into().unwrap()) as usize);
+        if st.queued > limit {
             return;
         }
-        st.queued += data.len();
+        st.queued += data.len() + DATAGRAM_OVERHEAD;
         st.queue.push_back(Datagram { from, data, at: SystemTime::now() });
         drop(st);
         EVENTS.bump_key(self.key);
@@ -780,7 +840,7 @@ impl Inet {
                     let control = self.control_messages(&st, d);
                     if flags & MSG_PEEK == 0 {
                         st.queue.pop_front();
-                        st.queued -= real;
+                        st.queued -= real + DATAGRAM_OVERHEAD;
                     }
                     return Ok(Received { data, real, from: Some(from), control });
                 }
@@ -909,10 +969,12 @@ impl Inet {
             let v6only = Self::v6only(&st);
             // An AF_INET6 socket can mean "the connected peer" by AF_UNSPEC.
             let dest = dest.filter(|d| !(self.v6() && d.len() >= 2 && d[..2] == [0, 0]));
-            let (addr, connected) = match dest {
-                Some(raw) => (self.parse_addr(raw, AddrUse::UdpSend, v6only)?, false),
-                None => (st.peer.ok_or(EDESTADDRREQ)?, true),
+            let addr = match dest {
+                Some(raw) => self.parse_addr(raw, AddrUse::UdpSend, v6only)?,
+                None => st.peer.ok_or(EDESTADDRREQ)?,
             };
+            // Naming the peer is the same as not naming anyone.
+            let connected = st.peer == Some(addr);
             if addr.port() == 0 && !ping {
                 return Err(EINVAL);
             }
@@ -941,8 +1003,10 @@ impl Inet {
             }
             Route::Local if !ping => {
                 let data = src.read(t, 0, total)?;
-                // A connected socket only hears from whom it's connected to.
-                let hearer = bound_at(self.proto, addr, false).into_iter().find(|s| s.st.lock().unwrap().peer.is_none_or(|p| p == from));
+                // A socket connected to the sender first, then one connected to nobody.
+                let candidates = bound_at(self.proto, addr, false);
+                let peer_of = |s: &Arc<Inet>| s.st.lock().unwrap().peer;
+                let hearer = candidates.iter().find(|s| peer_of(s) == Some(from)).or_else(|| candidates.iter().find(|s| peer_of(s).is_none()));
                 match hearer {
                     Some(s) => s.deliver(from, data),
                     None if connected => {
@@ -957,8 +1021,14 @@ impl Inet {
                 if tracing() {
                     eprintln!("[net] datagram of {total} to {host}");
                 }
-                let sock = self.host_socket(connected.then_some(host), uid)?;
-                let sent = if connected { sock.send(&data) } else { sock.send_to(&data, host) };
+                let (sock, host_peer) = self.host_socket(connected.then_some(host), uid)?;
+                let sent = match host_peer {
+                    None => sock.send_to(&data, host),
+                    Some(peer) if peer == host => sock.send(&data),
+                    // Connected elsewhere, which on the host rules out sending here. A socket
+                    // only for this: replies are for no one, since this one only hears its peer.
+                    Some(_) => UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).and_then(|once| once.send_to(&data, host)),
+                };
                 match sent {
                     Ok(_) => {}
                     Err(e) if hostio::out_of_buffers(&e) => {} // as if lost on the way
@@ -973,7 +1043,7 @@ impl Inet {
     }
 
     /// The host socket this one sends through, connected to `connect_to` if it's given.
-    fn host_socket(self: &Arc<Self>, connect_to: Option<SocketAddr>, uid: u32) -> Result<Arc<UdpSocket>, i64> {
+    fn host_socket(self: &Arc<Self>, connect_to: Option<SocketAddr>, uid: u32) -> Result<(Arc<UdpSocket>, Option<SocketAddr>), i64> {
         let mut st = self.st.lock().unwrap();
         if st.host_udp.is_none() {
             let place = UDP_READERS.take(uid).ok_or(ENOBUFS)?;
@@ -994,7 +1064,7 @@ impl Inet {
             sock.connect(to).map_err(|e| hostio::linux_errno(&e))?;
             st.host_peer = Some(to);
         }
-        Ok(sock)
+        Ok((sock, st.host_peer))
     }
 }
 
@@ -1240,14 +1310,13 @@ impl Kernel {
             mm.write(base, &r.data[at..at + n])?;
             at += n;
         }
-        // What didn't fit says so.
-        let shown = r.control.len().min(room as usize);
-        if shown > 0 {
-            mm.write(control, &r.control[..shown])?;
+        let (shown, control_cut) = fit_control(&r.control, room as usize);
+        if !shown.is_empty() {
+            mm.write(control, &shown)?;
         }
-        mm.write_u64(msg + 40, shown as u64)?;
+        mm.write_u64(msg + 40, shown.len() as u64)?;
         let truncated = !s.is_stream() && r.real > r.data.len();
-        let msg_flags = if truncated { MSG_TRUNC as u32 } else { 0 } | if shown < r.control.len() { MSG_CTRUNC } else { 0 };
+        let msg_flags = if truncated { MSG_TRUNC as u32 } else { 0 } | if control_cut { MSG_CTRUNC } else { 0 };
         mm.write_u32(msg + 48, msg_flags)?;
         drop(mm);
         if name != 0 {
@@ -1358,8 +1427,23 @@ impl Kernel {
             let peer = conn.st.lock().unwrap().peer;
             self.write_name(t, a[1], a[2], &s.sockaddr(peer))?;
         }
-        let file = File::new(Kind::Inet(conn), (flags & SOCK_NONBLOCK) as u32);
-        t.files().alloc(file, flags & SOCK_CLOEXEC != 0, 0)
+        let file = File::new(Kind::Inet(conn.clone()), (flags & SOCK_NONBLOCK) as u32);
+        let result = t.files().alloc(file, flags & SOCK_CLOEXEC != 0, 0);
+        if result.is_err() {
+            // No descriptor for it: it isn't accepted, and stays for when there is one.
+            let mut st = s.st.lock().unwrap();
+            if st.phase == Phase::Listening {
+                st.backlog.push_front(conn);
+                drop(st);
+                EVENTS.bump_key(s.key);
+            } else {
+                drop(st);
+                conn.abandon();
+            }
+        } else {
+            conn.st.lock().unwrap().unaccepted = None;
+        }
+        result
     }
 
     /// A connection to a listener on this device: done on the spot, whoever's there.
@@ -1367,6 +1451,10 @@ impl Kernel {
     /// be taken the other way round.
     fn connect_here(&self, s: &Arc<Inet>, st: &mut State, addr: SocketAddr, uid: u32) -> Result<(), i64> {
         let listener = bound_at(s.proto, addr, true).into_iter().next().ok_or(ECONNREFUSED)?;
+        // Holding this one's lock, whatever the port table says: never wait on it again.
+        if Arc::ptr_eq(&listener, s) {
+            return Err(ECONNREFUSED);
+        }
         s.autobind(st, uid)?;
         let source = source_for(&Route::Local, addr);
         let local = st.local.unwrap();
@@ -1378,14 +1466,15 @@ impl Kernel {
         if l.phase != Phase::Listening || l.backlog.len() >= MAX_BACKLOG {
             return Err(ECONNREFUSED);
         }
+        let place = UNACCEPTED.take(uid).ok_or(ECONNREFUSED)?;
         let (opts, stored) = (l.opts.clone(), l.stored.clone());
-        let server = State { opts, stored, local: Some(here), peer: Some(name), phase: Phase::Connected, io: Some(theirs), ..State::default() };
+        let server = State { opts, stored, local: Some(here), peer: Some(name), phase: Phase::Connected, io: Some(theirs), unaccepted: Some(place), ..State::default() };
         l.backlog.push_back(Arc::new(Inet { family: listener.family, ty: s.ty, proto: s.proto, key: server_key, st: Mutex::new(server) }));
         drop(l);
         EVENTS.bump_key(listener.key);
         st.io = Some(mine);
         st.source = Some(source);
-        st.peer = Some(addr);
+        st.peer = Some(here);
         st.err = 0;
         st.phase = Phase::Connected;
         Ok(())
@@ -1402,16 +1491,7 @@ impl Kernel {
             match (st.phase, st.io.clone()) {
                 (Phase::Listening, _) => {
                     if reading {
-                        st.phase = Phase::Idle;
-                        for waiting in std::mem::take(&mut st.backlog) {
-                            waiting.abandon();
-                        }
-                        if let Some(local) = st.local {
-                            let mut ports = PORTS.lock().unwrap();
-                            if let Some(me) = ports.get_mut(&(s.proto, local.port())).and_then(|h| h.iter_mut().find(|b| b.owner == s.key)) {
-                                me.listening = false;
-                            }
-                        }
+                        s.stop_listening(&mut st);
                     }
                     Ok(0)
                 }
@@ -1447,11 +1527,10 @@ impl Kernel {
         }
         let uid = self.creds(t).euid;
         let mut st = s.st.lock().unwrap();
-        // A host socket can't be disconnected, or easily told who to hear from instead.
-        // The next one to send out gets a new one.
-        st.host_udp = None;
-        st.host_peer = None;
         if raw[..2] == [0, 0] {
+            // A host socket can't be disconnected. The next to send out gets a new one.
+            st.host_udp = None;
+            st.host_peer = None;
             st.peer = None;
             st.source = None;
             return Ok(0);
@@ -1462,8 +1541,25 @@ impl Kernel {
         // the source address, and sends nothing on them. Port 0 is fine for that.
         let to = route(addr, false, broadcast)?;
         s.autobind(&mut st, uid)?;
-        st.source = Some(source_for(&to, addr));
-        st.peer = Some(addr);
+        // A host socket stays, so the port the world sees does too. One not connected yet
+        // is on its first send; one that is can be told, or isn't any use now.
+        if st.host_peer.is_some() {
+            match (&to, st.host_udp.clone()) {
+                (Route::Host(host), Some(sock)) => {
+                    st.host_peer = None;
+                    sock.connect(host).map_err(|e| hostio::linux_errno(&e))?;
+                    st.host_peer = Some(*host);
+                }
+                _ => {
+                    st.host_udp = None;
+                    st.host_peer = None;
+                }
+            }
+        }
+        let source = source_for(&to, addr);
+        st.source = Some(source);
+        // 0.0.0.0 and :: mean this machine, and answers come from it by name.
+        st.peer = Some(if addr.ip().is_unspecified() { SocketAddr::new(source, addr.port()) } else { addr });
         Ok(0)
     }
 
@@ -1478,6 +1574,9 @@ impl Kernel {
         let uid = self.creds(t).euid;
         let mut st = s.st.lock().unwrap();
         if raw[..2] == [0, 0] {
+            if st.phase == Phase::Listening {
+                s.stop_listening(&mut st);
+            }
             Inet::disconnect(&mut st);
             drop(st);
             EVENTS.bump_key(s.key);
@@ -1496,6 +1595,8 @@ impl Kernel {
                     Route::Host(host) => host,
                     Route::Local => {
                         self.connect_here(s, &mut st, addr, uid)?;
+                        drop(st);
+                        EVENTS.bump_key(s.key); // it's writable now
                         return Ok(0);
                     }
                     Route::Refused | Route::Dns | Route::Lost => return Err(ECONNREFUSED),
@@ -1625,6 +1726,10 @@ impl Kernel {
         if s.raw() && level != SOL_SOCKET {
             return self.iptables_set(t, s, level, name, val, a[4] as usize);
         }
+        // Going past the limit that keeps one socket from holding all the memory.
+        if level == SOL_SOCKET && matches!(name, SO_SNDBUFFORCE | SO_RCVBUFFORCE) && !self.creds(t).capable(CAP_NET_ADMIN) {
+            return Err(EPERM);
+        }
         let v = sockopt_bytes(t, val, a[4])?;
         s.set_option(level, name, &v)?;
         Ok(0)
@@ -1716,6 +1821,21 @@ impl Kernel {
 }
 
 impl Inet {
+    /// No longer a listener. Who's waiting is told it's been reset, and only a listener
+    /// is marked so in the port table, which is what connecting goes by.
+    fn stop_listening(&self, st: &mut State) {
+        st.phase = Phase::Idle;
+        for waiting in std::mem::take(&mut st.backlog) {
+            waiting.abandon();
+        }
+        if let Some(local) = st.local {
+            let mut ports = PORTS.lock().unwrap();
+            if let Some(me) = ports.get_mut(&(self.proto, local.port())).and_then(|h| h.iter_mut().find(|b| b.owner == self.key)) {
+                me.listening = false;
+            }
+        }
+    }
+
     /// Back to how a new socket is, as a connection failing or AF_UNSPEC leaves it. As
     /// tcp_disconnect: one that was going or up leaves an error to find. That includes a
     /// thread in connect(), which an abort wakes.
@@ -1817,7 +1937,7 @@ impl Inet {
             (SOL_SOCKET, SO_SNDBUF | SO_RCVBUF | SO_SNDBUFFORCE | SO_RCVBUFFORCE) => {
                 // Linux doubles it, for its own bookkeeping, and that's what reads back.
                 let forced = matches!(name, SO_SNDBUFFORCE | SO_RCVBUFFORCE);
-                let v = (as_int()?.max(0) as u32).min(if forced { u32::MAX / 2 } else { BUF_MAX });
+                let v = (as_int()?.max(0) as u32).min(if forced { i32::MAX as u32 / 2 } else { BUF_MAX });
                 let key = if matches!(name, SO_SNDBUF | SO_SNDBUFFORCE) { SO_SNDBUF } else { SO_RCVBUF };
                 let least = if key == SO_SNDBUF { 4608 } else { 2304 };
                 st.stored.insert((SOL_SOCKET, key), ((v * 2).max(least) as i32).to_le_bytes().to_vec());

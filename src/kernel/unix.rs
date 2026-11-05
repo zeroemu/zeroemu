@@ -709,12 +709,28 @@ impl Kernel {
             match self.socket_syscall(if receiving { Sysno::recvmsg } else { Sysno::sendmsg }, t, [a[0], msg, this, 0, 0, 0]) {
                 Ok(n) => t.proc.mm().write_u32(msg + 56, n as u32)?,
                 Err(e) if done == 0 => return Err(e),
-                Err(_) => break,
+                Err(e) => {
+                    // Taken from the socket, and this call has something else to say. Its
+                    // reader needn't wait for ever for what it would have been told.
+                    if receiving
+                        && !matches!(e, EAGAIN | EINTR | ERESTARTSYS)
+                        && let Ok(f) = t.files().get(int(a[0]))
+                        && let Kind::Inet(s) = &f.kind
+                    {
+                        s.put_back_err(e);
+                    }
+                    break;
+                }
             }
             done += 1;
             if until.is_some_and(|at| Instant::now() >= at) {
                 break;
             }
+        }
+        if let Some(at) = until {
+            let left = at.saturating_duration_since(Instant::now());
+            let spec = [(left.as_secs() as i64).to_le_bytes(), (left.subsec_nanos() as i64).to_le_bytes()].concat();
+            t.proc.mm().write(a[4], &spec)?;
         }
         Ok(done)
     }
@@ -860,8 +876,18 @@ impl Kernel {
                     conn.st.lock().unwrap().passcred = true;
                 }
                 let peer_name = conn.peer().and_then(|p| p.st.lock().unwrap().name.clone());
-                let f = File::new(Kind::Socket(conn), (flags & SOCK_NONBLOCK) as u32);
-                let fd = t.files().alloc(f, flags & SOCK_CLOEXEC != 0, 0)?;
+                let f = File::new(Kind::Socket(conn.clone()), (flags & SOCK_NONBLOCK) as u32);
+                let fd = match t.files().alloc(f, flags & SOCK_CLOEXEC != 0, 0) {
+                    Ok(fd) => fd,
+                    Err(e) => {
+                        // No descriptor for it: it stays for when there is one.
+                        if let Some(backlog) = sock.st.lock().unwrap().backlog.as_mut() {
+                            backlog.push_front(conn);
+                        }
+                        EVENTS.bump_key(sock.key());
+                        return Err(e);
+                    }
+                };
                 if a[1] != 0 {
                     self.write_addr(t, a[1], a[2], peer_name.as_deref())?;
                 }

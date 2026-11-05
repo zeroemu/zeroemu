@@ -19,6 +19,7 @@ typedef unsigned char u8;
 #define NR_connect 203
 #define NR_sendto 206
 #define NR_recvfrom 207
+#define NR_setsockopt 208
 
 static i64 sys6(i64 n, i64 a, i64 b, i64 c, i64 d, i64 e, i64 f) {
     register i64 x8 __asm__("x8") = n;
@@ -344,6 +345,8 @@ int cmain(void) {
     u8 forged[32] = { 0 };
     check(sys(NR_sendto, app, forged, sizeof forged, 0, &group, sizeof group) == -EPERM, "forging a group's news: EPERM");
     check(sys(NR_socket, AF_INET, SOCK_RAW, 255) == -EPERM, "a raw socket: EPERM");
+    int big_buf = 1 << 30;
+    check(sys(NR_setsockopt, s, 1 /* SOL_SOCKET */, 33 /* SO_RCVBUFFORCE */, &big_buf, 4) == -EPERM, "SO_RCVBUFFORCE: EPERM");
 
     puts_(failures ? "SOME CHECKS FAILED\n" : "all checks passed\n");
     return failures;

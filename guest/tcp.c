@@ -224,14 +224,14 @@ static void through_echo(u16 port) {
 }
 
 int cmain(int argc, char **argv) {
-    u16 ports[10];
-    if (argc < 11) { puts_("usage: tcp echo silent closes resets refused sink pieces adb-server half-resets udp-echo\n"); return 1; }
-    for (int i = 0; i < 10; i++) {
+    u16 ports[11];
+    if (argc < 12) { puts_("usage: tcp echo silent closes resets refused sink pieces adb-server half-resets udp-echo udp-echo2\n"); return 1; }
+    for (int i = 0; i < 11; i++) {
         u32 v = 0;
         for (char *c = argv[i + 1]; *c; c++) v = v * 10 + (u32)(*c - '0');
         ports[i] = (u16)v;
     }
-    u16 echo = ports[0], silent = ports[1], closes = ports[2], resets = ports[3], refused = ports[4], sink = ports[5], pieces = ports[6], adb_server = ports[7], half_resets = ports[8], udp_echo = ports[9];
+    u16 echo = ports[0], silent = ports[1], closes = ports[2], resets = ports[3], refused = ports[4], sink = ports[5], pieces = ports[6], adb_server = ports[7], half_resets = ports[8], udp_echo = ports[9], udp_echo2 = ports[10];
     char buf[256];
     u8 hip_of_udp[4] = { 10, 0, 2, 2 };
     i64 r = 0;
@@ -351,6 +351,43 @@ int cmain(int argc, char **argv) {
         expect(got_m, 2, "recvmmsg: both echoes");
         check(in[0].len == 5 && same(r1, "first", 5) && in[1].len == 6 && same(r2, "second", 6), "in order and whole");
         sys(NR_close, u);
+
+        // Naming an address on a connected socket: it goes, and only its peer is heard.
+        {
+            struct in4 to_echo = host(udp_echo), elsewhere = host(udp_echo2);
+            int nu = (int)sys(NR_socket, AF_INET, SOCK_DGRAM, 0);
+            expect(sys(NR_connect, nu, &to_echo, sizeof to_echo), 0, "connect");
+            expect(sys(NR_write, nu, "one", 3), 3, "write, which connects the host socket");
+            wait_for(nu, POLLIN, 5000);
+            expect(sys(NR_read, nu, buf, 16), 3, "the echo");
+            expect(sys(NR_sendto, nu, "two", 3, 0, &to_echo, sizeof to_echo), 3, "sendto naming the peer works");
+            wait_for(nu, POLLIN, 5000);
+            expect(sys(NR_read, nu, buf, 16), 3, "and it's heard");
+            expect(sys(NR_sendto, nu, "off", 3, 0, &elsewhere, sizeof elsewhere), 3, "sendto naming someone else goes too");
+            expect(wait_for(nu, POLLIN, 200), 0, "and their answer isn't for a socket connected elsewhere");
+            sys(NR_close, nu);
+
+            // The port the world sees doesn't change when a socket connects.
+            struct in4 seen1, seen2;
+            int pu = (int)sys(NR_socket, AF_INET, SOCK_DGRAM, 0);
+            sys(NR_sendto, pu, "port", 4, 0, &to_echo, sizeof to_echo);
+            wait_for(pu, POLLIN, 5000);
+            sys(NR_read, pu, buf, 16);
+            int plen = sizeof seen1;
+            sys(NR_getsockname, pu, &seen1, &plen);
+            expect(sys(NR_connect, pu, &to_echo, sizeof to_echo), 0, "connect after sending");
+            sys(NR_write, pu, "again", 5);
+            check(wait_for(pu, POLLIN, 5000) & POLLIN, "an answer through the same socket");
+            expect(sys(NR_read, pu, buf, 16), 5, "right");
+            plen = sizeof seen2;
+            sys(NR_getsockname, pu, &seen2, &plen);
+            check(seen1.port == seen2.port, "with the same port");
+            // A reply on its way when it connects still arrives.
+            sys(NR_sendto, pu, "late", 4, 0, &to_echo, sizeof to_echo);
+            expect(sys(NR_connect, pu, &to_echo, sizeof to_echo), 0, "connect while an answer's on its way");
+            check(wait_for(pu, POLLIN, 5000) & POLLIN, "it still comes");
+            sys(NR_close, pu);
+        }
 
         // Connected: the host hears a closed port, and the next call hears of it.
         int cu = (int)sys(NR_socket, AF_INET, SOCK_DGRAM, 0);

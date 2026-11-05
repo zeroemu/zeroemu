@@ -304,6 +304,8 @@ int cmain(void) {
     check(sys(NR_setsockopt, fd, SOL_TCP, TCP_NODELAY, &on, 4) == 0 && intopt(fd, SOL_TCP, TCP_NODELAY) == 1, "TCP_NODELAY");
     check(sys(NR_setsockopt, u, SOL_TCP, TCP_NODELAY, &on, 4) == -ENOPROTOOPT, "not on a datagram socket");
     check(sys(NR_setsockopt, u, SOL_IP, 200, &ttl, 4) == 0 && intopt(u, SOL_IP, 200) == 7, "an option nobody's heard of is kept");
+    int huge = 0x7fffffff;
+    check(sys(NR_setsockopt, u, SOL_SOCKET, 33 /* SO_RCVBUFFORCE */, &huge, 4) == 0 && intopt(u, SOL_SOCKET, SO_RCVBUF) > 0, "SO_RCVBUFFORCE, as root: positive however large");
     check(intopt(u, SOL_IP, 201) == -ENOPROTOOPT, "and one never set can't be read");
     u64 c1 = 0, c2 = 0;
     int clen = 8;

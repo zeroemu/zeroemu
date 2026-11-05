@@ -28,6 +28,8 @@ typedef unsigned char u8;
 #define NR_recvmsg 212
 #define NR_accept4 242
 #define NR_recvmmsg 243
+#define NR_getrlimit 163
+#define NR_setrlimit 164
 #define NR_sendmmsg 269
 
 static i64 sys6(i64 n, i64 a, i64 b, i64 c, i64 d, i64 e, i64 f) {
@@ -317,6 +319,48 @@ int cmain(void) {
     sys(NR_close, zero);
     sys(NR_close, any4);
 
+    // ---- changing its mind, a listener: this used to hang for ever on its own lock
+    {
+        int ul = listener(41005);
+        int waiting = connected(41005);
+        struct { u16 family; u8 pad[14]; } unspec = { 0, { 0 } };
+        expect(sys(NR_connect, ul, &unspec, sizeof unspec), 0, "connect(AF_UNSPEC) on a listener");
+        expect(sys(NR_accept4, ul, 0, 0, 0), -EINVAL, "it isn't one now");
+        check(wait_for(waiting, POLLIN, 1000) & POLLIN, "whoever was waiting hears");
+        expect(sys(NR_read, waiting, buf, 8), -ECONNRESET, "that it's been reset");
+        struct in4 self_to = v4(127, 0, 0, 1, 41005);
+        expect(sys(NR_connect, ul, &self_to, sizeof self_to), -ECONNREFUSED, "connecting it to its own port: refused, and returns");
+        int nobody = (int)sys(NR_socket, AF_INET, SOCK_STREAM, 0);
+        expect(sys(NR_connect, nobody, &self_to, sizeof self_to), -ECONNREFUSED, "so does anyone else");
+        int taker = (int)sys(NR_socket, AF_INET, SOCK_STREAM, 0);
+        int yes = 1;
+        sys(NR_setsockopt, taker, SOL_SOCKET, SO_REUSEADDR, &yes, 4);
+        sys(NR_setsockopt, ul, SOL_SOCKET, SO_REUSEADDR, &yes, 4);
+        sys(NR_close, waiting);
+        sys(NR_close, nobody);
+        sys(NR_close, taker);
+        sys(NR_close, ul);
+    }
+
+    // ---- no descriptor for it: the connection stays queued
+    {
+        int al = listener(41006);
+        int client = connected(41006);
+        struct { u64 cur, max; } low, old;
+        sys(NR_getrlimit, 7, &old);
+        low.cur = 0; low.max = old.max;
+        sys(NR_setrlimit, 7, &low);
+        expect(sys(NR_accept4, al, 0, 0, 0), -24 /* EMFILE */, "at the limit: EMFILE");
+        sys(NR_setrlimit, 7, &old);
+        int taken = (int)sys(NR_accept4, al, 0, 0, 0);
+        check(taken >= 0, "with room again, it's still there");
+        expect(sys(NR_write, client, "kept", 4), 4, "and still connected");
+        expect(sys(NR_read, taken, buf, 8), 4, "both ways");
+        sys(NR_close, taken);
+        sys(NR_close, client);
+        sys(NR_close, al);
+    }
+
     // The kernel picks a port for a listener with none.
     int auto_l = (int)sys(NR_socket, AF_INET, SOCK_STREAM, 0);
     sys(NR_listen, auto_l, 4);
@@ -356,6 +400,78 @@ int cmain(void) {
     expect(sys(NR_recvfrom, cu, buf, 8, MSG_DONTWAIT, 0, 0), -ECONNREFUSED, "and the next call hears");
     expect(sys(NR_recvfrom, cu, buf, 8, MSG_DONTWAIT, 0, 0), -EAGAIN, "once");
     sys(NR_close, cu);
+
+    // Connected to 0.0.0.0 means this machine, and that's who answers.
+    {
+        int server_u = (int)sys(NR_socket, AF_INET, SOCK_DGRAM, 0);
+        struct in4 at_u = v4(127, 0, 0, 1, 41013), any_u = v4(0, 0, 0, 0, 41013);
+        sys(NR_bind, server_u, &at_u, sizeof at_u);
+        int client_u = (int)sys(NR_socket, AF_INET, SOCK_DGRAM, 0);
+        expect(sys(NR_connect, client_u, &any_u, sizeof any_u), 0, "connect a datagram socket to 0.0.0.0");
+        mlen = sizeof me;
+        check(sys(NR_getpeername, client_u, &me, &mlen) == 0 && same(me.addr, lo, 4), "its peer is loopback");
+        expect(sys(NR_write, client_u, "q", 1), 1, "send");
+        len = sizeof peer;
+        expect(sys(NR_recvfrom, server_u, buf, 8, MSG_DONTWAIT, &peer, &len), 1, "heard");
+        sys(NR_sendto, server_u, "a", 1, 0, &peer, sizeof peer);
+        expect(sys(NR_recvfrom, client_u, buf, 8, MSG_DONTWAIT, 0, 0), 1, "and the answer isn't thrown away");
+        sys(NR_close, server_u);
+        sys(NR_close, client_u);
+    }
+
+    // A socket connected to the sender is who hears it, even with another on the port.
+    {
+        int yes = 1;
+        struct in4 shared = v4(127, 0, 0, 1, 41014), sender_at = v4(127, 0, 0, 1, 41015);
+        int general = (int)sys(NR_socket, AF_INET, SOCK_DGRAM, 0), to_sender = (int)sys(NR_socket, AF_INET, SOCK_DGRAM, 0), sender = (int)sys(NR_socket, AF_INET, SOCK_DGRAM, 0);
+        sys(NR_setsockopt, general, SOL_SOCKET, SO_REUSEADDR, &yes, 4);
+        sys(NR_setsockopt, to_sender, SOL_SOCKET, SO_REUSEADDR, &yes, 4);
+        sys(NR_bind, general, &shared, sizeof shared);
+        sys(NR_bind, to_sender, &shared, sizeof shared);
+        sys(NR_bind, sender, &sender_at, sizeof sender_at);
+        sys(NR_connect, to_sender, &sender_at, sizeof sender_at);
+        sys(NR_sendto, sender, "m", 1, 0, &shared, sizeof shared);
+        expect(sys(NR_recvfrom, to_sender, buf, 8, MSG_DONTWAIT, 0, 0), 1, "a connected socket hears its peer");
+        expect(sys(NR_recvfrom, general, buf, 8, MSG_DONTWAIT, 0, 0), -EAGAIN, "and the other on that port doesn't");
+        sys(NR_close, general);
+        sys(NR_close, to_sender);
+        sys(NR_close, sender);
+    }
+
+    // Naming the peer is the same as sending without a name.
+    {
+        int cu2 = (int)sys(NR_socket, AF_INET, SOCK_DGRAM, 0);
+        struct in4 nobody2 = v4(127, 0, 0, 1, 41018);
+        sys(NR_connect, cu2, &nobody2, sizeof nobody2);
+        expect(sys(NR_sendto, cu2, "x", 1, 0, &nobody2, sizeof nobody2), 1, "sendto its own peer");
+        expect(sys(NR_recvfrom, cu2, buf, 8, MSG_DONTWAIT, 0, 0), -ECONNREFUSED, "is told nobody's there too");
+        // Failing to connect changes nothing.
+        struct in6 wrong_family = { AF_INET6, be(9), 0, { 0 }, 0 };
+        expect(sys(NR_connect, cu2, &wrong_family, sizeof wrong_family), -97 /* EAFNOSUPPORT */, "a failed connect");
+        mlen = sizeof me;
+        check(sys(NR_getpeername, cu2, &me, &mlen) == 0 && me.port == be(41018), "leaves the peer it had");
+        sys(NR_close, cu2);
+    }
+
+    // Lots of nothing can't fill the world: each datagram costs something on a queue.
+    {
+        int deaf = (int)sys(NR_socket, AF_INET, SOCK_DGRAM, 0), noisy = (int)sys(NR_socket, AF_INET, SOCK_DGRAM, 0);
+        struct in4 deaf_at = v4(127, 0, 0, 1, 41016);
+        sys(NR_bind, deaf, &deaf_at, sizeof deaf_at);
+        for (int i = 0; i < 4000; i++) sys(NR_sendto, noisy, "", 0, 0, &deaf_at, sizeof deaf_at);
+        int count = 0;
+        while (sys(NR_recvfrom, deaf, buf, 8, MSG_DONTWAIT, 0, 0) == 0) count++;
+        check(count > 100 && count < 4000, "empty datagrams still fill a queue, and some were dropped");
+        int big_rcv = 2000, small = (int)sys(NR_socket, AF_INET, SOCK_DGRAM, 0);
+        struct in4 small_at = v4(127, 0, 0, 1, 41017);
+        sys(NR_bind, small, &small_at, sizeof small_at);
+        sys(NR_setsockopt, small, SOL_SOCKET, 8 /* SO_RCVBUF */, &big_rcv, 4);
+        expect(sys(NR_sendto, noisy, big, 30000, 0, &small_at, sizeof small_at), 30000, "a datagram bigger than the buffer");
+        expect(sys(NR_recvfrom, small, big, 30000, MSG_DONTWAIT, 0, 0), 30000, "still arrives on an empty queue");
+        sys(NR_close, deaf);
+        sys(NR_close, noisy);
+        sys(NR_close, small);
+    }
 
     // A connected socket hears only its peer, and isn't found by others.
     int picky = (int)sys(NR_socket, AF_INET, SOCK_DGRAM, 0);
@@ -423,6 +539,22 @@ int cmain(void) {
         struct msghdr small = { 0, 0, &io, 1, control, 16, 0 };
         expect(sys(NR_recvmsg, a, &small, 0), 3, "with no room for them");
         check(small.flags & MSG_CTRUNC, "MSG_CTRUNC");
+        expect(small.controllen, 16, "with what room there was: a header");
+
+        // Exactly enough for the one asked for: no complaint, padding or no padding.
+        int offs = 0;
+        sys(NR_setsockopt, a, SOL_IP, IP_PKTINFO, &offs, 4);
+        sys(NR_setsockopt, a, SOL_SOCKET, SO_TIMESTAMP, &offs, 4);
+        sys(NR_sendto, b, "ctl", 3, 0, &ua, sizeof ua);
+        struct msghdr exact = { 0, 0, &io, 1, control, 20, 0 };
+        expect(sys(NR_recvmsg, a, &exact, 0), 3, "room for a TTL and no padding");
+        check(!(exact.flags & MSG_CTRUNC), "that's enough");
+        expect(exact.controllen, 20, "and it says how much");
+        sys(NR_sendto, b, "ctl", 3, 0, &ua, sizeof ua);
+        struct msghdr cut = { 0, 0, &io, 1, control, 17, 0 };
+        expect(sys(NR_recvmsg, a, &cut, 0), 3, "room for only part of it");
+        check(cut.flags & MSG_CTRUNC, "says so");
+        expect(((struct cmsg *)control)->len, 17, "and its length is what's there");
     }
     sys(NR_close, a);
     sys(NR_close, b);

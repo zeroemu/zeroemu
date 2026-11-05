@@ -102,7 +102,8 @@ keep_pieces = server(pieces)
 keep_adb = server(echo)
 keep_half = server(half_resets)
 keep_udp = udp_echo()
-ports += [keep_sink[1], keep_pieces[1], keep_adb[1], keep_half[1], keep_udp[1]]
+keep_udp2 = udp_echo()
+ports += [keep_sink[1], keep_pieces[1], keep_adb[1], keep_half[1], keep_udp[1], keep_udp2[1]]
 
 env = dict(os.environ, DROIDRT_GPU="fake", DROIDRT_NET="1", ANDROID_ADB_SERVER_PORT=str(keep_adb[1]))
 started = time.time()

@@ -324,6 +324,15 @@ pub fn is_local_v4(ip: [u8; 4]) -> bool {
     IFACES.lock().unwrap().iter().any(|i| i.flags & IFF_UP != 0 && i.ipv4.iter().any(|a| a.0 == ip))
 }
 
+/// /proc/net/dev. Nothing here sees the traffic, so it's all zeros.
+pub fn proc_net_dev() -> String {
+    let mut out = String::from("Inter-|   Receive                                                |  Transmit\n face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed\n");
+    for i in all() {
+        out.push_str(&format!("{:>6}:{}\n", i.name, " 0".repeat(16)));
+    }
+    out
+}
+
 /// Addresses for SIOCGIFCONF: each interface's IPv4 address, `lo`'s first.
 pub fn ipv4_addresses() -> Vec<(String, [u8; 4])> {
     all().into_iter().flat_map(|i| i.ipv4.iter().map(|&(ip, _)| (i.name.clone(), ip)).collect::<Vec<_>>()).collect()

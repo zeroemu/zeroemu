@@ -351,9 +351,13 @@ pub fn reserve_dump_signal() {
 }
 
 /// DROIDRT_FAULTLOG=1 reports every fault that raises a signal, handled or not.
-fn fault_log() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("DROIDRT_FAULTLOG").is_some())
+fn fault_log(addr: u64) -> bool {
+    static WANT: std::sync::OnceLock<Option<Option<u64>>> = std::sync::OnceLock::new();
+    let want = WANT.get_or_init(|| {
+        let v = std::env::var("DROIDRT_FAULTLOG").ok()?;
+        Some(v.strip_prefix("0x").and_then(|h| u64::from_str_radix(h, 16).ok()))
+    });
+    want.is_some_and(|only| only.is_none_or(|a| a == addr))
 }
 
 /// DROIDRT_STRACE=<name> traces only processes whose executable path
@@ -848,7 +852,7 @@ impl Kernel {
                         // ART takes these all the time (implicit null and suspend
                         // checks) and handles them. Only one that kills is a crash:
                         // a real one comes back here once its handler gives up.
-                        if !self.signal_caught(t, signal::SIGSEGV) || fault_log() {
+                        if !self.signal_caught(t, signal::SIGSEGV) || fault_log(addr) {
                             self.crash_report(t, vcpu.as_ref(), "SIGSEGV", pc, addr, write);
                         }
                         self.force_signal(t, signal::SIGSEGV, SigInfo::fault(signal::SIGSEGV, code, addr), pc);

@@ -684,11 +684,16 @@ impl Kernel {
             }
             BINDER_GET_NODE_INFO_FOR_REF => {
                 let handle = t.proc.mm().read_u32(arg)?;
+                // The node's counts, not this reference's: servicemanager reads them
+                // to tell a lazy service whether it has clients. If its own reference
+                // were all it saw, the service would keep being told it has none and
+                // shut down under the clients it has.
                 let (strong, weak) = {
                     let g = world();
                     let w = g.as_ref().unwrap();
                     let r = w.procs.get(&b.id).and_then(|p| p.refs.get(&handle)).ok_or(EINVAL)?;
-                    (r.strong.max(1), r.weak.max(1))
+                    let n = w.nodes.get(&r.node).ok_or(EINVAL)?;
+                    (n.local_strong + n.refs_strong, n.local_weak)
                 };
                 let mut mm = t.proc.mm();
                 mm.write_u32(arg + 4, strong)?;

@@ -681,6 +681,14 @@ impl Blocks {
         put_file(&*self.sys, &format!("{base}/dm/suspended"), if st.suspended { "1\n" } else { "0\n" });
         put_file(&*self.sys, &format!("{base}/queue/read_ahead_kb"), "128\n");
         put_file(&*self.sys, &format!("{base}/queue/logical_block_size"), "512\n");
+        // What the table sits on. A restarted apexd rebuilds its list of active
+        // APEXes from the mounts, and finds each file through this and the loop's
+        // backing_file. Missing these, it reports the APEXes as not there at all.
+        for t in st.active.iter().flat_map(|table| table.iter()) {
+            if let Map::Linear { devt, .. } = &t.map {
+                put_file(&*self.sys, &format!("{base}/slaves/{}", name(*devt)), "");
+            }
+        }
     }
 
     /// Resolves a table's device reference: "major:minor" or a path.

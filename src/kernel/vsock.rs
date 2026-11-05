@@ -122,7 +122,7 @@ impl Vsock {
                 _ => {
                     eprintln!("droidrt: no host service {name}");
                     st.closed = true;
-                    EVENTS.bump();
+                    EVENTS.bump_key(Arc::as_ptr(self) as usize);
                     return Ok(data.len());
                 }
             }
@@ -152,7 +152,7 @@ impl Vsock {
         if start_stream {
             stream(Arc::downgrade(self));
         }
-        EVENTS.bump();
+        EVENTS.bump_key(Arc::as_ptr(self) as usize);
         Ok(data.len())
     }
 
@@ -161,7 +161,7 @@ impl Vsock {
             return Ok(Vec::new());
         }
         loop {
-            let seen = EVENTS.current();
+            let seen = EVENTS.watch_key(self as *const Self as usize);
             {
                 let mut st = self.st.lock().unwrap();
                 if !st.connected {
@@ -239,7 +239,7 @@ fn stream(conn: Weak<Vsock>) {
                 }
                 s.delay_ms.clamp(10, 1000)
             };
-            EVENTS.bump();
+            EVENTS.bump_key(conn.as_ptr() as usize);
             std::thread::sleep(Duration::from_millis(delay));
         }
     });

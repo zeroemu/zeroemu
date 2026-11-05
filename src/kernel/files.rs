@@ -9,7 +9,7 @@ use super::specialfd::{EventFd, SignalFd, TimerFd};
 use super::unix::{self, Socket};
 use super::wait::EVENTS;
 use super::inotify;
-use super::{ERESTARTSYS, Kernel, POLL, Thread, int};
+use super::{ERESTARTSYS, IDLE, Kernel, Thread, int};
 use crate::arch::Sysno;
 use crate::errno::*;
 use crate::mm::SharedObject;
@@ -457,6 +457,7 @@ pub(super) fn poll_mask(f: &File, t: &Thread, depth: u32) -> u64 {
         Kind::Pipe(end) => key_bit(Arc::as_ptr(&end.pipe) as usize),
         Kind::Binder(b) => key_bit(binder::poll_key(b.id)),
         Kind::Evdev(c) => key_bit(Arc::as_ptr(c) as usize),
+        Kind::Vsock(v) => key_bit(Arc::as_ptr(v) as usize),
         Kind::Inotify(i) => key_bit(Arc::as_ptr(i) as usize),
         Kind::Drm(_) | Kind::DmaBuf(_) | Kind::Sync(_) => key_bit(super::drm::GPU_KEY),
         _ => plain_bit(),
@@ -1996,7 +1997,7 @@ impl Kernel {
                 break Err(EINTR);
             }
             let nap = nap(deadline, ep.deadline());
-            fell_back = EVENTS.wait(seen, nap) && nap == POLL;
+            fell_back = EVENTS.wait(seen, nap) && nap == IDLE;
         };
         self.restore_mask(t, old, &r);
         r
@@ -2018,11 +2019,12 @@ fn epoll_timespec_ms(t: &Thread, ts: u64) -> Result<i64, i64> {
     Ok(sec.saturating_mul(1000).saturating_add((nsec + 999_999) / 1_000_000))
 }
 
-/// How long a poller may sleep: until its deadline or the next timer, and
-/// never longer than POLL (signals and exits are noticed by polling).
+/// How long a poller may sleep: until its deadline or the next timer. Changes,
+/// signals and exits all wake it, so the limit is only a backstop, and at hundreds of
+/// threads in epoll it had better be a long one.
 fn nap(deadline: Option<Instant>, timer: Option<Instant>) -> Duration {
     let until = deadline.into_iter().chain(timer).min();
-    until.map_or(POLL, |d| d.saturating_duration_since(Instant::now()).min(POLL)).max(Duration::from_micros(50))
+    until.map_or(IDLE, |d| d.saturating_duration_since(Instant::now()).min(IDLE)).max(Duration::from_micros(50))
 }
 
 /// DROIDRT_LATEWAKE=1: reports readiness nothing announced with EVENTS.bump.

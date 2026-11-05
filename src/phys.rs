@@ -168,6 +168,14 @@ impl PhysMem {
         unsafe { (self.host(gpa) as *const u64).read() }
     }
 
+    /// Makes a page-table entry visible, after everything written so far: the frame it
+    /// points at. Guest threads walk these tables without any lock, and on this
+    /// architecture they could otherwise see the entry before the frame's contents.
+    pub fn write_pte(&self, gpa: u64, value: u64) {
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+        self.write_u64(gpa, value);
+    }
+
     pub fn write_u64(&self, gpa: u64, v: u64) {
         unsafe { (self.host(gpa) as *mut u64).write(v) }
     }

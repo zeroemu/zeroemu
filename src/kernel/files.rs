@@ -377,7 +377,7 @@ impl Drop for PipeEnd {
         }
         self.pipe.cv.notify_all();
         drop(st);
-        EVENTS.bump();
+        EVENTS.bump_key(Arc::as_ptr(&self.pipe) as usize);
     }
 }
 
@@ -390,7 +390,7 @@ impl Pipe {
                 let out: Vec<u8> = st.buf.drain(..n).collect();
                 self.cv.notify_all();
                 drop(st);
-                EVENTS.bump();
+                EVENTS.bump_key(self as *const Self as usize);
                 return Ok(out);
             }
             if st.writers == 0 || max == 0 {
@@ -420,7 +420,7 @@ impl Pipe {
                 st.buf.extend(&data[done..done + n]);
                 done += n;
                 self.cv.notify_all();
-                EVENTS.bump();
+                EVENTS.bump_key(self as *const Self as usize);
                 if done == data.len() {
                     return Ok(done);
                 }
@@ -443,6 +443,25 @@ const POLLOUT: u16 = 0x4;
 const POLLERR: u16 = 0x8;
 const POLLHUP: u16 = 0x10;
 const POLLNVAL: u16 = 0x20;
+
+/// What a thread waiting for this file to change should watch in EVENTS: what each
+/// kind bumps. Those with no key of their own only ever get a plain bump.
+pub(super) fn poll_mask(f: &File, t: &Thread, depth: u32) -> u64 {
+    use super::wait::{key_bit, plain_bit};
+    match &f.kind {
+        Kind::Event(e) => key_bit(e.key()),
+        Kind::Timer(tf) => key_bit(tf.key()),
+        Kind::Signal(_) => key_bit(Arc::as_ptr(&t.proc) as usize),
+        Kind::Epoll(ep) => ep.mask(t, depth),
+        Kind::Socket(s) => s.mask(),
+        Kind::Pipe(end) => key_bit(Arc::as_ptr(&end.pipe) as usize),
+        Kind::Binder(b) => key_bit(binder::poll_key(b.id)),
+        Kind::Evdev(c) => key_bit(Arc::as_ptr(c) as usize),
+        Kind::Inotify(i) => key_bit(Arc::as_ptr(i) as usize),
+        Kind::Drm(_) | Kind::DmaBuf(_) | Kind::Sync(_) => key_bit(super::drm::GPU_KEY),
+        _ => plain_bit(),
+    }
+}
 
 /// Current poll(2) readiness of an open file. `depth` bounds nested epolls.
 pub(super) fn poll_ready(f: &File, t: &Thread, depth: u32) -> u16 {
@@ -1840,9 +1859,13 @@ impl Kernel {
         };
         let wanted = |fd: usize, s: &Vec<u64>| !s.is_empty() && s[fd / 64] & 1 << (fd % 64) != 0;
         let old = self.swap_mask(t, sigmask)?;
+        let mut watching = 0;
         let r = loop {
-            let seen = EVENTS.current();
+            // As the last pass found them. A descriptor closed and reopened since is
+            // a surprise this finds out about from its timeout.
+            let seen = EVENTS.watch(watching);
             let mut out = [vec![0u64; words], vec![0u64; words], vec![0u64; words]];
+            let mut mask = 0;
             let mut count = 0;
             let mut timer: Option<Instant> = None;
             {
@@ -1860,6 +1883,7 @@ impl Kernel {
                     if let Kind::Timer(tf) = &f.kind {
                         timer = timer.into_iter().chain(tf.deadline()).min();
                     }
+                    mask |= poll_mask(&f, t, 0);
                     let r = poll_ready(&f, t, 0);
                     for (i, mask) in [POLLIN | POLLHUP | POLLERR, POLLOUT | POLLERR, POLLPRI].iter().enumerate() {
                         if wanted(fd, &sets[i]) && r & mask != 0 {
@@ -1882,6 +1906,11 @@ impl Kernel {
             if t.interrupted() {
                 break Err(EINTR);
             }
+            // Something this pass was the first to watch may have changed before it looked.
+            if mask != watching {
+                watching = mask;
+                continue;
+            }
             EVENTS.wait(seen, nap(deadline, timer));
         };
         self.restore_mask(t, old, &r);
@@ -1889,9 +1918,11 @@ impl Kernel {
     }
 
     fn ppoll_wait(&self, t: &Thread, fds: u64, mut raw: Vec<u8>, deadline: Option<Instant>) -> Result<i64, i64> {
+        let mut watching = 0;
         loop {
-            let seen = EVENTS.current();
+            let seen = EVENTS.watch(watching);
             let mut ready = 0;
+            let mut mask = 0;
             let mut timer: Option<Instant> = None;
             {
                 for p in raw.chunks_exact_mut(8) {
@@ -1907,6 +1938,7 @@ impl Kernel {
                                 if let Kind::Timer(tf) = &f.kind {
                                     timer = timer.into_iter().chain(tf.deadline()).min();
                                 }
+                                mask |= poll_mask(&f, t, 0);
                                 poll_ready(&f, t, 0) & (events | POLLERR | POLLHUP)
                             }
                             Err(_) => POLLNVAL,
@@ -1925,6 +1957,10 @@ impl Kernel {
             if t.interrupted() {
                 return Err(EINTR);
             }
+            if mask != watching {
+                watching = mask;
+                continue;
+            }
             EVENTS.wait(seen, nap(deadline, timer));
         }
     }
@@ -1939,7 +1975,7 @@ impl Kernel {
         let old = self.swap_mask(t, sigmask)?;
         let mut fell_back = false;
         let r = loop {
-            let seen = EVENTS.current();
+            let seen = EVENTS.watch(ep.mask(t, 0));
             let ready = ep.collect(t, max.min(1024) as usize, 0);
             if !ready.is_empty() {
                 if fell_back && late_wake_log() {
@@ -2078,7 +2114,7 @@ impl super::drm::Io for DrmIo<'_> {
     }
     fn wait_until(&mut self, pred: &mut dyn FnMut() -> bool) -> Result<(), i64> {
         loop {
-            let seen = super::wait::EVENTS.current();
+            let seen = super::wait::EVENTS.watch_key(super::drm::GPU_KEY);
             if pred() {
                 return Ok(());
             }

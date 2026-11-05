@@ -159,7 +159,9 @@ impl Device {
     fn post(&self, events: &[(u16, u16, i32)]) {
         let now = since_boot();
         let clients = self.clients.lock().unwrap();
+        let mut woken = Vec::new();
         for c in clients.iter().filter_map(Weak::upgrade) {
+            woken.push(Arc::as_ptr(&c) as usize);
             let mut q = c.queue.lock().unwrap();
             for &(ty, code, value) in events.iter().chain(&[(EV_SYN, SYN_REPORT, 0)]) {
                 if q.len() >= QUEUE_MAX {
@@ -169,7 +171,9 @@ impl Device {
             }
         }
         drop(clients);
-        EVENTS.bump();
+        for c in woken {
+            EVENTS.bump_key(c);
+        }
     }
 }
 
@@ -427,7 +431,7 @@ impl Client {
             return Err(EINVAL);
         }
         loop {
-            let seen = EVENTS.current();
+            let seen = EVENTS.watch_key(self as *const Self as usize);
             {
                 let mut q = self.queue.lock().unwrap();
                 if !q.is_empty() {

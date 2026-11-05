@@ -650,24 +650,7 @@ mod tests {
     }
 
     /// Enough of a hypervisor for tmpfs: memory, no vCPUs.
-    struct NoHv;
-    impl crate::hv::Hypervisor for NoHv {
-        fn map_ram(&self, _: *mut u8, _: u64, _: u64) -> Result<(), String> {
-            Ok(())
-        }
-        fn unmap_ram(&self, _: u64, _: u64) -> Result<(), String> {
-            Ok(())
-        }
-        fn kernel_pages(&self, _: &mut dyn FnMut() -> (u64, *mut u8)) -> Vec<crate::hv::KernelPage> {
-            Vec::new()
-        }
-        fn create_vcpu(&self, _: crate::hv::PageTableRoot, _: &crate::hv::CpuState) -> Result<Box<dyn crate::hv::Vcpu>, String> {
-            Err("no vCPUs in tests".into())
-        }
-        fn max_vcpus(&self) -> usize {
-            0
-        }
-    }
+    use crate::hv::NoHv;
 
     #[test]
     fn mount_table() {

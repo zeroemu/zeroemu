@@ -164,6 +164,7 @@ pub fn open(fb_w: u32, fb_h: u32) -> Result<NativeWindow, String> {
         }
         let title = msg_cstr(cls("NSString"), sel("stringWithUTF8String:"), "droidrt");
         msg_id(window, sel("setTitle:"), title);
+        msg_bool(window, sel("setReleasedWhenClosed:"), 0); // this stays pointed at it
         msg_void(window, sel("center"));
         msg_id(window, sel("makeKeyAndOrderFront:"), std::ptr::null_mut());
         msg_bool(app, sel("activateIgnoringOtherApps:"), 1);
@@ -351,6 +352,14 @@ fn drain_ui() {
 /// belong to it wherever they happen.
 static TOUCHING: AtomicBool = AtomicBool::new(false);
 /// NSEventModifierFlags seen last, to tell a modifier's press from its release.
+/// Whether the window was on screen, when last looked at.
+static WAS_VISIBLE: AtomicBool = AtomicBool::new(false);
+static ON_CLOSED: std::sync::OnceLock<Box<dyn Fn() + Send + Sync>> = std::sync::OnceLock::new();
+
+pub fn on_closed(f: Box<dyn Fn() + Send + Sync>) {
+    let _ = ON_CLOSED.set(f);
+}
+
 /// Whether the window had the keyboard, when last looked at.
 static WAS_KEY: AtomicBool = AtomicBool::new(false);
 /// The frame's size, for mapping the pointer onto the frame.
@@ -581,6 +590,16 @@ fn check_lost_input() {
         return;
     }
     unsafe {
+        // Off screen, and not because it was minimized or the app hidden: closed.
+        let visible = msg_i64_ret(window, sel("isVisible")) & 1 != 0;
+        if WAS_VISIBLE.swap(visible, Ordering::Relaxed)
+            && !visible
+            && msg_i64_ret(window, sel("isMiniaturized")) & 1 == 0
+            && msg_i64_ret(APP.load(Ordering::Acquire), sel("isHidden")) & 1 == 0
+            && let Some(f) = ON_CLOSED.get()
+        {
+            f();
+        }
         let is_key = msg_i64_ret(window, sel("isKeyWindow")) & 1 != 0;
         if WAS_KEY.swap(is_key, Ordering::Relaxed) && !is_key {
             evdev::release_keys();

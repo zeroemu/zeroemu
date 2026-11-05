@@ -6,9 +6,10 @@
 //! registers and destroys its vCPU, and makes a new one when it next runs
 //! guest code. While parked, its register state is answered from the copy.
 //!
-//! A thread waiting for a vCPU kicks the one that has held its vCPU longest,
-//! which gives it up at its next exit, so threads spinning in user code
-//! cannot starve the rest.
+//! The first thread in line for a vCPU kicks those that have held theirs longest,
+//! which give them up at their next exit, so threads spinning in user code cannot
+//! starve the rest. Everyone else in line sleeps until it is first: hundreds of them
+//! polling this lock would be a load all of its own.
 //!
 //! Background threads also need a place in a much smaller pool, the cores a phone
 //! would have kept them to. There is nowhere better to hold them back: they
@@ -19,20 +20,20 @@ use crate::hv::{CpuState, Exit, Hypervisor, Kick, PageTableRoot, SyscallRegs, Ur
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-/// How long a waiter waits before kicking the longest holder, and how long a
-/// holder keeps its vCPU once others wait.
+/// How long a holder keeps its vCPU once others wait.
 const SLICE: Duration = Duration::from_millis(10);
 
 pub struct Pool {
     max: usize,
     /// Background threads' places, when this is the whole pool.
     background: Option<Arc<Pool>>,
+    /// No guest code runs from now on.
+    frozen: AtomicBool,
     st: Mutex<PoolState>,
-    cv: Condvar,
     /// Threads waiting for a vCPU (read without the lock on every exit).
     waiting: AtomicUsize,
     used: AtomicUsize,
@@ -41,10 +42,18 @@ pub struct Pool {
 #[derive(Default)]
 struct PoolState {
     next: u64,
-    holders: HashMap<u64, (Instant, Arc<dyn Kick>)>,
-    /// Waiters' tickets, served in order: a thread that just gave its vCPU
-    /// up must not take it straight back past the threads it yielded to.
-    queue: VecDeque<u64>,
+    holders: HashMap<u64, (Instant, Arc<Thread>)>,
+    /// Waiters, served in order: a thread that just gave its vCPU up must not take it
+    /// straight back past the threads it yielded to.
+    queue: VecDeque<(u64, Arc<Condvar>)>,
+}
+
+impl PoolState {
+    fn wake_first(&self) {
+        if let Some((_, cv)) = self.queue.front() {
+            cv.notify_one();
+        }
+    }
 }
 
 impl Pool {
@@ -55,15 +64,21 @@ impl Pool {
     }
 
     fn sized(max: usize, background: Option<Arc<Pool>>) -> Arc<Pool> {
-        Arc::new(Pool { max: max.max(1), background, st: Mutex::default(), cv: Condvar::new(), waiting: AtomicUsize::new(0), used: AtomicUsize::new(0) })
+        Arc::new(Pool { max: max.max(1), background, frozen: AtomicBool::new(false), st: Mutex::default(), waiting: AtomicUsize::new(0), used: AtomicUsize::new(0) })
     }
 
-    fn add_holder(&self, kick: Arc<dyn Kick>) -> u64 {
+    fn add_holder(&self, thread: &Arc<Thread>) -> u64 {
         let mut st = self.st.lock().unwrap();
         st.next += 1;
         let id = st.next;
-        st.holders.insert(id, (Instant::now(), kick));
+        st.holders.insert(id, (Instant::now(), thread.clone()));
         id
+    }
+
+    /// Stops guest code: from now on threads wait at the door. Kicking those already
+    /// inside is the caller's business. This is the end: nothing thaws them.
+    pub fn freeze(&self) {
+        self.frozen.store(true, Ordering::Release);
     }
 
     /// Few enough free vCPUs that blocked threads should give theirs back.
@@ -71,48 +86,54 @@ impl Pool {
         self.waiting.load(Ordering::Relaxed) > 0 || self.used.load(Ordering::Relaxed) * 4 >= self.max * 3
     }
 
-    /// Takes a vCPU slot, waiting for one; None if the thread is dying meanwhile.
-    fn acquire(&self, t: &Thread) -> Option<()> {
+    /// Takes a place, waiting for one. False if there is no point any more: the thread
+    /// is dying, or `still_wanted` says it no longer needs one.
+    fn acquire(&self, t: &Thread, still_wanted: impl Fn() -> bool) -> bool {
         let mut st = self.st.lock().unwrap();
+        if t.dying.load(Ordering::Acquire) {
+            return false;
+        }
         if self.used.load(Ordering::Relaxed) < self.max && st.queue.is_empty() {
             self.used.fetch_add(1, Ordering::Relaxed);
-            return Some(());
+            return true;
         }
         st.next += 1;
         let ticket = st.next;
-        st.queue.push_back(ticket);
+        let cv = Arc::new(Condvar::new());
+        st.queue.push_back((ticket, cv.clone()));
         self.waiting.fetch_add(1, Ordering::Relaxed);
-        let mut last_kick = Instant::now();
         let got = loop {
-            if self.used.load(Ordering::Relaxed) < self.max && st.queue.front() == Some(&ticket) {
+            if t.dying.load(Ordering::Acquire) || !still_wanted() {
+                break false;
+            }
+            let first = st.queue.front().is_some_and(|(x, _)| *x == ticket);
+            if first && self.used.load(Ordering::Relaxed) < self.max {
                 self.used.fetch_add(1, Ordering::Relaxed);
-                break Some(());
+                break true;
             }
-            if t.dying.load(Ordering::Acquire) {
-                break None;
-            }
-            if last_kick.elapsed() >= SLICE {
-                // Each waiter nudges a different long-running holder.
-                let pos = st.queue.iter().position(|&x| x == ticket).unwrap_or(0);
-                let mut holders: Vec<_> = st.holders.values().collect();
+            if first {
+                // As many of the longest holders as there are threads in line, once
+                // they have had their slice. One running guest code gives up its place
+                // at the exit this forces, and one asleep in the kernel when it wakes.
+                let mut holders: Vec<_> = st.holders.values().filter(|(since, _)| since.elapsed() >= SLICE).collect();
                 holders.sort_by_key(|(since, _)| *since);
-                if let Some((_, k)) = holders.get(pos) {
-                    k.kick();
+                for (_, holder) in holders.iter().take(st.queue.len()) {
+                    holder.kick();
                 }
-                last_kick = Instant::now();
             }
-            st = self.cv.wait_timeout(st, SLICE / 2).unwrap().0;
+            st = t.wait_for_turn(&cv, st, if first { SLICE / 2 } else { super::IDLE });
         };
-        st.queue.retain(|&x| x != ticket);
+        st.queue.retain(|(x, _)| *x != ticket);
         self.waiting.fetch_sub(1, Ordering::Relaxed);
-        self.cv.notify_all();
+        // It is first now, and there may be room for it too.
+        st.wake_first();
         got
     }
 
     fn release(&self) {
-        let _st = self.st.lock().unwrap();
+        let st = self.st.lock().unwrap();
         self.used.fetch_sub(1, Ordering::Relaxed);
-        self.cv.notify_all();
+        st.wake_first();
     }
 }
 
@@ -142,34 +163,42 @@ thread_local! {
 }
 
 impl Slot {
-    fn ensure(&self) -> Result<(), String> {
+    /// Makes the vCPU if there is none: true if it did.
+    fn ensure(&self) -> Result<bool, String> {
         let mut i = self.inner.borrow_mut();
         if i.vcpu.is_some() {
-            return Ok(());
+            return Ok(false);
         }
+        // Waiting in line for a background place can outlast being background.
         let gate = self.gate();
-        if let Some(g) = gate {
-            g.acquire(&self.thread).ok_or("dying")?;
+        let gated = gate.is_some_and(|g| g.acquire(&self.thread, || self.thread.urgency() == Urgency::Background));
+        if gate.is_some() && !gated && self.thread.dying.load(Ordering::Acquire) {
+            return Err("dying".into());
         }
-        let made = self.pool.acquire(&self.thread).ok_or_else(|| "dying".to_string()).and_then(|()| {
-            self.hv.create_vcpu(i.root, &i.state).inspect_err(|_| self.pool.release())
-        });
-        let v = match made {
+        let gate = gate.filter(|_| gated);
+        let release_gate = || {
+            if let Some(g) = gate {
+                g.release();
+            }
+        };
+        if !self.pool.acquire(&self.thread, || true) {
+            release_gate();
+            return Err("dying".into());
+        }
+        let v = match self.hv.create_vcpu(i.root, &i.state) {
             Ok(v) => v,
             Err(e) => {
-                if let Some(g) = gate {
-                    g.release();
-                }
+                self.pool.release();
+                release_gate();
                 return Err(e);
             }
         };
-        let kick = v.kicker();
-        let id = self.pool.add_holder(kick.clone());
-        i.gated = gate.map(|g| g.add_holder(kick.clone()));
-        *self.thread.kick.lock().unwrap() = Some(kick);
+        let id = self.pool.add_holder(&self.thread);
+        i.gated = gate.map(|g| g.add_holder(&self.thread));
+        *self.thread.kick.lock().unwrap() = Some(v.kicker());
         i.held = Some((id, Instant::now()));
         i.vcpu = Some(v);
-        Ok(())
+        Ok(true)
     }
 
     /// The pool this thread must also take a place in, as things stand.
@@ -177,15 +206,22 @@ impl Slot {
         self.pool.background.as_deref().filter(|_| self.thread.urgency() == Urgency::Background)
     }
 
-    /// The thread's urgency may have changed: tells the host, and brings its place
-    /// in the background pool into line.
-    fn follow_urgency(&self) {
+    /// Tells the host how urgent this thread is now.
+    fn tell_host(&self) -> Urgency {
         let want = self.thread.urgency();
         let mut i = self.inner.borrow_mut();
         if i.told != Some(want) {
             set_thread_urgency(want);
             i.told = Some(want);
         }
+        want
+    }
+
+    /// The thread's urgency may have changed: tells the host, and brings its place
+    /// in the background pool into line.
+    fn follow_urgency(&self) {
+        let want = self.tell_host();
+        let mut i = self.inner.borrow_mut();
         let background = want == Urgency::Background;
         if background && i.vcpu.is_some() && i.gated.is_none() {
             drop(i);
@@ -266,9 +302,23 @@ pub fn blocking() {
 
 impl Vcpu for LazyVcpu {
     fn run(&mut self) -> Exit {
+        while self.0.pool.frozen.load(Ordering::Acquire) {
+            std::thread::sleep(Duration::from_millis(50));
+        }
         self.0.follow_urgency();
-        if let Err(e) = self.0.ensure() {
-            return if e == "dying" { Exit::Interrupted } else { Exit::Fault { pc: 0, addr: 0, detail: e } };
+        match self.0.ensure() {
+            Err(e) => return if e == "dying" { Exit::Interrupted } else { Exit::Fault { pc: 0, addr: 0, detail: e } },
+            Ok(true) => {
+                // It may have waited: for a new urgency to take effect, or for a signal
+                // or exit that was sent when there was no vCPU to kick. Any sent from
+                // here on find this one.
+                self.0.tell_host();
+                let t = &self.0.thread;
+                if t.interrupted() || self.0.pool.frozen.load(Ordering::Acquire) {
+                    return Exit::Interrupted;
+                }
+            }
+            Ok(false) => {}
         }
         let exit = self.0.inner.borrow_mut().vcpu.as_mut().unwrap().run();
         self.0.maybe_yield();

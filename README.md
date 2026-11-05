@@ -35,7 +35,7 @@ arm64 Android on Apple Silicon and Windows on ARM, x86_64 Android on x86_64 PCs.
 | M2: demand paging, threads, futex, `fork`/`execve`/`wait4`, pipes, signals | done on macOS; x86_64 written (signal frames, TLB shootdown), untested |
 | M3: binder, `servicemanager`, property service, `logd`, `init` | done (macOS) |
 | M4: SurfaceFlinger, with Android's graphics stack unmodified on a virtio-gpu device backed by the Android Emulator's gfxstream renderer | done (macOS) |
-| M5: zygote, ART, `system_server`, launcher, apps | done (macOS): Android 16's Pixel launcher in the window about 24 s after start, `boot_completed` by about 33 s on a quiet host |
+| M5: zygote, ART, `system_server`, launcher, apps | done (macOS): Android 16's Pixel launcher in the window about 24 s after start on a first boot and about 11 s after that |
 | M6: input from the window | done (macOS): mouse as touch, scroll as a finger drag, keyboard; Chrome and Play Store open and draw from a tap |
 | Smoothness | in progress: see below |
 | Windows | no window and never run; compiles (`cargo check --target x86_64-pc-windows-msvc`) |
@@ -57,8 +57,8 @@ Known gaps:
 
 - No network: AF_INET sockets exist, for netd's iptables, but connecting fails as
   on a device with no route. Netlink answers like a machine with no interfaces.
-- `/data` lives in memory, so every boot is a first boot: dex2oat runs over the apps
-  that have no compiled code in the image.
+- `/data` is only saved at a clean exit, and held in memory while running. A kill or
+  a crash loses what happened since the last boot's save.
 - userfaultfd has only what ART's compacting collector uses: SIGBUS mode, on private
   anonymous memory.
 - Display frames are read back from the renderer into host memory, which limits
@@ -107,7 +107,11 @@ Android log records (`liblog`, i.e. `ALOGI` and friends) print to stderr as
 sets the lowest priority shown (default `I`; `S` silences them).
 
 `--boot` runs Android's own `init` in a window (`--headless` for none,
-`DROIDRT_BACKGROUND=1` to open it without taking focus). It needs the Android
+`DROIDRT_BACKGROUND=1` to open it without taking focus). A device keeps its `/data`
+and `/metadata` between boots, in one file per system image in the user's application
+data, saved when the window closes, on SIGINT or SIGTERM, or when Android shuts down:
+`--data <file>` puts it elsewhere, `--ephemeral` keeps nothing, and `--wipe-data` starts
+over. It needs the Android
 Emulator installed: droidrt loads its GPU renderer, `libgfxstream_backend`,
 from the SDK (or `DROIDRT_GFXSTREAM=<path>`), with the SDK's ANGLE on Metal
 underneath (`ANGLE_DEFAULT_PLATFORM` overrides). For development, `--push

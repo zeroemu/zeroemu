@@ -269,7 +269,7 @@ fn walk(phys: &PhysMem, owned: &mut Vec<u64>, mut table: u64, level: usize, va: 
         }
         let t = phys.alloc()?;
         owned.push(t);
-        phys.write_u64(slot, paging::table(t));
+        phys.write_pte(slot, paging::table(t));
         table = t;
     }
     Ok(Some(table + paging::index(va, leaf) as u64 * 8))
@@ -626,7 +626,7 @@ impl AddressSpace {
         let copy = self.phys.alloc()?;
         unsafe { std::ptr::copy_nonoverlapping(self.phys.host(frame), self.phys.host(copy), PAGE as usize) };
         let e = paging::user_page(copy, prot);
-        self.phys.write_u64(slot, e);
+        self.phys.write_pte(slot, e);
         // Sibling threads may read it through old entries until the flush.
         self.stale.frames.push(frame);
         self.tlb_gen += 1;
@@ -817,7 +817,7 @@ impl AddressSpace {
                     unsafe { std::ptr::copy_nonoverlapping(page.as_ptr(), self.phys.host(frame), page.len()) };
                 }
                 // It wasn't valid before, so no TLB holds it.
-                self.phys.write_u64(slot, paging::user_page(frame, prot));
+                self.phys.write_pte(slot, paging::user_page(frame, prot));
                 Ok(())
             })();
             if let Err(e) = filled {
@@ -915,7 +915,7 @@ impl AddressSpace {
             return Ok(());
         }
         let frame = self.populate(start, &vma, page).map_err(|_| SEGV_MAPERR)?;
-        self.phys.write_u64(slot, paging::user_page(frame, prot));
+        self.phys.write_pte(slot, paging::user_page(frame, prot));
         Ok(())
     }
 
@@ -964,7 +964,7 @@ impl AddressSpace {
             }
             let frame = self.populate(start, &vma, page)?;
             e = paging::user_page(frame, vma.prot);
-            self.phys.write_u64(slot, e);
+            self.phys.write_pte(slot, e);
         } else if write && !matches!(vma.backing, Backing::Shared { .. } | Backing::Dev { .. }) && !self.phys.is_sole_owner(paging::addr(e)) {
             // The kernel writes past the page tables: it must not reach a frame
             // another process still shares.

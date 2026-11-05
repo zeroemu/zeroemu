@@ -174,6 +174,10 @@ struct Txn {
     from: Option<(ProcId, i32)>,
     /// What the calling thread was itself answering, when it made this call.
     from_parent: Option<TxnId>,
+    /// The caller's nice, which a sync call runs at if that's higher than the handler's.
+    caller_nice: i32,
+    /// The handler's own, while it handles this.
+    saved_nice: i32,
     node: Option<NodeId>,
     code: u32,
     flags: u32,
@@ -200,6 +204,8 @@ struct BProc {
     area: Option<(u64, u64)>,
     allocs: BTreeMap<u64, Alloc>,
     max_threads: u32,
+    /// The opener's nice: what its idle threads go back to.
+    default_nice: i32,
     requested: u32,
     started: u32,
     dead: bool,
@@ -245,7 +251,7 @@ fn world() -> std::sync::MutexGuard<'static, Option<World>> {
 
 /// One open of a binder device (normally one per process).
 pub struct BinderFile {
-    id: ProcId,
+    pub(super) id: ProcId,
 }
 
 impl World {
@@ -268,7 +274,7 @@ impl World {
             th.cv.notify_one();
         }
         if p.polled {
-            EVENTS.bump();
+            EVENTS.bump_key(poll_key(id));
         }
     }
 }
@@ -314,6 +320,7 @@ pub fn open(t: &Thread, rdev: u64) -> Option<BinderFile> {
             area: None,
             allocs: BTreeMap::new(),
             max_threads: 0,
+            default_nice: t.nice(),
             requested: 0,
             started: 0,
             dead: false,
@@ -350,6 +357,11 @@ pub fn flush(b: &BinderFile) {
             th.cv.notify_one();
         }
     }
+}
+
+/// What a poller of this binder fd watches.
+pub fn poll_key(id: ProcId) -> usize {
+    (id as usize) << 6
 }
 
 pub fn readable(b: &BinderFile, tid: i32) -> bool {
@@ -1047,6 +1059,9 @@ impl Kernel {
             }
             w.thread(me, t.tid).stack.pop();
             answering = Some(txn);
+            if let Some(x) = w.txns.get(&txn) {
+                t.set_nice(x.saved_nice);
+            }
             match w.txns.get(&txn).and_then(|x| x.from).filter(|(fp, _)| w.procs.contains_key(fp)) {
                 Some((fp, ft)) => {
                     // Whoever waits for this has it on top of its stack, or something is
@@ -1349,6 +1364,8 @@ impl Kernel {
             Txn {
                 from: (!out.reply && !oneway).then_some((me, t.tid)),
                 from_parent,
+                caller_nice: t.nice(),
+                saved_nice: 0,
                 node,
                 code: out.code,
                 flags: out.flags,
@@ -1413,6 +1430,11 @@ impl Kernel {
                 // for the process. Nested incoming calls would make its replies
                 // pop the wrong transaction and reach the wrong callers.
                 let idle = th.stack.is_empty() && th.todo.is_empty();
+                // Waiting for the process's work, a thread is at the process's priority:
+                // a one-way call leaves its mark, with no reply to put it back.
+                if idle && looper {
+                    t.set_nice(w.procs[&b.id].default_nice);
+                }
                 while out.len() + 80 <= max {
                     let work = match w.thread(b.id, t.tid).todo.pop_front() {
                         Some(x) => x,
@@ -1422,7 +1444,7 @@ impl Kernel {
                         },
                         None => break,
                     };
-                    let stop = self.emit(w, b.id, t.tid, work, &mut out);
+                    let stop = self.emit(w, t, b.id, work, &mut out);
                     if stop {
                         break;
                     }
@@ -1465,12 +1487,14 @@ impl Kernel {
             if let Some(th) = g.as_mut().unwrap().procs.get_mut(&b.id).and_then(|p| p.threads.get_mut(&t.tid)) {
                 th.parked = false;
             }
+            yielded = false; // others may be waiting for a vCPU by now
         }
     }
 
     /// Writes one work item; returns true when the read should end here
     /// (after a transaction or reply, so the thread can act on it).
-    fn emit(&self, w: &mut World, me: ProcId, tid: i32, work: Work, out: &mut Vec<u8>) -> bool {
+    fn emit(&self, w: &mut World, t: &Thread, me: ProcId, work: Work, out: &mut Vec<u8>) -> bool {
+        let tid = t.tid;
         match work {
             Work::Complete => put32(out, BR_TRANSACTION_COMPLETE),
             Work::DeadReply => {
@@ -1553,10 +1577,25 @@ impl Kernel {
                 let oneway = x.flags & TF_ONE_WAY != 0;
                 if reply {
                     w.txns.remove(&id);
-                } else if !oneway {
-                    w.thread(me, tid).stack.push(id); // answered by this thread's BC_REPLY
-                } else {
+                    return true;
+                }
+                // As Linux: a call runs at its caller's priority if that is higher, and
+                // at least at what the object asks for. A UI thread waiting on a binder
+                // thread would otherwise wait on whatever that thread happens to be.
+                let (caller_nice, min) = (x.caller_nice, x.node.and_then(|n| w.nodes.get(&n)).map_or(0, |n| n.flags as u8 as i8 as i32));
+                let saved = t.nice();
+                if !oneway && caller_nice < min {
+                    t.set_nice(caller_nice);
+                } else if !oneway || saved > min {
+                    t.set_nice(min);
+                }
+                if oneway {
                     w.txns.remove(&id);
+                } else {
+                    if let Some(x) = w.txns.get_mut(&id) {
+                        x.saved_nice = saved;
+                    }
+                    w.thread(me, tid).stack.push(id); // answered by this thread's BC_REPLY
                 }
                 return true;
             }

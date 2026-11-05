@@ -17,6 +17,8 @@ typedef unsigned int u32;
 #define NR_exit_group 94
 #define NR_nanosleep 101
 #define NR_kill 129
+#define NR_setpriority 140
+#define NR_getpriority 141
 #define NR_clone 220
 #define NR_mmap 222
 #define NR_wait4 260
@@ -82,6 +84,7 @@ static void check(int cond, const char *name) {
 #define CODE_RELAY 21
 #define CODE_RELAYED 22
 #define CODE_CHAIN 23
+#define CODE_PRIORITY 24
 
 struct bwr { u64 wsize, wcons, wbuf, rsize, rcons, rbuf; };
 struct txn {
@@ -201,6 +204,12 @@ static void __attribute__((noreturn)) third_party(void) {
             acquire(fd, h);
             call_for_reply(fd, h, CODE_RELAYED, 0);
         }
+        if (t->code == CODE_PRIORITY) {
+            // The reply's size says what this thread is running at: 20 - nice.
+            static char anything[64];
+            reply(fd, anything, sys(NR_getpriority, 0, 0));
+            continue;
+        }
         reply(fd, "YYYY", 4);
     }
 }
@@ -299,6 +308,13 @@ int cmain(void) {
     check(next_cmd(mgr, 0) == BR_TRANSACTION_COMPLETE, "the callback's reply finds no one and completes");
     struct txn *y_said = 0;
     check(next_cmd(mgr, &y_said) == BR_REPLY && y_said->data_size == 4, "Y hears of the death, and answers");
+
+    // A call runs at its caller's priority if that's higher, and otherwise at nice 0.
+    sys(NR_setpriority, 0, 0, -5);
+    check(call_for_reply(mgr, hy, CODE_PRIORITY, 25), "a handler takes on a higher priority from its caller");
+    sys(NR_setpriority, 0, 0, 5);
+    check(call_for_reply(mgr, hy, CODE_PRIORITY, 20), "but not a lower one");
+    sys(NR_setpriority, 0, 0, 0);
 
     // test -> Y -> Z -> test: the last call belongs on the thread at the head of
     // the chain, though Z's own stack never mentions this process. Elsewhere it

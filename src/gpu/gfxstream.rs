@@ -369,11 +369,12 @@ fn flush_stats(took: Duration, frame: &[u8]) {
     let elapsed = w.since.elapsed();
     if elapsed >= Duration::from_secs(5) {
         eprintln!(
-            "droidrt: display {:.1} fps, {} black, readback avg {:.1} ms, worst {:.1} ms",
+            "droidrt: display {:.1} fps, {} black, readback avg {:.1} ms, worst {:.1} ms; {}",
             w.frames as f64 / elapsed.as_secs_f64(),
             w.black,
             w.total.as_secs_f64() * 1000.0 / w.frames as f64,
-            w.worst.as_secs_f64() * 1000.0
+            w.worst.as_secs_f64() * 1000.0,
+            crate::kernel::wakeup_stats(elapsed)
         );
         *g = None;
     }

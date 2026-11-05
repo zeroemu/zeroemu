@@ -5,7 +5,7 @@ use super::signal::SigInfo;
 use super::wait::EVENTS;
 use super::{ERESTARTSYS, POLL, Thread};
 use crate::errno::*;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -22,6 +22,11 @@ impl EventFd {
         EventFd { count: Mutex::new(initval), semaphore: flags & EFD_SEMAPHORE != 0 }
     }
 
+    /// What a waiter on this watches.
+    pub fn key(&self) -> usize {
+        self as *const Self as usize
+    }
+
     pub fn ready_in(&self) -> bool {
         *self.count.lock().unwrap() > 0
     }
@@ -32,14 +37,14 @@ impl EventFd {
 
     pub fn read(&self, t: &Thread, nonblock: bool) -> Result<u64, i64> {
         loop {
-            let seen = EVENTS.current();
+            let seen = EVENTS.watch_key(self.key());
             {
                 let mut c = self.count.lock().unwrap();
                 if *c > 0 {
                     let v = if self.semaphore { 1 } else { *c };
                     *c -= v;
                     drop(c);
-                    EVENTS.bump();
+                    EVENTS.bump_key(self.key());
                     return Ok(v);
                 }
             }
@@ -58,13 +63,13 @@ impl EventFd {
             return Err(EINVAL);
         }
         loop {
-            let seen = EVENTS.current();
+            let seen = EVENTS.watch_key(self.key());
             {
                 let mut c = self.count.lock().unwrap();
                 if COUNTER_MAX - *c >= v {
                     *c += v;
                     drop(c);
-                    EVENTS.bump();
+                    EVENTS.bump_key(self.key());
                     return Ok(());
                 }
             }
@@ -119,6 +124,12 @@ pub(super) fn deadline_for(clock: u64, boot: Instant, value: Duration, abstime: 
 }
 
 impl TimerFd {
+    /// What a waiter on this watches. Its expiries are noticed by waiters' own timeouts:
+    /// a change of plan is all there is to wake them for.
+    pub fn key(&self) -> usize {
+        self as *const Self as usize
+    }
+
     pub fn new(clock: u64, boot: Instant) -> Result<TimerFd, i64> {
         // REALTIME, MONOTONIC, BOOTTIME, REALTIME_ALARM, BOOTTIME_ALARM.
         if !matches!(clock, 0 | 1 | 7 | 8 | 9) {
@@ -164,7 +175,7 @@ impl TimerFd {
         st.interval = interval.min(super::wait::CENTURY);
         st.next = (!value.is_zero()).then(|| deadline_for(self.clock, self.boot, value, flags & TFD_TIMER_ABSTIME != 0));
         drop(st);
-        EVENTS.bump();
+        EVENTS.bump_key(self.key());
         old
     }
 
@@ -181,7 +192,7 @@ impl TimerFd {
 
     pub fn read(&self, t: &Thread, nonblock: bool) -> Result<u64, i64> {
         loop {
-            let seen = EVENTS.current();
+            let seen = EVENTS.watch_key(self.key());
             let wait = {
                 let mut st = self.st.lock().unwrap();
                 Self::tick(&mut st);
@@ -229,7 +240,7 @@ impl SignalFd {
             return Err(EINVAL);
         }
         loop {
-            let seen = EVENTS.current();
+            let seen = EVENTS.watch_key(Arc::as_ptr(&t.proc) as usize);
             let mut out = Vec::new();
             while out.len() + 128 <= max {
                 let Some((sig, info)) = self.take(t) else { break };

@@ -88,7 +88,6 @@ impl Kernel {
         };
         let th = Thread::new(tid, t.proc.clone(), t.mask.load(Ordering::Relaxed), own_files);
         *th.attrs.lock().unwrap() = t.attrs.lock().unwrap().fork();
-        th.inherit_sched(t);
         th.sec.inherit(&t.sec);
         {
             let mut mm = t.proc.mm();
@@ -102,7 +101,13 @@ impl Kernel {
         if flags & CLONE_CHILD_CLEARTID != 0 {
             th.clear_child_tid.store(ctid, Ordering::Relaxed);
         }
-        t.proc.threads.lock().unwrap().push(th.clone());
+        {
+            // One step: a move of the whole process to another cgroup either sees this
+            // thread in the list or happens before it copies its creator's group.
+            let mut threads = t.proc.threads.lock().unwrap();
+            th.inherit_sched(t);
+            threads.push(th.clone());
+        }
         self.spawn(th, state).inspect_err(|_| {
             t.proc.threads.lock().unwrap().retain(|x| x.tid != tid);
         })

@@ -128,7 +128,7 @@ impl Inotify {
         }
         st.drop_watch(wd);
         drop(st);
-        EVENTS.bump();
+        EVENTS.bump_key(self as *const Self as usize);
         Ok(0)
     }
 
@@ -139,7 +139,7 @@ impl Inotify {
     /// read(2): whole events only; a buffer too small for the first is EINVAL.
     pub fn read(&self, t: &Thread, count: usize, nonblock: bool) -> Result<Vec<u8>, i64> {
         loop {
-            let seen = EVENTS.current();
+            let seen = EVENTS.watch_key(self as *const Self as usize);
             {
                 let mut st = self.st.lock().unwrap();
                 if let Some(first) = st.queue.front() {
@@ -193,7 +193,6 @@ pub fn notify(path: &str, mask: u32, cookie: u32) {
     };
     let base = mask & ALL_EVENTS;
     let instances: Vec<Arc<Inotify>> = ALL.lock().unwrap().iter().filter_map(Weak::upgrade).collect();
-    let mut any = false;
     for i in instances {
         let mut st = i.st.lock().unwrap();
         let mut gone = Vec::new();
@@ -220,16 +219,17 @@ pub fn notify(path: &str, mask: u32, cookie: u32) {
                 }
             }
         }
-        any |= !out.is_empty() || !gone.is_empty();
+        let changed = !out.is_empty() || !gone.is_empty();
         for e in out {
             st.push(e);
         }
         for wd in gone {
             st.drop_watch(wd);
         }
-    }
-    if any {
-        EVENTS.bump();
+        drop(st);
+        if changed {
+            EVENTS.bump_key(Arc::as_ptr(&i) as usize);
+        }
     }
 }
 

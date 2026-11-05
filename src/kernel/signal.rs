@@ -286,7 +286,7 @@ impl Kernel {
         }
         proc.pending.lock().unwrap().insert(sig, info);
         if blocked {
-            super::wait::EVENTS.bump(); // a signalfd reader may be polling for it
+            super::wait::EVENTS.bump_key(Arc::as_ptr(proc) as usize); // a signalfd reader may be polling for it
         }
         // Wake a thread that can take it.
         let threads = proc.threads.lock().unwrap();

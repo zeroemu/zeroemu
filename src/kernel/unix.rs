@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 const AF_UNIX: u64 = 1;
-pub const S_IFSOCK: u32 = 0o140000;
+pub use crate::vfs::S_IFSOCK;
 const AT_FDCWD: i64 = -100;
 pub const SOCK_STREAM: u32 = 1;
 pub const SOCK_DGRAM: u32 = 2;
@@ -368,7 +368,7 @@ impl Drop for Socket {
                 names.remove(&key);
             }
         }
-        EVENTS.bump();
+        EVENTS.bump_key(self.key());
     }
 }
 
@@ -387,7 +387,7 @@ impl Socket {
         q.bytes += data.len();
         q.msgs.push_back(Msg { data, off: 0, fds: Vec::new(), from: Vec::new(), cred: Cred { pid: 1, uid: 0, gid: 0, sid: 0 } });
         drop(q);
-        EVENTS.bump();
+        EVENTS.bump_key(client.key());
         true
     }
 
@@ -395,8 +395,8 @@ impl Socket {
     pub fn finish(&self) {
         if let Some(client) = self.peer() {
             client.rx.lock().unwrap().write_closed = true;
+            EVENTS.bump_key(client.key());
         }
-        EVENTS.bump();
     }
 
     /// Feeds what arrived on a kernel-service socket to its service,
@@ -434,7 +434,7 @@ impl Socket {
                 q.msgs.push_back(Msg { data: reply, off: 0, fds: Vec::new(), from: Vec::new(), cred: Cred { pid: 1, uid: 0, gid: 0, sid: 0 } });
             }
         }
-        EVENTS.bump();
+        EVENTS.bump_key(client.key());
     }
 
     fn peer(&self) -> Option<Arc<Socket>> {
@@ -451,6 +451,18 @@ impl Socket {
         sb.connected = true;
         sb.peer = Some(Arc::downgrade(a));
         sb.peer_cred = a_cred;
+    }
+
+    /// What a waiter on this stands for in EVENTS.
+    pub fn key(&self) -> usize {
+        self as *const Self as usize
+    }
+
+    /// What a poller of this watches: its own queue and state, and whether its peer has
+    /// gone or made room.
+    pub fn mask(&self) -> u64 {
+        let peer = self.st.lock().unwrap().peer.as_ref().and_then(Weak::upgrade);
+        super::wait::key_bit(self.key()) | peer.map_or(0, |p| super::wait::key_bit(p.key()))
     }
 
     pub fn poll(&self) -> u16 {
@@ -488,7 +500,7 @@ impl Socket {
     fn deliver(&self, t: &Thread, target: &Arc<Socket>, msg: Msg, nonblock: bool) -> Result<(), i64> {
         let until = deadline(self.st.lock().unwrap().opts.sndtimeo);
         loop {
-            let seen = EVENTS.current();
+            let seen = EVENTS.watch_key(target.key());
             {
                 let mut q = target.rx.lock().unwrap();
                 if q.bytes + msg.data.len() <= QUEUE_LIMIT || q.bytes == 0 {
@@ -496,7 +508,7 @@ impl Socket {
                     q.msgs.push_back(msg);
                     drop(q);
                     target.serve();
-                    EVENTS.bump();
+                    EVENTS.bump_key(target.key());
                     return Ok(());
                 }
             }
@@ -563,7 +575,7 @@ impl Socket {
         let (mut from, mut cred) = (Vec::new(), Cred::default());
         let until = deadline(self.st.lock().unwrap().opts.rcvtimeo);
         loop {
-            let seen = EVENTS.current();
+            let seen = EVENTS.watch(self.mask());
             let (connected, shut_rd, gone) = {
                 let st = self.st.lock().unwrap();
                 if st.backlog.is_some() {
@@ -588,7 +600,7 @@ impl Socket {
                             q.bytes -= m.data.len();
                             fds = m.fds;
                             drop(q);
-                            EVENTS.bump();
+                            EVENTS.bump_key(self.key());
                         }
                         return Ok((out, fds, from, cred, real));
                     }
@@ -626,7 +638,7 @@ impl Socket {
                     if done || (consumed && (q.write_closed || gone)) {
                         drop(q);
                         if !peek {
-                            EVENTS.bump();
+                            EVENTS.bump_key(self.key());
                         }
                         let n = out.len();
                         return Ok((out, fds, from, cred, n));
@@ -796,7 +808,7 @@ impl Kernel {
                 let flags = if no == accept4 { a[3] } else { 0 };
                 let until = deadline(sock.st.lock().unwrap().opts.rcvtimeo);
                 let conn = loop {
-                    let seen = EVENTS.current();
+                    let seen = EVENTS.watch_key(sock.key());
                     {
                         let mut st = sock.st.lock().unwrap();
                         let backlog = st.backlog.as_mut().ok_or(EINVAL)?;
@@ -809,7 +821,7 @@ impl Kernel {
                     }
                     wait_or_give_up(t, seen, until)?;
                 };
-                EVENTS.bump();
+                EVENTS.bump_key(sock.key());
                 // A connection takes SO_PASSCRED from its listener: init sets it
                 // on sockets declared "passcred", and lmkd counts on it.
                 if sock.st.lock().unwrap().passcred {
@@ -870,7 +882,8 @@ impl Kernel {
                 Socket::connect_pair(&sock, &server, client, listen_cred);
                 backlog.push_back(server);
                 drop(lst);
-                EVENTS.bump();
+                EVENTS.bump_key(listener.key());
+                EVENTS.bump_key(sock.key());
                 Ok(0)
             }
             getsockname => {
@@ -921,10 +934,11 @@ impl Kernel {
                     st.shut_wr = true;
                     if let Some(p) = st.peer.as_ref().and_then(Weak::upgrade) {
                         p.rx.lock().unwrap().write_closed = true;
+                        EVENTS.bump_key(p.key());
                     }
                 }
                 drop(st);
-                EVENTS.bump();
+                EVENTS.bump_key(sock.key());
                 Ok(0)
             }
             setsockopt => {

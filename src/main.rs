@@ -23,7 +23,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 const USAGE: &str = "usage: droidrt [--system <system.img>] [--strace] [--display] <program> [args...]
-       droidrt --system <system.img> --boot [--headless] [--push <host>:<guest>]... [--run <cmd>] [init args...]
+       droidrt --system <system.img> --boot [--headless] [--data <file> | --ephemeral] [--wipe-data]
+               [--push <host>:<guest>]... [--run <cmd>] [init args...]
        droidrt --system <system.img> --ls <path> | --cat <path>
        droidrt --gpu-selftest";
 
@@ -59,6 +60,9 @@ fn run() -> Result<i32, String> {
     let mut display = false;
     let mut headless = false;
     let mut gpu_selftest = false;
+    let mut data: Option<PathBuf> = None;
+    let mut ephemeral = false;
+    let mut wipe_data = false;
     while let Some(flag) = args.peek().filter(|a| a.starts_with("--")).cloned() {
         args.next();
         match flag.as_str() {
@@ -80,6 +84,11 @@ fn run() -> Result<i32, String> {
                 push.push((guest.to_string(), std::fs::read(host).map_err(|e| format!("{host}: {e}"))?));
             }
             "--run" => run = Some(args.next().ok_or(USAGE)?),
+            // Where a booted device keeps /data between boots (by default, a file for
+            // this image in the user's application data); not at all; or starting over.
+            "--data" => data = Some(args.next().ok_or(USAGE)?.into()),
+            "--ephemeral" => ephemeral = true,
+            "--wipe-data" => wipe_data = true,
             "--display" => display = true,
             "--headless" => headless = true,
             "--gpu-selftest" => gpu_selftest = true,
@@ -110,7 +119,16 @@ fn run() -> Result<i32, String> {
     if !boot && (!push.is_empty() || run.is_some()) {
         return Err("--push and --run need --boot".into());
     }
-    let extras = boot.then_some(kernel::BootExtras { push, run });
+    let data = if boot && !ephemeral {
+        data.or_else(|| default_data_image(system.as_deref()?)).map(|path| kernel::DataImage { path, wipe: wipe_data })
+    } else {
+        None
+    };
+    // Before any thread starts: they all inherit the mask.
+    if data.is_some() {
+        kernel::reserve_exit_signals();
+    }
+    let extras = boot.then_some(kernel::BootExtras { push, run, data });
     // --headless wins over both --display and the window --boot implies.
     // DROIDRT_GPU=fake is the in-memory virtio-gpu (guest tests, no window).
     let show = !headless && (display || boot);
@@ -198,8 +216,24 @@ fn boot_guest(
     };
     kernel.start(mm, exe, &argv_copy, state)?;
     let status = kernel.wait_root();
+    kernel.save_data();
     // Like a shell: the exit code, or 128 + the signal that killed it.
     Ok(if status & 0x7f == 0 { (status >> 8) & 0xff } else { 128 + (status & 0x7f) })
+}
+
+/// A file for this image's device in the user's application data.
+fn default_data_image(system: &std::path::Path) -> Option<PathBuf> {
+    let base = if cfg!(windows) {
+        PathBuf::from(std::env::var_os("LOCALAPPDATA")?)
+    } else if cfg!(target_os = "macos") {
+        PathBuf::from(std::env::var_os("HOME")?).join("Library/Application Support")
+    } else {
+        PathBuf::from(std::env::var_os("HOME")?).join(".local/share")
+    };
+    // FNV-1a of the image's path: a device per image.
+    let path = std::fs::canonicalize(system).ok()?;
+    let id = path.to_string_lossy().bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ b as u64).wrapping_mul(0x0100_0000_01b3));
+    Some(base.join("droidrt").join(format!("data-{id:016x}.img")))
 }
 
 fn inspect_image(vfs: &vfs::Vfs, cmd: &str, path: &str) -> Result<i32, String> {

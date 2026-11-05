@@ -548,3 +548,257 @@ impl FileSystem for Tmpfs {
         self.nodes.lock().unwrap().get_mut(&ino).ok_or(ENOENT)?.xattrs.remove(name)
     }
 }
+
+// ---- a whole tree to and from a host file (persistent /data) ----
+
+/// Longest name, link target or attribute a saved tree can hold: more is a bad file.
+const SAVED_MAX: u64 = 1 << 24;
+
+fn put_u64(w: &mut impl io::Write, v: u64) -> io::Result<()> {
+    w.write_all(&v.to_le_bytes())
+}
+
+fn put_bytes(w: &mut impl io::Write, b: &[u8]) -> io::Result<()> {
+    put_u64(w, b.len() as u64)?;
+    w.write_all(b)
+}
+
+fn get_u64(r: &mut impl io::Read) -> io::Result<u64> {
+    let mut b = [0; 8];
+    r.read_exact(&mut b)?;
+    Ok(u64::from_le_bytes(b))
+}
+
+fn get_bytes(r: &mut impl io::Read) -> io::Result<Vec<u8>> {
+    let n = get_u64(r)?;
+    if n > SAVED_MAX {
+        return Err(io::Error::other("a saved name is too long"));
+    }
+    let mut b = vec![0; n as usize];
+    r.read_exact(&mut b)?;
+    Ok(b)
+}
+
+fn get_string(r: &mut impl io::Read) -> io::Result<String> {
+    String::from_utf8(get_bytes(r)?).map_err(|_| io::Error::other("a saved name isn't text"))
+}
+
+/// A tree read from a file, ready to go in.
+pub struct SavedTree {
+    nodes: HashMap<u64, Node>,
+    next: u64,
+}
+
+impl Tmpfs {
+    /// Writes the tree; returns the bytes of file contents. Sockets stay behind: what
+    /// was listening on them is gone. Files keep their holes.
+    pub fn save(&self, w: &mut impl io::Write) -> io::Result<u64> {
+        const NO_MORE_PAGES: u64 = u64::MAX;
+        enum Saved {
+            Dir(u64, Vec<(String, u64)>),
+            File(Arc<MemFile>),
+            Symlink(String),
+            Special(u64),
+        }
+        // The structure at one moment, and then the contents with the lock free.
+        let (saved, next) = {
+            let nodes = self.nodes.lock().unwrap();
+            let socket = |ino: &u64| nodes.get(ino).is_some_and(|n| n.mode & S_IFMT == crate::vfs::S_IFSOCK);
+            let mut saved = Vec::with_capacity(nodes.len());
+            for (&ino, n) in nodes.iter().filter(|(ino, _)| !socket(ino)) {
+                let kind = match &n.kind {
+                    Kind::Dir { entries, parent } => Saved::Dir(*parent, entries.iter().filter(|(_, c)| !socket(c)).map(|(k, &c)| (k.clone(), c)).collect()),
+                    Kind::File(f) => Saved::File(f.clone()),
+                    Kind::Symlink(t) => Saved::Symlink(t.clone()),
+                    Kind::Special { rdev } => Saved::Special(*rdev),
+                };
+                saved.push((ino, n.mode, n.uid, n.gid, n.nlink, n.mtime, n.xattrs.clone(), kind));
+            }
+            (saved, self.next.load(Ordering::Relaxed))
+        };
+        put_u64(w, next)?;
+        put_u64(w, saved.len() as u64)?;
+        let mut contents = 0;
+        let mut page = [0u8; 4096];
+        for (ino, mode, uid, gid, nlink, mtime, xattrs, kind) in saved {
+            for v in [ino, mode as u64, uid as u64, gid as u64, nlink as u64, mtime, xattrs.0.len() as u64] {
+                put_u64(w, v)?;
+            }
+            for (name, value) in &xattrs.0 {
+                put_bytes(w, name.as_bytes())?;
+                put_bytes(w, value)?;
+            }
+            match kind {
+                Saved::Dir(parent, entries) => {
+                    put_u64(w, 0)?;
+                    put_u64(w, parent)?;
+                    put_u64(w, entries.len() as u64)?;
+                    for (name, child) in entries {
+                        put_bytes(w, name.as_bytes())?;
+                        put_u64(w, child)?;
+                    }
+                }
+                Saved::File(f) => {
+                    put_u64(w, 1)?;
+                    let size = f.size();
+                    put_u64(w, size)?;
+                    for off in (0..size).step_by(page.len()) {
+                        if f.obj.has_frame(off) {
+                            f.obj.read(off, &mut page);
+                            put_u64(w, off)?;
+                            w.write_all(&page)?;
+                            contents += page.len() as u64;
+                        }
+                    }
+                    put_u64(w, NO_MORE_PAGES)?;
+                }
+                Saved::Symlink(t) => {
+                    put_u64(w, 2)?;
+                    put_bytes(w, t.as_bytes())?;
+                }
+                Saved::Special(rdev) => {
+                    put_u64(w, 3)?;
+                    put_u64(w, rdev)?;
+                }
+            }
+        }
+        Ok(contents)
+    }
+
+    /// Reads a tree written by `save`. Nothing changes until `install`.
+    pub fn read_saved(&self, r: &mut impl io::Read) -> io::Result<SavedTree> {
+        const NO_MORE_PAGES: u64 = u64::MAX;
+        let bad = |what: &str| io::Error::other(format!("a saved tree has {what}"));
+        let next = get_u64(r)?;
+        let count = get_u64(r)?;
+        let mut nodes = HashMap::new();
+        let mut page = [0u8; 4096];
+        for _ in 0..count {
+            let (ino, mode, uid, gid, nlink, mtime, attrs) = (get_u64(r)?, get_u64(r)?, get_u64(r)?, get_u64(r)?, get_u64(r)?, get_u64(r)?, get_u64(r)?);
+            let mut xattrs = BTreeMap::new();
+            for _ in 0..attrs {
+                let name = get_string(r)?;
+                xattrs.insert(name, get_bytes(r)?);
+            }
+            let kind = match get_u64(r)? {
+                0 => {
+                    let parent = get_u64(r)?;
+                    let mut entries = BTreeMap::new();
+                    for _ in 0..get_u64(r)? {
+                        let name = get_string(r)?;
+                        entries.insert(name, get_u64(r)?);
+                    }
+                    Kind::Dir { entries, parent }
+                }
+                1 => {
+                    let f = MemFile::with_quota(self.phys.clone(), self.quota.clone());
+                    let size = get_u64(r)?;
+                    loop {
+                        let off = get_u64(r)?;
+                        if off == NO_MORE_PAGES {
+                            break;
+                        }
+                        r.read_exact(&mut page)?;
+                        if off >= size || !off.is_multiple_of(page.len() as u64) {
+                            return Err(bad("a page outside its file"));
+                        }
+                        let n = (size - off).min(page.len() as u64) as usize;
+                        f.write_at(off, &page[..n]).map_err(|e| io::Error::other(format!("restoring a file: errno {e}")))?;
+                    }
+                    // Holes at the end have no pages to say how far the file goes.
+                    if f.size() < size {
+                        f.write_at(size - 1, &[0]).map_err(|e| io::Error::other(format!("restoring a file: errno {e}")))?;
+                    }
+                    Kind::File(f)
+                }
+                2 => Kind::Symlink(get_string(r)?),
+                3 => Kind::Special { rdev: get_u64(r)? },
+                _ => return Err(bad("an unknown kind of node")),
+            };
+            nodes.insert(ino, Node { mode: mode as u32, uid: uid as u32, gid: gid as u32, nlink: nlink as u32, mtime, kind, xattrs: Xattrs(xattrs) });
+        }
+        if !matches!(nodes.get(&ROOT).map(|n| &n.kind), Some(Kind::Dir { .. })) {
+            return Err(bad("no root"));
+        }
+        Ok(SavedTree { nodes, next })
+    }
+
+    /// Replaces the tree. Only before anything has it open.
+    pub fn install(&self, tree: SavedTree) {
+        *self.nodes.lock().unwrap() = tree.nodes;
+        self.next.store(tree.next, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod saved_tests {
+    use super::*;
+    use crate::vfs::S_IFSOCK;
+
+    fn phys() -> Arc<PhysMem> {
+        PhysMem::new(Arc::new(crate::hv::NoHv))
+    }
+
+    #[test]
+    fn a_saved_tree_comes_back_the_same() {
+        let phys = phys();
+        let a = Tmpfs::new(phys.clone(), 0o771);
+        a.write_file("system/packages.xml", 0o640, "hello");
+        let dir = a.mkdir_p("user/0", 0o700);
+        let link = a.symlink(dir, "here", "/data/user/0").unwrap();
+        a.set_attr(link, None, Some((1000, 1000)), Some(1234)).unwrap();
+        a.setxattr(dir, "security.selinux", b"u:object_r:x:s0", 0).unwrap();
+        let hole = a.create(dir, "hole", S_IFREG | 0o600, 0).unwrap();
+        let f = a.mem_file(hole).unwrap();
+        f.write_at(3 * 4096 + 10, b"end").unwrap();
+        let tail = a.create(dir, "tail", S_IFREG | 0o600, 0).unwrap();
+        a.mem_file(tail).unwrap().truncate(9000);
+        a.link(hole, 1, "again").unwrap();
+        a.create(dir, "sock", S_IFSOCK | 0o600, 0).unwrap();
+
+        let mut bytes = Vec::new();
+        let contents = a.save(&mut bytes).unwrap();
+        assert_eq!(contents, 4096 + 4096, "packages.xml and hole's one page, not its gap");
+
+        let b = Tmpfs::new(phys, 0o755);
+        let tree = b.read_saved(&mut &bytes[..]).unwrap();
+        b.install(tree);
+        let at = |path: &[&str]| path.iter().fold(ROOT, |d, n| b.lookup_ino(d, n).unwrap());
+        let xml = at(&["system", "packages.xml"]);
+        assert_eq!(&*b.read_all(xml).unwrap(), b"hello");
+        assert_eq!(b.stat(xml).unwrap().mode, S_IFREG | 0o640);
+        assert_eq!(b.stat(ROOT).unwrap().mode, S_IFDIR | 0o771);
+        let dir = at(&["user", "0"]);
+        assert_eq!(b.getxattr(dir, "security.selinux").unwrap(), b"u:object_r:x:s0");
+        let link = at(&["user", "0", "here"]);
+        let st = b.stat(link).unwrap();
+        assert_eq!((st.uid, st.gid, st.mtime), (1000, 1000, 1234));
+        assert_eq!(&*b.read_all(link).unwrap(), b"/data/user/0");
+        let hole = at(&["user", "0", "hole"]);
+        let f = b.mem_file(hole).unwrap();
+        assert_eq!(f.size(), 3 * 4096 + 13);
+        assert_eq!(f.read_at(3 * 4096 + 10, 3), b"end");
+        assert!(!f.obj.has_frame(0), "the gap stays a gap");
+        assert_eq!(at(&["again"]), hole, "hard links stay one file");
+        assert_eq!(b.stat(hole).unwrap().nlink, 2);
+        assert_eq!(b.mem_file(at(&["user", "0", "tail"])).unwrap().size(), 9000);
+        assert!(b.lookup_ino(dir, "sock").is_none(), "sockets stay behind");
+        let fresh = b.create(dir, "new", S_IFREG | 0o600, 0).unwrap();
+        assert!(fresh > link && fresh > hole, "new files don't reuse numbers");
+    }
+
+    #[test]
+    fn a_damaged_file_is_refused_and_changes_nothing() {
+        let phys = phys();
+        let a = Tmpfs::new(phys.clone(), 0o771);
+        a.write_file("x/y", 0o640, "hello");
+        let mut bytes = Vec::new();
+        a.save(&mut bytes).unwrap();
+        let b = Tmpfs::new(phys, 0o755);
+        b.write_file("mine", 0o600, "kept");
+        for cut in [0, 8, 20, bytes.len() / 2, bytes.len() - 1] {
+            assert!(b.read_saved(&mut &bytes[..cut]).is_err(), "cut at {cut}");
+        }
+        assert!(b.lookup_ino(ROOT, "mine").is_some());
+    }
+}

@@ -2,7 +2,7 @@
 //! change counter. Edge-triggered registrations are reported like
 //! level-triggered ones (spurious wakeups are allowed; missed ones are not).
 
-use super::files::{File, Kind, poll_ready};
+use super::files::{File, Kind, poll_mask, poll_ready};
 use super::Thread;
 use crate::errno::*;
 use std::collections::BTreeMap;
@@ -56,6 +56,8 @@ impl Epoll {
             }
             _ => return Err(EINVAL),
         }
+        drop(list);
+        super::wait::EVENTS.bump_key(self as *const Self as usize);
         Ok(())
     }
 
@@ -92,6 +94,17 @@ impl Epoll {
             !i.fired
                 && i.file.upgrade().is_some_and(|f| poll_ready(&f, t, depth + 1) as u32 & (i.events | EPOLLERR | EPOLLHUP) != 0)
         })
+    }
+
+    /// What a waiter on this watches: what its files say, and itself for changes
+    /// to the list.
+    pub fn mask(&self, t: &Thread, depth: u32) -> u64 {
+        let own = super::wait::key_bit(self as *const Self as usize);
+        if depth > 4 {
+            return own;
+        }
+        let list = self.interest.lock().unwrap();
+        list.values().filter_map(|i| i.file.upgrade()).fold(own, |m, f| m | poll_mask(&f, t, depth + 1))
     }
 
     /// The earliest timerfd expiry among the registrations.

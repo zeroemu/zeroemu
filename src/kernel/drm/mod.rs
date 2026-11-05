@@ -5,6 +5,10 @@
 
 use super::block::{self, makedev};
 use super::wait::EVENTS;
+
+/// What a waiter on any GPU file watches in EVENTS. They all come to the same few
+/// threads, the compositor's and the renderers'.
+pub const GPU_KEY: usize = 0x6770_7500;
 use super::{ERESTARTSYS, POLL, Thread};
 use crate::errno::*;
 use crate::gpu::{self, Blob, Box3, Fence, GpuBackend, Resource3d, Transfer};
@@ -145,7 +149,7 @@ struct Evq {
 impl Evq {
     fn push(&self, ev: Vec<u8>) {
         self.q.lock().unwrap().push_back(ev);
-        EVENTS.bump();
+        EVENTS.bump_key(GPU_KEY);
     }
 
     fn take(&self, max: usize) -> Result<Option<Vec<u8>>, i64> {
@@ -185,7 +189,7 @@ impl SyncPoint {
             return;
         }
         self.ns.store(now_ns(), Ordering::Relaxed);
-        EVENTS.bump();
+        EVENTS.bump_key(GPU_KEY);
     }
 
     fn ready(&self) -> bool {
@@ -498,7 +502,7 @@ impl Open {
 
     pub fn read_events(&self, t: &Thread, max: usize, nonblock: bool) -> Result<Vec<u8>, i64> {
         loop {
-            let seen = EVENTS.current();
+            let seen = EVENTS.watch_key(GPU_KEY);
             if let Some(b) = self.events.take(max)? {
                 return Ok(b);
             }

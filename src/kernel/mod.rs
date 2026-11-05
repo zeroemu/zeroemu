@@ -114,6 +114,7 @@ pub struct Kernel {
     next_asid: AtomicU32,
     /// Host threads running guest threads.
     live_threads: AtomicUsize,
+    persist: Option<Persist>,
     /// The vCPUs guest threads share.
     vcpus: Arc<vcpus::Pool>,
     futex: futex::Futexes,
@@ -162,6 +163,64 @@ pub struct BootExtras {
     /// (guest path in a writable filesystem such as /data, contents)
     pub push: Vec<(String, Vec<u8>)>,
     pub run: Option<String>,
+    /// Where /data is kept between boots, if it is.
+    pub data: Option<DataImage>,
+}
+
+pub struct DataImage {
+    pub path: std::path::PathBuf,
+    /// Start empty, whatever the file holds.
+    pub wipe: bool,
+}
+
+/// What a device keeps between boots: its /data and /metadata, in one host file.
+/// These live in memory. The file is read at boot and written at exit, and written
+/// whole, then renamed over the old one, so a failure leaves the last good one.
+struct Persist {
+    path: std::path::PathBuf,
+    trees: Vec<(&'static str, Arc<crate::tmpfs::Tmpfs>)>,
+}
+
+impl Persist {
+    const MAGIC: &'static [u8] = b"droidrt data 1\n";
+
+    fn load(&self) -> std::io::Result<u64> {
+        use std::io::Read;
+        let file = std::fs::File::open(&self.path)?;
+        let size = file.metadata()?.len();
+        let mut r = std::io::BufReader::with_capacity(1 << 20, file);
+        let mut magic = vec![0; Self::MAGIC.len()];
+        r.read_exact(&mut magic)?;
+        if magic != Self::MAGIC {
+            return Err(std::io::Error::other("not a droidrt data file"));
+        }
+        let mut read = Vec::new();
+        for (_, tree) in &self.trees {
+            read.push(tree.read_saved(&mut r)?);
+        }
+        for ((_, tree), saved) in self.trees.iter().zip(read) {
+            tree.install(saved);
+        }
+        Ok(size)
+    }
+
+    fn save(&self) -> std::io::Result<u64> {
+        use std::io::Write;
+        if let Some(dir) = self.path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let new = self.path.with_extension("new");
+        let file = std::fs::File::create(&new)?;
+        let mut w = std::io::BufWriter::with_capacity(1 << 20, file);
+        w.write_all(Self::MAGIC)?;
+        let mut contents = 0;
+        for (_, tree) in &self.trees {
+            contents += tree.save(&mut w)?;
+        }
+        w.into_inner().map_err(|e| e.into_error())?.sync_all()?;
+        std::fs::rename(&new, &self.path)?;
+        Ok(contents)
+    }
 }
 
 fn apply_extras(v: &Vfs, dev: &crate::tmpfs::Tmpfs, extras: &BootExtras) -> Result<(), String> {
@@ -201,9 +260,9 @@ fn apply_extras(v: &Vfs, dev: &crate::tmpfs::Tmpfs, extras: &BootExtras) -> Resu
 /// droidrt already mounted: a writable /metadata, and an fstab describing the
 /// mounts that exist (bound over the vendor's, which names virtio disks
 /// droidrt has no reason to emulate), so `mount_all` has nothing to wait for.
-fn first_stage_mounts(v: &Vfs, phys: &Arc<PhysMem>, dev: &crate::tmpfs::Tmpfs, partitions: &[String]) {
+fn first_stage_mounts(v: &Vfs, metadata: &Arc<crate::tmpfs::Tmpfs>, dev: &crate::tmpfs::Tmpfs, partitions: &[String]) {
     if let Ok(node) = v.resolve("/", "/metadata", true) {
-        let sb = v.new_super(crate::tmpfs::Tmpfs::new(phys.clone(), 0o755), "tmpfs", None, 0, "mode=0755");
+        let sb = v.new_super(metadata.clone(), "tmpfs", None, 0, "mode=0755");
         let _ = v.mount_at(&node, sb, 0);
     }
     let Ok(hw_fstab) = v.resolve("/", "/vendor/etc/fstab.ranchu", true) else { return };
@@ -255,7 +314,7 @@ fn add_boot_props(v: &mut Vfs, phys: &Arc<PhysMem>) {
     }
 }
 
-fn mount_tmpfs(vfs: &mut Vfs, phys: &Arc<PhysMem>) -> Arc<crate::tmpfs::Tmpfs> {
+fn mount_tmpfs(vfs: &mut Vfs, phys: &Arc<PhysMem>) -> (Arc<crate::tmpfs::Tmpfs>, Arc<crate::tmpfs::Tmpfs>) {
     use crate::tmpfs::Tmpfs;
     use crate::vfs::FileSystem;
     let dev = Tmpfs::new(phys.clone(), 0o755);
@@ -279,7 +338,7 @@ fn mount_tmpfs(vfs: &mut Vfs, phys: &Arc<PhysMem>) -> Arc<crate::tmpfs::Tmpfs> {
     let data = Tmpfs::new(phys.clone(), 0o771);
     data.mkdir_p("local/tmp", 0o771);
     data.mkdir_p("system", 0o775);
-    vfs.mount("/data", data);
+    vfs.mount("/data", data.clone());
     vfs.mount("/tmp", Tmpfs::new(phys.clone(), 0o1777));
     vfs.mount("/mnt", Tmpfs::new(phys.clone(), 0o755));
     vfs.mount("/cache", Tmpfs::new(phys.clone(), 0o770));
@@ -295,7 +354,7 @@ fn mount_tmpfs(vfs: &mut Vfs, phys: &Arc<PhysMem>) -> Arc<crate::tmpfs::Tmpfs> {
         sys.mkdir_p(d, 0o755);
     }
     vfs.mount("/sys", sys);
-    dev_handle
+    (dev_handle, data)
 }
 
 pub struct Process {
@@ -353,6 +412,8 @@ pub struct Thread {
     dying: AtomicBool,
     /// comm, prctl state, scheduling attributes.
     pub attrs: Mutex<control::ThreadAttrs>,
+    /// Where it sleeps in wait::EVENTS, once it runs.
+    event_slot: AtomicUsize,
     /// sched::CpuGroup, kept here for its readers on every guest entry.
     cpu_group: AtomicU8,
     /// hv::Urgency as computed from the attributes and the group.
@@ -388,6 +449,37 @@ fn dump_signal() -> libc::sigset_t {
         libc::sigemptyset(&mut set);
         libc::sigaddset(&mut set, libc::SIGUSR1);
         set
+    }
+}
+
+/// Wakeups since last asked, for DROIDRT_GPU_STATS.
+pub fn wakeup_stats(over: Duration) -> String {
+    static LAST: Mutex<(u64, u64)> = Mutex::new((0, 0));
+    let (plain, keyed) = (wait::BUMPS_PLAIN.load(Ordering::Relaxed), wait::BUMPS_KEYED.load(Ordering::Relaxed));
+    let mut last = LAST.lock().unwrap();
+    let secs = over.as_secs_f64().max(0.001);
+    let s = format!("bumps {:.0}/s plain, {:.0}/s keyed", (plain - last.0) as f64 / secs, (keyed - last.1) as f64 / secs);
+    *last = (plain, keyed);
+    s
+}
+
+/// SIGINT and SIGTERM, when a device has something to save before it goes.
+#[cfg(unix)]
+fn exit_signals() -> libc::sigset_t {
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, libc::SIGINT);
+        libc::sigaddset(&mut set, libc::SIGTERM);
+        set
+    }
+}
+
+/// Holds SIGINT and SIGTERM for `start`'s thread. As `reserve_dump_signal`.
+pub fn reserve_exit_signals() {
+    #[cfg(unix)]
+    unsafe {
+        libc::pthread_sigmask(libc::SIG_BLOCK, &exit_signals(), std::ptr::null_mut());
     }
 }
 
@@ -499,6 +591,7 @@ impl Thread {
             kick: Mutex::new(None),
             dying: AtomicBool::new(false),
             attrs: Mutex::new(control::ThreadAttrs::default()),
+            event_slot: AtomicUsize::new(usize::MAX),
             cpu_group: AtomicU8::new(sched::CpuGroup::Other as u8),
             urgency: AtomicU8::new(Urgency::Normal as u8),
             sec: Default::default(),
@@ -520,9 +613,30 @@ impl Thread {
     pub(super) fn update_urgency(&self, attrs: &control::ThreadAttrs) {
         let group = sched::CpuGroup::from_u8(self.cpu_group.load(Ordering::Relaxed));
         let u = sched::urgency(attrs.sched.policy, attrs.sched.nice, group);
-        if self.urgency.swap(u as u8, Ordering::Relaxed) != u as u8 && sched_tracing() {
+        let was = self.urgency.swap(u as u8, Ordering::Relaxed);
+        if was == u as u8 {
+            return;
+        }
+        if sched_tracing() {
             eprintln!("[sched] {} tid {}: {u:?} (nice {}, policy {}, {group:?})", attrs.comm, self.tid, attrs.sched.nice, attrs.sched.policy);
         }
+        // It may be queuing for a background place it no longer needs.
+        if was == Urgency::Background as u8 {
+            self.wake_sleeper();
+        }
+    }
+
+    /// What binder does to a thread for the length of a call.
+    pub(super) fn set_nice(&self, nice: i32) {
+        let mut attrs = self.attrs.lock().unwrap();
+        if attrs.sched.nice != nice {
+            attrs.sched.nice = nice;
+            self.update_urgency(&attrs);
+        }
+    }
+
+    pub(super) fn nice(&self) -> i32 {
+        self.attrs.lock().unwrap().sched.nice
     }
 
     pub(super) fn set_cpu_group(&self, group: sched::CpuGroup) {
@@ -563,7 +677,11 @@ impl Thread {
     fn kick(&self) {
         self.kick_vcpu();
         self.wake_sleeper();
-        wait::EVENTS.bump(); // poll, epoll and the like sleep on this
+        // Poll, epoll and the like sleep there.
+        let slot = self.event_slot.load(Ordering::Relaxed);
+        if slot != usize::MAX {
+            wait::EVENTS.wake_slot(slot);
+        }
     }
 
     fn wake_sleeper(&self) {
@@ -577,6 +695,16 @@ impl Thread {
     fn sleep<'a, T>(&self, cv: &Condvar, g: MutexGuard<'a, T>, timeout: Duration) -> MutexGuard<'a, T> {
         *self.sleeping_on.lock().unwrap() = Some(SleepOn(cv));
         let g = if self.interrupted() { g } else { cv.wait_timeout(g, timeout).unwrap().0 };
+        *self.sleeping_on.lock().unwrap() = None;
+        g
+    }
+
+    /// As `sleep` for a thread that can't do anything about a signal until it gets
+    /// where it is going, so only dying ends the wait. A signal still wakes it, but then
+    /// it goes back to sleep, as it would not if this looked at signals.
+    fn wait_for_turn<'a, T>(&self, cv: &Condvar, g: MutexGuard<'a, T>, timeout: Duration) -> MutexGuard<'a, T> {
+        *self.sleeping_on.lock().unwrap() = Some(SleepOn(cv));
+        let g = if self.dying.load(Ordering::Acquire) { g } else { cv.wait_timeout(g, timeout).unwrap().0 };
         *self.sleeping_on.lock().unwrap() = None;
         g
     }
@@ -609,7 +737,8 @@ impl Kernel {
             v.mount("/", crate::tmpfs::Tmpfs::new(phys.clone(), 0o755));
             v
         });
-        let dev = mount_tmpfs(&mut v, &phys);
+        let (dev, data) = mount_tmpfs(&mut v, &phys);
+        let mut persist = None;
         if boot {
             evdev::start_input_fifo();
             // There is no virtual HCI controller yet. With the feature declared,
@@ -647,7 +776,20 @@ impl Kernel {
             blocks.add_static(&name, dev);
         }
         if let Some(extras) = &extras {
-            first_stage_mounts(&v, &phys, &dev, &names);
+            let metadata = crate::tmpfs::Tmpfs::new(phys.clone(), 0o755);
+            first_stage_mounts(&v, &metadata, &dev, &names);
+            if let Some(image) = &extras.data {
+                let p = Persist { path: image.path.clone(), trees: vec![("data", data.clone()), ("metadata", metadata)] };
+                if !image.wipe {
+                    let started = Instant::now();
+                    match p.load() {
+                        Ok(size) => eprintln!("droidrt: {}: read {} MB in {:.1} s", p.path.display(), size >> 20, started.elapsed().as_secs_f64()),
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(e) => eprintln!("droidrt: {}: {e}; starting with an empty /data", p.path.display()),
+                    }
+                }
+                persist = Some(p);
+            }
             apply_extras(&v, &dev, extras)?;
         }
         // Properties, as init would set them up: defaults from build.prop,
@@ -695,6 +837,7 @@ impl Kernel {
             next_asid: AtomicU32::new(1),
             live_threads: AtomicUsize::new(0),
             vcpus: vcpus::Pool::new(max_vcpus),
+            persist,
             futex: futex::Futexes::default(),
             root_pid: AtomicI32::new(0),
             props,
@@ -833,6 +976,24 @@ impl Kernel {
                 k.dump_threads();
             });
         }
+        if self.persist.is_some() {
+            let k = self.clone();
+            crate::gpu::on_window_closed(Box::new(move || k.request_exit(0)));
+            #[cfg(unix)]
+            {
+                let k = self.clone();
+                let _ = std::thread::Builder::new().name("exit-signals".into()).spawn(move || {
+                    let mut sig = 0;
+                    if unsafe { libc::sigwait(&exit_signals(), &mut sig) } == 0 {
+                        k.request_exit(sig);
+                    }
+                    // Again while saving: this time they mean it.
+                    if unsafe { libc::sigwait(&exit_signals(), &mut sig) } == 0 {
+                        std::process::exit(128 + sig);
+                    }
+                });
+            }
+        }
         #[cfg(unix)]
         {
             let k = self.clone();
@@ -878,6 +1039,34 @@ impl Kernel {
     }
 
     /// Blocks until the root process exits; returns its wait status.
+    /// Ends the run as if the root process had exited with `status`.
+    pub fn request_exit(&self, status: i32) {
+        let (lock, cv) = &self.exit;
+        lock.lock().unwrap().get_or_insert(status);
+        cv.notify_all();
+    }
+
+    /// Keeps what a device keeps, if it does: stops guest code running first, so the
+    /// file holds one moment rather than a smear of them.
+    pub fn save_data(&self) {
+        let Some(p) = &self.persist else { return };
+        self.vcpus.freeze();
+        let procs: Vec<Arc<Process>> = self.procs.lock().unwrap().values().cloned().collect();
+        for proc in procs {
+            for th in proc.threads.lock().unwrap().iter() {
+                th.kick_vcpu();
+            }
+        }
+        // Long enough for syscalls under way to finish what they are writing. Those
+        // that sleep instead aren't writing.
+        std::thread::sleep(Duration::from_millis(100));
+        let started = Instant::now();
+        match p.save() {
+            Ok(contents) => eprintln!("droidrt: {}: saved {} MB in {:.1} s", p.path.display(), contents >> 20, started.elapsed().as_secs_f64()),
+            Err(e) => eprintln!("droidrt: {}: not saved: {e}", p.path.display()),
+        }
+    }
+
     pub fn wait_root(&self) -> i32 {
         let (lock, cv) = &self.exit;
         let mut status = lock.lock().unwrap();
@@ -912,6 +1101,7 @@ impl Kernel {
 
     fn thread_main(self: &Arc<Self>, t: &Arc<Thread>, state: CpuState) {
         GUEST_TID.with(|tid| tid.set(t.tid));
+        t.event_slot.store(wait::EVENTS.slot_of_this_thread(), Ordering::Relaxed);
         crate::vfs::set_current_ns(t.proc.mnt_ns.load(Ordering::Relaxed));
         let root = t.proc.mm().root;
         let mut vcpu: Box<dyn Vcpu> = Box::new(vcpus::LazyVcpu::new(self.hv.clone(), self.vcpus.clone(), t.clone(), root, state));

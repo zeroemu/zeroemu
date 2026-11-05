@@ -53,6 +53,14 @@ pub fn save_shown_frame(_path: &str) -> std::io::Result<()> {
     Err(std::io::Error::other("no window on this host"))
 }
 
+/// `f` runs when the user closes the window. It is called on the UI thread.
+pub fn on_window_closed(f: Box<dyn Fn() + Send + Sync>) {
+    #[cfg(target_os = "macos")]
+    window::on_closed(f);
+    #[cfg(not(target_os = "macos"))]
+    drop(f);
+}
+
 /// virtio-gpu capability set ids.
 pub const CAPSET_VIRGL: u32 = 1;
 pub const CAPSET_VIRGL2: u32 = 2;

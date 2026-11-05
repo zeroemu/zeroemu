@@ -1102,6 +1102,10 @@ mod imp {
             self.slot().seen.store(generation, Ordering::Release);
         }
 
+        fn flush_tlb_now(&mut self) {
+            self.flush_tlb(); // it waits for the other vCPUs
+        }
+
         fn flush_tlb(&mut self) {
             // SeqCst pairs with the entry check in run(); see there.
             let generation = self.shared.tlb_gen.fetch_add(1, Ordering::SeqCst) + 1;

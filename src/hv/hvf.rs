@@ -15,6 +15,9 @@ use std::sync::Arc;
 
 const VECTORS: u64 = KERNEL_WINDOW;
 const TLB_FLUSH: u64 = KERNEL_WINDOW + 0x800;
+/// The same flush for the kernel's own use: comes back with `hvc` instead of
+/// going on to EL0.
+const TLB_FLUSH_NOW: u64 = KERNEL_WINDOW + 0x820;
 
 /// Vector index for "synchronous exception from lower EL, AArch64".
 const VEC_LOWER_SYNC: u64 = 8;
@@ -79,6 +82,9 @@ impl Hypervisor for Hvf {
         ];
         for (i, insn) in flush.iter().enumerate() {
             put(TLB_FLUSH - KERNEL_WINDOW + i as u64 * 4, *insn);
+        }
+        for (i, insn) in flush[..4].iter().chain(&[0xd400_0002 | (16 << 5)]).enumerate() {
+            put(TLB_FLUSH_NOW - KERNEL_WINDOW + i as u64 * 4, *insn);
         }
         vec![KernelPage { va: KERNEL_WINDOW, gpa, exec: true }]
     }
@@ -302,6 +308,22 @@ impl Vcpu for HvfVcpu {
     fn set_page_tables(&mut self, root: PageTableRoot) {
         self.set_sys(HV_SYS_REG_TTBR0_EL1, root.root | (root.asid as u64) << 48);
         self.flush_pending = true;
+    }
+
+    fn flush_tlb_now(&mut self) {
+        let (pc, cpsr) = (self.reg(HV_REG_PC), self.reg(HV_REG_CPSR));
+        self.set_reg(HV_REG_PC, TLB_FLUSH_NOW);
+        self.set_reg(HV_REG_CPSR, CPSR_EL1H_MASKED);
+        // Anything but the hvc is a kick or timer, and just continues the stub:
+        // the thread looks at its signals before it next enters the guest.
+        loop {
+            check("hv_vcpu_run", unsafe { hv_vcpu_run(self.id) });
+            if unsafe { (*self.exit).reason } == HV_EXIT_REASON_EXCEPTION {
+                break;
+            }
+        }
+        self.set_reg(HV_REG_PC, pc);
+        self.set_reg(HV_REG_CPSR, cpsr);
     }
 
     fn flush_tlb(&mut self) {

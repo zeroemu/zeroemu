@@ -107,7 +107,6 @@ pub(super) fn put_timespec(b: &mut [u8], d: Duration) {
 
 /// When a timer set to `value` expires. An absolute value is on `clock`:
 /// wall-clock for REALTIME, REALTIME_ALARM and TAI, else time since boot.
-/// Far-future values stop at a century, which Instant can always represent.
 pub(super) fn deadline_for(clock: u64, boot: Instant, value: Duration, abstime: bool) -> Instant {
     let delay = if !abstime {
         value
@@ -116,7 +115,7 @@ pub(super) fn deadline_for(clock: u64, boot: Instant, value: Duration, abstime: 
     } else {
         value.saturating_sub(boot.elapsed())
     };
-    Instant::now() + delay.min(Duration::from_secs(100 * 365 * 86400))
+    super::wait::instant_after(delay)
 }
 
 impl TimerFd {
@@ -138,9 +137,10 @@ impl TimerFd {
             st.expirations += 1;
             st.next = None;
         } else {
-            let n = 1 + ((now - next).as_nanos() / st.interval.as_nanos()) as u64;
-            st.expirations += n;
-            st.next = Some(next + st.interval * n as u32);
+            let n = 1 + (now - next).as_nanos() / st.interval.as_nanos();
+            st.expirations = st.expirations.saturating_add(n as u64);
+            let ahead = st.interval.as_nanos() * n;
+            st.next = Some(next + Duration::new((ahead / 1_000_000_000) as u64, (ahead % 1_000_000_000) as u32));
         }
     }
 
@@ -161,7 +161,7 @@ impl TimerFd {
         let (interval, value) = (timespec(&new[0..16]), timespec(&new[16..32]));
         let mut st = self.st.lock().unwrap();
         st.expirations = 0;
-        st.interval = interval;
+        st.interval = interval.min(super::wait::CENTURY);
         st.next = (!value.is_zero()).then(|| deadline_for(self.clock, self.boot, value, flags & TFD_TIMER_ABSTIME != 0));
         drop(st);
         EVENTS.bump();

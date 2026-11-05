@@ -418,6 +418,7 @@ impl ProcFs {
             K::PStatus | K::PStat | K::PStatm => {
                 let p = self.proc_or_zombie(pid)?;
                 let state = if p.status.lock().unwrap().is_some() { ('Z', "zombie") } else { ('R', "running") };
+                let shown = if extra != 0 { extra as i32 } else { pid };
                 let threads = p.threads.lock().unwrap().len().max(1);
                 let (virt, rss, stack) = p.mm.lock().unwrap().as_ref().map_or((0, 0, 0), |m| {
                     let (v, r) = m.usage();
@@ -435,7 +436,7 @@ impl ProcFs {
                     K::PStatus => {
                         let groups: Vec<String> = c.groups.iter().map(|g| g.to_string()).collect();
                         text(format!(
-                            "Name:\t{name}\nUmask:\t{:04o}\nState:\t{} ({})\nTgid:\t{pid}\nNgid:\t0\nPid:\t{pid}\nPPid:\t{ppid}\nTracerPid:\t0\nUid:\t{}\t{}\t{}\t{}\nGid:\t{}\t{}\t{}\t{}\nFDSize:\t64\nGroups:\t{}\nVmPeak:\t{} kB\nVmSize:\t{} kB\nVmRSS:\t{} kB\nThreads:\t{threads}\nSigQ:\t0/0\nSigPnd:\t0000000000000000\nShdPnd:\t0000000000000000\nCapInh:\t{:016x}\nCapPrm:\t{:016x}\nCapEff:\t{:016x}\nCapBnd:\t{:016x}\nCapAmb:\t{:016x}\nNoNewPrivs:\t{}\nSeccomp:\t{}\nSeccomp_filters:\t{}\nCpus_allowed_list:\t0-{}\n",
+                            "Name:\t{name}\nUmask:\t{:04o}\nState:\t{} ({})\nTgid:\t{pid}\nNgid:\t0\nPid:\t{shown}\nPPid:\t{ppid}\nTracerPid:\t0\nUid:\t{}\t{}\t{}\t{}\nGid:\t{}\t{}\t{}\t{}\nFDSize:\t64\nGroups:\t{}\nVmPeak:\t{} kB\nVmSize:\t{} kB\nVmRSS:\t{} kB\nThreads:\t{threads}\nSigQ:\t0/0\nSigPnd:\t0000000000000000\nShdPnd:\t0000000000000000\nCapInh:\t{:016x}\nCapPrm:\t{:016x}\nCapEff:\t{:016x}\nCapBnd:\t{:016x}\nCapAmb:\t{:016x}\nNoNewPrivs:\t{}\nSeccomp:\t{}\nSeccomp_filters:\t{}\nCpus_allowed_list:\t0-{}\n",
                             p.umask.load(Ordering::Relaxed),
                             state.0,
                             state.1,
@@ -450,7 +451,7 @@ impl ProcFs {
                         ))
                     }
                     K::PStat => text(format!(
-                        "{pid} ({name}) {} {ppid} {pgid} {sid} 0 -1 4194560 0 0 0 0 0 0 0 0 {} {} {threads} 0 0 {virt} {} 18446744073709551615 0 0 {stack} 0 0 0 0 0 0 0 0 0 0 17 0 {} {} 0 0 0 0 0 0 0 0 0 0 0\n",
+                        "{shown} ({name}) {} {ppid} {pgid} {sid} 0 -1 4194560 0 0 0 0 0 0 0 0 {} {} {threads} 0 0 {virt} {} 18446744073709551615 0 0 {stack} 0 0 0 0 0 0 0 0 0 0 17 0 {} {} 0 0 0 0 0 0 0 0 0 0 0\n",
                         state.0,
                         ta.sched.proc_priority(),
                         ta.sched.nice,
@@ -500,7 +501,7 @@ impl ProcFs {
             K::ConfigGz => Ok(Content::File(gzip_stored(kernel_config().as_bytes()))),
             K::PCgroup => {
                 self.proc(pid)?;
-                text(super::cgroup::proc_pid_cgroup(&kernel, pid))
+                text(super::cgroup::proc_pid_cgroup(&kernel, pid, if extra != 0 { extra as i32 } else { pid }))
             }
             K::PEnviron => Ok(Content::File(Vec::new())),
         }

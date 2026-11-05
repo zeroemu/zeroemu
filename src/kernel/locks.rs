@@ -170,7 +170,7 @@ impl Locks {
             return Err(super::ERESTARTSYS);
         }
         super::vcpus::blocking();
-        Ok(self.released.wait_timeout(st, super::POLL).unwrap().0)
+        Ok(t.sleep(&self.released, st, super::IDLE))
     }
 }
 

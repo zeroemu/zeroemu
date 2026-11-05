@@ -253,6 +253,18 @@ impl Vcpu for LazyVcpu {
         }
     }
 
+    fn flush_tlb_now(&mut self) {
+        // ready() came first, but keep to what a parked thread can do: a new
+        // vCPU flushes on its first entry, and nothing else here is on the way.
+        if let Some(v) = &mut self.0.inner.borrow_mut().vcpu {
+            v.flush_tlb_now();
+        }
+    }
+
+    fn ready(&mut self) -> bool {
+        self.0.ensure().is_ok()
+    }
+
     fn kicker(&self) -> Arc<dyn Kick> {
         unreachable!("the slot keeps Thread::kick up to date")
     }

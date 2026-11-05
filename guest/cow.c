@@ -18,6 +18,10 @@ typedef unsigned int u32;
 #define NR_clone 220
 #define NR_mmap 222
 #define NR_mprotect 226
+#define NR_madvise 233
+#define NR_mremap 216
+#define NR_memfd_create 279
+#define NR_ftruncate 46
 #define NR_wait4 260
 
 static i64 sys6(i64 n, i64 a, i64 b, i64 c, i64 d, i64 e, i64 f) {
@@ -108,8 +112,17 @@ static void writer(void *arg) {
     }
 }
 
-static char stacks[2][65536] __attribute__((aligned(16)));
-static int tids[2];
+// The kernel writes for this thread: clock_gettime into the same page. The
+// copy that makes must not lose what the other two threads store meanwhile.
+static void kernel_writer(void *arg) {
+    (void)arg;
+    while (!__atomic_load_n(&stop_writers, __ATOMIC_ACQUIRE)) {
+        sys(NR_clock_gettime, 1, shared_page + 64);
+    }
+}
+
+static char stacks[3][65536] __attribute__((aligned(16)));
+static int tids[3];
 
 int cmain(void) {
     char *m = (char *)sys(NR_mmap, 0, 1 << 20, 3, 0x22, -1, 0);
@@ -193,17 +206,63 @@ int cmain(void) {
         tids[i] = 1;
         spawn(stacks[i] + sizeof stacks[i], writer, (void *)i, &tids[i]);
     }
+    tids[2] = 1;
+    spawn(stacks[2] + sizeof stacks[2], kernel_writer, 0, &tids[2]);
     for (int i = 0; i < FORKS; i++) {
         pid = fork_();
         if (pid == 0) sys(NR_exit, 0);
         wait_status(pid);
     }
     __atomic_store_n(&stop_writers, 1, __ATOMIC_RELEASE);
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < 3; i++) {
         while (tids[i] != 0) sys(NR_futex, &tids[i], 0, tids[i], 0);
     }
-    check(lost == 0, "threads writing one page lose nothing across 300 forks");
+    check(lost == 0, "threads writing one page, one through the kernel, lose nothing across 300 forks");
     if (lost) puts_("     lost writes: "), putn(lost), puts_("\n");
+
+    // A write-only private page stays readable through fork, as arm64 has it.
+    char *wo = (char *)sys(NR_mmap, 0, 4096, 2 /* PROT_WRITE */, 0x22, -1, 0);
+    wo[0] = 'w';
+    pid = fork_();
+    if (pid == 0) sys(NR_exit, wo[0] != 'w');
+    check(wait_status(pid) == 0, "a write-only page reads back after fork");
+
+    // What fork does with a mapping.
+    char *df = (char *)sys(NR_mmap, 0, 8192, 3, 0x22, -1, 0);
+    df[0] = 'd';
+    df[4096] = 'k';
+    check(sys(NR_madvise, df, 4096, 10 /* MADV_DONTFORK */) == 0, "MADV_DONTFORK");
+    pid = fork_();
+    if (pid == 0) {
+        // The page is gone: mapping there exactly must work, and it starts empty.
+        char *again = (char *)sys(NR_mmap, df, 4096, 3, 0x22 | 0x100000 /* MAP_FIXED_NOREPLACE */, -1, 0);
+        sys(NR_exit, !(again == df && again[0] == 0 && df[4096] == 'k'));
+    }
+    check(wait_status(pid) == 0, "the child lacks a DONTFORK page and keeps the next one");
+    char *wipe = (char *)sys(NR_mmap, 0, 4096, 3, 0x22, -1, 0);
+    wipe[0] = 'w';
+    check(sys(NR_madvise, wipe, 4096, 18 /* MADV_WIPEONFORK */) == 0, "MADV_WIPEONFORK");
+    pid = fork_();
+    if (pid == 0) sys(NR_exit, wipe[0] != 0);
+    check(wait_status(pid) == 0 && wipe[0] == 'w', "the child reads zeros, the parent its data");
+
+    // mremap: moving a touched shared mapping must not free frames its object owns.
+    int shm = (int)sys(NR_memfd_create, "m", 0);
+    sys(NR_ftruncate, shm, 8192);
+    char *sm = (char *)sys(NR_mmap, 0, 8192, 3, 0x01 /* MAP_SHARED */, shm, 0);
+    sm[0] = 's';
+    sm[4096] = 't';
+    char *dst = (char *)sys(NR_mmap, 0, 8192, 3, 0x22, -1, 0);
+    char *moved = (char *)sys(NR_mremap, sm, 8192, 4096, 1 | 2 /* MAYMOVE|FIXED */, dst);
+    check(moved == dst && moved[0] == 's', "shrink a shared mapping to a fixed address");
+    char *other = (char *)sys(NR_mmap, 0, 4096, 3, 0x01, shm, 4096);
+    for (int i = 0; i < 64; i++) ((volatile char *)sys(NR_mmap, 0, 4096, 3, 0x22, -1, 0))[0] = 'x';
+    check(other[0] == 't', "the page it left behind still belongs to the object");
+
+    char *pv = (char *)sys(NR_mmap, 0, 8192, 3, 0x22, -1, 0);
+    check(sys(NR_mremap, pv, 4096, 4096, 1 | 2, 0x7fc0000000) == -22, "mremap into the kernel window: EINVAL");
+    check(sys(NR_mremap, pv + 4096, 4096, 8192, 1 | 2, pv) == -22, "mremap onto itself: EINVAL");
+    check(sys(NR_mremap, pv, 0, 4096, 1) == -22, "mremap of zero bytes of private memory: EINVAL");
 
     puts_(failures ? "SOME CHECKS FAILED\n" : "all checks passed\n");
     return failures;

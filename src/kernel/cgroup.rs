@@ -401,13 +401,15 @@ fn hierarchies(k: &Kernel) -> Vec<(u32, Arc<CgroupFs>)> {
 }
 
 /// /proc/<pid>/cgroup: "<hierarchy>:<controllers>:<path>" per hierarchy.
-pub fn proc_pid_cgroup(k: &Kernel, pid: i32) -> String {
+/// `tid`: a thread moved on its own is in its own group; others in its process's.
+pub fn proc_pid_cgroup(k: &Kernel, pid: i32, tid: i32) -> String {
     let mut hs = hierarchies(k);
     hs.sort_by_key(|(id, _)| std::cmp::Reverse(*id));
     hs.into_iter()
         .map(|(id, h)| {
             let st = h.st.lock().unwrap();
-            let path = CgroupFs::path(&st, h.cgroup_of(k, &st, pid));
+            let group = st.member.get(&tid).copied().filter(|g| st.nodes.contains_key(g)).unwrap_or_else(|| h.cgroup_of(k, &st, pid));
+            let path = CgroupFs::path(&st, group);
             format!("{id}:{}:{path}\n", h.controllers.join(","))
         })
         .collect()

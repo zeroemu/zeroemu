@@ -1,6 +1,6 @@
 //! Time, system information, affinity, and other small syscalls.
 
-use super::{Kernel, POLL, Thread};
+use super::{IDLE, Kernel, Thread};
 use crate::arch::{Arch, Sysno};
 use crate::errno::*;
 use crate::hv::Vcpu;
@@ -60,19 +60,19 @@ impl Kernel {
                     let mut mm = t.proc.mm();
                     (mm.read_u64(req)?, mm.read_u64(req + 8)?)
                 };
-                let d = Duration::new(s, ns as u32);
+                let d = super::wait::guest_timespec(s, ns)?;
                 let deadline = if abs {
                     let (now_s, now_ns) = self.clock(clock);
-                    Instant::now() + d.saturating_sub(Duration::new(now_s, now_ns as u32))
+                    super::wait::instant_after(d.saturating_sub(Duration::new(now_s, now_ns as u32)))
                 } else {
-                    Instant::now() + d
+                    super::wait::instant_after(d)
                 };
                 while Instant::now() < deadline {
                     if t.interrupted() {
                         return Err(EINTR);
                     }
                     super::vcpus::blocking();
-                    std::thread::sleep(deadline.saturating_duration_since(Instant::now()).min(POLL));
+                    t.nap(deadline.saturating_duration_since(Instant::now()).min(IDLE));
                 }
                 Ok(0)
             }
@@ -136,7 +136,7 @@ impl Kernel {
                         };
                         for p in procs {
                             for th in p.threads.lock().unwrap().iter().filter(|th| th.tid != t.tid) {
-                                th.kick();
+                                th.kick_vcpu();
                             }
                         }
                         Ok(0)
@@ -158,7 +158,7 @@ impl Kernel {
 
     fn clock(&self, id: u64) -> (u64, u64) {
         let d = match id {
-            0 | 5 | 8 => SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default(), // REALTIME(_COARSE), REALTIME_ALARM
+            0 | 5 | 8 | 11 => SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default(), // REALTIME(_COARSE), REALTIME_ALARM
             _ => self.boot.elapsed(),
         };
         (d.as_secs(), d.subsec_nanos() as u64)

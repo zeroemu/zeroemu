@@ -2,7 +2,7 @@
 
 use super::{Kernel, Thread};
 use crate::errno::*;
-use crate::mm::{Backing, Placement, SharedObject};
+use crate::mm::{Backing, Placement, SharedObject, OnFork};
 use crate::phys::PAGE;
 
 const MAP_SHARED: u64 = 0x01;
@@ -13,6 +13,10 @@ const MREMAP_MAYMOVE: u64 = 1;
 const MREMAP_FIXED: u64 = 2;
 const MADV_DONTNEED: u64 = 4;
 const MADV_FREE: u64 = 8;
+const MADV_DONTFORK: u64 = 10;
+const MADV_DOFORK: u64 = 11;
+const MADV_WIPEONFORK: u64 = 18;
+const MADV_KEEPONFORK: u64 = 19;
 /// PROT_GROWSDOWN / PROT_GROWSUP / arm64 PROT_BTI and PROT_MTE.
 const PROT_IGNORED: u32 = 0x0100_0000 | 0x0200_0000 | 0x10 | 0x20;
 
@@ -48,6 +52,8 @@ impl Kernel {
                 Err(e) => return -e,
             };
             mm.set_name(a, len, "/dev/binderfs/binder");
+            // VM_DONTCOPY on Linux: a child has no business with these buffers.
+            let _ = mm.set_on_fork(a, len, OnFork::Drop);
             drop(mm);
             return match super::binder::set_area(b, a, len) {
                 Ok(()) => a as i64,
@@ -186,6 +192,18 @@ impl Kernel {
     }
 
     pub(super) fn sys_madvise(&self, t: &Thread, addr: u64, len: u64, advice: u64) -> i64 {
+        let on_fork = match advice {
+            MADV_DONTFORK => Some(OnFork::Drop),
+            MADV_WIPEONFORK => Some(OnFork::Wipe),
+            MADV_DOFORK | MADV_KEEPONFORK => Some(OnFork::Copy),
+            _ => None,
+        };
+        if let Some(on_fork) = on_fork {
+            return match t.proc.mm().set_on_fork(crate::arch::untag(addr), len, on_fork) {
+                Ok(()) => 0,
+                Err(e) => -e,
+            };
+        }
         if matches!(advice, MADV_DONTNEED | MADV_FREE) {
             // Private mappings read back as zeros (or the file) afterwards.
             if let Err(e) = t.proc.mm().discard(crate::arch::untag(addr), len) {

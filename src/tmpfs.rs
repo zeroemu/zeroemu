@@ -148,10 +148,19 @@ struct Node {
 #[derive(Clone, Default)]
 pub struct Xattrs(BTreeMap<String, Vec<u8>>);
 
-/// tmpfs stores security.*, trusted.* and user.* only. Anything else,
-/// including system.* (no POSIX ACLs), is EOPNOTSUPP on get, set and remove.
+const ACL_NAMES: [&str; 2] = ["system.posix_acl_access", "system.posix_acl_default"];
+
+/// tmpfs stores security.*, trusted.*, user.* and POSIX ACLs, as with
+/// CONFIG_TMPFS_POSIX_ACL: /data lives here and Android expects ext4's ACLs.
+/// Anything else is EOPNOTSUPP on get, set and remove. ACLs are stored, not
+/// enforced, and new files do not inherit a default ACL.
 fn tmpfs_xattr(name: &str) -> bool {
-    ["security.", "trusted.", "user."].iter().any(|p| name.starts_with(p))
+    ACL_NAMES.contains(&name) || ["security.", "trusted.", "user."].iter().any(|p| name.starts_with(p))
+}
+
+/// posix_acl_from_xattr: a little-endian version 2 header and 8-byte entries.
+fn valid_acl(value: &[u8]) -> bool {
+    value.len() >= 4 && value[0..4] == 2u32.to_le_bytes() && (value.len() - 4).is_multiple_of(8)
 }
 
 impl Xattrs {
@@ -165,6 +174,9 @@ impl Xattrs {
     pub fn set(&mut self, name: &str, value: &[u8], flags: u32) -> Result<(), i64> {
         if !tmpfs_xattr(name) {
             return Err(EOPNOTSUPP);
+        }
+        if ACL_NAMES.contains(&name) && !valid_acl(value) {
+            return Err(EINVAL);
         }
         match self.0.contains_key(name) {
             true if flags & XATTR_CREATE != 0 => return Err(EEXIST),

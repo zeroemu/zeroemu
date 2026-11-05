@@ -157,6 +157,9 @@ impl Vsock {
     }
 
     pub fn read(&self, t: &Thread, count: usize, nonblock: bool) -> Result<Vec<u8>, i64> {
+        if count == 0 {
+            return Ok(Vec::new());
+        }
         loop {
             let seen = EVENTS.current();
             {

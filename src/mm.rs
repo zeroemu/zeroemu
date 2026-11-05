@@ -150,7 +150,20 @@ pub struct Stale {
     devs: Vec<Arc<DevMem>>,
 }
 
+/// `prot` without write access. A write-only mapping stays readable, as it is
+/// on arm64: no entry grants EL0 write without read, and no access at all would
+/// fault forever.
+fn read_only(prot: u32) -> u32 {
+    if prot & PROT_WRITE != 0 { (prot & !PROT_WRITE) | PROT_READ } else { prot }
+}
+
 impl Stale {
+    pub fn absorb(&mut self, other: Stale) {
+        self.frames.extend(other.frames);
+        self.objs.extend(other.objs);
+        self.devs.extend(other.devs);
+    }
+
     pub fn release(&mut self, phys: &PhysMem) {
         for f in self.frames.drain(..) {
             phys.free(f);
@@ -162,11 +175,23 @@ impl Stale {
     }
 }
 
+/// What fork does with a mapping (madvise; binder's area is never inherited).
+#[derive(Clone, Copy, PartialEq, Default)]
+pub enum OnFork {
+    #[default]
+    Copy,
+    /// MADV_DONTFORK: the child does not have it.
+    Drop,
+    /// MADV_WIPEONFORK: the child reads zeros.
+    Wipe,
+}
+
 #[derive(Clone)]
 pub struct Vma {
     pub end: u64,
     pub prot: u32,
     pub backing: Backing,
+    pub on_fork: OnFork,
     /// Shown in /proc/<pid>/maps (a file path, "[stack]", …).
     pub name: Option<Arc<str>>,
 }
@@ -241,16 +266,14 @@ pub struct AddressSpace {
     /// startstack: bionic finds the main thread's stack mapping by it).
     pub start_stack: u64,
     pub brk: u64,
-    /// Set when entries were removed or downgraded: vCPUs must flush before
-    /// re-entering the guest, and `stale` frames may be freed only after that.
-    pub tlb_dirty: bool,
+    /// Bumped when entries are removed or downgraded. `flushed_gen` catches up
+    /// once a TLB flush has run in the guest. A thread behind on this flushes
+    /// before re-entering, even if another thread has asked for a flush too:
+    /// that one may be preempted, and this thread must not run on old entries.
+    /// `stale` frames may be freed only after the flush.
+    pub tlb_gen: u64,
+    pub flushed_gen: u64,
     stale: Stale,
-    /// Bumped when fork makes writable pages read-only; `flushed_epoch` catches
-    /// up once a TLB flush has actually run in the guest. Until then a sibling
-    /// thread may still write through a stale entry, so a copy-on-write fault
-    /// must not copy yet: the write would land in the old frame and be lost.
-    pub cow_epoch: u64,
-    pub flushed_epoch: u64,
 }
 
 impl AddressSpace {
@@ -274,9 +297,8 @@ impl AddressSpace {
             brk_start: 0,
             start_stack: 0,
             brk: 0,
-            tlb_dirty: false,
-            cow_epoch: 0,
-            flushed_epoch: 0,
+            tlb_gen: 0,
+            flushed_gen: 0,
             stale: Stale::default(),
         })
     }
@@ -367,7 +389,7 @@ impl AddressSpace {
                 if h != 0 && self.is_free(h, h.saturating_add(len)) { h } else { self.gap(len)? }
             }
         };
-        self.vmas.insert(start, Vma { end: start + len, prot, backing, name: None });
+        self.vmas.insert(start, Vma { end: start + len, prot, backing, on_fork: OnFork::Copy, name: None });
         Ok(start)
     }
 
@@ -391,6 +413,7 @@ impl AddressSpace {
             let contiguous = |o1: &u64, o2: &u64| o1 + (a.end - a_start) == *o2;
             a.end == b_start
                 && a.prot == b.prot
+                && a.on_fork == b.on_fork
                 && a.name == b.name
                 && match (&a.backing, &b.backing) {
                     (Backing::Anon, Backing::Anon) => true,
@@ -477,7 +500,7 @@ impl AddressSpace {
             }
         }
         if freed {
-            self.tlb_dirty = true;
+            self.tlb_gen += 1;
         }
         Ok(())
     }
@@ -489,7 +512,7 @@ impl AddressSpace {
             return Err(EINVAL);
         }
         if self.clear_pages(start, start.saturating_add(page_up(len))) {
-            self.tlb_dirty = true;
+            self.tlb_gen += 1;
         }
         Ok(())
     }
@@ -563,7 +586,7 @@ impl AddressSpace {
     /// The page-table entry for `frame` under `prot`: not writable while a
     /// private frame still has other owners, so the first write copies it.
     fn entry_for(&self, frame: u64, prot: u32, shared: bool) -> u64 {
-        let prot = if !shared && !self.phys.is_sole_owner(frame) { prot & !PROT_WRITE } else { prot };
+        let prot = if !shared && !self.phys.is_sole_owner(frame) { read_only(prot) } else { prot };
         paging::user_page(frame, prot)
     }
 
@@ -573,9 +596,31 @@ impl AddressSpace {
         unsafe { std::ptr::copy_nonoverlapping(self.phys.host(frame), self.phys.host(copy), PAGE as usize) };
         let e = paging::user_page(copy, prot);
         self.phys.write_u64(slot, e);
-        self.phys.free(frame);
-        self.tlb_dirty = true;
+        // Sibling threads may read it through old entries until the flush.
+        self.stale.frames.push(frame);
+        self.tlb_gen += 1;
         Ok(e)
+    }
+
+    /// madvise's fork policies. Only private anonymous memory can be wiped.
+    pub fn set_on_fork(&mut self, start: u64, len: u64, on_fork: OnFork) -> Result<(), i64> {
+        let end = start.saturating_add(page_up(len));
+        if !start.is_multiple_of(PAGE) || end > USER_TOP {
+            return Err(EINVAL);
+        }
+        if !self.covered(start, end) {
+            return Err(ENOMEM);
+        }
+        self.split(start);
+        self.split(end);
+        if on_fork == OnFork::Wipe && self.vmas.range(start..end).any(|(_, v)| !matches!(v.backing, Backing::Anon)) {
+            return Err(EINVAL);
+        }
+        for (_, v) in self.vmas.range_mut(start..end) {
+            v.on_fork = on_fork;
+        }
+        self.merge(start, end);
+        Ok(())
     }
 
     pub fn protect(&mut self, start: u64, len: u64, prot: u32) -> Result<(), i64> {
@@ -598,7 +643,9 @@ impl AddressSpace {
             phys.write_u64(slot, self.entry_for(paging::addr(e), prot, self.is_shared(va)));
             changed = true;
         });
-        self.tlb_dirty |= changed;
+        if changed {
+            self.tlb_gen += 1;
+        }
         Ok(())
     }
 
@@ -612,7 +659,10 @@ impl AddressSpace {
         if old + old_len > vma.end {
             return Err(EFAULT);
         }
-        let (prot, mut backing, vma_name) = (vma.prot, vma.backing.clone(), vma.name.clone());
+        if old_len == 0 && !matches!(vma.backing, Backing::Shared { .. } | Backing::Dev { .. }) {
+            return Err(EINVAL);
+        }
+        let (prot, on_fork, mut backing, vma_name) = (vma.prot, vma.on_fork, vma.backing.clone(), vma.name.clone());
         if fixed.is_none() && new_len <= old_len {
             self.unmap(old + new_len, old_len - new_len)?;
             return Ok(old);
@@ -628,6 +678,13 @@ impl AddressSpace {
         }
         let dst = match fixed {
             Some(a) => {
+                if !a.is_multiple_of(PAGE) || a < MIN_ADDR || a.saturating_add(new_len) > USER_TOP {
+                    return Err(EINVAL);
+                }
+                // mremap_to: source and destination may not overlap.
+                if a < old.saturating_add(old_len) && old < a + new_len {
+                    return Err(EINVAL);
+                }
                 self.unmap(a, new_len)?;
                 a
             }
@@ -640,17 +697,16 @@ impl AddressSpace {
             phys.write_u64(slot, 0);
             moves.push((va - old, e));
         });
-        // Drop the old range (its moved pages are no longer in the tables).
-        self.split(old);
-        self.split(old + old_len);
-        self.vmas.remove(&old);
-        self.unmap(old + keep, old_len - keep)?;
-        self.vmas.insert(dst, Vma { end: dst + new_len, prot, backing, name: vma_name });
+        // Drop the old range while its VMA still says whether leftover pages are
+        // shared; moved pages are no longer in the tables. old_len 0 keeps the
+        // source, which is how Linux duplicates a shared mapping.
+        self.unmap(old, old_len)?;
+        self.vmas.insert(dst, Vma { end: dst + new_len, prot, backing, on_fork, name: vma_name });
         for (off, e) in moves {
             let slot = walk(&self.phys, &mut self.tables, self.root.root, 0, dst + off, true)?.unwrap();
             self.phys.write_u64(slot, e);
         }
-        self.tlb_dirty = true;
+        self.tlb_gen += 1;
         Ok(dst)
     }
 
@@ -726,19 +782,15 @@ impl AddressSpace {
             let (frame, shared) = (paging::addr(e), matches!(vma.backing, Backing::Shared { .. } | Backing::Dev { .. }));
             if !paging::permits(e, write, exec) {
                 if write && !shared && !self.phys.is_sole_owner(frame) {
-                    // Copy-on-write, once no stale writable entry can exist. If
-                    // one may, flush and retry: this fault will come back.
-                    if self.cow_epoch != self.flushed_epoch {
-                        self.tlb_dirty = true;
-                        return Ok(());
-                    }
+                    // No thread can still write the old frame: fork flushed
+                    // before it let go of the address space.
                     self.break_cow(slot, frame, prot).map_err(|_| SEGV_MAPERR)?;
                     return Ok(());
                 }
                 self.phys.write_u64(slot, self.entry_for(frame, prot, shared));
             }
             // Either way the entry now allows it; a stale TLB entry caused the fault.
-            self.tlb_dirty = true;
+            self.tlb_gen += 1;
             return Ok(());
         }
         let frame = self.populate(start, &vma, page).map_err(|_| SEGV_MAPERR)?;
@@ -884,14 +936,14 @@ impl AddressSpace {
 
     // ---- lifecycle ----
 
-    /// fork(): private pages are copied (eagerly; copy-on-write comes later),
-    /// shared ones stay shared.
     /// A copy of this address space. Shared mappings keep their frames;
     /// private frames are shared too, read-only in both spaces, until one
-    /// writes (fault and host_ptr copy them then).
+    /// writes (fault and host_ptr copy them then). A caller with other threads
+    /// must flush TLBs before releasing the lock: they may hold writable entries
+    /// for what is now read-only, and a copy made meanwhile would lose their writes.
     pub fn fork(&mut self, kernel: &KernelWindow, asid: u16) -> Result<AddressSpace, i64> {
         let mut child = AddressSpace::new(self.phys.clone(), kernel, asid)?;
-        child.vmas = self.vmas.clone();
+        child.vmas = self.vmas.iter().filter(|(_, v)| v.on_fork != OnFork::Drop).map(|(&s, v)| (s, v.clone())).collect();
         child.brk_start = self.brk_start;
         child.start_stack = self.start_stack;
         child.brk = self.brk;
@@ -899,6 +951,9 @@ impl AddressSpace {
         self.visit(0, USER_TOP, &mut |_, slot, va, e| pages.push((slot, va, e)));
         let mut downgraded = false;
         for (slot, va, e) in pages {
+            if self.find(va).is_some_and(|(_, v)| v.on_fork != OnFork::Copy) {
+                continue;
+            }
             let mut entry = e;
             if !self.is_shared(va) {
                 let frame = paging::addr(e);
@@ -906,7 +961,7 @@ impl AddressSpace {
                 if paging::permits(e, true, false) {
                     // Both copies read-only: the parent's entry changes under its threads.
                     let prot = self.find(va).map_or(0, |(_, v)| v.prot);
-                    entry = paging::user_page(frame, prot & !PROT_WRITE);
+                    entry = paging::user_page(frame, read_only(prot));
                     self.phys.write_u64(slot, entry);
                     downgraded = true;
                 }
@@ -915,8 +970,7 @@ impl AddressSpace {
             self.phys.write_u64(child_slot, entry);
         }
         if downgraded {
-            self.tlb_dirty = true;
-            self.cow_epoch += 1;
+            self.tlb_gen += 1;
         }
         Ok(child)
     }
@@ -924,6 +978,11 @@ impl AddressSpace {
     /// What was unmapped since the last flush; release it once that happened.
     pub fn take_stale(&mut self) -> Stale {
         std::mem::take(&mut self.stale)
+    }
+
+    /// Takes back what a thread took and never flushed for.
+    pub fn return_stale(&mut self, stale: Stale) {
+        self.stale.absorb(stale);
     }
 
 }

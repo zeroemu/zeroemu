@@ -66,7 +66,14 @@ use signal::{Actions, SigInfo};
 pub(super) const ERESTARTSYS: i64 = 512;
 
 /// How often blocked threads re-check for signals and process exit.
-pub(super) const POLL: Duration = Duration::from_millis(20);
+/// Hardware the image declares and droidrt has no driver behind. SystemConfig
+/// applies these last, whichever file declared the feature.
+const NO_BLUETOOTH: &str = "<config>\n  <unavailable-feature name=\"android.hardware.bluetooth\" />\n  <unavailable-feature name=\"android.hardware.bluetooth_le\" />\n</config>\n";
+
+pub(super) const POLL: Duration = Duration::from_millis(200);
+/// For sleeps every wakeup reaches directly (Thread::sleep): only a kick lost
+/// in the instant before the sleep starts ever waits this long.
+pub(super) const IDLE: Duration = Duration::from_secs(2);
 /// Guest threads at once (each is a host thread; vCPUs are shared).
 const MAX_THREADS: usize = 16384;
 
@@ -95,6 +102,8 @@ pub struct Kernel {
     timers: Arc<timers::TimerQueue>,
     procs: Mutex<HashMap<i32, Arc<Process>>>,
     next_id: AtomicI32,
+    /// Serializes allocation; set once ids have wrapped around.
+    id_wrapped: Mutex<bool>,
     next_asid: AtomicU32,
     /// Host threads running guest threads.
     live_threads: AtomicUsize,
@@ -263,6 +272,8 @@ pub struct Process {
     /// Process-directed pending signals.
     pending: Mutex<HashMap<u32, SigInfo>>,
     timers: Mutex<timers::ProcTimers>,
+    mm_taker: AtomicI32,
+    files_taker: AtomicI32,
     knobs: Mutex<procfs::Knobs>,
     pub creds: Mutex<creds::Creds>,
     /// Process group, session, limits, and other process-wide control state.
@@ -278,6 +289,13 @@ pub struct Process {
 pub struct Thread {
     pub tid: i32,
     pub proc: Arc<Process>,
+    /// The condvar this thread sleeps on, for a kick to wake it.
+    sleeping_on: Mutex<Option<SleepOn>>,
+    /// The signals an rt_sigtimedwait is waiting for: they are blocked, so
+    /// sending one kicks nobody else's way.
+    sigwait_set: AtomicU64,
+    nap_lock: Mutex<()>,
+    nap_cv: Condvar,
     clear_child_tid: AtomicU64,
     mask: AtomicU64,
     /// Mask to restore after a sigsuspend once its handler returns.
@@ -353,6 +371,22 @@ fn dump_after() -> Option<u64> {
     *AFTER.get_or_init(|| std::env::var("DROIDRT_DUMP").ok().and_then(|v| v.parse().ok()))
 }
 
+thread_local! {
+    // The guest thread this host thread runs; 0 for droidrt's own threads.
+    static GUEST_TID: std::cell::Cell<i32> = const { std::cell::Cell::new(0) };
+}
+
+/// For the thread dump: who last took a lock. If the lock stays taken, that is
+/// who holds it.
+fn guest_tid() -> i32 {
+    GUEST_TID.with(|t| t.get())
+}
+
+struct SleepOn(*const Condvar);
+// The pointer is only used under Thread::sleeping_on, and the sleeper clears
+// it under that lock before the condvar can go away.
+unsafe impl Send for SleepOn {}
+
 /// Locked access to a live process's address space.
 pub struct Mm<'a>(MutexGuard<'a, Option<AddressSpace>>);
 
@@ -370,13 +404,19 @@ impl DerefMut for Mm<'_> {
 
 impl Process {
     pub fn mm(&self) -> Mm<'_> {
-        Mm(self.mm.lock().unwrap())
+        let guard = self.mm.lock().unwrap();
+        self.mm_taker.store(guest_tid(), Ordering::Relaxed);
+        Mm(guard)
     }
 }
 
 impl Thread {
     fn new(tid: i32, proc: Arc<Process>, mask: u64, own_files: Option<Arc<Mutex<FdTable>>>) -> Arc<Thread> {
         Arc::new(Thread {
+            sleeping_on: Mutex::new(None),
+            sigwait_set: AtomicU64::new(0),
+            nap_lock: Mutex::new(()),
+            nap_cv: Condvar::new(),
             own_files,
             tid,
             proc,
@@ -396,20 +436,52 @@ impl Thread {
     /// Whether a blocking wait should give up now (signal or exit).
     /// The descriptor table this thread's syscalls use.
     pub(super) fn files(&self) -> std::sync::MutexGuard<'_, FdTable> {
-        match &self.own_files {
+        let guard = match &self.own_files {
             Some(f) => f.lock().unwrap(),
             None => self.proc.files.lock().unwrap(),
-        }
+        };
+        self.proc.files_taker.store(self.tid, Ordering::Relaxed);
+        guard
     }
 
     pub(super) fn interrupted(&self) -> bool {
         self.dying.load(Ordering::Acquire) || self.has_deliverable_signal()
     }
 
-    fn kick(&self) {
+    /// Stops the thread's vCPU if it is in the guest.
+    fn kick_vcpu(&self) {
         if let Some(k) = self.kick.lock().unwrap().as_ref() {
             k.kick();
         }
+    }
+
+    /// Makes the thread look at its signals and whether it is dying, wherever
+    /// it is: in the guest, or asleep in a syscall.
+    fn kick(&self) {
+        self.kick_vcpu();
+        self.wake_sleeper();
+        wait::EVENTS.bump(); // poll, epoll and the like sleep on this
+    }
+
+    fn wake_sleeper(&self) {
+        if let Some(cv) = &*self.sleeping_on.lock().unwrap() {
+            unsafe { (*cv.0).notify_all() };
+        }
+    }
+
+    /// Sleeps on `cv` until it is notified, the thread is kicked, or `timeout`
+    /// passes. Anything that can end the sleep must notify `cv`.
+    fn sleep<'a, T>(&self, cv: &Condvar, g: MutexGuard<'a, T>, timeout: Duration) -> MutexGuard<'a, T> {
+        *self.sleeping_on.lock().unwrap() = Some(SleepOn(cv));
+        let g = if self.interrupted() { g } else { cv.wait_timeout(g, timeout).unwrap().0 };
+        *self.sleeping_on.lock().unwrap() = None;
+        g
+    }
+
+    /// Sleeps for `d` unless kicked.
+    fn nap(&self, d: Duration) {
+        let g = self.nap_lock.lock().unwrap();
+        drop(self.sleep(&self.nap_cv, g, d));
     }
 }
 
@@ -435,6 +507,13 @@ impl Kernel {
             v
         });
         let dev = mount_tmpfs(&mut v, &phys);
+        if boot {
+            // There is no virtual HCI controller yet. With the feature declared,
+            // Android's Bluetooth stack aborts and restarts for as long as it runs.
+            let oem = crate::tmpfs::Tmpfs::new(phys.clone(), 0o755);
+            oem.write_file("etc/sysconfig/droidrt.xml", 0o644, NO_BLUETOOTH);
+            v.mount("/oem", oem);
+        }
         let sys = v.resolve("/", "/sys", true).map(|n| v.fs_arc(&n)).map_err(|e| format!("/sys: errno {e}"))?;
         let blocks = block::Blocks::new(dev.clone(), sys.clone());
         let drm = gpu.as_ref().map(|g| drm::Device::new(g.clone(), phys.clone()));
@@ -501,6 +580,7 @@ impl Kernel {
             timers: timers::TimerQueue::new(me.clone()),
             procs: Mutex::new(HashMap::new()),
             next_id: AtomicI32::new(1),
+            id_wrapped: Mutex::new(false),
             next_asid: AtomicU32::new(1),
             live_threads: AtomicUsize::new(0),
             vcpus: vcpus::Pool::new(max_vcpus),
@@ -531,6 +611,30 @@ impl Kernel {
         Ok(mm)
     }
 
+    /// A free pid or tid. Ids wrap at pid_max as on Linux, and never reuse a
+    /// live thread, process, group or session id. /proc keeps them in 16 bits.
+    fn alloc_id(&self) -> i32 {
+        const PID_MAX: i32 = 32768;
+        const AFTER_WRAP: i32 = 300;
+        let mut wrapped = self.id_wrapped.lock().unwrap();
+        loop {
+            let mut id = self.next_id.load(Ordering::Relaxed);
+            if id >= PID_MAX {
+                id = AFTER_WRAP;
+                *wrapped = true;
+            }
+            self.next_id.store(id + 1, Ordering::Relaxed);
+            let taken = *wrapped
+                && self.procs.lock().unwrap().values().any(|p| {
+                    let a = p.attrs.lock().unwrap();
+                    p.pid == id || a.pgid == id || a.sid == id || p.threads.lock().unwrap().iter().any(|t| t.tid == id)
+                });
+            if !taken {
+                return id;
+            }
+        }
+    }
+
     fn process(&self, pid: i32) -> Option<Arc<Process>> {
         self.procs.lock().unwrap().get(&pid).cloned()
     }
@@ -552,7 +656,19 @@ impl Kernel {
         };
         procs.sort_by_key(|p| p.pid);
         eprintln!("[droidrt] ---- thread dump: {} processes ----", procs.len());
+        if let Some(tid) = binder::lock_taker() {
+            eprintln!("[droidrt] binder lock held by tid {tid}");
+        }
         for p in procs {
+            if p.mm.try_lock().is_err() {
+                eprintln!("[droidrt] {}: address space locked by tid {}", p.pid, p.mm_taker.load(Ordering::Relaxed));
+            }
+            if p.files.try_lock().is_err() {
+                eprintln!("[droidrt] {}: fd table locked by tid {}", p.pid, p.files_taker.load(Ordering::Relaxed));
+            }
+            if p.creds.try_lock().is_err() {
+                eprintln!("[droidrt] {}: creds locked", p.pid);
+            }
             let Ok(threads) = p.threads.try_lock().map(|t| t.clone()) else {
                 eprintln!("[droidrt] {}: thread list locked", p.pid);
                 continue;
@@ -616,7 +732,7 @@ impl Kernel {
                 }
             });
         }
-        let pid = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let pid = self.alloc_id();
         let proc = Arc::new(Process {
             pid,
             ppid: AtomicI32::new(0),
@@ -624,6 +740,8 @@ impl Kernel {
             files: Mutex::new(FdTable::stdio()),
             cwd: Mutex::new("/".into()),
             timers: Mutex::default(),
+            mm_taker: AtomicI32::new(0),
+            files_taker: AtomicI32::new(0),
             exe: Mutex::new(exe),
             cmdline: Mutex::new(cmdline_bytes(argv)),
             sig: Mutex::new(Actions::default()),
@@ -682,12 +800,13 @@ impl Kernel {
     }
 
     fn thread_main(self: &Arc<Self>, t: &Arc<Thread>, state: CpuState) {
+        GUEST_TID.with(|tid| tid.set(t.tid));
         crate::vfs::set_current_ns(t.proc.mnt_ns.load(Ordering::Relaxed));
         let root = t.proc.mm().root;
         let mut vcpu: Box<dyn Vcpu> = Box::new(vcpus::LazyVcpu::new(self.hv.clone(), self.vcpus.clone(), t.clone(), root, state));
         let mut stale = crate::mm::Stale::default();
         let mut restart: Option<SyscallRegs> = None;
-        // The copy-on-write epoch a requested TLB flush will cover.
+        // The generation a requested TLB flush will cover, until it has run.
         let mut flushing: Option<u64> = None;
         let mut exit_code = 0;
 
@@ -700,14 +819,15 @@ impl Kernel {
                 break;
             }
             let exit = vcpu.run();
-            // The flush requested last time ran on entry; now frames are safe to reuse.
-            stale.release(&self.phys);
-            // (Interrupted: the vCPU may not have reached the flush yet.)
+            // The flush requested last time ran on entry; now frames are safe to
+            // reuse. (Interrupted: the vCPU may not have reached the flush yet.)
             if !matches!(exit, Exit::Interrupted)
-                && let Some(epoch) = flushing.take()
+                && let Some(generation) = flushing.take()
             {
                 let mut mm = t.proc.mm();
-                mm.flushed_epoch = mm.flushed_epoch.max(epoch);
+                mm.flushed_gen = mm.flushed_gen.max(generation);
+                drop(mm);
+                stale.release(&self.phys);
             }
             match exit {
                 Exit::Syscall => {
@@ -744,15 +864,15 @@ impl Kernel {
                 Exit::Interrupted => {}
             }
             let mut mm = t.proc.mm();
-            if mm.tlb_dirty {
-                mm.tlb_dirty = false;
-                stale = mm.take_stale();
+            if mm.flushed_gen < mm.tlb_gen {
+                stale.absorb(mm.take_stale());
                 vcpu.flush_tlb();
-                flushing = Some(mm.cow_epoch);
+                flushing = Some(mm.tlb_gen);
             }
         }
         drop(vcpu); // destroyed on the thread that owns it
-        stale.release(&self.phys);
+        // Never flushed for: another thread will, or the address space goes with us.
+        t.proc.mm().return_stale(stale);
         self.thread_exit(t, exit_code);
     }
 
@@ -813,8 +933,8 @@ impl Kernel {
             kill => self.sys_kill(int(a[0]) as i32, a[1] as u32, t),
             tgkill => self.sys_tgkill(int(a[0]) as i32, int(a[1]) as i32, a[2] as u32, t),
             tkill => self.sys_tgkill(-1, int(a[0]) as i32, a[1] as u32, t),
-            rt_tgsigqueueinfo => self.sys_sigqueueinfo(t, int(a[0]) as i32, int(a[1]) as i32, a[2] as u32, a[3]).unwrap_or_else(|e| -e),
-            rt_sigqueueinfo => self.sys_sigqueueinfo(t, int(a[0]) as i32, 0, a[1] as u32, a[2]).unwrap_or_else(|e| -e),
+            rt_tgsigqueueinfo => self.sys_sigqueueinfo(t, int(a[0]) as i32, Some(int(a[1]) as i32), a[2] as u32, a[3]).unwrap_or_else(|e| -e),
+            rt_sigqueueinfo => self.sys_sigqueueinfo(t, int(a[0]) as i32, None, a[1] as u32, a[2]).unwrap_or_else(|e| -e),
             timer_create | timer_settime | timer_gettime | timer_getoverrun | timer_delete | setitimer | getitimer | alarm => self.timer_syscall(no, t, a).unwrap_or_else(|e| -e),
             getpid => t.proc.pid as i64,
             gettid => t.tid as i64,
@@ -963,11 +1083,11 @@ impl Kernel {
 
     fn process_exit(self: &Arc<Self>, proc: &Arc<Process>, status: i32) {
         // Closing files first lets pipe readers see EOF.
+        // Two statements: the lock must be free before the files go. Closing them
+        // can wait on locks whose holders are putting descriptors in this table.
         let files = std::mem::replace(&mut *proc.files.lock().unwrap(), FdTable::empty());
         drop(files);
         locks::LOCKS.release(locks::Owner::Process(proc.pid));
-        // Two statements: the lock must be free before the address space goes.
-        // Its mappings can hold the last reference to a binder file.
         let old = proc.mm.lock().unwrap().take();
         drop(old);
         // Children move before we become a zombie: whoever reaps us finds them in place.

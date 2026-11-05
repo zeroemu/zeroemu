@@ -11,7 +11,7 @@
 
 use super::signal::SigInfo;
 use super::specialfd::{deadline_for, put_timespec};
-use super::wait::EVENTS;
+use super::wait::{CENTURY, EVENTS};
 use super::{Kernel, Process, Thread};
 use crate::arch::Sysno;
 use crate::errno::*;
@@ -117,7 +117,13 @@ impl TimerQueue {
             let queue = self.clone();
             let _ = std::thread::Builder::new().name("timers".into()).spawn(move || queue.run());
         });
-        self.heap.lock().unwrap().push(Reverse(Due { at, generation, timer: Arc::downgrade(timer) }));
+        let mut heap = self.heap.lock().unwrap();
+        // Superseded entries otherwise stay until their deadline, however far off.
+        if heap.len() >= 4096 {
+            heap.retain(|Reverse(due)| due.timer.upgrade().is_some_and(|t| t.st.try_lock().map_or(true, |st| st.generation == due.generation)));
+        }
+        heap.push(Reverse(Due { at, generation, timer: Arc::downgrade(timer) }));
+        drop(heap);
         self.wake.notify_one();
     }
 
@@ -214,7 +220,8 @@ impl Kernel {
             let now = Instant::now();
             let due = st.next.unwrap_or(now);
             let missed = (now.saturating_duration_since(due).as_nanos() / st.interval.as_nanos()).min(i32::MAX as u128) as u32;
-            let next = due.checked_add(st.interval * (missed + 1)).unwrap_or(now + st.interval);
+            // The interval is capped when set and `missed` fits the time gone by.
+            let next = due + st.interval * (missed + 1);
             st.overrun = st.overrun.saturating_add(missed as i32);
             st.generation += 1;
             st.next = Some(next);
@@ -229,8 +236,14 @@ impl Kernel {
         }
         st.overrun_last = st.overrun;
         st.overrun = 0;
-        let info = SigInfo::timer(timer.signo, timer.code, timer.id, st.overrun_last, timer.value);
-        drop(st);
+        // ITIMER_REAL's SI_KERNEL siginfo has no such fields.
+        let info = if timer.code == SI_TIMER {
+            SigInfo::timer(timer.signo, timer.code, timer.id, st.overrun_last, timer.value)
+        } else {
+            SigInfo::timer(timer.signo, timer.code, 0, 0, 0)
+        };
+        // With `st` held: timer_delete, having taken it, knows no signal is on
+        // its way and can remove the one that is pending.
         match &timer.thread {
             Some(th) => {
                 if let Some(th) = th.upgrade() {
@@ -248,7 +261,7 @@ impl Kernel {
         let mut st = timer.st.lock().unwrap();
         let old = st.remaining();
         st.generation += 1;
-        st.interval = interval;
+        st.interval = if value.is_zero() { Duration::ZERO } else { interval.min(CENTURY) };
         st.overrun = 0;
         st.overrun_last = 0;
         st.next = (!value.is_zero()).then(|| deadline_for(timer.clock, self.boot, value, abstime));
@@ -334,8 +347,9 @@ impl Kernel {
             }
             alarm => {
                 let old = self.arm_timer(&self.real_timer(t), Duration::ZERO, Duration::from_secs(a[0] as u32 as u64), false);
-                // Rounded up, so a running alarm never reads as none.
-                Ok(old.1.as_secs() as i64 + (old.1.subsec_nanos() != 0) as i64)
+                // Rounded to nearest, but a running alarm never reads as none.
+                let rounded = old.1.as_secs() + (old.1.subsec_millis() >= 500) as u64;
+                Ok(if old.1.is_zero() { 0 } else { rounded.max(1) as i64 })
             }
             _ => Err(ENOSYS),
         }

@@ -5,7 +5,7 @@
 //! `ucontext` (sigcontext + 8-byte `uc_sigmask`), `siginfo`, and a
 //! 64-byte-aligned FXSAVE/XSAVE image above the frame.
 
-use super::{Kernel, POLL, Process, Ret, Thread};
+use super::{Kernel, Process, Ret, Thread};
 use crate::errno::*;
 use crate::hv::{CpuState, SyscallRegs, Vcpu};
 use std::sync::Arc;
@@ -289,6 +289,9 @@ impl Kernel {
         }
         // Wake a thread that can take it.
         let threads = proc.threads.lock().unwrap();
+        for th in threads.iter().filter(|th| th.sigwait_set.load(Ordering::SeqCst) & bit(sig) != 0) {
+            th.wake_sleeper();
+        }
         if let Some(th) = threads
             .iter()
             .find(|t| t.mask.load(Ordering::Relaxed) & bit(sig) == 0)
@@ -493,7 +496,7 @@ impl Kernel {
         *t.saved_mask.lock().unwrap() = Some(old);
         while !t.interrupted() {
             super::vcpus::blocking();
-            std::thread::sleep(POLL.min(std::time::Duration::from_millis(2)));
+            t.nap(super::IDLE);
         }
         -EINTR
     }
@@ -511,32 +514,38 @@ impl Kernel {
                 None
             } else {
                 match (mm.read_u64(timeout), mm.read_u64(timeout + 8)) {
-                    (Ok(s), Ok(ns)) if ns < 1_000_000_000 => Some(std::time::Instant::now() + std::time::Duration::new(s, ns as u32)),
-                    (Ok(_), Ok(_)) => return -EINVAL,
+                    (Ok(s), Ok(ns)) => match super::wait::guest_timespec(s, ns) {
+                        Ok(d) => Some(super::wait::instant_after(d)),
+                        Err(e) => return -e,
+                    },
                     (Err(e), _) | (_, Err(e)) => return -e,
                 }
             };
             (want, deadline)
         };
-        loop {
+        // Published before looking, so a signal sent after the look finds us.
+        t.sigwait_set.store(want, Ordering::SeqCst);
+        let result = loop {
             if let Some((sig, si)) = t.take_from(want) {
                 if info != 0
                     && let Err(e) = t.proc.mm().write(info, &si.0)
                 {
-                    return -e;
+                    break -e;
                 }
-                return sig as i64;
+                break sig as i64;
             }
             if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
-                return -EAGAIN;
+                break -EAGAIN;
             }
             if t.interrupted() {
-                return -EINTR; // a signal outside the set, to be handled
+                break -EINTR; // a signal outside the set, to be handled
             }
-            let nap = deadline.map_or(POLL, |d| d.saturating_duration_since(std::time::Instant::now()).min(POLL));
+            let nap = deadline.map_or(super::IDLE, |d| d.saturating_duration_since(std::time::Instant::now()).min(super::IDLE));
             super::vcpus::blocking();
-            std::thread::sleep(nap.min(std::time::Duration::from_millis(5)));
-        }
+            t.nap(nap);
+        };
+        t.sigwait_set.store(0, Ordering::SeqCst);
+        result
     }
 
     /// The signals pending for the thread or its process.

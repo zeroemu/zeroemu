@@ -43,11 +43,15 @@ pub struct Inet {
     connected_local: AtomicBool,
 }
 
-/// 127/8, 224/4, ::1, ff00::/8.
+/// Loopback, multicast, and the wildcard, which Linux routes to loopback.
 fn reaches_loopback(addr: &[u8]) -> bool {
+    let v4 = |first: u8| first == 0 || first == 127 || (224..240).contains(&first);
     match addr.get(0..2).map(|f| u16::from_le_bytes([f[0], f[1]]) as u64) {
-        Some(AF_INET) => addr.get(4).is_some_and(|&b| b == 127 || (224..240).contains(&b)),
-        Some(AF_INET6) => addr.get(8..24).is_some_and(|ip| ip[0] == 0xff || (ip[..15].iter().all(|&b| b == 0) && ip[15] == 1)),
+        Some(AF_INET) => addr.get(4).is_some_and(|&b| v4(b)),
+        Some(AF_INET6) => addr.get(8..24).is_some_and(|ip| {
+            let mapped = ip[..10].iter().all(|&b| b == 0) && ip[10] == 0xff && ip[11] == 0xff;
+            ip[0] == 0xff || (ip[..15].iter().all(|&b| b == 0) && ip[15] <= 1) || (mapped && v4(ip[12]))
+        }),
         _ => false,
     }
 }
@@ -159,10 +163,15 @@ impl Kernel {
                 (word(0), word(8) & 0xffff_ffff, total as i64)
             }
         };
-        let local = if name == 0 {
-            s.connected_local.load(Ordering::Relaxed)
-        } else {
-            reaches_loopback(&mm.read_vec(name, namelen.min(128) as usize)?)
+        let dest = if name != 0 && namelen != 0 { Some(mm.read_vec(name, namelen.min(128) as usize)?) } else { None };
+        // connect(AF_UNSPEC) dissolves the association.
+        if no == connect && dest.as_ref().is_some_and(|d| d.len() >= 2 && d[..2] == [0, 0]) {
+            s.connected_local.store(false, Ordering::Relaxed);
+            return Ok(0);
+        }
+        let local = match &dest {
+            Some(d) => reaches_loopback(d),
+            None => s.connected_local.load(Ordering::Relaxed),
         };
         if !local {
             return Err(ENETUNREACH);

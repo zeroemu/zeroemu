@@ -163,6 +163,12 @@ pub trait Vcpu {
     /// Invalidates cached translations for every vCPU of the VM before this
     /// one next enters the guest (after unmapping or downgrading pages).
     fn flush_tlb(&mut self);
+    /// Invalidates cached translations for every vCPU of the VM before returning.
+    fn flush_tlb_now(&mut self);
+    /// Makes sure there is a vCPU behind this object; false if the thread is dying.
+    fn ready(&mut self) -> bool {
+        true
+    }
     fn kicker(&self) -> Arc<dyn Kick>;
 }
 

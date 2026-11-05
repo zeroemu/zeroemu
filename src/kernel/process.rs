@@ -3,7 +3,7 @@
 
 use super::creds::Creds;
 use super::signal::{SIGCHLD, SIGCONT, SigInfo};
-use super::{ERESTARTSYS, Kernel, POLL, Process, Ret, Thread, int};
+use super::{ERESTARTSYS, Kernel, Process, Ret, Thread, int};
 use crate::arch::Sysno;
 use crate::elf;
 use crate::errno::*;
@@ -64,11 +64,11 @@ impl Kernel {
         if flags & CLONE_SETTLS != 0 {
             state.set_tls(tls);
         }
-        let tid = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let tid = self.alloc_id();
         let r = if flags & CLONE_THREAD != 0 {
             self.clone_thread(t, flags, tid, ptid, ctid, state)
         } else {
-            self.fork(t, flags, tid, ptid, ctid, state)
+            self.fork(t, vcpu, flags, tid, (ptid, ctid), state)
         };
         Ret::Value(match r {
             Ok(()) => tid as i64,
@@ -109,9 +109,21 @@ impl Kernel {
 
     /// fork, vfork and posix_spawn. CLONE_VM without CLONE_THREAD (vfork) gets
     /// a copy too: equivalent for children that only exec or exit.
-    fn fork(self: &Arc<Self>, t: &Arc<Thread>, flags: u64, pid: i32, ptid: u64, ctid: u64, state: CpuState) -> Result<(), i64> {
+    fn fork(self: &Arc<Self>, t: &Arc<Thread>, vcpu: &mut dyn Vcpu, flags: u64, pid: i32, (ptid, ctid): (u64, u64), state: CpuState) -> Result<(), i64> {
         let parent = &t.proc;
-        let mut mm = parent.mm().fork(&self.kwin, self.alloc_asid())?;
+        let threaded = parent.threads.lock().unwrap().len() > 1;
+        // Not under the lock below: this can wait for a free vCPU.
+        if threaded && !vcpu.ready() {
+            return Err(EINTR);
+        }
+        let mut mm = {
+            let mut pm = parent.mm();
+            let mm = pm.fork(&self.kwin, self.alloc_asid())?;
+            if threaded {
+                vcpu.flush_tlb_now();
+            }
+            mm
+        };
         if flags & CLONE_PARENT_SETTID != 0 {
             parent.mm().write_u32(ptid, pid as u32)?;
         }
@@ -125,6 +137,8 @@ impl Kernel {
             files: Mutex::new(t.files().fork_copy(pid)),
             cwd: Mutex::new(parent.cwd.lock().unwrap().clone()),
             timers: Mutex::default(),
+            mm_taker: AtomicI32::new(0),
+            files_taker: AtomicI32::new(0),
             exe: Mutex::new(parent.exe.lock().unwrap().clone()),
             cmdline: Mutex::new(parent.cmdline.lock().unwrap().clone()),
             sig: Mutex::new(parent.sig.lock().unwrap().clone()),
@@ -199,6 +213,11 @@ impl Kernel {
         }
         vcpu.set_page_tables(mm.root);
         vcpu.set_state(&state);
+        // A flush this thread already asked for counts against these numbers.
+        {
+            let current = t.proc.mm();
+            (mm.tlb_gen, mm.flushed_gen) = (current.tlb_gen, current.flushed_gen);
+        }
         let old = t.proc.mm.lock().unwrap().replace(mm);
         drop(old);
         Ret::NoReturn
@@ -370,7 +389,7 @@ impl Kernel {
                 return Err(ERESTARTSYS);
             }
             super::vcpus::blocking();
-            children = proc.child_cv.wait_timeout(children, POLL).unwrap().0;
+            children = t.sleep(&proc.child_cv, children, super::IDLE);
         }
     }
 
@@ -593,20 +612,20 @@ impl Kernel {
 
     /// rt_sigqueueinfo (`tid` 0) and rt_tgsigqueueinfo: the sender writes the
     /// siginfo, but may only claim to be the kernel or tkill to itself.
-    pub(super) fn sys_sigqueueinfo(&self, sender: &Thread, pid: i32, tid: i32, sig: u32, uinfo: u64) -> Result<i64, i64> {
-        if sig > 64 {
+    pub(super) fn sys_sigqueueinfo(&self, sender: &Thread, pid: i32, tid: Option<i32>, sig: u32, uinfo: u64) -> Result<i64, i64> {
+        if sig > 64 || tid.is_some_and(|tid| tid <= 0 || pid <= 0) {
             return Err(EINVAL);
         }
         let mut bytes = [0u8; 128];
         bytes.copy_from_slice(&sender.proc.mm().read_vec(uinfo, 128)?);
         let code = i32::from_le_bytes(bytes[8..12].try_into().unwrap());
-        if (code >= 0 || code == -6) && pid != sender.proc.pid {
+        if (code >= 0 || code == -6) && tid.unwrap_or(pid) != sender.tid {
             return Err(EPERM);
         }
         bytes[0..4].copy_from_slice(&(sig as i32).to_le_bytes());
         let info = SigInfo(bytes);
         let creds = self.creds(sender);
-        if tid != 0 {
+        if let Some(tid) = tid {
             let th = self.task(tid).filter(|th| th.proc.pid == pid).ok_or(ESRCH)?;
             if !self.may_signal(sender, &creds, &th.proc, sig) {
                 return Err(EPERM);

@@ -3,11 +3,11 @@
 //!
 //! Lock order: the waiter table, then the address space (to read the word).
 
-use super::{ERESTARTSYS, Kernel, POLL, Thread};
+use super::{ERESTARTSYS, IDLE, Kernel, Thread};
 use crate::errno::*;
 use std::collections::HashMap;
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 const FUTEX_WAIT: u32 = 0;
 const FUTEX_WAKE: u32 = 1;
@@ -110,14 +110,17 @@ impl Kernel {
                             _ => return -EFAULT,
                         }
                     };
-                    let d = Duration::new(s, ns as u32);
+                    let d = match super::wait::guest_timespec(s, ns) {
+                        Ok(d) => d,
+                        Err(e) => return -e,
+                    };
                     Some(if op & FUTEX_CMD_MASK == FUTEX_WAIT {
-                        Instant::now() + d // relative
+                        super::wait::instant_after(d) // relative
                     } else if op & FUTEX_CLOCK_REALTIME != 0 {
                         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
-                        Instant::now() + d.saturating_sub(now)
+                        super::wait::instant_after(d.saturating_sub(now))
                     } else {
-                        self.boot + d // absolute CLOCK_MONOTONIC
+                        self.boot + d.min(super::wait::CENTURY) // absolute CLOCK_MONOTONIC
                     })
                 };
                 self.futex_wait(t, key, addr, val, deadline, bitset)
@@ -162,14 +165,17 @@ impl Kernel {
                             _ => return -EFAULT,
                         }
                     };
-                    let d = Duration::new(s, ns as u32);
+                    let d = match super::wait::guest_timespec(s, ns) {
+                        Ok(d) => d,
+                        Err(e) => return -e,
+                    };
                     // Absolute: LOCK_PI on CLOCK_REALTIME, LOCK_PI2 on
                     // CLOCK_MONOTONIC unless asked otherwise.
                     Some(if cmd == FUTEX_LOCK_PI || op & FUTEX_CLOCK_REALTIME != 0 {
                         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
-                        Instant::now() + d.saturating_sub(now)
+                        super::wait::instant_after(d.saturating_sub(now))
                     } else {
-                        self.boot + d
+                        self.boot + d.min(super::wait::CENTURY)
                     })
                 };
                 self.futex_lock_pi(t, key, addr, cmd == FUTEX_TRYLOCK_PI, deadline)
@@ -240,9 +246,9 @@ impl Kernel {
                 self.futex.remove(key, &w);
                 return if *w.woken.lock().unwrap() { 0 } else { err };
             }
-            let nap = deadline.map_or(POLL, |d| d.saturating_duration_since(Instant::now()).min(POLL));
+            let nap = deadline.map_or(IDLE, |d| d.saturating_duration_since(Instant::now()).min(IDLE));
             super::vcpus::blocking();
-            woken = w.cv.wait_timeout(woken, nap).unwrap().0;
+            woken = t.sleep(&w.cv, woken, nap);
         }
     }
 
@@ -307,9 +313,9 @@ impl Kernel {
                 self.futex.remove(key, &w);
                 return if *w.woken.lock().unwrap() { 0 } else { -EINTR };
             }
-            let nap = deadline.map_or(POLL, |d| d.saturating_duration_since(Instant::now()).min(POLL));
+            let nap = deadline.map_or(IDLE, |d| d.saturating_duration_since(Instant::now()).min(IDLE));
             super::vcpus::blocking();
-            woken = w.cv.wait_timeout(woken, nap).unwrap().0;
+            woken = t.sleep(&w.cv, woken, nap);
         }
     }
 }

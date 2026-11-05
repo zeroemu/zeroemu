@@ -399,7 +399,7 @@ impl Pipe {
                 return Err(ERESTARTSYS);
             }
             super::vcpus::blocking();
-            st = self.cv.wait_timeout(st, POLL).unwrap().0;
+            st = t.sleep(&self.cv, st, super::IDLE);
         }
     }
 
@@ -428,7 +428,7 @@ impl Pipe {
                 return if done > 0 { Ok(done) } else { Err(ERESTARTSYS) };
             }
             super::vcpus::blocking();
-            st = self.cv.wait_timeout(st, POLL).unwrap().0;
+            st = t.sleep(&self.cv, st, super::IDLE);
         }
     }
 }
@@ -1447,7 +1447,7 @@ impl Kernel {
                     return Err(ERESTARTSYS);
                 }
                 super::vcpus::blocking();
-                std::thread::sleep(POLL);
+                t.nap(super::IDLE);
             },
             Kind::Block(b) => {
                 let dev = self.blocks.device(b.devt).ok_or(ENXIO)?;
@@ -1714,7 +1714,7 @@ impl Kernel {
         } else {
             let mut mm = t.proc.mm();
             let (s, ns) = (mm.read_u64(timeout)?, mm.read_u64(timeout + 8)?);
-            Some(Instant::now() + Duration::new(s, ns.min(999_999_999) as u32))
+            Some(super::wait::instant_after(super::wait::guest_timespec(s, ns)?))
         };
         let raw = t.proc.mm().read_vec(fds, nfds as usize * 8)?;
         let old = self.swap_mask(t, sigmask)?;
@@ -1764,7 +1764,7 @@ impl Kernel {
                 None
             } else {
                 let (s, ns) = (mm.read_u64(a[4])?, mm.read_u64(a[4] + 8)?);
-                Some(Instant::now() + Duration::new(s, ns.min(999_999_999) as u32))
+                Some(super::wait::instant_after(super::wait::guest_timespec(s, ns)?))
             };
             // The sixth argument points at { const sigset_t *ss; size_t ss_len }.
             let sigmask = if a[5] == 0 { 0 } else { mm.read_u64(a[5])? };
@@ -1866,10 +1866,14 @@ impl Kernel {
         let Kind::Epoll(ep) = &f.kind else { return Err(EINVAL) };
         let deadline = (timeout_ms >= 0).then(|| Instant::now() + Duration::from_millis(timeout_ms as u64));
         let old = self.swap_mask(t, sigmask)?;
+        let mut fell_back = false;
         let r = loop {
             let seen = EVENTS.current();
             let ready = ep.collect(t, max.min(1024) as usize, 0);
             if !ready.is_empty() {
+                if fell_back && late_wake_log() {
+                    eprintln!("[droidrt] late wake: tid {} epoll fd {epfd}: only the fallback timeout noticed {} ready events", t.tid, ready.len());
+                }
                 let (size, data_off) = self.arch.epoll_event_layout();
                 let mut out = vec![0u8; ready.len() * size];
                 for (i, (ev, data)) in ready.iter().enumerate() {
@@ -1884,7 +1888,8 @@ impl Kernel {
             if t.interrupted() {
                 break Err(EINTR);
             }
-            EVENTS.wait(seen, nap(deadline, ep.deadline()));
+            let nap = nap(deadline, ep.deadline());
+            fell_back = EVENTS.wait(seen, nap) && nap == POLL;
         };
         self.restore_mask(t, old, &r);
         r
@@ -1911,6 +1916,13 @@ fn epoll_timespec_ms(t: &Thread, ts: u64) -> Result<i64, i64> {
 fn nap(deadline: Option<Instant>, timer: Option<Instant>) -> Duration {
     let until = deadline.into_iter().chain(timer).min();
     until.map_or(POLL, |d| d.saturating_duration_since(Instant::now()).min(POLL)).max(Duration::from_micros(50))
+}
+
+/// DROIDRT_LATEWAKE=1: reports readiness nothing announced with EVENTS.bump.
+/// Those files work, but only as fast as the fallback timeout.
+fn late_wake_log() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("DROIDRT_LATEWAKE").is_some())
 }
 
 /// The namespace node behind an open file, if it keeps one.

@@ -5,7 +5,7 @@
 //! line editing, echo or job-control signals yet.
 
 use super::wait::EVENTS;
-use super::{ERESTARTSYS, POLL, Thread};
+use super::{ERESTARTSYS, Thread};
 use crate::errno::*;
 use crate::vfs::Vfs;
 use std::collections::{BTreeMap, VecDeque};
@@ -207,7 +207,7 @@ impl End {
                 return Err(ERESTARTSYS);
             }
             super::vcpus::blocking();
-            st = self.pty.cv.wait_timeout(st, POLL).unwrap().0;
+            st = t.sleep(&self.pty.cv, st, super::IDLE);
         }
     }
 
@@ -242,7 +242,7 @@ impl End {
                 return if done > 0 { Ok(done) } else { Err(ERESTARTSYS) };
             }
             super::vcpus::blocking();
-            st = self.pty.cv.wait_timeout(st, POLL).unwrap().0;
+            st = t.sleep(&self.pty.cv, st, super::IDLE);
         }
     }
 

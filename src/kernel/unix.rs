@@ -207,7 +207,7 @@ pub(super) fn sockopt_bytes(t: &Thread, val: u64, len: u64) -> Result<Vec<u8>, i
 
 /// When a blocking call with this SO_RCVTIMEO / SO_SNDTIMEO gives up.
 fn deadline(timeout: Option<Duration>) -> Option<Instant> {
-    timeout.map(|d| Instant::now() + d)
+    timeout.map(super::wait::instant_after)
 }
 
 /// One sleep of a blocking socket call. A timeout ran out: EAGAIN. Signals
@@ -679,7 +679,7 @@ impl Kernel {
                         v.connect(&addr).map(|_| 0)
                     }
                     sendto | sendmsg if no == sendto => {
-                        let data = t.proc.mm().read_vec(a[1], a[2] as usize)?;
+                        let data = t.proc.mm().read_vec(a[1], a[2].min(IO_MAX) as usize)?;
                         v.write(&data).map(|n| n as i64)
                     }
                     recvfrom if a[4] == 0 => {
@@ -697,7 +697,15 @@ impl Kernel {
             socket if a[0] == super::inet::AF_INET || a[0] == super::inet::AF_INET6 => self.inet_socket(t, a),
             // Closing a PF_KEY socket waits for RCU on Linux; netd's stats map
             // swap opens and closes one for that alone. Nothing here needs it.
-            socket if a[0] == super::inet::AF_KEY => self.inet_socket(t, a),
+            socket if a[0] == super::inet::AF_KEY => {
+                if a[1] & 0xf != 3 {
+                    return Err(ESOCKTNOSUPPORT);
+                }
+                if a[2] != 2 {
+                    return Err(EPROTONOSUPPORT); // PF_KEY_V2 only
+                }
+                self.inet_socket(t, a)
+            }
             socket if a[0] == super::vsock::AF_VSOCK => {
                 if a[1] & 0xf != SOCK_STREAM as u64 {
                     return Err(ESOCKTNOSUPPORT);

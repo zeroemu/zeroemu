@@ -171,9 +171,14 @@ int cmain(void) {
     check(set("/tmp/x/f", "foo.bar", "1", 0) == -EOPNOTSUPP && get("/tmp/x/f", "foo.bar") == -EOPNOTSUPP, "unknown namespace: EOPNOTSUPP");
     check(set("/tmp/x/f", "user.", "1", 0) == -EINVAL, "empty suffix: EINVAL");
     check(set("/tmp/x/f", "", "1", 0) == -ERANGE && get("/tmp/x/f", "") == -ERANGE, "empty name: ERANGE");
-    check(set("/tmp/x/f", "system.posix_acl_access", "1", 0) == -EOPNOTSUPP, "tmpfs has no ACLs");
-    check(get("/tmp/x/f", "system.posix_acl_access") == -EOPNOTSUPP, "get system.*: EOPNOTSUPP");
-    check(sys(NR_removexattr, "/tmp/x/f", "system.posix_acl_access") == -EOPNOTSUPP, "remove system.*: EOPNOTSUPP");
+    // vold puts a default ACL on /data/media/0, and user 0's data is destroyed if it can't.
+    static const char acl[12] = {2, 0, 0, 0, 1, 0, 7, 0, 0, 0, 0, 0};
+    check(sys(NR_setxattr, "/tmp/x/f", "system.posix_acl_access", "1", 1, 0) == -EINVAL, "a malformed ACL: EINVAL");
+    check(get("/tmp/x/f", "system.posix_acl_access") == -ENODATA, "no ACL yet: ENODATA");
+    check(sys(NR_setxattr, "/tmp/x", "system.posix_acl_default", acl, sizeof acl, 0) == 0, "set a default ACL on a directory");
+    check(sys(NR_getxattr, "/tmp/x", "system.posix_acl_default", buf, 256) == sizeof acl && buf[6] == 7, "and read it back");
+    check(sys(NR_removexattr, "/tmp/x", "system.posix_acl_default") == 0, "and remove it");
+    check(set("/tmp/x/f", "system.other", "1", 0) == -EOPNOTSUPP, "other system.* names: EOPNOTSUPP");
     char name[300];
     memcpy(name, "user.", 5);
     memset(name + 5, 'n', 250);
@@ -220,7 +225,7 @@ int cmain(void) {
     check(sys(NR_fsetxattr, sv[0], "security.", custom, 1, 0) == -EINVAL, "socket: empty security suffix EINVAL");
     i64 mfd = sys(NR_memfd_create, "x", 0);
     check(sys(NR_fsetxattr, mfd, "user.m", "M", 1, 0) == 0 && sys(NR_fgetxattr, mfd, "user.m", buf, 256) == 1 && buf[0] == 'M', "memfd xattrs");
-    check(sys(NR_fgetxattr, mfd, "system.posix_acl_access", buf, 8) == -EOPNOTSUPP, "memfd get system.*: EOPNOTSUPP");
+    check(sys(NR_fgetxattr, mfd, "system.other", buf, 8) == -EOPNOTSUPP, "memfd get system.*: EOPNOTSUPP");
     i64 nfd = sys(NR_openat, AT_FDCWD, "/dev/null", O_RDWR, 0);
     check(sys(NR_fgetxattr, nfd, "security.selinux", buf, 256) == 26 && is("u:object_r:null_device:s0"), "fgetxattr on /dev/null");
     check(sys(NR_fgetxattr, 999, "security.selinux", buf, 256) == -EBADF, "bad fd: EBADF");

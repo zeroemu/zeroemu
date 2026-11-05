@@ -55,6 +55,19 @@ def pieces(c):
     c.sendall(b"b" * 1000)
 
 
+def udp_echo():
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.bind(("127.0.0.1", 0))
+
+    def serve():
+        while True:
+            data, peer = s.recvfrom(65536)
+            s.sendto(data, peer)
+
+    threading.Thread(target=serve, daemon=True).start()
+    return s, s.getsockname()[1]
+
+
 def server(handler):
     s = socket.socket()
     s.bind(("127.0.0.1", 0))
@@ -88,7 +101,8 @@ keep_sink = server(sink)
 keep_pieces = server(pieces)
 keep_adb = server(echo)
 keep_half = server(half_resets)
-ports += [keep_sink[1], keep_pieces[1], keep_adb[1], keep_half[1]]
+keep_udp = udp_echo()
+ports += [keep_sink[1], keep_pieces[1], keep_adb[1], keep_half[1], keep_udp[1]]
 
 env = dict(os.environ, DROIDRT_GPU="fake", DROIDRT_NET="1", ANDROID_ADB_SERVER_PORT=str(keep_adb[1]))
 started = time.time()

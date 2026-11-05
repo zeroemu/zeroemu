@@ -361,6 +361,7 @@ impl Kernel {
                     _ if self.is_init(&t.proc) => continue, // queued while blocked
                     d => {
                         if d == Default_::Core || self.strace {
+                            super::binder::dump_rings(t.proc.pid);
                             eprintln!(
                                 "[droidrt] pid {} ({}) killed by {}",
                                 t.proc.pid,

@@ -171,6 +171,8 @@ for tests that must not touch the host's mouse: `down X Y`, `move X Y`, `up X Y`
 the display's frame rate and black frames every five seconds, and
 `DROIDRT_SCHED_TRACE=1` each change in a thread's host priority.
 `DROIDRT_NET_TRACE=1` logs each network socket call and where connections go.
+`DROIDRT_BINDER_RING=1` keeps each thread's last binder events, ioctls included, and
+prints them when its process is killed by a signal.
 `DROIDRT_SYSCOUNT=1` adds to each thread dump what each thread has called since the
 last, which finds a thread in a loop: send `SIGUSR1` twice, a few seconds apart.
 `DROIDRT_DRM_TRACE=1` logs GPU ioctls, transfers and fences;

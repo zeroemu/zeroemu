@@ -393,6 +393,50 @@ int cmain(void) {
         check(await(mgr, BR_CLEAR_DEATH_DONE, 0) >= 0, "BC_DEAD_BINDER_DONE releases it");
     }
 
+    // An obituary can cause calls, and libbinder won't send one while it has anything
+    // unread: so it comes alone, whatever's waiting behind it.
+    nsaid = 0;
+    i64 doomed = sys(NR_clone, 17, 0, 0, 0, 0);
+    if (doomed == 0) {
+        int fd = open_binder();
+        struct flat obj = { TYPE_BINDER, 0, 0x9999, 0xaaaa };
+        u64 offs[1] = { 0 };
+        send_txn(fd, BC_TRANSACTION, 0, 6, &obj, sizeof obj, offs, sizeof offs);
+        sys(NR_exit_group, 0);
+    }
+    t = await(mgr, BR_TRANSACTION, 0);
+    if (t >= 0) {
+        u32 h3 = (u32)((struct flat *)said[t].t.buffer)->binder_or_handle;
+        struct { u32 cmd; u32 handle; u64 cookie; } __attribute__((packed)) req = { BC_REQUEST_DEATH, h3, 0xd2 };
+        command(mgr, BC_ACQUIRE, h3);
+        bw(mgr, &req, sizeof req, 0, 0, 0);
+        u64 buffer = said[t].t.buffer;
+        send_txn(mgr, BC_REPLY, 0, 0, "", 0, 0, 0);
+        free_buffer(mgr, buffer);
+        sys(NR_wait4, doomed, &st, 0, 0);
+        struct timespec_k { i64 s, ns; } settle = {0, 200000000};
+        sys(NR_nanosleep, &settle, 0);
+        i64 caller = sys(NR_clone, 17, 0, 0, 0, 0);
+        if (caller == 0) {
+            int fd = open_binder();
+            struct { u32 cmd; struct txn t; } __attribute__((packed)) w;
+            memset(&w, 0, sizeof w);
+            w.cmd = BC_TRANSACTION;
+            w.t.code = 7;
+            w.t.flags = 1; // one way: it waits for the manager with nobody waiting for it
+            bw(fd, &w, sizeof w, 0, 0, 0);
+            sys(NR_exit_group, 0);
+        }
+        sys(NR_wait4, caller, &st, 0, 0);
+        sys(NR_nanosleep, &settle, 0);
+        nsaid = 0;
+        check(await(mgr, BR_DEAD_BINDER, 0) >= 0, "an obituary, with a call queued behind it");
+        check(find(BR_TRANSACTION, 0) < 0, "comes alone in its read");
+        struct { u32 cmd; u64 cookie; } __attribute__((packed)) done3 = { BC_DEAD_BINDER_DONE, 0xd2 };
+        bw(mgr, &done3, sizeof done3, 0, 0, 0);
+        check(await(mgr, BR_TRANSACTION, 0) >= 0, "and the call comes next");
+    }
+
     puts_(failures ? "SOME CHECKS FAILED\n" : "all checks passed\n");
     return failures;
 }

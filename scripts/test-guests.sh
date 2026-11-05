@@ -8,7 +8,7 @@ case "$(uname -s)" in
 esac
 scripts/build-guests.sh >/dev/null 2>&1 || { echo "guest build failed"; exit 1; }
 bad=0
-for t in m2 m3 shm binder binder_nested binder_refs binder_unwind mounts creds sock selinux pty threads bpf drm locks ashmem inotify tun openrace xattr smoke clonefiles timers misc_syscalls cow uffd inet ifcfg; do
+for t in m2 m3 shm binder binder_nested binder_refs binder_unwind mounts creds sock selinux pty threads bpf drm locks ashmem inotify tun openrace xattr smoke clonefiles timers misc_syscalls cow uffd inet loop ifcfg; do
     bin="target/guest/${t}_aarch64"
     [ -x "$bin" ] || continue
     # Only this one sees the network interface, which the others don't expect.

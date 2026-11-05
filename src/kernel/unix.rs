@@ -60,7 +60,7 @@ pub fn handles(no: Sysno) -> bool {
     matches!(
         no,
         socket | socketpair | bind | listen | accept | accept4 | connect | getsockname | getpeername | sendto | recvfrom | setsockopt
-            | getsockopt | shutdown | sendmsg | recvmsg
+            | getsockopt | shutdown | sendmsg | recvmsg | sendmmsg | recvmmsg
     )
 }
 
@@ -105,7 +105,7 @@ struct Queue {
 }
 
 /// SOL_SOCKET options that read back as they were set, whatever the family.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(super) struct SockOpts {
     pub(super) rcvtimeo: Option<Duration>,
     pub(super) sndtimeo: Option<Duration>,
@@ -683,8 +683,47 @@ pub fn write(sock: &Arc<Socket>, t: &Thread, data: Vec<u8>, nonblock: bool) -> R
 }
 
 impl Kernel {
+    /// sendmmsg and recvmmsg: sendmsg and recvmsg over an array of `struct mmsghdr`,
+    /// each a msghdr and the length that came of it. An error after the first message
+    /// isn't reported: what went through is.
+    fn many_messages(&self, no: Sysno, t: &Arc<Thread>, a: [u64; 6]) -> Result<i64, i64> {
+        const MMSGHDR: u64 = 64;
+        const MSG_WAITFORONE: u64 = 0x10000;
+        let receiving = no == Sysno::recvmmsg;
+        let flags = a[3];
+        // Checked after each message, as Linux does: the first can wait for ever.
+        let until = if receiving && a[4] != 0 {
+            let spec = t.proc.mm().read_vec(a[4], 16)?;
+            let (s, ns) = (i64::from_le_bytes(spec[0..8].try_into().unwrap()), i64::from_le_bytes(spec[8..16].try_into().unwrap()));
+            if s < 0 || !(0..1_000_000_000).contains(&ns) {
+                return Err(EINVAL);
+            }
+            Some(super::wait::instant_after(Duration::new(s as u64, ns as u32)))
+        } else {
+            None
+        };
+        let mut done = 0;
+        for i in 0..a[2].min(1024) {
+            let msg = a[1] + i * MMSGHDR;
+            let this = if receiving && i > 0 && flags & MSG_WAITFORONE != 0 { flags | MSG_DONTWAIT } else { flags } & !MSG_WAITFORONE;
+            match self.socket_syscall(if receiving { Sysno::recvmsg } else { Sysno::sendmsg }, t, [a[0], msg, this, 0, 0, 0]) {
+                Ok(n) => t.proc.mm().write_u32(msg + 56, n as u32)?,
+                Err(e) if done == 0 => return Err(e),
+                Err(_) => break,
+            }
+            done += 1;
+            if until.is_some_and(|at| Instant::now() >= at) {
+                break;
+            }
+        }
+        Ok(done)
+    }
+
     pub(super) fn socket_syscall(&self, no: Sysno, t: &Arc<Thread>, a: [u64; 6]) -> Result<i64, i64> {
         use Sysno::*;
+        if no == sendmmsg || no == recvmmsg {
+            return self.many_messages(no, t, a);
+        }
         if no != socket && no != socketpair {
             let f = t.files().get(int(a[0]))?;
             if let Kind::Netlink(nl) = &f.kind {

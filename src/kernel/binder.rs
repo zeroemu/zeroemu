@@ -168,6 +168,44 @@ struct BThread {
     /// outgoing one it waits on (top).
     stack: Vec<TxnId>,
     looper: u32,
+    /// DROIDRT_BINDER_RING=1: what's happened lately, for when a process aborts.
+    ring: VecDeque<String>,
+}
+
+/// DROIDRT_BINDER_RING=1: keeps each thread's last binder events, and prints them when
+/// its process is killed by a signal. A thread given a reply it isn't waiting for has
+/// aborted long after whatever went wrong.
+fn ring_on() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var("DROIDRT_BINDER_RING").as_deref() == Ok("1"));
+    *ON
+}
+
+impl BThread {
+    fn note(&mut self, event: std::fmt::Arguments) {
+        if ring_on() {
+            if self.ring.len() >= 64 {
+                self.ring.pop_front();
+            }
+            self.ring.push_back(format!("{event} stack {:?} todo {}", self.stack, self.todo.len()));
+        }
+    }
+}
+
+/// Prints what the threads of process `pid` last did.
+pub fn dump_rings(pid: i32) {
+    if !ring_on() {
+        return;
+    }
+    let mut g = world();
+    let Some(w) = g.as_mut() else { return };
+    for p in w.procs.values().filter(|p| p.pid == pid) {
+        for (tid, th) in &p.threads {
+            eprintln!("[binder-ring] tid {tid}: stack {:?}", th.stack);
+            for event in &th.ring {
+                eprintln!("[binder-ring]   {tid}: {event}");
+            }
+        }
+    }
 }
 
 struct Txn {
@@ -427,10 +465,15 @@ impl World {
             (Some(call), Some(caller)) => {
                 self.thread(me, tid).todo.push_back(Work::Complete);
                 let th = self.thread(to, caller);
+                th.note(format_args!("failed reply queued: answer to {call} couldn't be delivered"));
                 th.stack.retain(|&x| x != call);
                 th.todo.push_back(Work::FailedReply);
             }
-            _ => self.thread(me, tid).todo.push_back(Work::FailedReply),
+            _ => {
+                let th = self.thread(me, tid);
+                th.note(format_args!("failed reply queued: couldn't send"));
+                th.todo.push_back(Work::FailedReply);
+            }
         }
         self.wake(to);
     }
@@ -448,6 +491,7 @@ impl World {
             if let Some((p, tid)) = txn.from
                 && let Some(th) = self.procs.get_mut(&p).and_then(|x| x.threads.get_mut(&tid))
             {
+                th.note(format_args!("dead reply queued for {call}"));
                 th.stack.retain(|&x| x != call);
                 th.todo.push_back(Work::DeadReply);
                 self.wake(p);
@@ -848,6 +892,25 @@ impl Kernel {
     }
 
     fn binder_write_read(&self, t: &Arc<Thread>, file: &File, b: &BinderFile, arg: u64) -> Result<i64, i64> {
+        if !ring_on() {
+            return self.binder_write_read_inner(t, file, b, arg);
+        }
+        let bwr = t.proc.mm().read_vec(arg, 48)?;
+        let note = |what: String| {
+            if let Some(th) = world().as_mut().and_then(|w| w.procs.get_mut(&b.id)).and_then(|p| p.threads.get_mut(&t.tid)) {
+                th.note(format_args!("{what}"));
+            }
+        };
+        note(format!("ioctl in: write {} consumed {} read {} consumed {}", u64_at(&bwr, 0), u64_at(&bwr, 8), u64_at(&bwr, 24), u64_at(&bwr, 32)));
+        let result = self.binder_write_read_inner(t, file, b, arg);
+        let after = t.proc.mm().read_vec(arg, 48).unwrap_or_default();
+        if after.len() == 48 {
+            note(format!("ioctl out: {result:?}, wrote {} read {}", u64_at(&after, 8), u64_at(&after, 32)));
+        }
+        result
+    }
+
+    fn binder_write_read_inner(&self, t: &Arc<Thread>, file: &File, b: &BinderFile, arg: u64) -> Result<i64, i64> {
         let bwr = t.proc.mm().read_vec(arg, 48)?;
         let (wsize, wcons, wbuf) = (u64_at(&bwr, 0), u64_at(&bwr, 8), u64_at(&bwr, 16));
         let (rsize, rcons, rbuf) = (u64_at(&bwr, 24), u64_at(&bwr, 32), u64_at(&bwr, 40));
@@ -863,7 +926,14 @@ impl Kernel {
                     break;
                 }
                 let args = &cmds[off + 4..off + 4 + size];
-                self.binder_command(t, b, cmd, args)?;
+                if let Err(e) = self.binder_command(t, b, cmd, args) {
+                    if ring_on() {
+                        if let Some(th) = world().as_mut().and_then(|w| w.procs.get_mut(&b.id)).and_then(|p| p.threads.get_mut(&t.tid)) {
+                            th.note(format_args!("command {cmd:#x} failed: {e}"));
+                        }
+                    }
+                    return Err(e);
+                }
                 off += 4 + size;
                 consumed = wcons + off as u64;
             }
@@ -871,7 +941,17 @@ impl Kernel {
         }
 
         if rsize > rcons {
-            let out = self.binder_read(t, file, b, (rsize - rcons) as usize, rcons == 0)?;
+            let out = match self.binder_read(t, file, b, (rsize - rcons) as usize, rcons == 0) {
+                Ok(out) => out,
+                Err(e) => {
+                    if ring_on() && e != EINTR {
+                        if let Some(th) = world().as_mut().and_then(|w| w.procs.get_mut(&b.id)).and_then(|p| p.threads.get_mut(&t.tid)) {
+                            th.note(format_args!("read failed: {e}"));
+                        }
+                    }
+                    return Err(e);
+                }
+            };
             t.proc.mm().write(rbuf + rcons, &out)?;
             t.proc.mm().write_u64(arg + 32, rcons + out.len() as u64)?;
         }
@@ -1049,14 +1129,17 @@ impl Kernel {
         let mut answering: Option<TxnId> = None;
         let (to, to_thread, node) = if out.reply {
             let Some(&txn) = w.thread(me, t.tid).stack.last() else {
+                w.thread(me, t.tid).note(format_args!("BC_REPLY with nothing to answer"));
                 w.thread(me, t.tid).todo.push_back(Work::FailedReply);
                 return;
             };
             // The top must be a call to this thread, not its own outgoing one.
             if w.txns.get(&txn).is_some_and(|x| x.from == Some((me, t.tid))) {
+                w.thread(me, t.tid).note(format_args!("BC_REPLY with its own call {txn} on top"));
                 w.thread(me, t.tid).todo.push_back(Work::FailedReply);
                 return;
             }
+            w.thread(me, t.tid).note(format_args!("BC_REPLY to {txn}"));
             w.thread(me, t.tid).stack.pop();
             answering = Some(txn);
             if let Some(x) = w.txns.get(&txn) {
@@ -1067,6 +1150,8 @@ impl Kernel {
                     // Whoever waits for this has it on top of its stack, or something is
                     // badly wrong, and nothing good would come of answering it.
                     if w.procs[&fp].threads.get(&ft).and_then(|th| th.stack.last()) != Some(&txn) {
+                        let waiting = w.procs[&fp].threads.get(&ft).map(|th| th.stack.clone());
+                        w.thread(me, t.tid).note(format_args!("BC_REPLY to {txn}: caller {ft} isn't waiting for it: {waiting:?}"));
                         w.thread(me, t.tid).todo.push_back(Work::FailedReply);
                         return;
                     }
@@ -1095,6 +1180,7 @@ impl Kernel {
                 if tracing() {
                     eprintln!("[binder] pid {} call to handle {handle}: dead or unknown", t.proc.pid);
                 }
+                w.thread(me, t.tid).note(format_args!("call to dead handle {handle}: dead reply queued"));
                 w.thread(me, t.tid).todo.push_back(Work::DeadReply);
                 drop(g);
                 return;
@@ -1106,6 +1192,7 @@ impl Kernel {
                 // for an answer, and never into its own process.
                 let top = w.thread(me, t.tid).stack.last().copied();
                 if owner == me || top.and_then(|x| w.txns.get(&x)).is_some_and(|x| x.from == Some((me, t.tid))) {
+                    w.thread(me, t.tid).note(format_args!("call refused: own process {}, code {}", owner == me, out.code));
                     w.thread(me, t.tid).todo.push_back(Work::FailedReply);
                     return;
                 }
@@ -1378,10 +1465,12 @@ impl Kernel {
                 reply: out.reply,
             },
         );
+        w.thread(me, t.tid).note(format_args!("sent {txn} to proc {to} thread {to_thread:?} code {} flags {:#x}: {}", out.code, out.flags, if out.reply { "reply" } else { "call" }));
         w.thread(me, t.tid).todo.push_back(Work::Complete);
         if out.reply {
             // The caller's wait is over from here, whenever it reads this.
             let caller = w.thread(to, to_thread.unwrap());
+            caller.note(format_args!("reply {txn} queued, for {answering:?}"));
             caller.stack.retain(|&x| Some(x) != answering);
             caller.todo.push_back(Work::Reply(txn));
         } else if oneway {
@@ -1416,6 +1505,7 @@ impl Kernel {
             put32(&mut out, BR_NOOP);
         }
         let mut yielded = false;
+        let mut asked_for_looper = false;
         loop {
             let mut g = world();
             {
@@ -1453,14 +1543,22 @@ impl Kernel {
                 let p = w.procs.get_mut(&b.id).unwrap();
                 if !p.todo.is_empty() && p.requested == 0 && p.started < p.max_threads && out.len() + 4 <= max && looper {
                     p.requested += 1;
-                    put32(&mut out, BR_SPAWN_LOOPER);
+                    asked_for_looper = true;
+                    // In place of the leading BR_NOOP, as Linux: first. What comes after
+                    // a transaction waits until its handler next talks to the driver.
+                    if at_start {
+                        out[..4].copy_from_slice(&BR_SPAWN_LOOPER.to_le_bytes());
+                    } else {
+                        put32(&mut out, BR_SPAWN_LOOPER);
+                    }
+                    w.thread(b.id, t.tid).note(format_args!("read: spawn looper"));
                 }
                 // This thread took one piece of process work; another may take the rest.
                 if !w.procs[&b.id].todo.is_empty() {
                     w.wake(b.id);
                 }
             }
-            if out.len() > if at_start { 4 } else { 0 } {
+            if asked_for_looper || out.len() > if at_start { 4 } else { 0 } {
                 return Ok(out);
             }
             let th = g.as_mut().unwrap().thread(b.id, t.tid);
@@ -1496,13 +1594,18 @@ impl Kernel {
     fn emit(&self, w: &mut World, t: &Thread, me: ProcId, work: Work, out: &mut Vec<u8>) -> bool {
         let tid = t.tid;
         match work {
-            Work::Complete => put32(out, BR_TRANSACTION_COMPLETE),
+            Work::Complete => {
+                w.thread(me, tid).note(format_args!("read: complete"));
+                put32(out, BR_TRANSACTION_COMPLETE);
+            }
             Work::DeadReply => {
                 // Whoever queued this already took the call off our stack.
+                w.thread(me, tid).note(format_args!("read: dead reply"));
                 put32(out, BR_DEAD_REPLY);
                 return true;
             }
             Work::FailedReply => {
+                w.thread(me, tid).note(format_args!("read: failed reply"));
                 put32(out, BR_FAILED_REPLY);
                 return true;
             }
@@ -1548,14 +1651,24 @@ impl Kernel {
                 }
             }
             Work::DeadBinder(cookie) => {
+                w.thread(me, tid).note(format_args!("read: dead binder {cookie:#x}"));
                 put32(out, BR_DEAD_BINDER);
                 put64(out, cookie);
+                // Nothing after it in this read, as Linux: an obituary can cause calls,
+                // and libbinder sends nothing while it has anything unread. It would take
+                // a transaction read with this as nested in that call, with the call
+                // still unsent, and send it and the reply together, in the wrong order.
+                return true;
             }
             Work::ClearDeathDone(cookie) => {
                 put32(out, BR_CLEAR_DEATH_NOTIFICATION_DONE);
                 put64(out, cookie);
             }
             Work::Txn(id) | Work::Reply(id) => {
+                if ring_on() {
+                    let what = w.txns.get(&id).map(|x| (x.reply, x.code, x.flags, x.from));
+                    w.thread(me, tid).note(format_args!("read: {id} (reply, code, flags, from) {what:?}"));
+                }
                 let Some(x) = w.txns.get(&id) else { return false };
                 let (ptr, cookie) = x.node.and_then(|n| w.nodes.get(&n)).map_or((0, 0), |n| (n.ptr, n.cookie));
                 let reply = x.reply;

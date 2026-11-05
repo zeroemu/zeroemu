@@ -1,7 +1,7 @@
 // Freestanding arm64 test of sockets with a network behind them: the name server, and
 // TCP to servers on the host through 10.0.2.2. Run by scripts/test-tcp.py with
 // DROIDRT_NET=1, which starts the servers and passes their ports:
-//   tcp echo silent closes resets refused sink pieces adb-server half-resets
+//   tcp echo silent closes resets refused sink pieces adb-server half-resets udp-echo
 
 typedef unsigned long u64;
 typedef long i64;
@@ -31,6 +31,8 @@ typedef unsigned char u8;
 #define NR_shutdown 210
 #define NR_sendmsg 211
 #define NR_recvmsg 212
+#define NR_recvmmsg 243
+#define NR_sendmmsg 269
 
 static i64 sys6(i64 n, i64 a, i64 b, i64 c, i64 d, i64 e, i64 f) {
     register i64 x8 __asm__("x8") = n;
@@ -222,15 +224,17 @@ static void through_echo(u16 port) {
 }
 
 int cmain(int argc, char **argv) {
-    u16 ports[9];
-    if (argc < 10) { puts_("usage: tcp echo silent closes resets refused sink pieces adb-server half-resets\n"); return 1; }
-    for (int i = 0; i < 9; i++) {
+    u16 ports[10];
+    if (argc < 11) { puts_("usage: tcp echo silent closes resets refused sink pieces adb-server half-resets udp-echo\n"); return 1; }
+    for (int i = 0; i < 10; i++) {
         u32 v = 0;
         for (char *c = argv[i + 1]; *c; c++) v = v * 10 + (u32)(*c - '0');
         ports[i] = (u16)v;
     }
-    u16 echo = ports[0], silent = ports[1], closes = ports[2], resets = ports[3], refused = ports[4], sink = ports[5], pieces = ports[6], adb_server = ports[7], half_resets = ports[8];
+    u16 echo = ports[0], silent = ports[1], closes = ports[2], resets = ports[3], refused = ports[4], sink = ports[5], pieces = ports[6], adb_server = ports[7], half_resets = ports[8], udp_echo = ports[9];
     char buf[256];
+    u8 hip_of_udp[4] = { 10, 0, 2, 2 };
+    i64 r = 0;
     struct in4 test_net = v4(192, 0, 2, 1, 80);
 
     // ---- what the resolver does, once there's an address
@@ -264,7 +268,7 @@ int cmain(int argc, char **argv) {
     check(wait_for(dns, POLLIN, 5000) & POLLIN, "poll sees the answer");
     struct in4 from;
     len = sizeof from;
-    i64 r = sys(NR_recvfrom, dns, a, sizeof a, 0, &from, &len);
+    r = sys(NR_recvfrom, dns, a, sizeof a, 0, &from, &len);
     u8 sip[4] = { 10, 0, 2, 3 };
     check(r > 12 && len == 16 && same(from.addr, sip, 4) && from.port == be(53), "the answer comes from exactly 10.0.2.3:53");
     check(a[0] == 0x12 && a[1] == 0x34 && (a[2] & 0x80), "with the ID");
@@ -306,6 +310,74 @@ int cmain(int argc, char **argv) {
     expect(sys(NR_recvfrom, closed, a, 8, 0, 0, 0), -ECONNREFUSED, "and the next call gets ECONNREFUSED");
     expect(sys(NR_write, closed, "x", 1), 1, "once");
     expect(sys(NR_write, closed, "x", 1), -ECONNREFUSED, "the one after, on a send too");
+
+    // ---- datagrams to the host and back
+    {
+        struct in4 echo_to = host(udp_echo), echo_from;
+        int u = (int)sys(NR_socket, AF_INET, SOCK_DGRAM, 0);
+        expect(sys(NR_sendto, u, "marco", 5, 0, &echo_to, sizeof echo_to), 5, "a datagram to the host");
+        check(wait_for(u, POLLIN, 5000) & POLLIN, "the echo arrives");
+        int alen = sizeof echo_from;
+        expect(sys(NR_recvfrom, u, buf, 16, 0, &echo_from, &alen), 5, "whole");
+        check(same(buf, "marco", 5), "right");
+        check(alen == 16 && same(echo_from.addr, hip_of_udp, 4) && echo_from.port == be(udp_echo), "from 10.0.2.2, not the host's own view");
+        sys(NR_sendto, u, "one", 3, 0, &echo_to, sizeof echo_to);
+        wait_for(u, POLLIN, 5000);
+        sys(NR_sendto, u, "three", 5, 0, &echo_to, sizeof echo_to);
+        expect(sys(NR_recvfrom, u, buf, 16, 0, 0, 0), 3, "datagrams stay separate");
+        wait_for(u, POLLIN, 5000);
+        expect(sys(NR_recvfrom, u, buf, 16, 0, 0, 0), 5, "the second");
+        sys(NR_sendto, u, "a long one", 10, 0, &echo_to, sizeof echo_to);
+        wait_for(u, POLLIN, 5000);
+        expect(sys(NR_recvfrom, u, buf, 2, MSG_TRUNC, 0, 0), 10, "MSG_TRUNC: the real length of what was cut");
+
+        // sendmmsg and recvmmsg, as Chromium's QUIC uses
+        char first[8] = "first", second[8] = "second", r1[8], r2[8];
+        struct iovec i1 = { first, 5 }, i2 = { second, 6 }, o1 = { r1, 8 }, o2 = { r2, 8 };
+        struct mmsghdr { struct msghdr hdr; u32 len; } out[2], in[2];
+        memset(out, 0, sizeof out);
+        memset(in, 0, sizeof in);
+        out[0].hdr.name = &echo_to; out[0].hdr.namelen = sizeof echo_to; out[0].hdr.iov = &i1; out[0].hdr.iovlen = 1;
+        out[1].hdr.name = &echo_to; out[1].hdr.namelen = sizeof echo_to; out[1].hdr.iov = &i2; out[1].hdr.iovlen = 1;
+        expect(sys(NR_sendmmsg, u, out, 2, 0), 2, "sendmmsg to the host");
+        in[0].hdr.iov = &o1; in[0].hdr.iovlen = 1;
+        in[1].hdr.iov = &o2; in[1].hdr.iovlen = 1;
+        i64 got_m = 0;
+        for (int i = 0; i < 50 && got_m < 2; i++) {
+            wait_for(u, POLLIN, 100);
+            i64 m = sys(NR_recvmmsg, u, (char *)in + got_m * (i64)sizeof in[0], 2 - got_m, MSG_DONTWAIT, 0);
+            if (m > 0) got_m += m;
+        }
+        expect(got_m, 2, "recvmmsg: both echoes");
+        check(in[0].len == 5 && same(r1, "first", 5) && in[1].len == 6 && same(r2, "second", 6), "in order and whole");
+        sys(NR_close, u);
+
+        // Connected: the host hears a closed port, and the next call hears of it.
+        int cu = (int)sys(NR_socket, AF_INET, SOCK_DGRAM, 0);
+        expect(sys(NR_connect, cu, &echo_to, sizeof echo_to), 0, "connect to the host's echo");
+        expect(sys(NR_write, cu, "polo", 4), 4, "write");
+        wait_for(cu, POLLIN, 5000);
+        expect(sys(NR_read, cu, buf, 16), 4, "read");
+        check(same(buf, "polo", 4), "right");
+        struct in4 closed_to = host(refused);
+        expect(sys(NR_connect, cu, &closed_to, sizeof closed_to), 0, "reconnect, to a port nobody's on");
+        expect(sys(NR_write, cu, "x", 1), 1, "the send goes");
+        check(wait_for(cu, POLLERR | POLLIN, 5000) & POLLERR, "poll shows an error when the host hears of it");
+        expect(sys(NR_recvfrom, cu, buf, 8, MSG_DONTWAIT, 0, 0), -ECONNREFUSED, "ECONNREFUSED");
+        struct { u16 family; u8 pad[14]; } unspec_u = { 0, { 0 } };
+        expect(sys(NR_connect, cu, &unspec_u, sizeof unspec_u), 0, "AF_UNSPEC");
+        expect(sys(NR_sendto, cu, "back", 4, 0, &echo_to, sizeof echo_to), 4, "and it can send anywhere again");
+        wait_for(cu, POLLIN, 5000);
+        expect(sys(NR_recvfrom, cu, buf, 16, 0, 0, 0), 4, "and hear back");
+        sys(NR_close, cu);
+
+        // Too big for this host to send, if it's that kind of host; never a crash.
+        int bigu = (int)sys(NR_socket, AF_INET, SOCK_DGRAM, 0);
+        r = sys(NR_sendto, bigu, big, 65000, 0, &echo_to, sizeof echo_to);
+        check(r == 65000 || r == -90 /* EMSGSIZE */, "a very large datagram goes, or is refused as too large");
+        expect(sys(NR_sendto, bigu, big, 65600, 0, &echo_to, sizeof echo_to), -90, "past the limit: EMSGSIZE");
+        sys(NR_close, bigu);
+    }
 
     // ---- connecting, non-blocking, as IoBridge does
     int fd = (int)sys(NR_socket, AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);

@@ -235,6 +235,8 @@ syscalls! {
     shutdown = 210, 48;
     sendmsg = 211, 46;
     recvmsg = 212, 47;
+    recvmmsg = 243, 299;
+    sendmmsg = 269, 307;
     brk = 214, 12;
     munmap = 215, 11;
     mremap = 216, 25;

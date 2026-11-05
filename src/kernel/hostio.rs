@@ -4,6 +4,9 @@
 //! Host threads make the connection and move bytes between the queues and it, the one
 //! that writes starting only when there is something to write. They hold only this and
 //! the connection, so the guest's last close is still noticed.
+//!
+//! Two guest sockets connected to each other use the same thing with no host in it and
+//! no threads: each one's write goes straight to the other's queue.
 
 use super::wait::EVENTS;
 use crate::errno::*;
@@ -11,15 +14,54 @@ use std::collections::{BTreeMap, VecDeque};
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::Duration;
 
 /// A connect can't be cancelled, so a dropped SYN holds a thread for a minute or more,
 /// whether or not the socket's still open. Without these an app connecting to somewhere
 /// that doesn't answer could use up the host's threads, which everything needs.
-const MAX_CONNECTING_PER_UID: usize = 512;
-const MAX_CONNECTING: usize = 1024;
-static CONNECTING: std::sync::Mutex<BTreeMap<u32, usize>> = std::sync::Mutex::new(BTreeMap::new());
+static CONNECTING: Quota = Quota::new(512, 1024);
+
+/// A limit on helper threads a guest can make, each and in all: a process that exits
+/// can't take them with it, and every part of the device needs host threads.
+pub struct Quota {
+    each: usize,
+    all: usize,
+    going: Mutex<BTreeMap<u32, usize>>,
+}
+
+/// A place in a quota, given back when dropped.
+pub struct QuotaPlace {
+    quota: &'static Quota,
+    uid: u32,
+}
+
+impl Quota {
+    pub const fn new(each: usize, all: usize) -> Quota {
+        Quota { each, all, going: Mutex::new(BTreeMap::new()) }
+    }
+
+    pub fn take(&'static self, uid: u32) -> Option<QuotaPlace> {
+        let mut going = self.going.lock().unwrap();
+        if going.values().sum::<usize>() >= self.all || going.get(&uid).is_some_and(|&n| n >= self.each) {
+            return None;
+        }
+        *going.entry(uid).or_default() += 1;
+        Some(QuotaPlace { quota: self, uid })
+    }
+}
+
+impl Drop for QuotaPlace {
+    fn drop(&mut self) {
+        let mut going = self.quota.going.lock().unwrap();
+        if let Some(n) = going.get_mut(&self.uid) {
+            *n -= 1;
+            if *n == 0 {
+                going.remove(&self.uid);
+            }
+        }
+    }
+}
 
 /// How long a closed socket's queued bytes wait for a peer that isn't reading. Linux
 /// bounds this too. A write timeout isn't an option: on Windows it leaves the socket
@@ -62,6 +104,16 @@ pub fn linux_errno(e: &std::io::Error) -> i64 {
     }
 }
 
+/// A host error that isn't one of the kinds std names. A datagram too big for the host
+/// to send is the caller's to hear about; no buffers for it is like losing it on the way.
+pub fn datagram_too_big(e: &std::io::Error) -> bool {
+    e.raw_os_error() == Some(if cfg!(windows) { 10040 } else if cfg!(target_os = "macos") { 40 } else { 90 })
+}
+
+pub fn out_of_buffers(e: &std::io::Error) -> bool {
+    e.raw_os_error() == Some(if cfg!(windows) { 10055 } else if cfg!(target_os = "macos") { 55 } else { 105 })
+}
+
 /// What a guest thread waiting on something watches in EVENTS: any number nothing
 /// else uses. EVENTS drops the low bits, as of an address.
 pub fn fresh_key() -> usize {
@@ -99,6 +151,9 @@ struct State {
     writing: bool,
     /// It has bytes that aren't in `tx` any more, in a host call.
     sending: bool,
+    /// The other end, if that's a guest socket and not the host. Writes go straight to
+    /// its `rx`; `tx` stays empty. One lock at a time: both ends can be in here at once.
+    peer: Option<Weak<Io>>,
 }
 
 pub struct Io {
@@ -117,6 +172,30 @@ impl Io {
         Arc::new(Io { key, st: Mutex::default(), pumps: Condvar::new() })
     }
 
+    /// The two ends of a connection between guest sockets.
+    pub fn pair(a: usize, b: usize) -> (Arc<Io>, Arc<Io>) {
+        let (a, b) = (Io::with_key(a), Io::with_key(b));
+        a.st.lock().unwrap().peer = Some(Arc::downgrade(&b));
+        b.st.lock().unwrap().peer = Some(Arc::downgrade(&a));
+        (a, b)
+    }
+
+    fn peer(&self) -> Option<Arc<Io>> {
+        self.st.lock().unwrap().peer.as_ref()?.upgrade()
+    }
+
+    /// The other end has gone. With `reset`, it wasn't tidy about it.
+    fn peer_left(&self, reset: bool) {
+        let mut st = self.st.lock().unwrap();
+        st.rx_eof = true;
+        if reset {
+            st.err = ECONNRESET;
+            st.dead = true;
+        }
+        drop(st);
+        self.changed();
+    }
+
     /// What a guest thread waiting on this watches in EVENTS.
     pub fn key(&self) -> usize {
         self.key
@@ -132,10 +211,17 @@ impl Io {
     pub fn read(self: &Arc<Self>, max: usize, keep_err: bool) -> Result<Vec<u8>, i64> {
         let mut st = self.st.lock().unwrap();
         if !st.rx.is_empty() {
-            let n = max.min(st.rx.len());
+            let before = st.rx.len();
+            let n = max.min(before);
             let out: Vec<u8> = st.rx.drain(..n).collect();
+            let peer = st.peer.as_ref().and_then(Weak::upgrade);
             drop(st);
             self.pumps.notify_all();
+            if let Some(peer) = peer
+                && (before >= LIMIT || (before >= WRITABLE && before - n < WRITABLE))
+            {
+                peer.changed(); // it may be waiting for room
+            }
             return Ok(out);
         }
         Self::nothing_to_read(&mut st, keep_err)
@@ -172,7 +258,14 @@ impl Io {
     /// How much `write` would take now; an error if none ever will; EAGAIN if it's not
     /// connected yet. No bytes need copying from the guest to find out.
     pub fn room(&self, keep_err: bool) -> Result<usize, i64> {
-        Self::room_in(&mut self.st.lock().unwrap(), keep_err)
+        let mut st = self.st.lock().unwrap();
+        let room = Self::room_in(&mut st, keep_err)?;
+        let peer = st.peer.clone();
+        drop(st);
+        Ok(match peer {
+            Some(peer) => peer.upgrade().map_or(LIMIT, |p| LIMIT.saturating_sub(p.st.lock().unwrap().rx.len())),
+            None => room,
+        })
     }
 
     fn room_in(st: &mut State, keep_err: bool) -> Result<usize, i64> {
@@ -192,6 +285,10 @@ impl Io {
     pub fn write(self: &Arc<Self>, data: &[u8], keep_err: bool) -> Result<usize, i64> {
         let mut st = self.st.lock().unwrap();
         let n = data.len().min(Self::room_in(&mut st, keep_err)?);
+        if let Some(peer) = st.peer.clone() {
+            drop(st);
+            return self.write_to_peer(peer, data);
+        }
         if n == 0 {
             return if data.is_empty() { Ok(0) } else { Err(EAGAIN) };
         }
@@ -200,6 +297,32 @@ impl Io {
         drop(st);
         self.pumps.notify_all();
         Ok(n)
+    }
+
+    fn write_to_peer(&self, peer: Weak<Io>, data: &[u8]) -> Result<usize, i64> {
+        let accepted = peer.upgrade().and_then(|p| {
+            let mut ps = p.st.lock().unwrap();
+            if ps.closed {
+                return None;
+            }
+            let n = data.len().min(LIMIT.saturating_sub(ps.rx.len()));
+            ps.rx.extend(&data[..n]);
+            drop(ps);
+            if n > 0 {
+                p.changed();
+            }
+            Some(n)
+        });
+        match accepted {
+            Some(0) if !data.is_empty() => Err(EAGAIN),
+            Some(n) => Ok(n),
+            // As for a peer that's closed on Linux: this send goes through, and the
+            // reset it provokes fails the next.
+            None => {
+                self.st.lock().unwrap().dead = true;
+                Ok(data.len())
+            }
+        }
     }
 
     fn ensure_writer(self: &Arc<Self>, st: &mut State) -> Result<(), i64> {
@@ -219,6 +342,7 @@ impl Io {
 
     /// poll(2)'s view from the guest.
     pub fn readiness(&self) -> u16 {
+        let peer_queue = self.peer().map(|p| p.st.lock().unwrap().rx.len());
         let st = self.st.lock().unwrap();
         // While connecting nothing at all, not even writable: to the callers that wait
         // for that and then look for an error, no error would mean connected.
@@ -233,7 +357,7 @@ impl Io {
             r |= POLLRDHUP;
         }
         // A send that will fail doesn't block, so it counts as writable.
-        if st.tx.len() < WRITABLE || st.dead || st.shut_wr {
+        if peer_queue.unwrap_or(st.tx.len()) < WRITABLE || st.dead || st.shut_wr {
             r |= POLLOUT;
         }
         // Each way shut, by this end or the other.
@@ -290,6 +414,13 @@ impl Io {
             } else if let Some(stream) = &st.stream {
                 let _ = stream.shutdown(Shutdown::Write);
             }
+            if let Some(p) = st.peer.as_ref().and_then(Weak::upgrade) {
+                drop(st);
+                p.peer_left(false);
+                self.pumps.notify_all();
+                self.changed();
+                return;
+            }
         }
         drop(st);
         self.pumps.notify_all();
@@ -304,6 +435,13 @@ impl Io {
     fn close_within(self: &Arc<Self>, limit: Duration) {
         let mut st = self.st.lock().unwrap();
         st.closed = true;
+        if let Some(p) = st.peer.as_ref().and_then(Weak::upgrade) {
+            // Closing with bytes unread: the other end hears about it, as on Linux.
+            let reset = !st.rx.is_empty();
+            drop(st);
+            p.peer_left(reset);
+            return;
+        }
         if let Some(stream) = st.stream.clone() {
             if !st.writing {
                 let _ = stream.shutdown(Shutdown::Both); // wakes the reader
@@ -337,7 +475,11 @@ impl Io {
         if let Some(stream) = &st.stream {
             let _ = stream.shutdown(Shutdown::Both);
         }
+        let peer = st.peer.as_ref().and_then(Weak::upgrade);
         drop(st);
+        if let Some(p) = peer {
+            p.peer_left(true);
+        }
         self.pumps.notify_all();
         self.changed();
     }
@@ -362,22 +504,7 @@ impl Io {
     /// this: a socket closed meanwhile leaves the thread until the connect ends. ENOBUFS
     /// if `uid` or everybody has too many going.
     pub fn connect(self: &Arc<Self>, to: SocketAddr, timeout: Duration, nodelay: bool, uid: u32) -> Result<(), i64> {
-        {
-            let mut going = CONNECTING.lock().unwrap();
-            if going.values().sum::<usize>() >= MAX_CONNECTING || going.get(&uid).is_some_and(|&n| n >= MAX_CONNECTING_PER_UID) {
-                return Err(ENOBUFS);
-            }
-            *going.entry(uid).or_default() += 1;
-        }
-        let finished = move || {
-            let mut going = CONNECTING.lock().unwrap();
-            if let Some(n) = going.get_mut(&uid) {
-                *n -= 1;
-                if *n == 0 {
-                    going.remove(&uid);
-                }
-            }
-        };
+        let place = CONNECTING.take(uid).ok_or(ENOBUFS)?;
         {
             let mut st = self.st.lock().unwrap();
             st.connecting = true;
@@ -386,11 +513,10 @@ impl Io {
         let io = self.clone();
         let spawned = std::thread::Builder::new().name("hostio-connect".into()).stack_size(STACK).spawn(move || {
             let result = TcpStream::connect_timeout(&to, timeout);
-            finished();
+            drop(place);
             io.connected(result);
         });
         if spawned.is_err() {
-            finished();
             self.st.lock().unwrap().connecting = false;
             return Err(ENOBUFS);
         }
@@ -566,9 +692,9 @@ mod tests {
         // Nothing listens, but they all fail fast: what matters is the count, from a uid
         // nothing else here uses.
         const UID: u32 = 4_000_000;
-        CONNECTING.lock().unwrap().insert(UID, MAX_CONNECTING_PER_UID);
+        CONNECTING.going.lock().unwrap().insert(UID, CONNECTING.each);
         let refused = Io::new().connect(SocketAddr::from(([127, 0, 0, 1], 9)), Duration::from_secs(1), false, UID);
-        CONNECTING.lock().unwrap().remove(&UID);
+        CONNECTING.going.lock().unwrap().remove(&UID);
         assert_eq!(refused, Err(ENOBUFS));
     }
 }

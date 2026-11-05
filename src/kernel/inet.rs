@@ -10,8 +10,10 @@
 //! ip_tables / ip6_tables get and replace whole tables through socket options on a raw
 //! socket. droidrt keeps those tables (nothing filters).
 //!
-//! Known not to work yet: traffic between guest sockets (connecting gets ECONNREFUSED,
-//! and datagrams vanish), UDP beyond this device (likewise), and ICMP replies. SO_MARK
+//! Sockets on this device reach each other with no host socket at all. A datagram socket
+//! that sends beyond the device gets one host socket of its own, with a thread reading it.
+//!
+//! Known not to work: ICMP replies, IPv6 past ::1, and connections from outside. SO_MARK
 //! is kept and has no effect, so per-network routing, VPNs and per-UID firewalls don't
 //! apply to anything, and 10.0.2.2 is open to every app, as on the emulator.
 
@@ -24,10 +26,10 @@ use super::{Kernel, Thread, dns, net};
 use crate::arch::Sysno;
 use crate::errno::*;
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, LazyLock, Mutex};
-use std::time::Duration;
+use std::sync::{Arc, LazyLock, Mutex, Weak};
+use std::time::{Duration, SystemTime};
 
 pub const AF_INET: u64 = 2;
 pub const AF_INET6: u64 = 10;
@@ -46,6 +48,7 @@ const MSG_WAITALL: u64 = 0x100;
 const MSG_ERRQUEUE: u64 = 0x2000;
 const MSG_NOSIGNAL: u64 = 0x4000;
 const MSG_FASTOPEN: u64 = 0x2000_0000;
+const MSG_CTRUNC: u32 = 0x8;
 
 const POLLRDNORM: u16 = 0x40;
 const POLLWRNORM: u16 = 0x100;
@@ -130,7 +133,14 @@ enum Phase {
 struct Datagram {
     from: SocketAddr,
     data: Vec<u8>,
+    at: SystemTime,
 }
+
+/// Each host datagram socket has a thread reading it.
+static UDP_READERS: hostio::Quota = hostio::Quota::new(512, 1024);
+/// Connections waiting to be accepted on a listener. Nothing's dropping SYNs here to make
+/// a client wait for room, so this is only so a stuck server can't hold unlimited memory.
+const MAX_BACKLOG: usize = 4096;
 
 #[derive(Default)]
 struct State {
@@ -152,6 +162,12 @@ struct State {
     shut_wr: bool,
     queue: VecDeque<Datagram>,
     queued: usize,
+    /// Connections to accept, on a listener.
+    backlog: VecDeque<Arc<Inet>>,
+    /// A datagram socket's way to the world, once it has sent there, and where that's
+    /// connected, if it is. Connected, the host tells of a closed port.
+    host_udp: Option<Arc<UdpSocket>>,
+    host_peer: Option<SocketAddr>,
 }
 
 pub struct Inet {
@@ -172,6 +188,9 @@ impl Drop for Inet {
             } else {
                 io.close();
             }
+        }
+        for waiting in std::mem::take(&mut st.backlog) {
+            waiting.abandon();
         }
         if let Some(local) = st.local {
             release_port(self.proto, local.port(), self.key);
@@ -257,6 +276,7 @@ struct Binding {
     reuse_port: bool,
     uid: u32,
     listening: bool,
+    sock: Weak<Inet>,
 }
 
 /// By protocol, then port.
@@ -305,6 +325,36 @@ fn take_port(proto: u32, port: u16, new: Binding) -> Result<u16, i64> {
         }
     }
     Err(EADDRINUSE)
+}
+
+/// Who'd get something sent to `dest` on this device, best match first. The port table's
+/// lock isn't held on return, because dropping a socket takes it.
+fn bound_at(proto: u32, dest: SocketAddr, listening: bool) -> Vec<Arc<Inet>> {
+    let ip = match dest.ip() {
+        IpAddr::V4(ip) if ip.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
+        IpAddr::V6(ip) if ip.is_unspecified() => IpAddr::V6(Ipv6Addr::LOCALHOST),
+        ip => ip,
+    };
+    let mut found: Vec<(u8, Weak<Inet>)> = {
+        let ports = PORTS.lock().unwrap();
+        let holders = ports.get(&(proto, dest.port())).map_or(&[][..], |h| &h[..]);
+        holders
+            .iter()
+            .filter(|b| !listening || b.listening)
+            .filter_map(|b| {
+                let score = match (b.ip, ip) {
+                    (a, b) if a == b => 2,
+                    (IpAddr::V4(a), IpAddr::V4(_)) if a.is_unspecified() => 1,
+                    (IpAddr::V6(a), IpAddr::V6(_)) if a.is_unspecified() => 1,
+                    (IpAddr::V6(a), IpAddr::V4(_)) if a.is_unspecified() && !b.v6only => 1,
+                    _ => return None,
+                };
+                Some((score, b.sock.clone()))
+            })
+            .collect()
+    };
+    found.sort_by_key(|&(score, _)| std::cmp::Reverse(score));
+    found.into_iter().filter_map(|(_, sock)| sock.upgrade()).collect()
 }
 
 fn release_port(proto: u32, port: u16, owner: usize) {
@@ -400,6 +450,69 @@ struct Received {
     /// What there was: a datagram can be longer than the room for it.
     real: usize,
     from: Option<SocketAddr>,
+    /// Control messages it asked for.
+    control: Vec<u8>,
+}
+
+/// Appends a `cmsghdr` (64-bit layout), padded to 8.
+fn push_cmsg(out: &mut Vec<u8>, level: u64, ty: u64, data: &[u8]) {
+    out.extend_from_slice(&((16 + data.len()) as u64).to_le_bytes());
+    out.extend_from_slice(&(level as i32).to_le_bytes());
+    out.extend_from_slice(&(ty as i32).to_le_bytes());
+    out.extend_from_slice(data);
+    out.resize(out.len().next_multiple_of(8), 0);
+}
+
+fn is_on(v: Option<&Vec<u8>>) -> bool {
+    v.is_some_and(|v| v.iter().any(|&b| b != 0))
+}
+
+/// The host's address as a guest should see it.
+fn guest_view(from: SocketAddr) -> SocketAddr {
+    match from.ip() {
+        IpAddr::V4(ip) if ip.is_loopback() => SocketAddr::from(([10, 0, 2, 2], from.port())),
+        _ => from,
+    }
+}
+
+/// Reads a host datagram socket until nobody else holds it. Its timeout is how it finds
+/// that out: a shutdown doesn't wake a reader on an unconnected socket, on macOS at least.
+fn read_host_datagrams(owner: Weak<Inet>, sock: Arc<UdpSocket>, _place: hostio::QuotaPlace) {
+    use std::io::ErrorKind::*;
+    let mut buf = vec![0; 65536];
+    let mut heard = 0;
+    loop {
+        match sock.recv_from(&mut buf) {
+            Ok((n, from)) => {
+                if tracing() && heard == 0 {
+                    eprintln!("[net] first datagram back on a host socket: {n} bytes from {from}");
+                }
+                heard += 1;
+                let Some(s) = owner.upgrade() else { return };
+                if !s.st.lock().unwrap().host_udp.as_ref().is_some_and(|h| Arc::ptr_eq(h, &sock)) {
+                    return;
+                }
+                s.deliver(guest_view(from), buf[..n].to_vec());
+            }
+            Err(e) if matches!(e.kind(), WouldBlock | TimedOut | Interrupted) => {
+                if owner.strong_count() == 0 || Arc::strong_count(&sock) == 1 {
+                    return;
+                }
+            }
+            Err(e) => {
+                // A connected socket's peer has no such port, or similar: for the next
+                // call to report. Windows calls that a reset.
+                let Some(s) = owner.upgrade() else { return };
+                let mut st = s.st.lock().unwrap();
+                if st.host_peer.is_some() {
+                    st.err = if e.kind() == ConnectionReset { ECONNREFUSED } else { hostio::linux_errno(&e) };
+                }
+                drop(st);
+                EVENTS.bump_key(s.key);
+                std::thread::sleep(Duration::from_millis(10)); // nothing hot, whatever this was
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -493,9 +606,16 @@ impl Inet {
         out
     }
 
-    fn binding(&self, st: &State, ip: IpAddr, uid: u32) -> Binding {
+    fn binding(self: &Arc<Self>, st: &State, ip: IpAddr, uid: u32) -> Binding {
         let flag = |opt| st.opts.get(opt).is_some_and(|v| v.iter().any(|&b| b != 0));
-        Binding { owner: self.key, ip, v6only: Self::v6only(st), reuse_addr: flag(SO_REUSEADDR), reuse_port: flag(SO_REUSEPORT), uid, listening: false }
+        Binding { owner: self.key, ip, v6only: Self::v6only(st), reuse_addr: flag(SO_REUSEADDR), reuse_port: flag(SO_REUSEPORT), uid, listening: false, sock: Arc::downgrade(self) }
+    }
+
+    /// What it's connected to is told it's been reset: nobody ever accepted this.
+    fn abandon(&self) {
+        if let Some(io) = self.st.lock().unwrap().io.take() {
+            io.abort();
+        }
     }
 
     fn wildcard(&self) -> IpAddr {
@@ -503,7 +623,7 @@ impl Inet {
     }
 
     /// Gives the socket a port if it has none yet.
-    fn autobind(&self, st: &mut State, uid: u32) -> Result<(), i64> {
+    fn autobind(self: &Arc<Self>, st: &mut State, uid: u32) -> Result<(), i64> {
         if st.local.is_none() {
             let ip = self.wildcard();
             let port = take_port(self.proto, 0, self.binding(st, ip, uid))?;
@@ -528,7 +648,7 @@ impl Inet {
         let st = self.st.lock().unwrap();
         let mut r = if self.is_stream() {
             match (&st.io, st.phase) {
-                (_, Phase::Listening) => 0,
+                (_, Phase::Listening) => if st.backlog.is_empty() { 0 } else { POLLIN },
                 (Some(io), _) => io.readiness(),
                 (None, _) => POLLOUT | POLLHUP | if st.shut_rd { POLLIN | POLLRDHUP } else { 0 } | if st.err != 0 { POLLERR } else { 0 },
             }
@@ -560,11 +680,13 @@ impl Inet {
     /// A datagram arrives. Too many waiting and it's dropped, as on any host.
     pub fn deliver(&self, from: SocketAddr, data: Vec<u8>) {
         let mut st = self.st.lock().unwrap();
-        if st.queued + data.len() > UDP_QUEUE {
+        // QUIC asks for more than the default, and bursts.
+        let limit = st.stored.get(&(SOL_SOCKET, SO_RCVBUF)).map_or(UDP_QUEUE, |v| i32::from_le_bytes(v[..4].try_into().unwrap()) as usize);
+        if st.queued + data.len() > limit {
             return;
         }
         st.queued += data.len();
-        st.queue.push_back(Datagram { from, data });
+        st.queue.push_back(Datagram { from, data, at: SystemTime::now() });
         drop(st);
         EVENTS.bump_key(self.key);
     }
@@ -592,7 +714,7 @@ impl Inet {
             match st.io.clone() {
                 Some(io) => (io, deadline(st.opts.rcvtimeo)),
                 None if st.err != 0 => return Err(std::mem::take(&mut st.err)),
-                None if st.shut_rd => return Ok(Received { data: Vec::new(), real: 0, from: None }),
+                None if st.shut_rd => return Ok(Received { data: Vec::new(), real: 0, from: None, control: Vec::new() }),
                 None => return Err(ENOTCONN),
             }
         };
@@ -640,7 +762,7 @@ impl Inet {
         if flags & MSG_TRUNC != 0 {
             got = Vec::new(); // on a stream this means throw them away
         }
-        Ok(Received { data: got, real, from: None })
+        Ok(Received { data: got, real, from: None, control: Vec::new() })
     }
 
     fn datagram_recv(&self, t: &Thread, max: usize, flags: u64, nonblock: bool) -> Result<Received, i64> {
@@ -655,14 +777,15 @@ impl Inet {
                 if let Some(d) = st.queue.front() {
                     let (real, from) = (d.data.len(), d.from);
                     let data = d.data[..real.min(max)].to_vec();
+                    let control = self.control_messages(&st, d);
                     if flags & MSG_PEEK == 0 {
                         st.queue.pop_front();
                         st.queued -= real;
                     }
-                    return Ok(Received { data, real, from: Some(from) });
+                    return Ok(Received { data, real, from: Some(from), control });
                 }
                 if st.shut_rd {
-                    return Ok(Received { data: Vec::new(), real: 0, from: None });
+                    return Ok(Received { data: Vec::new(), real: 0, from: None, control: Vec::new() });
                 }
             }
             if nonblock {
@@ -670,6 +793,53 @@ impl Inet {
             }
             wait_or_give_up(t, seen, until)?;
         }
+    }
+
+    /// What recvmsg was asked to say about a datagram. Nothing can tell the real TTL or
+    /// where it was addressed, but these are what a caller who asks can use.
+    fn control_messages(&self, st: &State, d: &Datagram) -> Vec<u8> {
+        const SO_TIMESTAMP: u64 = 29;
+        const SO_TIMESTAMPNS: u64 = 35;
+        const IP_TTL: u64 = 2;
+        const IP_PKTINFO: u64 = 8;
+        const IP_RECVTTL: u64 = 12;
+        const IPV6_RECVPKTINFO: u64 = 49;
+        const IPV6_PKTINFO: u64 = 50;
+        const IPV6_RECVHOPLIMIT: u64 = 51;
+        const IPV6_HOPLIMIT: u64 = 52;
+        let mut out = Vec::new();
+        let since = d.at.duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default();
+        if st.opts.get(SO_TIMESTAMP).is_some_and(|v| v.iter().any(|&b| b != 0)) {
+            let spec = [(since.as_secs() as i64).to_le_bytes(), (since.subsec_micros() as i64).to_le_bytes()].concat();
+            push_cmsg(&mut out, SOL_SOCKET, SO_TIMESTAMP, &spec);
+        }
+        if is_on(st.stored.get(&(SOL_SOCKET, SO_TIMESTAMPNS))) {
+            let spec = [(since.as_secs() as i64).to_le_bytes(), (since.subsec_nanos() as i64).to_le_bytes()].concat();
+            push_cmsg(&mut out, SOL_SOCKET, SO_TIMESTAMPNS, &spec);
+        }
+        if is_on(st.stored.get(&(SOL_IP, IP_RECVTTL))) {
+            push_cmsg(&mut out, SOL_IP, IP_TTL, &64i32.to_le_bytes());
+        }
+        let on_loopback = d.from.ip().is_loopback();
+        let index: i32 = if on_loopback { 1 } else { 2 };
+        let here = match st.local.map(|l| l.ip()) {
+            Some(IpAddr::V4(ip)) if !ip.is_unspecified() => ip,
+            _ if on_loopback => Ipv4Addr::LOCALHOST,
+            _ => Ipv4Addr::from(net::eth_address().unwrap_or(net::ETH_ADDRESS)),
+        };
+        if is_on(st.stored.get(&(SOL_IP, IP_PKTINFO))) {
+            let info = [index.to_le_bytes(), here.octets(), here.octets()].concat();
+            push_cmsg(&mut out, SOL_IP, IP_PKTINFO, &info);
+        }
+        if self.v6() && is_on(st.stored.get(&(SOL_IPV6, IPV6_RECVPKTINFO))) {
+            let mut info = here.to_ipv6_mapped().octets().to_vec();
+            info.extend_from_slice(&index.to_le_bytes());
+            push_cmsg(&mut out, SOL_IPV6, IPV6_PKTINFO, &info);
+        }
+        if self.v6() && is_on(st.stored.get(&(SOL_IPV6, IPV6_RECVHOPLIMIT))) {
+            push_cmsg(&mut out, SOL_IPV6, IPV6_HOPLIMIT, &64i32.to_le_bytes());
+        }
+        out
     }
 
     /// Queues what fits, sleeping for the rest unless `nonblock`. A partial count rather
@@ -734,7 +904,7 @@ impl Inet {
             return Err(EMSGSIZE);
         }
         let ping = matches!(self.proto, IPPROTO_ICMP | IPPROTO_ICMPV6);
-        let (route_to, connected) = {
+        let (route_to, connected, addr, from) = {
             let mut st = self.st.lock().unwrap();
             let v6only = Self::v6only(&st);
             // An AF_INET6 socket can mean "the connected peer" by AF_UNSPEC.
@@ -756,7 +926,9 @@ impl Inet {
             let broadcast = st.opts.get(SO_BROADCAST).is_some_and(|v| v.iter().any(|&b| b != 0));
             let to = route(addr, false, broadcast)?;
             self.autobind(&mut st, uid)?;
-            (to, connected)
+            let local = st.local.unwrap();
+            let from_ip = if local.ip().is_unspecified() { st.source.unwrap_or_else(|| source_for(&to, addr)) } else { local.ip() };
+            (to, connected, addr, SocketAddr::new(from_ip, local.port()))
         };
         if tracing() {
             eprintln!("[net] send {total} bytes: {route_to:?}");
@@ -767,10 +939,62 @@ impl Inet {
                 self.st.lock().unwrap().err = ECONNREFUSED;
                 EVENTS.bump_key(self.key);
             }
-            // Nobody to hear it yet.
+            Route::Local if !ping => {
+                let data = src.read(t, 0, total)?;
+                // A connected socket only hears from whom it's connected to.
+                let hearer = bound_at(self.proto, addr, false).into_iter().find(|s| s.st.lock().unwrap().peer.is_none_or(|p| p == from));
+                match hearer {
+                    Some(s) => s.deliver(from, data),
+                    None if connected => {
+                        self.st.lock().unwrap().err = ECONNREFUSED;
+                        EVENTS.bump_key(self.key);
+                    }
+                    None => {}
+                }
+            }
+            Route::Host(host) if !ping => {
+                let data = src.read(t, 0, total)?;
+                if tracing() {
+                    eprintln!("[net] datagram of {total} to {host}");
+                }
+                let sock = self.host_socket(connected.then_some(host), uid)?;
+                let sent = if connected { sock.send(&data) } else { sock.send_to(&data, host) };
+                match sent {
+                    Ok(_) => {}
+                    Err(e) if hostio::out_of_buffers(&e) => {} // as if lost on the way
+                    Err(e) if hostio::datagram_too_big(&e) => return Err(EMSGSIZE),
+                    Err(e) => return Err(hostio::linux_errno(&e)),
+                }
+            }
+            // Nobody to hear it, or no way to send it: ICMP.
             Route::Local | Route::Host(_) | Route::Lost | Route::Refused => {}
         }
         Ok(total)
+    }
+
+    /// The host socket this one sends through, connected to `connect_to` if it's given.
+    fn host_socket(self: &Arc<Self>, connect_to: Option<SocketAddr>, uid: u32) -> Result<Arc<UdpSocket>, i64> {
+        let mut st = self.st.lock().unwrap();
+        if st.host_udp.is_none() {
+            let place = UDP_READERS.take(uid).ok_or(ENOBUFS)?;
+            let sock = Arc::new(UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).map_err(|e| hostio::linux_errno(&e))?);
+            let _ = sock.set_read_timeout(Some(Duration::from_secs(1)));
+            let (owner, reader) = (Arc::downgrade(self), sock.clone());
+            std::thread::Builder::new().name("hostio-udp".into()).stack_size(256 << 10).spawn(move || read_host_datagrams(owner, reader, place)).map_err(|_| ENOBUFS)?;
+            if tracing() {
+                eprintln!("[net] host datagram socket for {:#x}", self.key);
+            }
+            st.host_udp = Some(sock);
+            st.host_peer = None;
+        }
+        let sock = st.host_udp.clone().unwrap();
+        if let Some(to) = connect_to
+            && st.host_peer != Some(to)
+        {
+            sock.connect(to).map_err(|e| hostio::linux_errno(&e))?;
+            st.host_peer = Some(to);
+        }
+        Ok(sock)
     }
 }
 
@@ -935,7 +1159,7 @@ impl Kernel {
             connect if s.is_stream() => self.stream_connect(t, s, f, a),
             connect => self.datagram_connect(t, s, a),
             listen => self.inet_listen(t, s),
-            accept | accept4 => self.inet_accept(t, s, f),
+            accept | accept4 => self.inet_accept(t, s, f, a, if no == accept4 { a[3] } else { 0 }),
             shutdown => self.inet_shutdown(s, a[1]),
             getsockname => {
                 let name = {
@@ -998,9 +1222,9 @@ impl Kernel {
     }
 
     fn inet_recvmsg(&self, t: &Thread, s: &Inet, f: &File, msg: u64, flags: u64) -> Result<i64, i64> {
-        let (name, iov, iovlen) = {
+        let (name, iov, iovlen, control, room) = {
             let mut mm = t.proc.mm();
-            (mm.read_u64(msg)?, mm.read_u64(msg + 16)?, mm.read_u64(msg + 24)?)
+            (mm.read_u64(msg)?, mm.read_u64(msg + 16)?, mm.read_u64(msg + 24)?, mm.read_u64(msg + 32)?, mm.read_u64(msg + 40)?)
         };
         let iovs = read_iov(t, iov, iovlen)?;
         let total: u64 = iovs.iter().map(|v| v.1).sum();
@@ -1016,10 +1240,15 @@ impl Kernel {
             mm.write(base, &r.data[at..at + n])?;
             at += n;
         }
-        // No control messages yet. A datagram that didn't fit says so.
-        mm.write_u64(msg + 40, 0)?;
+        // What didn't fit says so.
+        let shown = r.control.len().min(room as usize);
+        if shown > 0 {
+            mm.write(control, &r.control[..shown])?;
+        }
+        mm.write_u64(msg + 40, shown as u64)?;
         let truncated = !s.is_stream() && r.real > r.data.len();
-        mm.write_u32(msg + 48, if truncated { MSG_TRUNC as u32 } else { 0 })?;
+        let msg_flags = if truncated { MSG_TRUNC as u32 } else { 0 } | if shown < r.control.len() { MSG_CTRUNC } else { 0 };
+        mm.write_u32(msg + 48, msg_flags)?;
         drop(mm);
         if name != 0 {
             let addr = r.from.map_or(Vec::new(), |from| s.sockaddr(Some(from)));
@@ -1056,7 +1285,7 @@ impl Kernel {
         result.map(|n| n as i64)
     }
 
-    fn inet_bind(&self, t: &Thread, s: &Inet, a: [u64; 6]) -> Result<i64, i64> {
+    fn inet_bind(&self, t: &Thread, s: &Arc<Inet>, a: [u64; 6]) -> Result<i64, i64> {
         let raw = t.proc.mm().read_vec(a[1], a[2].min(128) as usize)?;
         let creds = self.creds(t);
         let mut st = s.st.lock().unwrap();
@@ -1079,7 +1308,7 @@ impl Kernel {
         Ok(0)
     }
 
-    fn inet_listen(&self, t: &Thread, s: &Inet) -> Result<i64, i64> {
+    fn inet_listen(&self, t: &Thread, s: &Arc<Inet>) -> Result<i64, i64> {
         if !s.is_stream() {
             return Err(EOPNOTSUPP);
         }
@@ -1104,24 +1333,62 @@ impl Kernel {
         Ok(0)
     }
 
-    /// Nothing can arrive yet. A blocking call waits like any other for what won't come:
-    /// until a signal, an exit or its timeout. Returning at once would have a server's
-    /// accept loop spinning for the life of the device.
-    fn inet_accept(&self, t: &Arc<Thread>, s: &Inet, f: &File) -> Result<i64, i64> {
+    fn inet_accept(&self, t: &Arc<Thread>, s: &Inet, f: &File, a: [u64; 6], flags: u64) -> Result<i64, i64> {
         if !s.is_stream() {
             return Err(EOPNOTSUPP);
         }
         let until = deadline(s.st.lock().unwrap().opts.rcvtimeo);
-        loop {
+        let conn = loop {
             let seen = EVENTS.watch_key(s.key);
-            if s.st.lock().unwrap().phase != Phase::Listening {
-                return Err(EINVAL);
+            {
+                let mut st = s.st.lock().unwrap();
+                if st.phase != Phase::Listening {
+                    return Err(EINVAL);
+                }
+                if let Some(conn) = st.backlog.pop_front() {
+                    break conn;
+                }
             }
             if f.nonblock() {
                 return Err(EAGAIN);
             }
             wait_or_give_up(t, seen, until)?;
+        };
+        if a[1] != 0 {
+            let peer = conn.st.lock().unwrap().peer;
+            self.write_name(t, a[1], a[2], &s.sockaddr(peer))?;
         }
+        let file = File::new(Kind::Inet(conn), (flags & SOCK_NONBLOCK) as u32);
+        t.files().alloc(file, flags & SOCK_CLOEXEC != 0, 0)
+    }
+
+    /// A connection to a listener on this device: done on the spot, whoever's there.
+    /// `st` is the connecting socket's, which isn't listening, so no two locks here can
+    /// be taken the other way round.
+    fn connect_here(&self, s: &Arc<Inet>, st: &mut State, addr: SocketAddr, uid: u32) -> Result<(), i64> {
+        let listener = bound_at(s.proto, addr, true).into_iter().next().ok_or(ECONNREFUSED)?;
+        s.autobind(st, uid)?;
+        let source = source_for(&Route::Local, addr);
+        let local = st.local.unwrap();
+        let name = SocketAddr::new(if local.ip().is_unspecified() { source } else { local.ip() }, local.port());
+        let here = SocketAddr::new(if addr.ip().is_unspecified() { source } else { addr.ip() }, addr.port());
+        let server_key = hostio::fresh_key();
+        let (mine, theirs) = Io::pair(s.key, server_key);
+        let mut l = listener.st.lock().unwrap();
+        if l.phase != Phase::Listening || l.backlog.len() >= MAX_BACKLOG {
+            return Err(ECONNREFUSED);
+        }
+        let (opts, stored) = (l.opts.clone(), l.stored.clone());
+        let server = State { opts, stored, local: Some(here), peer: Some(name), phase: Phase::Connected, io: Some(theirs), ..State::default() };
+        l.backlog.push_back(Arc::new(Inet { family: listener.family, ty: s.ty, proto: s.proto, key: server_key, st: Mutex::new(server) }));
+        drop(l);
+        EVENTS.bump_key(listener.key);
+        st.io = Some(mine);
+        st.source = Some(source);
+        st.peer = Some(addr);
+        st.err = 0;
+        st.phase = Phase::Connected;
+        Ok(())
     }
 
     fn inet_shutdown(&self, s: &Inet, how: u64) -> Result<i64, i64> {
@@ -1136,6 +1403,9 @@ impl Kernel {
                 (Phase::Listening, _) => {
                     if reading {
                         st.phase = Phase::Idle;
+                        for waiting in std::mem::take(&mut st.backlog) {
+                            waiting.abandon();
+                        }
                         if let Some(local) = st.local {
                             let mut ports = PORTS.lock().unwrap();
                             if let Some(me) = ports.get_mut(&(s.proto, local.port())).and_then(|h| h.iter_mut().find(|b| b.owner == s.key)) {
@@ -1170,13 +1440,17 @@ impl Kernel {
         result
     }
 
-    fn datagram_connect(&self, t: &Thread, s: &Inet, a: [u64; 6]) -> Result<i64, i64> {
+    fn datagram_connect(&self, t: &Thread, s: &Arc<Inet>, a: [u64; 6]) -> Result<i64, i64> {
         let raw = t.proc.mm().read_vec(a[1], a[2].min(128) as usize)?;
         if raw.len() < 2 {
             return Err(EINVAL);
         }
         let uid = self.creds(t).euid;
         let mut st = s.st.lock().unwrap();
+        // A host socket can't be disconnected, or easily told who to hear from instead.
+        // The next one to send out gets a new one.
+        st.host_udp = None;
+        st.host_peer = None;
         if raw[..2] == [0, 0] {
             st.peer = None;
             st.source = None;
@@ -1196,7 +1470,7 @@ impl Kernel {
     /// As __inet_stream_connect: the first call starts it, later ones say how it's going
     /// and the one that sees the end reports that, so a call interrupted by a signal
     /// can simply be made again.
-    fn stream_connect(&self, t: &Thread, s: &Inet, f: &File, a: [u64; 6]) -> Result<i64, i64> {
+    fn stream_connect(&self, t: &Thread, s: &Arc<Inet>, f: &File, a: [u64; 6]) -> Result<i64, i64> {
         let raw = t.proc.mm().read_vec(a[1], a[2].min(128) as usize)?;
         if raw.len() < 2 {
             return Err(EINVAL);
@@ -1220,7 +1494,11 @@ impl Kernel {
                 }
                 let host = match to? {
                     Route::Host(host) => host,
-                    Route::Local | Route::Refused | Route::Dns | Route::Lost => return Err(ECONNREFUSED),
+                    Route::Local => {
+                        self.connect_here(s, &mut st, addr, uid)?;
+                        return Ok(0);
+                    }
+                    Route::Refused | Route::Dns | Route::Lost => return Err(ECONNREFUSED),
                 };
                 s.autobind(&mut st, uid)?;
                 st.source = Some(IpAddr::from(net::eth_address().unwrap_or(net::ETH_ADDRESS)));

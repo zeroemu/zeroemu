@@ -18,6 +18,8 @@ const TLB_FLUSH: u64 = KERNEL_WINDOW + 0x800;
 /// The same flush for the kernel's own use: comes back with `hvc` instead of
 /// going on to EL0.
 const TLB_FLUSH_NOW: u64 = KERNEL_WINDOW + 0x820;
+/// Past the entries of the vector table, whose only EL1 code is `hvc`.
+const VECTORS_END: u64 = KERNEL_WINDOW + 0x800;
 
 /// Vector index for "synchronous exception from lower EL, AArch64".
 const VEC_LOWER_SYNC: u64 = 8;
@@ -214,6 +216,12 @@ impl Vcpu for HvfVcpu {
                         ),
                     };
                 }
+                // A kick can land after the guest took an exception and before the
+                // vector's hvc ran. ELR holds the instruction after an svc: going
+                // back to EL0 from here would drop the syscall, and the guest would
+                // see its first argument as the result. Let the hvc happen; the
+                // thread looks at its signals on the way back in anyway.
+                HV_EXIT_REASON_CANCELED if self.reg(HV_REG_CPSR) & CPSR_MODE_MASK != 0 && self.reg(HV_REG_PC) < VECTORS_END => continue,
                 HV_EXIT_REASON_CANCELED => {
                     self.back_to_el0();
                     return Exit::Interrupted;

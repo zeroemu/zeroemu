@@ -13,6 +13,8 @@ typedef long i64;
 #define NR_clone 220
 #define NR_gettid 178
 #define NR_openat 56
+#define NR_clock_gettime 113
+#define NR_membarrier 283
 #define NR_close 57
 
 static i64 sys6(i64 n, i64 a, i64 b, i64 c, i64 d, i64 e, i64 f) {
@@ -139,6 +141,21 @@ static void pi_holder(void *arg) {
     pi_unlock(tid);
 }
 
+// One thread makes a syscall whose first argument is not its result, while
+// another keeps kicking its vCPU out of the guest. A kick landing just after
+// the svc must not lose the call.
+#define KICK_CALLS 2000000
+static volatile int kicks_done;
+static volatile long dropped_calls;
+static void caller(void *arg) {
+    (void)arg;
+    long ts[2];
+    for (long i = 0; i < KICK_CALLS; i++) {
+        if (sys(NR_clock_gettime, 1, ts) != 0) dropped_calls++;
+    }
+    __atomic_store_n(&kicks_done, 1, __ATOMIC_RELEASE);
+}
+
 int cmain(void) {
     char *stacks = (char *)sys(NR_mmap, 0, (u64)STACK * N_BLOCK, 3, 0x22, -1, 0);
     check((i64)stacks > 0, "stacks mapped");
@@ -190,6 +207,15 @@ int cmain(void) {
 
     __atomic_store_n(&pi_release, 1, __ATOMIC_RELEASE);
     join(&tids[0]);
+
+    sys(NR_membarrier, 1 << 4 /* REGISTER_PRIVATE_EXPEDITED */, 0, 0);
+    tids[0] = 1;
+    spawn(stacks + STACK, caller, 0, &tids[0]);
+    while (!__atomic_load_n(&kicks_done, __ATOMIC_ACQUIRE)) {
+        sys(NR_membarrier, 1 << 3 /* PRIVATE_EXPEDITED */, 0, 0);
+    }
+    join(&tids[0]);
+    check(dropped_calls == 0, "kicks never lose a syscall");
 
     if (failures) {
         puts_("SOME CHECKS FAILED\n");

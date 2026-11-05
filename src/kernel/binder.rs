@@ -62,6 +62,8 @@ const BR_SPAWN_LOOPER: u32 = 0x720d;
 const BR_DEAD_BINDER: u32 = 0x8008_720f;
 const BR_CLEAR_DEATH_NOTIFICATION_DONE: u32 = 0x8008_7210;
 const BR_FAILED_REPLY: u32 = 0x7211;
+/// mmap_area keeps receive areas to this size.
+pub(super) const MAX_AREA: u64 = 4 << 20;
 
 // Object types (B_PACK_CHARS).
 const TYPE_BINDER: u32 = 0x7362_2a85;
@@ -329,6 +331,8 @@ struct Outgoing {
     /// BINDER_TYPE_PTR buffers, by object offset: their contents.
     sg: HashMap<u64, Vec<u8>>,
     sg_size: u64,
+    /// More than any receive area holds: fails like a full one.
+    too_big: bool,
 }
 
 impl World {
@@ -636,8 +640,9 @@ impl Kernel {
         let (target, code, flags) = (u64_at(a, 0), u32_at(a, 16), u32_at(a, 20));
         let (data_size, offsets_size) = (u64_at(a, 32), u64_at(a, 40));
         let (data_ptr, offsets_ptr) = (u64_at(a, 48), u64_at(a, 56));
-        if data_size > 1 << 20 || offsets_size > 1 << 16 {
-            return Err(EINVAL);
+        let too_big = Outgoing { reply, target, code, flags, data: Vec::new(), offsets: Vec::new(), sg: HashMap::new(), sg_size: 0, too_big: true };
+        if data_size > MAX_AREA || offsets_size > MAX_AREA {
+            return Ok(too_big);
         }
         let data = mm.read_vec(data_ptr, data_size as usize)?;
         let raw = mm.read_vec(offsets_ptr, offsets_size as usize)?;
@@ -649,15 +654,15 @@ impl Kernel {
                 let o = o as usize;
                 if o + 40 <= data.len() && u32_at(&data, o) == TYPE_PTR {
                     let (buf, len) = (u64_at(&data, o + 8), u64_at(&data, o + 16));
-                    if len > 1 << 20 {
-                        return Err(EINVAL);
+                    if len > MAX_AREA {
+                        return Ok(too_big);
                     }
                     sgmap.insert(o as u64, mm.read_vec(buf, len as usize)?);
                     sg_size += align8(len);
                 }
             }
         }
-        Ok(Outgoing { reply, target, code, flags, data, offsets, sg: sgmap, sg_size })
+        Ok(Outgoing { reply, target, code, flags, data, offsets, sg: sgmap, sg_size, too_big: false })
     }
 
     fn binder_transact(&self, t: &Arc<Thread>, b: &BinderFile, mut out: Outgoing) {
@@ -715,7 +720,8 @@ impl Kernel {
         let data_len = align8(out.data.len() as u64);
         let offs_len = align8(out.offsets.len() as u64 * 8);
         let total = data_len + offs_len + out.sg_size + if want_secctx { align8(caller_ctx.len() as u64) } else { 0 };
-        let Some(buffer) = w.alloc(to, total) else {
+        let buffer = if out.too_big { None } else { w.alloc(to, total) };
+        let Some(buffer) = buffer else {
             eprintln!("[droidrt] binder: no receive buffer space in pid {}", w.procs[&to].pid);
             w.thread(me, t.tid).todo.push_back(Work::FailedReply);
             // The caller is waiting for this reply: it fails too, rather than hang.

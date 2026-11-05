@@ -45,7 +45,7 @@ impl Kernel {
             if prot & 2 != 0 {
                 return -EPERM;
             }
-            let len = len.min(4 << 20);
+            let len = len.min(super::binder::MAX_AREA);
             let mut mm = t.proc.mm();
             let a = match mm.map(place, len, 1, Backing::Anon) {
                 Ok(a) => a,

@@ -72,6 +72,10 @@ const NLMSG_MIN_TYPE: u16 = 0x10;
 const RTM_NEWLINK: u16 = 16;
 const RTM_GETLINK: u16 = 18;
 const RTM_NEWADDR: u16 = 20;
+const RTM_DELADDR: u16 = 21;
+/// Multicast groups (RTNLGRP_*).
+const RTNLGRP_LINK: u32 = 1;
+const RTNLGRP_IPV4_IFADDR: u32 = 5;
 const RTM_GETADDR: u16 = 22;
 const RTM_GETROUTE: u16 = 26;
 const RTM_MAX: u16 = 127;
@@ -329,8 +333,19 @@ impl Netlink {
                 if body.is_empty() {
                     return Reply::Ok(Vec::new());
                 }
-                // rtnetlink kinds: NEW, DEL, GET, SET. Only `lo` and its
-                // addresses exist, no routes; changes are accepted as if applied.
+                if ty == RTM_NEWADDR || ty == RTM_DELADDR {
+                    return address_request(ty, body);
+                }
+                if ty == RTM_NEWLINK && body.len() >= 16 {
+                    let word = |at: usize| u32::from_le_bytes(body[at..at + 4].try_into().unwrap());
+                    if let Some(payload) = super::net::set_flags(word(4) as i32, word(8), word(12)) {
+                        multicast_kernel(RTNLGRP_LINK, RTM_NEWLINK, &payload);
+                    }
+                    return Reply::Ok(Vec::new());
+                }
+                // rtnetlink kinds: NEW, DEL, GET, SET. There are no routes, nor rules
+                // nor neighbours: changes are accepted as if applied, since traffic
+                // doesn't pass through any of this.
                 match ((ty - 16) & 3, dump) {
                     (2, true) => Reply::Dump(match ty {
                         RTM_GETLINK => super::net::link_payloads().iter().map(|p| nlmsg(RTM_NEWLINK, NLM_F_MULTI, seq, port, p)).collect(),
@@ -359,6 +374,63 @@ impl Netlink {
             _ => Reply::Ok(Vec::new()),
         }
     }
+}
+
+/// RTM_NEWADDR and RTM_DELADDR. Only IPv4 addresses are kept.
+fn address_request(ty: u16, body: &[u8]) -> Reply {
+    const IFA_ADDRESS: u16 = 1;
+    const IFA_LOCAL: u16 = 2;
+    if body.len() < 8 || body[0] != 2 {
+        return Reply::Ok(Vec::new());
+    }
+    let prefix = body[1];
+    let index = i32::from_le_bytes(body[4..8].try_into().unwrap());
+    let (mut local, mut address) = (None, None);
+    let mut off = 8;
+    while off + 4 <= body.len() {
+        let len = u16::from_le_bytes([body[off], body[off + 1]]) as usize;
+        let kind = u16::from_le_bytes([body[off + 2], body[off + 3]]);
+        if len < 4 || off + len > body.len() {
+            break;
+        }
+        if len == 8 {
+            let ip: [u8; 4] = body[off + 4..off + 8].try_into().unwrap();
+            match kind {
+                IFA_LOCAL => local = Some(ip),
+                IFA_ADDRESS => address = Some(ip),
+                _ => {}
+            }
+        }
+        off += len.next_multiple_of(4);
+    }
+    let ip = local.or(address).unwrap_or([0; 4]);
+    if ty == RTM_NEWADDR && ip == [0; 4] {
+        // netd's setCfg sends this when clearing an address. It is not an address.
+        return Reply::Ok(Vec::new());
+    }
+    let change = if ty == RTM_NEWADDR {
+        super::net::set_address(index, Some((ip, prefix)))
+    } else {
+        super::net::set_address(index, None).and_then(|c| if c.is_some() || index == 1 { Ok(c) } else { Err(EADDRNOTAVAIL) })
+    };
+    match change {
+        Ok(Some((new, message))) => {
+            announce_address(new, &message);
+            Reply::Ok(Vec::new())
+        }
+        Ok(None) => Reply::Ok(Vec::new()),
+        Err(e) => Reply::Err(e),
+    }
+}
+
+fn multicast_kernel(group: u32, ty: u16, payload: &[u8]) {
+    let data = nlmsg(ty, 0, 0, 0, payload);
+    multicast(NETLINK_ROUTE, &Packet { data, from: 0, group, cred: [0; 3] }, 0);
+}
+
+/// An address came or went: what IpClient waits to hear.
+pub fn announce_address(new: bool, message: &[u8]) {
+    multicast_kernel(RTNLGRP_IPV4_IFADDR, if new { RTM_NEWADDR } else { RTM_DELADDR }, message);
 }
 
 /// What the kernel does with one request.

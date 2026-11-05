@@ -222,7 +222,7 @@ fn table() -> &'static [(&'static str, &'static str, Kind)] {
                 v.push((Box::leak(path.into_boxed_str()), def, kind));
             }
         };
-        for iface in ["all", "default", "lo"] {
+        for iface in ["all", "default", "lo", super::net::ETH] {
             for (key, def) in IPV4_CONF {
                 add(format!("net/ipv4/conf/{iface}/{key}"), def, Int(MIN, MAX));
             }
@@ -239,7 +239,7 @@ fn table() -> &'static [(&'static str, &'static str, Kind)] {
             add(format!("net/ipv6/conf/{iface}/stable_secret"), "", Str(64));
         }
         for proto in ["ipv4", "ipv6"] {
-            for iface in ["default", "lo"] {
+            for iface in ["default", "lo", super::net::ETH] {
                 for (key, def) in NEIGH {
                     add(format!("net/{proto}/neigh/{iface}/{key}"), def, Int(MIN, MAX));
                 }

@@ -24,7 +24,7 @@ use std::sync::{Arc, Mutex};
 
 const USAGE: &str = "usage: droidrt [--system <system.img>] [--strace] [--display] <program> [args...]
        droidrt --system <system.img> --boot [--headless] [--data <file> | --ephemeral] [--wipe-data]
-               [--adb-port <port> | --no-adb]
+               [--adb-port <port> | --no-adb] [--no-net]
                [--push <host>:<guest>]... [--run <cmd>] [init args...]
        droidrt --system <system.img> --ls <path> | --cat <path>
        droidrt --gpu-selftest";
@@ -66,6 +66,7 @@ fn run() -> Result<i32, String> {
     let mut wipe_data = false;
     let mut adb_port: Option<u16> = None;
     let mut no_adb = false;
+    let mut no_net = false;
     while let Some(flag) = args.peek().filter(|a| a.starts_with("--")).cloned() {
         args.next();
         match flag.as_str() {
@@ -95,6 +96,7 @@ fn run() -> Result<i32, String> {
             // Host adb: normally found on the first port pair free for an emulator.
             "--adb-port" => adb_port = Some(args.next().ok_or(USAGE)?.parse().map_err(|_| USAGE)?),
             "--no-adb" => no_adb = true,
+            "--no-net" => no_net = true,
             "--display" => display = true,
             "--headless" => headless = true,
             "--gpu-selftest" => gpu_selftest = true,
@@ -134,7 +136,7 @@ fn run() -> Result<i32, String> {
     if data.is_some() {
         kernel::reserve_exit_signals();
     }
-    let extras = boot.then_some(kernel::BootExtras { push, run, data });
+    let extras = boot.then_some(kernel::BootExtras { push, run, data, network: !no_net });
     if (boot && !no_adb) || adb_port.is_some() {
         kernel::adb::start(adb_port);
     }

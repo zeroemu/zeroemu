@@ -8,10 +8,12 @@ case "$(uname -s)" in
 esac
 scripts/build-guests.sh >/dev/null 2>&1 || { echo "guest build failed"; exit 1; }
 bad=0
-for t in m2 m3 shm binder binder_nested binder_refs binder_unwind mounts creds sock selinux pty threads bpf drm locks ashmem inotify tun openrace xattr smoke clonefiles timers misc_syscalls cow uffd inet; do
+for t in m2 m3 shm binder binder_nested binder_refs binder_unwind mounts creds sock selinux pty threads bpf drm locks ashmem inotify tun openrace xattr smoke clonefiles timers misc_syscalls cow uffd inet ifcfg; do
     bin="target/guest/${t}_aarch64"
     [ -x "$bin" ] || continue
-    out=$(DROIDRT_GPU=fake perl -e 'alarm 90; exec @ARGV' target/release/droidrt "$bin" alpha beta 2>&1)
+    # Only this one sees the network interface, which the others don't expect.
+    net=0; [ "$t" = ifcfg ] && net=1
+    out=$(DROIDRT_NET=$net DROIDRT_GPU=fake perl -e 'alarm 90; exec @ARGV' target/release/droidrt "$bin" alpha beta 2>&1)
     if printf '%s\n' "$out" | grep -q "all checks passed" && ! printf '%s\n' "$out" | grep -qE "^FAIL|panicked|internal error"; then
         printf '%-16s ok\n' "$t"
     else

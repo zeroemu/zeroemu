@@ -1,7 +1,12 @@
-//! The network interfaces droidrt shows: loopback, plus the TUN devices
-//! programs create (system_server's Thread network makes "thread-wpan").
-//! There is no traffic. One list feeds /sys/class/net, rtnetlink
-//! (RTM_GETLINK, RTM_GETADDR) and the SIOCGIF*/SIOCSIF* ioctls.
+//! The network interfaces droidrt shows: loopback, the TUN devices programs
+//! create (system_server's Thread network makes "thread-wpan"), and for a device on
+//! the network, eth1. No packets pass through any of them: guest sockets are
+//! connected to host sockets directly, and these exist so that Android believes
+//! it has a network. One list feeds /sys/class/net, rtnetlink (RTM_GETLINK,
+//! RTM_GETADDR) and the SIOCGIF*/SIOCSIF* ioctls.
+//!
+//! Not eth0: the image's overlays configure that as a restricted interface, which can
+//! never become the default network.
 
 use crate::errno::*;
 use crate::vfs::FileSystem;
@@ -12,6 +17,7 @@ const ARPHRD_LOOPBACK: u16 = 772;
 const ARPHRD_NONE: u16 = 0xfffe;
 const ARPHRD_ETHER: u16 = 1;
 const IFF_UP: u32 = 0x1;
+const IFF_BROADCAST: u32 = 0x2;
 const IFF_LOOPBACK: u32 = 0x8;
 const IFF_POINTOPOINT: u32 = 0x10;
 const IFF_RUNNING: u32 = 0x40;
@@ -26,14 +32,29 @@ struct Iface {
     ty: u16,
     mtu: u32,
     flags: u32,
+    mac: [u8; 6],
+    /// Its IPv4 address and prefix length, once it has one.
+    ipv4: Option<([u8; 4], u8)>,
 }
+
+/// The network interface's name, and what a device's static configuration gives it.
+pub const ETH: &str = "eth1";
+pub const ETH_ADDRESS: [u8; 4] = [10, 0, 2, 15];
+const ETH_MAC: [u8; 6] = [0x52, 0x54, 0, 0x12, 0x34, 0x56];
 
 static IFACES: Mutex<Vec<Iface>> = Mutex::new(Vec::new());
 static NEXT_INDEX: Mutex<i32> = Mutex::new(2);
+/// Whether the device has a network: eth1 has an address.
+static IPV4_UP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the device has a route to anywhere but itself.
+pub fn ipv4_up() -> bool {
+    IPV4_UP.load(std::sync::atomic::Ordering::Relaxed)
+}
 static SYS: OnceLock<Arc<dyn FileSystem>> = OnceLock::new();
 
 fn lo() -> Iface {
-    Iface { name: "lo".into(), index: 1, ty: ARPHRD_LOOPBACK, mtu: 65536, flags: IFF_UP | IFF_LOOPBACK | IFF_RUNNING }
+    Iface { name: "lo".into(), index: 1, ty: ARPHRD_LOOPBACK, mtu: 65536, flags: IFF_UP | IFF_LOOPBACK | IFF_RUNNING, mac: [0; 6], ipv4: Some(([127, 0, 0, 1], 8)) }
 }
 
 /// The interfaces, `lo` first.
@@ -55,8 +76,9 @@ fn publish_iface(sys: &dyn FileSystem, i: &Iface) {
     put("type", i.ty.to_string());
     put("mtu", i.mtu.to_string());
     put("flags", format!("{:#x}", i.flags));
-    put("address", "00:00:00:00:00:00".into());
-    put("broadcast", "00:00:00:00:00:00".into());
+    let hex = |b: [u8; 6]| b.map(|x| format!("{x:02x}")).join(":");
+    put("address", hex(i.mac));
+    put("broadcast", hex(if i.ty == ARPHRD_ETHER { [0xff; 6] } else { [0; 6] }));
     put("addr_len", if i.ty == ARPHRD_NONE { "0" } else { "6" }.into());
     put("operstate", if i.ty == ARPHRD_LOOPBACK { "unknown" } else if i.flags & IFF_UP != 0 { "up" } else { "down" }.into());
     put("carrier", "1".into());
@@ -65,8 +87,17 @@ fn publish_iface(sys: &dyn FileSystem, i: &Iface) {
     put("uevent", format!("INTERFACE={}\nIFINDEX={}", i.name, i.index));
 }
 
-pub fn publish(sys: Arc<dyn FileSystem>) {
+/// `network`: the device has eth1, up and waiting for an address, before anything
+/// looks: nothing needs telling that it appeared.
+pub fn publish(sys: Arc<dyn FileSystem>, network: bool) {
     publish_iface(sys.as_ref(), &lo());
+    if network {
+        let mut next = NEXT_INDEX.lock().unwrap();
+        let eth = Iface { name: ETH.into(), index: *next, ty: ARPHRD_ETHER, mtu: 1500, flags: IFF_UP | IFF_BROADCAST | IFF_RUNNING | IFF_MULTICAST, mac: ETH_MAC, ipv4: None };
+        *next += 1;
+        publish_iface(sys.as_ref(), &eth);
+        IFACES.lock().unwrap().push(eth);
+    }
     let _ = SYS.set(sys);
 }
 
@@ -92,6 +123,8 @@ pub fn add_tun(name: &str, tap: bool) -> Result<String, i64> {
         ty: if tap { ARPHRD_ETHER } else { ARPHRD_NONE },
         mtu: 1500,
         flags: if tap { IFF_MULTICAST } else { IFF_POINTOPOINT | IFF_NOARP | IFF_MULTICAST },
+        mac: [0; 6],
+        ipv4: None,
     };
     *next += 1;
     if let Some(sys) = SYS.get() {
@@ -140,8 +173,8 @@ fn link_payload(i: &Iface) -> Vec<u8> {
     attr(&mut p, IFLA_OPERSTATE, &[if i.ty == ARPHRD_LOOPBACK { 0 } else if up { 6 } else { 2 }]);
     attr(&mut p, IFLA_CARRIER, &[1]);
     if i.ty != ARPHRD_NONE {
-        attr(&mut p, IFLA_ADDRESS, &[0; 6]);
-        attr(&mut p, IFLA_BROADCAST, &[0; 6]);
+        attr(&mut p, IFLA_ADDRESS, &i.mac);
+        attr(&mut p, IFLA_BROADCAST, if i.ty == ARPHRD_ETHER { &[0xff; 6] } else { &[0; 6] });
     }
     p
 }
@@ -178,7 +211,74 @@ pub fn addr_payloads(family: u8) -> Vec<Vec<u8>> {
         attr(&mut p, IFA_FLAGS, &IFA_F_PERMANENT.to_le_bytes());
         out.push(p);
     }
+    if family == 0 || family == 2 {
+        out.extend(IFACES.lock().unwrap().iter().filter_map(address_message));
+    }
     out
+}
+
+/// RTM_NEWADDR or RTM_DELADDR for an interface's IPv4 address. IpClient won't read one
+/// without IFA_ADDRESS and IFA_FLAGS, and this is its only source for the address.
+fn address_message(i: &Iface) -> Option<Vec<u8>> {
+    const IFA_ADDRESS: u16 = 1;
+    const IFA_LOCAL: u16 = 2;
+    const IFA_LABEL: u16 = 3;
+    const IFA_BROADCAST: u16 = 4;
+    const IFA_FLAGS: u16 = 8;
+    const IFA_F_PERMANENT: u32 = 0x80;
+    let (ip, prefix) = i.ipv4?;
+    let mut p = vec![2u8, prefix, IFA_F_PERMANENT as u8, 0];
+    p.extend_from_slice(&i.index.to_le_bytes());
+    attr(&mut p, IFA_ADDRESS, &ip);
+    attr(&mut p, IFA_LOCAL, &ip);
+    let mask = u32::MAX.checked_shr(prefix as u32).unwrap_or(0);
+    attr(&mut p, IFA_BROADCAST, &(u32::from_be_bytes(ip) | mask).to_be_bytes());
+    let mut label = i.name.as_bytes().to_vec();
+    label.push(0);
+    attr(&mut p, IFA_LABEL, &label);
+    attr(&mut p, IFA_FLAGS, &IFA_F_PERMANENT.to_le_bytes());
+    Some(p)
+}
+
+/// Gives interface `index` an address, or takes it away. What to announce, if
+/// anything changed: (is it new, the message). The caller holds no lock of ours then.
+pub fn set_address(index: i32, ip: Option<([u8; 4], u8)>) -> Result<Option<(bool, Vec<u8>)>, i64> {
+    let mut list = IFACES.lock().unwrap();
+    let Some(i) = list.iter_mut().find(|i| i.index == index) else {
+        return if index == 1 { Ok(None) } else { Err(ENODEV) };
+    };
+    if i.ipv4 == ip {
+        return Ok(None);
+    }
+    let old = address_message(i);
+    i.ipv4 = ip;
+    if i.name == ETH {
+        IPV4_UP.store(ip.is_some(), std::sync::atomic::Ordering::Relaxed);
+    }
+    Ok(match ip {
+        Some(_) => address_message(i).map(|m| (true, m)),
+        None => old.map(|m| (false, m)),
+    })
+}
+
+/// RTM_NEWLINK: changes the flags `change` selects. The new link message, if they moved.
+pub fn set_flags(index: i32, flags: u32, change: u32) -> Option<Vec<u8>> {
+    let mut list = IFACES.lock().unwrap();
+    let i = list.iter_mut().find(|i| i.index == index)?;
+    let new = (i.flags & !change) | (flags & change);
+    if new == i.flags {
+        return None;
+    }
+    i.flags = new;
+    if let Some(sys) = SYS.get() {
+        publish_iface(sys.as_ref(), i);
+    }
+    Some(link_payload(i))
+}
+
+/// Addresses for SIOCGIFCONF: each interface's IPv4 address, `lo`'s first.
+pub fn ipv4_addresses() -> Vec<(String, [u8; 4])> {
+    all().into_iter().filter_map(|i| i.ipv4.map(|(ip, _)| (i.name, ip))).collect()
 }
 
 /// The interface an RTM_GETLINK request names (by index, or IFLA_IFNAME).
@@ -214,6 +314,9 @@ pub fn ifreq_ioctl(cmd: u64, req: &mut [u8; 40]) -> Result<(), i64> {
     const SIOCGIFFLAGS: u64 = 0x8913;
     const SIOCSIFFLAGS: u64 = 0x8914;
     const SIOCGIFADDR: u64 = 0x8915;
+    const SIOCSIFADDR: u64 = 0x8916;
+    const SIOCGIFNETMASK: u64 = 0x891b;
+    const SIOCETHTOOL: u64 = 0x8946;
     const SIOCGIFMTU: u64 = 0x8921;
     const SIOCSIFMTU: u64 = 0x8922;
     const SIOCGIFHWADDR: u64 = 0x8927;
@@ -244,13 +347,25 @@ pub fn ifreq_ioctl(cmd: u64, req: &mut [u8; 40]) -> Result<(), i64> {
         SIOCGIFHWADDR => {
             u.fill(0);
             u[..2].copy_from_slice(&i.ty.to_le_bytes());
+            u[2..8].copy_from_slice(&i.mac);
         }
-        SIOCGIFADDR if i.ty == ARPHRD_LOOPBACK => {
+        SIOCGIFADDR | SIOCGIFNETMASK => {
+            let (ip, prefix) = i.ipv4.ok_or(EADDRNOTAVAIL)?;
             u.fill(0);
             u[..2].copy_from_slice(&2u16.to_le_bytes()); // AF_INET
-            u[4..8].copy_from_slice(&[127, 0, 0, 1]);
+            let value = if cmd == SIOCGIFADDR { ip } else { (!u32::MAX.checked_shr(prefix as u32).unwrap_or(0)).to_be_bytes() };
+            u[4..8].copy_from_slice(&value);
         }
-        SIOCGIFADDR => return Err(EADDRNOTAVAIL),
+        // netd clears an interface with this before configuring it.
+        SIOCSIFADDR => {
+            let ip: [u8; 4] = u[4..8].try_into().unwrap();
+            let address = if ip == [0; 4] { None } else { Some((ip, i.ipv4.map_or(24, |(_, p)| p))) };
+            if let Some((new, message)) = set_address(i.index, address)? {
+                super::netlink::announce_address(new, &message);
+            }
+        }
+        // Drivers answer for themselves, and there isn't one.
+        SIOCETHTOOL => return Err(EOPNOTSUPP),
         // lo stays up at its MTU; others take what they are given.
         SIOCSIFFLAGS => {
             let flags = u16::from_le_bytes([u[0], u[1]]) as u32;

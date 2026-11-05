@@ -302,19 +302,25 @@ fn walk(fs: &dyn FileSystem, path: &str) -> Option<u64> {
 
 /// Creates or replaces a small attribute file.
 pub(super) fn put_file(fs: &dyn FileSystem, path: &str, content: &str) {
+    put_bytes(fs, path, content.as_bytes());
+}
+
+/// Creates or replaces a small file; which, if anyone needs to set its owner.
+pub(super) fn put_bytes(fs: &dyn FileSystem, path: &str, content: &[u8]) -> Option<u64> {
     let (dir, name) = path.rsplit_once('/').unwrap_or(("", path));
     let d = mkdir_p(fs, dir);
     let ino = match fs.lookup(d, name).ok().flatten() {
         Some(i) => i,
         None => match fs.create(d, name, S_IFREG | 0o644, 0) {
             Ok(i) => i,
-            Err(_) => return,
+            Err(_) => return None,
         },
     };
     if let Some(f) = fs.mem_file(ino) {
         f.truncate(0);
-        let _ = f.write_at(0, content.as_bytes());
+        let _ = f.write_at(0, content);
     }
+    Some(ino)
 }
 
 fn remove(fs: &dyn FileSystem, path: &str) {

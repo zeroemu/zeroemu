@@ -241,14 +241,22 @@ impl Kernel {
             let mut mm = t.proc.mm();
             let room = mm.read_u32(arg)? as usize;
             let buf = mm.read_u64(arg + 8)?;
-            if buf != 0 && room >= 40 {
-                let mut req = [0u8; 40];
-                req[..2].copy_from_slice(b"lo");
-                req[16..18].copy_from_slice(&2u16.to_le_bytes()); // AF_INET
-                req[20..24].copy_from_slice(&[127, 0, 0, 1]);
-                mm.write(buf, &req)?;
+            let addresses = super::net::ipv4_addresses();
+            let mut used = 0;
+            for (name, ip) in &addresses {
+                if buf != 0 && used + 40 > room {
+                    break;
+                }
+                if buf != 0 {
+                    let mut req = [0u8; 40];
+                    req[..name.len()].copy_from_slice(name.as_bytes());
+                    req[16..18].copy_from_slice(&2u16.to_le_bytes()); // AF_INET
+                    req[20..24].copy_from_slice(ip);
+                    mm.write(buf + used as u64, &req)?;
+                }
+                used += 40;
             }
-            mm.write_u32(arg, 40)?;
+            mm.write_u32(arg, used as u32)?;
             return Ok(0);
         }
         let mut req = [0u8; 40];

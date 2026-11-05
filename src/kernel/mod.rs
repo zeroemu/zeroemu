@@ -79,7 +79,48 @@ pub(super) const ERESTARTSYS: i64 = 512;
 /// of every boot, holding up SystemUI and so the boot animation, for layers that
 /// nearly always go through the composer HAL instead.
 const BOOT_PROPS: &str = "ro.hw_timeout_multiplier=5\nro.surface_flinger.supports_background_blur=0\nservice.sf.prime_shader_cache=0\nservice.adb.listen_addrs=vsock:5555\n";
-const NO_BLUETOOTH: &str = "<config>\n  <unavailable-feature name=\"android.hardware.bluetooth\" />\n  <unavailable-feature name=\"android.hardware.bluetooth_le\" />\n</config>\n";
+const NO_BLUETOOTH: &str = "  <unavailable-feature name=\"android.hardware.bluetooth\" />\n  <unavailable-feature name=\"android.hardware.bluetooth_le\" />\n";
+/// Without this feature EthernetService never starts.
+const ETHERNET: &str = "  <feature name=\"android.hardware.ethernet\" />\n";
+
+/// A device's network settings, in the format of Android's IpConfigStore: a Java
+/// DataOutputStream's ints and strings. A static address means no DHCP, which would
+/// need raw packets and a server to answer them.
+fn static_ip_config() -> Vec<u8> {
+    let mut out = 3i32.to_be_bytes().to_vec();
+    let text = |out: &mut Vec<u8>, s: &str| {
+        out.extend_from_slice(&(s.len() as u16).to_be_bytes());
+        out.extend_from_slice(s.as_bytes());
+    };
+    let [a, b, c, d] = net::ETH_ADDRESS;
+    for s in ["ipAssignment", "STATIC", "linkAddress", &format!("{a}.{b}.{c}.{d}")] {
+        text(&mut out, s);
+    }
+    out.extend_from_slice(&24i32.to_be_bytes());
+    text(&mut out, "gateway");
+    out.extend_from_slice(&0i32.to_be_bytes());
+    out.extend_from_slice(&1i32.to_be_bytes());
+    for s in ["10.0.2.2", "dns", "10.0.2.3", "proxySettings", "NONE", "id", net::ETH, "eos"] {
+        text(&mut out, s);
+    }
+    out
+}
+
+/// Writes the static configuration where EthernetConfigStore looks. It prefers its
+/// module's copy, which it makes on first read from the older place, so that copy
+/// has to agree once a saved /data holds one.
+fn seed_network_config(data: &crate::tmpfs::Tmpfs) {
+    use crate::vfs::FileSystem;
+    const AID_SYSTEM: u32 = 1000;
+    let config = static_ip_config();
+    let apex = "misc/apexdata/com.android.tethering/misc/ethernet";
+    let keep_apex = apex.split('/').try_fold(1, |d, part| data.lookup(d, part).ok().flatten()).is_some();
+    for dir in ["misc/ethernet"].into_iter().chain(keep_apex.then_some(apex)) {
+        if let Some(ino) = block::put_bytes(data, &format!("{dir}/ipconfig.txt"), &config) {
+            let _ = data.set_attr(ino, Some(0o600), Some((AID_SYSTEM, AID_SYSTEM)), None);
+        }
+    }
+}
 
 pub(super) const POLL: Duration = Duration::from_millis(200);
 /// For sleeps every wakeup reaches directly (Thread::sleep): only a kick lost
@@ -169,6 +210,8 @@ pub struct BootExtras {
     pub run: Option<String>,
     /// Where /data is kept between boots, if it is.
     pub data: Option<DataImage>,
+    /// The device has a network.
+    pub network: bool,
 }
 
 pub struct DataImage {
@@ -757,7 +800,8 @@ impl Kernel {
             // There is no virtual HCI controller yet. With the feature declared,
             // Android's Bluetooth stack aborts and restarts for as long as it runs.
             let oem = crate::tmpfs::Tmpfs::new(phys.clone(), 0o755);
-            oem.write_file("etc/sysconfig/droidrt.xml", 0o644, NO_BLUETOOTH);
+            let network = extras.as_ref().is_some_and(|e| e.network);
+            oem.write_file("etc/sysconfig/droidrt.xml", 0o644, &format!("<config>\n{NO_BLUETOOTH}{}</config>\n", if network { ETHERNET } else { "" }));
             v.mount("/oem", oem);
             add_boot_props(&mut v, &phys);
         }
@@ -767,7 +811,7 @@ impl Kernel {
         if let Some(d) = &drm {
             d.publish(dev.as_ref(), sys.as_ref());
         }
-        net::publish(sys.clone());
+        net::publish(sys.clone(), extras.as_ref().is_some_and(|e| e.network) || std::env::var("DROIDRT_NET").as_deref() == Ok("1"));
         power::publish(sys.as_ref());
         let sysctl = sysctl::Sysctl::new();
         // libcutils opens /dev/ashmem<boot id> (init names the node so).
@@ -802,6 +846,9 @@ impl Kernel {
                     }
                 }
                 persist = Some(p);
+            }
+            if extras.network {
+                seed_network_config(&data);
             }
             apply_extras(&v, &dev, extras)?;
         }

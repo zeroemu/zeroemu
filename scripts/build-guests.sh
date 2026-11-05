@@ -26,7 +26,7 @@ for arch in aarch64 x86_64; do
 done
 
 # arm64-only tests (they use arm64 inline asm for raw syscalls).
-for t in m3 shm binder mounts creds sock selinux pty threads bpf drm locks ashmem inotify tun binder_nested openrace clonefiles misc_syscalls cow timers binder_refs binder_unwind uffd inet vsock; do
+for t in m3 shm binder mounts creds sock selinux pty threads bpf drm locks ashmem inotify tun binder_nested openrace clonefiles misc_syscalls cow timers binder_refs binder_unwind uffd inet vsock ifcfg; do
     clang -target aarch64-linux-gnu -O2 -ffreestanding -fno-stack-protector -fno-pic \
         -fno-builtin -nostdlib -c "guest/$t.c" -o "$OUT/${t}_aarch64.o"
     "$LLD" -flavor gnu -static -o "$OUT/${t}_aarch64" "$OUT/${t}_aarch64.o"

@@ -1778,12 +1778,14 @@ impl Kernel {
             let mut count = 0;
             let mut timer: Option<Instant> = None;
             {
-                let files = t.files();
                 for fd in 0..nfds {
                     if !(0..3).any(|i| wanted(fd, &sets[i])) {
                         continue;
                     }
-                    let f = match files.get(fd as i64) {
+                    // Not held across the poll: a binder fd takes the binder lock,
+                    // whose holder may be installing a descriptor in this table.
+                    let f = t.files().get(fd as i64);
+                    let f = match f {
                         Ok(f) => f,
                         Err(e) => break_with(e)?,
                     };
@@ -1824,14 +1826,15 @@ impl Kernel {
             let mut ready = 0;
             let mut timer: Option<Instant> = None;
             {
-                let files = t.files();
                 for p in raw.chunks_exact_mut(8) {
                     let fd = i32::from_le_bytes(p[0..4].try_into().unwrap());
                     let events = u16::from_le_bytes(p[4..6].try_into().unwrap());
                     let revents = if fd < 0 {
                         0
                     } else {
-                        match files.get(fd as i64) {
+                        // Not held across the poll, as in pselect6.
+                        let f = t.files().get(fd as i64);
+                        match f {
                             Ok(f) => {
                                 if let Kind::Timer(tf) = &f.kind {
                                     timer = timer.into_iter().chain(tf.deadline()).min();

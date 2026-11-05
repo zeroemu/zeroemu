@@ -180,6 +180,10 @@ struct World {
     mgr: [Option<NodeId>; 3],
 }
 
+/// Lock order: this lock, then address spaces and fd tables. A transaction copies
+/// into the receiver and installs descriptors in its table with this held, so
+/// nothing may hold either of those while taking it: poll_ready can take it, and
+/// the last reference to a BinderFile can go away anywhere (see its Drop).
 static WORLD: Mutex<Option<World>> = Mutex::new(None);
 
 static WORLD_TAKER: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);

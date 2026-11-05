@@ -38,9 +38,11 @@ impl Kernel {
             Placement::Hint(addr)
         };
         // A binder fd's receive area: read-only to the process, filled by the driver.
-        if flags & MAP_ANONYMOUS == 0
-            && let Ok(f) = t.files().get(fd)
-            && let Some(b) = super::binder::mmap_area(&f)
+        // Bound first: a temporary fd table guard would live through the block,
+        // and set_area takes the binder lock.
+        let file = if flags & MAP_ANONYMOUS == 0 { t.files().get(fd).ok() } else { None };
+        if let Some(f) = &file
+            && let Some(b) = super::binder::mmap_area(f)
         {
             if prot & 2 != 0 {
                 return -EPERM;

@@ -64,6 +64,7 @@ enum K {
     PNsLink,
     NsFile,
     Cgroups,
+    ConfigGz,
     PCgroup,
     /// /proc/pressure and its cpu, memory, io files (extra: which).
     Pressure,
@@ -77,13 +78,14 @@ enum K {
     AttrSockcreate,
 }
 
-const ALL: [K; 47] = [
+const ALL: [K; 48] = [
     K::Root, K::Self_, K::ThreadSelf, K::Meminfo, K::Cpuinfo, K::Stat, K::Uptime, K::Loadavg, K::Version, K::Filesystems,
     K::Cmdline, K::Mounts, K::Sysctl, K::Pid, K::PCmdline, K::PComm, K::PExe, K::PCwd, K::PFd, K::PFdLink,
     K::PMaps, K::PStatus, K::PStat, K::PStatm, K::PTask, K::PAttr, K::PMounts, K::POom, K::PEnviron,
     K::Task, K::PMountinfo, K::POomAdj, K::POomScore, K::PTimerslack, K::PNs, K::PNsLink, K::NsFile,
     K::Cgroups, K::PCgroup, K::Pressure, K::PressureFile,
     K::AttrCurrent, K::AttrPrev, K::AttrExec, K::AttrFscreate, K::AttrKeycreate, K::AttrSockcreate,
+    K::ConfigGz,
 ];
 const ATTR_K: [K; 6] = [K::AttrCurrent, K::AttrPrev, K::AttrExec, K::AttrFscreate, K::AttrKeycreate, K::AttrSockcreate];
 
@@ -163,6 +165,64 @@ fn psi_trigger(data: &[u8]) -> Result<usize, i64> {
     }
 }
 
+/// What /proc/config.gz describes. system_server reads CONFIG_VMAP_STACK from
+/// it and aborts if the file is missing (Debug.isVmapStack).
+fn kernel_config() -> String {
+    let arch = match crate::arch::Arch::HOST {
+        crate::arch::Arch::Aarch64 => "CONFIG_ARM64=y\n",
+        crate::arch::Arch::X86_64 => "CONFIG_X86_64=y\n",
+    };
+    format!(
+        "{arch}CONFIG_64BIT=y\n\
+         CONFIG_ANDROID_BINDER_IPC=y\n\
+         CONFIG_ANDROID_BINDERFS=y\n\
+         CONFIG_ASHMEM=y\n\
+         CONFIG_BPF_SYSCALL=y\n\
+         CONFIG_CGROUPS=y\n\
+         CONFIG_CGROUP_BPF=y\n\
+         CONFIG_CPUSETS=y\n\
+         CONFIG_FUTEX=y\n\
+         CONFIG_HIGH_RES_TIMERS=y\n\
+         CONFIG_INET=y\n\
+         CONFIG_IPV6=y\n\
+         CONFIG_MEMCG=y\n\
+         CONFIG_NET=y\n\
+         CONFIG_POSIX_TIMERS=y\n\
+         CONFIG_PSI=y\n\
+         CONFIG_SECURITY_SELINUX=y\n\
+         CONFIG_TMPFS=y\n\
+         CONFIG_TUN=y\n\
+         CONFIG_VMAP_STACK=y\n\
+         CONFIG_VSOCKETS=y\n\
+         # CONFIG_USERFAULTFD is not set\n"
+    )
+}
+
+/// `data` as a gzip file of one stored (uncompressed) deflate block per 64 KiB.
+fn gzip_stored(data: &[u8]) -> Vec<u8> {
+    let mut out = vec![0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 0xff];
+    let mut chunks = data.chunks(0xffff).peekable();
+    if chunks.peek().is_none() {
+        out.extend_from_slice(&[1, 0, 0, 0xff, 0xff]);
+    }
+    while let Some(chunk) = chunks.next() {
+        out.push(chunks.peek().is_none() as u8);
+        out.extend_from_slice(&(chunk.len() as u16).to_le_bytes());
+        out.extend_from_slice(&(!(chunk.len() as u16)).to_le_bytes());
+        out.extend_from_slice(chunk);
+    }
+    let mut crc = !0u32;
+    for &b in data {
+        crc ^= b as u32;
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 { crc >> 1 ^ 0xedb8_8320 } else { crc >> 1 };
+        }
+    }
+    out.extend_from_slice(&(!crc).to_le_bytes());
+    out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    out
+}
+
 fn mk(k: K, pid: i32, extra: u64) -> u64 {
     (ALL.iter().position(|&x| x == k).unwrap() as u64 + 1) | (pid as u64) << 16 | extra << 48
 }
@@ -236,6 +296,7 @@ impl ProcFs {
                     ("cmdline", K::Cmdline),
                     ("mounts", K::Mounts),
                     ("cgroups", K::Cgroups),
+                    ("config.gz", K::ConfigGz),
                 ]
                 .iter()
                 .map(|(n, k)| (n.to_string(), mk(*k, 0, 0)))
@@ -436,6 +497,7 @@ impl ProcFs {
             }
             K::NsFile => Ok(Content::File(Vec::new())),
             K::Cgroups => text(super::cgroup::proc_cgroups(&kernel)),
+            K::ConfigGz => Ok(Content::File(gzip_stored(kernel_config().as_bytes()))),
             K::PCgroup => {
                 self.proc(pid)?;
                 text(super::cgroup::proc_pid_cgroup(&kernel, pid))

@@ -963,9 +963,13 @@ impl Kernel {
 
     fn process_exit(self: &Arc<Self>, proc: &Arc<Process>, status: i32) {
         // Closing files first lets pipe readers see EOF.
-        drop(std::mem::replace(&mut *proc.files.lock().unwrap(), FdTable::empty()));
+        let files = std::mem::replace(&mut *proc.files.lock().unwrap(), FdTable::empty());
+        drop(files);
         locks::LOCKS.release(locks::Owner::Process(proc.pid));
-        drop(proc.mm.lock().unwrap().take());
+        // Two statements: the lock must be free before the address space goes.
+        // Its mappings can hold the last reference to a binder file.
+        let old = proc.mm.lock().unwrap().take();
+        drop(old);
         // Children move before we become a zombie: whoever reaps us finds them in place.
         self.reparent_children(proc);
         *proc.status.lock().unwrap() = Some(status);

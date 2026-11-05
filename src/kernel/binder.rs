@@ -184,11 +184,17 @@ pub struct BinderFile {
 }
 
 impl Drop for BinderFile {
+    /// The last reference can go anywhere, including under an address space or
+    /// fd table lock. The binder lock is taken before those, never after, so
+    /// the release happens on a thread of its own.
     fn drop(&mut self) {
-        let mut g = world();
-        g.as_mut().unwrap().release(self.id);
-        drop(g);
-        EVENTS.bump();
+        let id = self.id;
+        let _ = std::thread::Builder::new().name("binder-release".into()).spawn(move || {
+            let mut g = world();
+            g.as_mut().unwrap().release(id);
+            drop(g);
+            EVENTS.bump();
+        });
     }
 }
 

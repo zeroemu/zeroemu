@@ -290,6 +290,49 @@ int cmain(void) {
         check(woke, "close wakes a thread in a binder read");
     }
 
+    // A handle held only weakly cannot become strong: the owner may have destroyed
+    // the object when its last strong reference went, and BR_ACQUIRE would touch it.
+    {
+        nsaid = 0;
+        i64 pid3 = sys(NR_clone, 17, 0, 0, 0, 0);
+        if (pid3 == 0) {
+            int fd = open_binder();
+            nsaid = 0;
+            struct flat obj = { TYPE_BINDER, 0, 0x9999, 0xaaaa };
+            u64 offs[1] = { 0 };
+            send_txn(fd, BC_TRANSACTION, 0, 5, &obj, sizeof obj, offs, sizeof offs);
+            int bad = await(fd, BR_REPLY, 0) < 0;
+            bad |= await(fd, BR_RELEASE, 0x9999) < 0;
+            // Now the manager tries to take it strong again. Nothing may come of it:
+            // it tells us by a second call that it tried.
+            nsaid = 0;
+            send_txn(fd, BC_TRANSACTION, 0, 6, "x", 1, 0, 0);
+            bad |= await(fd, BR_REPLY, 0) < 0;
+            bad |= find(BR_ACQUIRE, 0x9999) >= 0;
+            sys(NR_exit_group, bad);
+        }
+        int tt = await(mgr, BR_TRANSACTION, 0);
+        check(tt >= 0, "a second child's call arrives");
+        if (tt >= 0) {
+            u32 h3 = (u32)((struct flat *)said[tt].t.buffer)->binder_or_handle;
+            u64 buffer = said[tt].t.buffer;
+            command(mgr, BC_INCREFS, h3); // keep the handle, weakly
+            free_buffer(mgr, buffer);     // and let go of the strong count the buffer had
+            send_txn(mgr, BC_REPLY, 0, 0, "", 0, 0, 0);
+            nsaid = 0;
+            int t2 = await(mgr, BR_TRANSACTION, 0);
+            command(mgr, BC_ACQUIRE, h3);
+            if (t2 >= 0) {
+                u64 buffer2 = said[t2].t.buffer;
+                send_txn(mgr, BC_REPLY, 0, 0, "", 0, 0, 0);
+                free_buffer(mgr, buffer2);
+            }
+        }
+        int st3 = -1;
+        sys(NR_wait4, pid3, &st3, 0, 0);
+        check(st3 == 0, "a weak handle's owner hears no BR_ACQUIRE after BR_RELEASE");
+    }
+
     // An offset near the top of the address space must fail, not take down binder.
     nsaid = 0;
     {

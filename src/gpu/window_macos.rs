@@ -107,6 +107,11 @@ unsafe fn msg_i64_ret(obj: *mut c_void, sel: *mut c_void) -> i64 {
     unsafe { f(obj, sel) }
 }
 
+unsafe fn msg_point(obj: *mut c_void, sel: *mut c_void) -> NSPoint {
+    let f: unsafe extern "C" fn(*mut c_void, *mut c_void) -> NSPoint = unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+    unsafe { f(obj, sel) }
+}
+
 unsafe fn msg_rect(obj: *mut c_void, sel: *mut c_void) -> NSRect {
     let f: unsafe extern "C" fn(*mut c_void, *mut c_void) -> NSRect = unsafe { std::mem::transmute(objc_msgSend as *const ()) };
     unsafe { f(obj, sel) }
@@ -327,6 +332,147 @@ fn drain_ui() {
     }
 }
 
+/// A touch is in progress: it began in the content area, and drags and the release
+/// belong to it wherever they happen.
+static TOUCHING: AtomicBool = AtomicBool::new(false);
+/// NSEventModifierFlags seen last, to tell a modifier's press from its release.
+static MODIFIERS: AtomicU64 = AtomicU64::new(0);
+
+/// Android's keys for a Mac's virtual key codes (kVK_*). Escape is BACK and F1 HOME,
+/// as there is no other way to reach them; F2 is the recent apps list.
+fn linux_key(mac: u16) -> Option<u16> {
+    Some(match mac {
+        0x00 => 30,  // A
+        0x01 => 31,  // S
+        0x02 => 32,  // D
+        0x03 => 33,  // F
+        0x04 => 35,  // H
+        0x05 => 34,  // G
+        0x06 => 44,  // Z
+        0x07 => 45,  // X
+        0x08 => 46,  // C
+        0x09 => 47,  // V
+        0x0b => 48,  // B
+        0x0c => 16,  // Q
+        0x0d => 17,  // W
+        0x0e => 18,  // E
+        0x0f => 19,  // R
+        0x10 => 21,  // Y
+        0x11 => 20,  // T
+        0x12 => 2,   // 1
+        0x13 => 3,   // 2
+        0x14 => 4,   // 3
+        0x15 => 5,   // 4
+        0x16 => 7,   // 6
+        0x17 => 6,   // 5
+        0x18 => 13,  // =
+        0x19 => 10,  // 9
+        0x1a => 8,   // 7
+        0x1b => 12,  // -
+        0x1c => 9,   // 8
+        0x1d => 11,  // 0
+        0x1e => 27,  // ]
+        0x1f => 24,  // O
+        0x20 => 22,  // U
+        0x21 => 26,  // [
+        0x22 => 23,  // I
+        0x23 => 25,  // P
+        0x24 => 28,  // Return
+        0x25 => 38,  // L
+        0x26 => 36,  // J
+        0x27 => 40,  // '
+        0x28 => 37,  // K
+        0x29 => 39,  // ;
+        0x2a => 43,  // backslash
+        0x2b => 51,  // ,
+        0x2c => 53,  // /
+        0x2d => 49,  // N
+        0x2e => 50,  // M
+        0x2f => 52,  // .
+        0x30 => 15,  // Tab
+        0x31 => 57,  // Space
+        0x32 => 41,  // `
+        0x33 => 14,  // Delete (backspace)
+        0x35 => 158, // Escape: BACK
+        0x37 => 125, // Command: META
+        0x38 => 42,  // Shift
+        0x39 => 58,  // Caps Lock
+        0x3a => 56,  // Option: ALT
+        0x3b => 29,  // Control
+        0x3c => 54,  // right Shift
+        0x3d => 100, // right Option
+        0x3e => 97,  // right Control
+        0x75 => 111, // Forward Delete
+        0x73 => 102, // Home
+        0x77 => 107, // End
+        0x74 => 104, // Page Up
+        0x79 => 109, // Page Down
+        0x7a => 172, // F1: HOME
+        0x78 => 580, // F2: APP_SWITCH
+        0x7b => 105, // Left
+        0x7c => 106, // Right
+        0x7d => 108, // Down
+        0x7e => 103, // Up
+        _ => return None,
+    })
+}
+
+/// Sends a mouse or key event in our window to the guest. True if it was consumed:
+/// keys sent on would beep, having no responder.
+unsafe fn forward_input(event: *mut c_void) -> bool {
+    use crate::kernel::evdev::{self, Touch};
+    const LEFT_DOWN: i64 = 1;
+    const LEFT_UP: i64 = 2;
+    const LEFT_DRAGGED: i64 = 6;
+    const KEY_DOWN: i64 = 10;
+    const KEY_UP: i64 = 11;
+    const FLAGS_CHANGED: i64 = 12;
+    let window = WINDOW.load(Ordering::Acquire);
+    unsafe {
+        if window.is_null() || msg0(event, sel("window")) != window {
+            return false;
+        }
+        match msg_i64_ret(event, sel("type")) {
+            ty @ (LEFT_DOWN | LEFT_UP | LEFT_DRAGGED) => {
+                let at = msg_point(event, sel("locationInWindow"));
+                let bounds = msg_rect(msg0(window, sel("contentView")), sel("bounds"));
+                let (x, y) = (at.x / bounds.size.width, 1.0 - at.y / bounds.size.height);
+                let inside = (0.0..=1.0).contains(&x) && (0.0..=1.0).contains(&y);
+                match ty {
+                    LEFT_DOWN if inside => {
+                        TOUCHING.store(true, Ordering::Relaxed);
+                        evdev::touch(Touch::Down, x, y);
+                    }
+                    LEFT_DRAGGED if TOUCHING.load(Ordering::Relaxed) => evdev::touch(Touch::Move, x, y),
+                    LEFT_UP if TOUCHING.swap(false, Ordering::Relaxed) => evdev::touch(Touch::Up, x, y),
+                    _ => {}
+                }
+                false // the window still handles its title bar and resizing
+            }
+            ty @ (KEY_DOWN | KEY_UP) => {
+                // Android repeats held keys itself.
+                let repeat = ty == KEY_DOWN && msg_i64_ret(event, sel("isARepeat")) & 1 != 0;
+                if !repeat && let Some(code) = linux_key(msg_i64_ret(event, sel("keyCode")) as u16) {
+                    evdev::key(code, ty == KEY_DOWN);
+                }
+                true
+            }
+            FLAGS_CHANGED => {
+                let flags = msg_i64_ret(event, sel("modifierFlags")) as u64;
+                let before = MODIFIERS.swap(flags, Ordering::Relaxed);
+                if let Some(code) = linux_key(msg_i64_ret(event, sel("keyCode")) as u16) {
+                    // The device-independent modifier bits: one changed.
+                    const DEVICE_INDEPENDENT: u64 = 0xffff_0000;
+                    let down = (flags & DEVICE_INDEPENDENT).count_ones() > (before & DEVICE_INDEPENDENT).count_ones();
+                    evdev::key(code, down);
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
 fn pump_once(wait_s: f64) {
     drain_ui();
     show_frame();
@@ -340,7 +486,9 @@ fn pump_once(wait_s: f64) {
         let mode = NSDefaultRunLoopMode;
         let event = msg_next_event(app, sel("nextEventMatchingMask:untilDate:inMode:dequeue:"), u64::MAX, until, mode, 1);
         if !event.is_null() {
-            msg_id(app, sel("sendEvent:"), event);
+            if !forward_input(event) {
+                msg_id(app, sel("sendEvent:"), event);
+            }
             msg_void(app, sel("updateWindows"));
         }
     }

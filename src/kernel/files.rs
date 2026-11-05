@@ -103,6 +103,8 @@ pub enum Kind {
     Vsock(Arc<super::vsock::Vsock>),
     /// /dev/tun (net.rs).
     Tun(super::net::Tun),
+    /// /dev/input/event* (evdev.rs).
+    Evdev(Arc<super::evdev::Client>),
     Binder(BinderFile),
     /// A loop or device-mapper device (block.rs).
     Block(BlockOpen),
@@ -455,6 +457,7 @@ pub(super) fn poll_ready(f: &File, t: &Thread, depth: u32) -> u16 {
         Kind::Inotify(i) => if i.pending() > 0 { POLLIN } else { 0 },
         Kind::Vsock(v) => POLLOUT | if v.readable() { POLLIN } else { 0 },
         Kind::Tun(_) => POLLOUT,
+        Kind::Evdev(c) => POLLOUT | if c.readable() { POLLIN } else { 0 },
         Kind::Binder(b) => {
             (if binder::readable(b, t.tid) { POLLIN } else { 0 }) | POLLOUT
         }
@@ -807,6 +810,13 @@ impl Kernel {
                     Kind::Binder(b) => return self.binder_ioctl(t, &f, b, cmd, a[2]),
                     Kind::Ashmem(m) => return m.ioctl(cmd, a[2], &mut AshmemIo { t }),
                     Kind::Tun(n) => return n.ioctl(cmd, a[2], &mut AshmemIo { t }),
+                    Kind::Evdev(c) => {
+                        let (ret, bytes) = c.ioctl(cmd, || t.proc.mm().read_u32(a[2]).map(|v| v as i32))?;
+                        if !bytes.is_empty() {
+                            t.proc.mm().write(a[2], &bytes)?;
+                        }
+                        return Ok(ret);
+                    }
                     Kind::Inotify(i) if cmd == 0x541b => {
                         t.proc.mm().write_u32(a[2], i.pending() as u32)?; // FIONREAD
                         return Ok(0);
@@ -1111,6 +1121,7 @@ impl Kernel {
                 r if super::drm::is_node(r) => Kind::Drm(self.drm.as_ref().ok_or(ENXIO)?.open(r)),
                 r if r == super::ashmem::rdev() => Kind::Ashmem(super::ashmem::Ashmem::new()),
                 r if r == super::net::tun_rdev() => Kind::Tun(super::net::Tun::new()),
+                r if block::major(r) == super::evdev::INPUT_MAJOR => Kind::Evdev(super::evdev::open(r).ok_or(ENXIO)?),
                 rdev => binder::file_for(t, rdev).ok_or(ENXIO)?,
             },
             S_IFBLK if self.blocks.device(stat.rdev).is_some() => Kind::Block(BlockOpen { devt: stat.rdev, pos: Mutex::new(0) }),
@@ -1443,6 +1454,7 @@ impl Kernel {
             Kind::Inet(_) => return Err(ENOTCONN),
             Kind::Inotify(i) => i.read(t, count, f.nonblock())?,
             Kind::Vsock(v) => v.read(t, count, f.nonblock())?,
+            Kind::Evdev(c) => c.read(t, count, f.nonblock())?,
             // No packets ever come in.
             Kind::Tun(_) if f.nonblock() => return Err(EAGAIN),
             Kind::Tun(_) => loop {
@@ -1539,6 +1551,7 @@ impl Kernel {
             Kind::Inet(_) => return Err(ENETUNREACH),
             Kind::Vsock(v) => v.write(&data)?,
             Kind::Tun(_) => data.len(), // sent nowhere
+            Kind::Evdev(_) => data.len(), // LEDs and the like: there are none
             Kind::Pty(p) => p.write(t, &data, f.nonblock())?,
             Kind::Mem(m) => {
                 if !m.writable {
@@ -1594,6 +1607,7 @@ impl Kernel {
             Kind::Event(_) | Kind::Timer(_) | Kind::Signal(_) | Kind::Epoll(_) | Kind::Bpf(_) | Kind::Sync(_) | Kind::Inotify(_) => Stat { mode: 0o600, nlink: 1, ..Default::default() }, // anon_inode
             Kind::Drm(d) => Stat { mode: 0o020666, rdev: d.rdev(), nlink: 1, ..Default::default() },
             Kind::Ashmem(a) => Stat { mode: 0o020666, rdev: super::ashmem::rdev(), nlink: 1, size: a.size(), ..Default::default() },
+            Kind::Evdev(_) => Stat { mode: 0o020660, nlink: 1, ..Default::default() },
             Kind::Tun(_) => Stat { mode: 0o020660, rdev: super::net::tun_rdev(), nlink: 1, ..Default::default() },
             Kind::DmaBuf(b) => Stat { mode: 0o600, nlink: 1, size: b.size(), ..Default::default() },
             Kind::Binder(_) => Stat { mode: 0o020666, nlink: 1, rdev: 0xa36, ..Default::default() },
@@ -1957,6 +1971,7 @@ pub(super) fn file_name(f: &File) -> String {
         Kind::Ashmem(a) => a.map_name(),
         Kind::Inotify(_) => "anon_inode:inotify".into(),
         Kind::Tun(_) => "/dev/tun".into(),
+        Kind::Evdev(_) => "/dev/input/event".into(),
         Kind::Vsock(v) => format!("socket:[{}]", Arc::as_ptr(v) as usize % 100_000),
         Kind::Event(_) => "anon_inode:[eventfd]".into(),
         Kind::Timer(_) => "anon_inode:[timerfd]".into(),

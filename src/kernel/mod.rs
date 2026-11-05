@@ -15,6 +15,7 @@ mod cgroup;
 mod control;
 mod creds;
 mod drm;
+pub mod evdev;
 mod epoll;
 mod files;
 mod futex;
@@ -226,6 +227,10 @@ fn mount_tmpfs(vfs: &mut Vfs, phys: &Arc<PhysMem>) -> Arc<crate::tmpfs::Tmpfs> {
     }
     dev.mkdir_p("socket", 0o755);
     dev.mkdir_p("pts", 0o755);
+    let input = dev.mkdir_p("input", 0o755);
+    for (name, rdev) in evdev::nodes() {
+        dev.create(input, name, 0o020666, rdev).expect("tmpfs /dev");
+    }
     vfs.mount("/dev", dev);
     let pts = Tmpfs::with_type(phys.clone(), 0o755, "devpts");
     pts.create(1, "ptmx", 0o020000, 0x502).expect("devpts");
@@ -512,6 +517,7 @@ impl Kernel {
         });
         let dev = mount_tmpfs(&mut v, &phys);
         if boot {
+            evdev::start_input_fifo();
             // There is no virtual HCI controller yet. With the feature declared,
             // Android's Bluetooth stack aborts and restarts for as long as it runs.
             let oem = crate::tmpfs::Tmpfs::new(phys.clone(), 0o755);

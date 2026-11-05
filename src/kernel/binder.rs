@@ -460,29 +460,41 @@ impl World {
         h
     }
 
-    /// A counted handle for `node` in process `p`. When the owner's thread `by`
-    /// is the one handing the object out, BR_INCREFS/BR_ACQUIRE go on that thread's
-    /// own list, as Linux's binder_translate_binder does: it reads them before its
-    /// transaction completes, while its Parcel still holds the object alive. Queued
-    /// on the process, another thread could get them after the object is gone.
-    fn handle_for(&mut self, p: ProcId, node: NodeId, strong: bool, by: Option<(ProcId, i32)>) -> u32 {
+    /// A counted handle for `node` in process `p`, if it can have one (see inc_node).
+    /// When the owner's thread `by` is the one handing the object out,
+    /// BR_INCREFS/BR_ACQUIRE go on that thread's own list, as Linux's
+    /// binder_translate_binder does: it reads them before its transaction completes,
+    /// while its Parcel still holds the object alive. Queued on the process, another
+    /// thread could get them after the object is gone.
+    fn handle_for(&mut self, p: ProcId, node: NodeId, strong: bool, by: Option<(ProcId, i32)>) -> Option<u32> {
         let h = self.ref_for(p, node);
-        self.inc_ref(p, h, strong, by);
-        h
+        if self.inc_ref(p, h, strong, by) {
+            return Some(h);
+        }
+        // A reference this call just made, with nothing counted on it, goes again.
+        let proc = self.procs.get_mut(&p).unwrap();
+        if proc.refs.get(&h).is_some_and(|r| r.strong == 0 && r.weak == 0) {
+            proc.refs.remove(&h);
+            proc.node_refs.remove(&node);
+            self.drop_ref(p, node);
+        }
+        None
     }
 
-    fn inc_ref(&mut self, p: ProcId, handle: u32, strong: bool, by: Option<(ProcId, i32)>) {
-        let Some(r) = self.procs.get_mut(&p).and_then(|proc| proc.refs.get_mut(&handle)) else { return };
+    fn inc_ref(&mut self, p: ProcId, handle: u32, strong: bool, by: Option<(ProcId, i32)>) -> bool {
+        let Some(r) = self.procs.get_mut(&p).and_then(|proc| proc.refs.get_mut(&handle)) else { return false };
         let node = r.node;
         let first = if strong { r.strong == 0 } else { r.weak == 0 };
+        if first && !self.inc_node(node, strong, true, by) {
+            return false;
+        }
+        let r = self.procs.get_mut(&p).unwrap().refs.get_mut(&handle).unwrap();
         if strong {
             r.strong += 1;
         } else {
             r.weak += 1;
         }
-        if first {
-            self.inc_node(node, strong, true, by);
-        }
+        true
     }
 
     /// binder_dec_ref: the last count on a handle gives it up.
@@ -517,24 +529,42 @@ impl World {
         self.dec_node(node, false, true);
     }
 
-    /// binder_inc_node. `internal`: for a reference in another process, which
-    /// `refs` already counts when weak.
-    fn inc_node(&mut self, node: NodeId, strong: bool, internal: bool, by: Option<(ProcId, i32)>) {
-        let Some(n) = self.nodes.get_mut(&node) else { return };
-        match (strong, internal) {
-            (true, true) => n.refs_strong += 1,
-            (true, false) => n.local_strong += 1,
-            (false, true) => {}
-            (false, false) => n.local_weak += 1,
+    /// binder_inc_node. `internal`: for a reference in another process, which `refs`
+    /// already counts when weak. False if the reference may not be had: with nobody
+    /// holding the object strongly and no owner's thread vouching for it, its owner
+    /// may have destroyed it, and BR_ACQUIRE would touch freed memory. A handle held
+    /// only weakly cannot become strong this way.
+    fn inc_node(&mut self, node: NodeId, strong: bool, internal: bool, by: Option<(ProcId, i32)>) -> bool {
+        let owner_ctx = self.nodes.get(&node).and_then(|n| self.procs.get(&n.owner)).map(|p| p.ctx);
+        let is_mgr = owner_ctx.is_some_and(|ctx| self.mgr[ctx] == Some(node));
+        let Some(n) = self.nodes.get_mut(&node) else { return false };
+        if strong {
+            if internal {
+                if by.is_none() && n.refs_strong == 0 && !(is_mgr && n.has_strong) {
+                    return false;
+                }
+                n.refs_strong += 1;
+            } else {
+                n.local_strong += 1;
+            }
+        } else if !internal {
+            n.local_weak += 1;
         }
         let unannounced = if strong { !n.has_strong } else { !n.has_weak };
         if !unannounced || n.dead {
-            return;
+            return true;
         }
         let owner = n.owner;
         match by {
-            Some((bp, tid)) if bp == owner => self.thread(owner, tid).todo.push_back(Work::Node(node)),
-            _ => self.queue_node(node),
+            Some((bp, tid)) if bp == owner => {
+                n.queued = true;
+                self.thread(owner, tid).todo.push_back(Work::Node(node));
+                true
+            }
+            // Already on its way to the owner, or a strong reference with no thread
+            // to tell: a local one, which only lasts as long as what holds it.
+            _ if n.queued || strong => true,
+            _ => false,
         }
     }
 
@@ -828,8 +858,12 @@ impl Kernel {
                     w.ref_for(b.id, mgr);
                 }
                 match cmd {
-                    BC_INCREFS => w.inc_ref(b.id, handle, false, None),
-                    BC_ACQUIRE => w.inc_ref(b.id, handle, true, None),
+                    BC_INCREFS => {
+                        w.inc_ref(b.id, handle, false, None);
+                    }
+                    BC_ACQUIRE => {
+                        w.inc_ref(b.id, handle, true, None);
+                    }
                     BC_RELEASE => w.dec_ref(b.id, handle, true),
                     _ => w.dec_ref(b.id, handle, false),
                 }
@@ -1031,7 +1065,10 @@ impl Kernel {
                 ty @ (TYPE_BINDER | TYPE_WEAK_BINDER) if o + 24 <= out.data.len() => {
                     let (flags, ptr, cookie) = (u32_at(&out.data, o + 4), u64_at(&out.data, o + 8), u64_at(&out.data, o + 16));
                     let n = w.node_for(me, ptr, cookie, flags);
-                    let h = w.handle_for(to, n, ty == TYPE_BINDER, Some((me, t.tid)));
+                    let Some(h) = w.handle_for(to, n, ty == TYPE_BINDER, Some((me, t.tid))) else {
+                        failed = true;
+                        break;
+                    };
                     held.push(Held::Ref { handle: h, strong: ty == TYPE_BINDER });
                     out.data[o..o + 4].copy_from_slice(&(if ty == TYPE_BINDER { TYPE_HANDLE } else { TYPE_WEAK_HANDLE }).to_le_bytes());
                     out.data[o + 8..o + 16].copy_from_slice(&(h as u64).to_le_bytes());
@@ -1054,7 +1091,10 @@ impl Kernel {
                         w.inc_node(n, ty == TYPE_HANDLE, false, None);
                         held.push(Held::Node { node: n, strong: ty == TYPE_HANDLE });
                     } else {
-                        let h = w.handle_for(to, n, ty == TYPE_HANDLE, None);
+                        let Some(h) = w.handle_for(to, n, ty == TYPE_HANDLE, None) else {
+                            failed = true;
+                            break;
+                        };
                         out.data[o + 8..o + 16].copy_from_slice(&(h as u64).to_le_bytes());
                         held.push(Held::Ref { handle: h, strong: ty == TYPE_HANDLE });
                     }

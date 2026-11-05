@@ -321,9 +321,13 @@ int cmain(void) {
             send_txn(mgr, BC_REPLY, 0, 0, "", 0, 0, 0);
             nsaid = 0;
             int t2 = await(mgr, BR_TRANSACTION, 0);
+            u64 buffer2 = t2 >= 0 ? said[t2].t.buffer : 0;
             command(mgr, BC_ACQUIRE, h3);
+            // Calling through the weak handle must fail, and must not wake the object.
+            nsaid = 0;
+            send_txn(mgr, BC_TRANSACTION, h3, 7, "y", 1, 0, 0);
+            check(await(mgr, BR_DEAD_REPLY, 0) >= 0, "a weak handle cannot be called");
             if (t2 >= 0) {
-                u64 buffer2 = said[t2].t.buffer;
                 send_txn(mgr, BC_REPLY, 0, 0, "", 0, 0, 0);
                 free_buffer(mgr, buffer2);
             }

@@ -1003,10 +1003,13 @@ impl Kernel {
             }
         } else {
             let handle = out.target as u32;
+            // As Linux: only a strong reference can be called. Holding the target for
+            // the call on the strength of a weak one could revive a node whose object
+            // its owner has already destroyed, and BR_ACQUIRE would touch freed memory.
             let node = if handle == 0 {
                 w.mgr[ctx]
             } else {
-                w.procs[&me].refs.get(&handle).map(|r| r.node)
+                w.procs[&me].refs.get(&handle).filter(|r| r.strong > 0).map(|r| r.node)
             };
             let Some(node) = node.filter(|n| w.nodes.get(n).is_some_and(|n| !n.dead && w.procs.contains_key(&n.owner))) else {
                 if tracing() {
@@ -1076,7 +1079,8 @@ impl Kernel {
                 }
                 ty @ (TYPE_HANDLE | TYPE_WEAK_HANDLE) if o + 24 <= out.data.len() => {
                     let handle = u32_at(&out.data, o + 8);
-                    let n = if handle == 0 { w.mgr[ctx] } else { w.procs[&me].refs.get(&handle).map(|r| r.node) };
+                    // A weak reference cannot be passed on as a strong one.
+                    let n = if handle == 0 { w.mgr[ctx] } else { w.procs[&me].refs.get(&handle).filter(|r| ty == TYPE_WEAK_HANDLE || r.strong > 0).map(|r| r.node) };
                     let Some(n) = n else {
                         failed = true;
                         break;
@@ -1417,6 +1421,11 @@ impl Kernel {
                     node.local_weak += 1;
                 }
                 if strong && !had_strong {
+                    // Telling an owner about an object it was told to let go of is only
+                    // sound if it still has it, as when it sends it out again itself.
+                    if had_weak && tracing() {
+                        eprintln!("[binder] node {n} ptr {:#x} announced again: refs {} strong {} local {}", node.ptr, node.refs, node.refs_strong, node.local_strong);
+                    }
                     node.local_strong += 1;
                 }
                 (node.has_strong, node.has_weak) = (strong, weak);

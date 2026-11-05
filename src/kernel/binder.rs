@@ -1139,7 +1139,10 @@ impl Kernel {
         // Copy everything into the receiver's (read-only to it) buffer.
         let secctx = if want_secctx { buffer + data_len + offs_len + out.sg_size } else { 0 };
         let copied = (|| -> Result<(), i64> {
-            let mut mm = receiver.mm();
+            // It may be on its way out: its address space goes before the release
+            // of its binder fd has run.
+            let mut guard = receiver.mm.lock().unwrap();
+            let mm = guard.as_mut().ok_or(ESRCH)?;
             mm.write_force(buffer, &out.data)?;
             let offs: Vec<u8> = out.offsets.iter().flat_map(|o| o.to_le_bytes()).collect();
             mm.write_force(buffer + data_len, &offs)?;

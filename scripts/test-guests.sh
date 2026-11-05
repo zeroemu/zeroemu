@@ -12,7 +12,7 @@ for t in m2 m3 shm binder binder_nested binder_refs mounts creds sock selinux pt
     bin="target/guest/${t}_aarch64"
     [ -x "$bin" ] || continue
     out=$(DROIDRT_GPU=fake perl -e 'alarm 90; exec @ARGV' target/release/droidrt "$bin" alpha beta 2>&1)
-    if printf '%s\n' "$out" | grep -q "all checks passed" && ! printf '%s\n' "$out" | grep -q "^FAIL"; then
+    if printf '%s\n' "$out" | grep -q "all checks passed" && ! printf '%s\n' "$out" | grep -qE "^FAIL|panicked|internal error"; then
         printf '%-16s ok\n' "$t"
     else
         printf '%-16s FAILED\n' "$t"

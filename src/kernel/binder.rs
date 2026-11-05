@@ -161,6 +161,8 @@ struct BThread {
     /// Asleep in binder_read, waiting for `cv`.
     parked: bool,
     cv: Arc<Condvar>,
+    /// The fd was closed: its next read returns to the guest with nothing.
+    need_return: bool,
     todo: VecDeque<Work>,
     /// Transactions this thread is in: incoming ones being handled, and the
     /// outgoing one it waits on (top).
@@ -332,6 +334,21 @@ pub fn set_area(b: &BinderFile, start: u64, size: u64) -> Result<(), i64> {
     }
     p.area = Some((start, size));
     Ok(())
+}
+
+/// close() of a binder fd, as Linux's binder_flush: threads in a read go back to
+/// the guest, where they find the fd gone. bootanimation ends this way, its render
+/// thread closing the driver under a main thread asleep in joinThreadPool.
+pub fn flush(b: &BinderFile) {
+    let mut g = world();
+    let Some(p) = g.as_mut().unwrap().procs.get_mut(&b.id) else { return };
+    for th in p.threads.values_mut() {
+        th.need_return = true;
+        if th.parked {
+            th.parked = false;
+            th.cv.notify_one();
+        }
+    }
 }
 
 pub fn readable(b: &BinderFile, tid: i32) -> bool {
@@ -1305,6 +1322,10 @@ impl Kernel {
                 }
             }
             if out.len() > if at_start { 4 } else { 0 } {
+                return Ok(out);
+            }
+            let th = g.as_mut().unwrap().thread(b.id, t.tid);
+            if std::mem::take(&mut th.need_return) {
                 return Ok(out);
             }
             if file.nonblock() {

@@ -573,6 +573,9 @@ impl Kernel {
                 };
                 // POSIX record locks go with any close of the file.
                 super::locks::LOCKS.release_on(entry.file.lock_key(), t.proc.pid);
+                if let Kind::Binder(b) = &entry.file.kind {
+                    super::binder::flush(b);
+                }
                 Ok(0)
             }
             flock => {

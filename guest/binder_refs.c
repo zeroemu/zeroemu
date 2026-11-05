@@ -15,6 +15,8 @@ typedef unsigned int u32;
 #define NR_mmap 222
 #define NR_wait4 260
 #define NR_nanosleep 101
+#define NR_close 57
+#define NR_futex 98
 
 static i64 sys6(i64 n, i64 a, i64 b, i64 c, i64 d, i64 e, i64 f) {
     register i64 x8 __asm__("x8") = n;
@@ -189,6 +191,41 @@ static void child(void) {
     sys(NR_exit_group, bad);
 }
 
+// A thread asleep in a read, for the close test below.
+#define CLONE_THREAD_FLAGS (0x100 | 0x200 | 0x400 | 0x800 | 0x10000 | 0x40000 | 0x200000)
+static i64 spawn(void *stack_top, void (*fn)(void *), void *arg, int *ctid) {
+    register i64 x0 __asm__("x0") = CLONE_THREAD_FLAGS;
+    register i64 x1 __asm__("x1") = (i64)stack_top;
+    register i64 x2 __asm__("x2") = 0;
+    register i64 x3 __asm__("x3") = 0;
+    register i64 x4 __asm__("x4") = (i64)ctid;
+    register i64 x8 __asm__("x8") = NR_clone;
+    register void *x19 __asm__("x19") = (void *)fn;
+    register void *x20 __asm__("x20") = arg;
+    __asm__ volatile(
+        "svc #0\n"
+        "cbnz x0, 1f\n"
+        "mov x0, x20\n"
+        "blr x19\n"
+        "mov x0, #0\n"
+        "mov x8, #93\n"
+        "svc #0\n"
+        "1:\n"
+        : "+r"(x0)
+        : "r"(x1), "r"(x2), "r"(x3), "r"(x4), "r"(x8), "r"(x19), "r"(x20)
+        : "memory", "x30");
+    return x0;
+}
+
+static volatile int reader_started;
+static void reader(void *arg) {
+    static u32 buf[64];
+    u32 enter = BC_ENTER_LOOPER;
+    bw((int)(long)arg, &enter, 4, 0, 0, 0);
+    reader_started = 1;
+    bw((int)(long)arg, 0, 0, buf, sizeof buf, 0);
+}
+
 int cmain(void) {
     int mgr = open_binder();
     check(sys(NR_ioctl, mgr, BINDER_SET_CONTEXT_MGR, 0) == 0, "become context manager");
@@ -233,6 +270,25 @@ int cmain(void) {
     nsaid = 0;
     send_txn(mgr, BC_TRANSACTION, handle, 2, "x", 1, 0, 0);
     check(await(mgr, BR_DEAD_REPLY, 0) >= 0, "a released handle is gone");
+
+    // Closing a binder fd wakes a thread reading it, or bootanimation never exits.
+    {
+        int other = open_binder();
+        static char stack[65536] __attribute__((aligned(16)));
+        static int tid = 1;
+        spawn(stack + sizeof stack, reader, (void *)(long)other, &tid);
+        while (!reader_started) {}
+        struct timespec_k0 { i64 s, ns; } nap0 = {0, 100000000};
+        sys(NR_nanosleep, &nap0, 0);
+        sys(NR_close, other);
+        i64 until[2] = {5, 0};
+        int woke = 0;
+        for (int i = 0; i < 5 && tid; i++) {
+            if (tid) sys(NR_futex, &tid, 0, tid, until);
+        }
+        woke = tid == 0;
+        check(woke, "close wakes a thread in a binder read");
+    }
 
     // An offset near the top of the address space must fail, not take down binder.
     nsaid = 0;

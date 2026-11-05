@@ -249,6 +249,7 @@ syscalls! {
     renameat2 = 276, 316;
     getrandom = 278, 318;
     memfd_create = 279, 319;
+    userfaultfd = 282, 323;
     msync = 227, 26;
     mlock = 228, 149;
     munlock = 229, 150;

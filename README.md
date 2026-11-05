@@ -35,7 +35,7 @@ arm64 Android on Apple Silicon and Windows on ARM, x86_64 Android on x86_64 PCs.
 | M2: demand paging, threads, futex, `fork`/`execve`/`wait4`, pipes, signals | done on macOS; x86_64 written (signal frames, TLB shootdown), untested |
 | M3: binder, `servicemanager`, property service, `logd`, `init` | done (macOS) |
 | M4: SurfaceFlinger, with Android's graphics stack unmodified on a virtio-gpu device backed by the Android Emulator's gfxstream renderer | done (macOS) |
-| M5: zygote, ART, `system_server`, launcher, apps | done (macOS): Android 16's Pixel launcher in the window about 35 s after start, `boot_completed` by about 50 s on a quiet host |
+| M5: zygote, ART, `system_server`, launcher, apps | done (macOS): Android 16's Pixel launcher in the window about 24 s after start, `boot_completed` by about 33 s on a quiet host |
 | M6: input from the window | done (macOS): mouse as touch, scroll as a finger drag, keyboard; Chrome and Play Store open and draw from a tap |
 | Smoothness | in progress: see below |
 | Windows | no window and never run; compiles (`cargo check --target x86_64-pc-windows-msvc`) |
@@ -57,8 +57,10 @@ Known gaps:
 
 - No network: AF_INET sockets exist, for netd's iptables, but connecting fails as
   on a device with no route. Netlink answers like a machine with no interfaces.
-- `/data` lives in memory, so every boot is a first boot: ART compiles its boot
-  image and dex2oat runs over the installed apps, for minutes, in the background.
+- `/data` lives in memory, so every boot is a first boot: dex2oat runs over the apps
+  that have no compiled code in the image.
+- userfaultfd has only what ART's compacting collector uses: SIGBUS mode, on private
+  anonymous memory.
 - Display frames are read back from the renderer into host memory, which limits
   the frame rate.
 - SELinux is permissive: selinuxfs, process and socket contexts, and exec

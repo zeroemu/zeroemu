@@ -7,6 +7,7 @@ use crate::hv::{KernelPage, PageTableRoot};
 use crate::paging::{self, KERNEL_WINDOW, PROT_EXEC, PROT_READ, PROT_WRITE, USER_TOP};
 use crate::phys::{PAGE, PhysMem};
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// Lowest mappable address (Linux's mmap_min_addr on Android).
@@ -175,6 +176,16 @@ impl Stale {
     }
 }
 
+/// A userfaultfd, as its registered mappings know it. When it closes, they go back
+/// to being ordinary memory.
+#[derive(Default)]
+pub struct UffdCtx {
+    pub open: AtomicBool,
+}
+
+/// `AddressSpace::fault`'s answer for a page a userfaultfd must supply: SIGBUS.
+pub const FAULT_UFFD: i32 = -1;
+
 /// What fork does with a mapping (madvise; binder's area is never inherited).
 #[derive(Clone, Copy, PartialEq, Default)]
 pub enum OnFork {
@@ -194,6 +205,15 @@ pub struct Vma {
     pub on_fork: OnFork,
     /// Shown in /proc/<pid>/maps (a file path, "[stack]", …).
     pub name: Option<Arc<str>>,
+    /// The userfaultfd that supplies this mapping's missing pages.
+    pub uffd: Option<Arc<UffdCtx>>,
+}
+
+impl Vma {
+    /// The userfaultfd in charge, if it is still open.
+    fn uffd(&self) -> Option<&Arc<UffdCtx>> {
+        self.uffd.as_ref().filter(|c| c.open.load(Ordering::Relaxed))
+    }
 }
 
 /// (start, end, prot, shared, file offset, name) of one mapping.
@@ -395,7 +415,7 @@ impl AddressSpace {
                 if h != 0 && self.is_free(h, h.saturating_add(len)) { h } else { self.gap(len)? }
             }
         };
-        self.vmas.insert(start, Vma { end: start + len, prot, backing, on_fork: OnFork::Copy, name: None });
+        self.vmas.insert(start, Vma { end: start + len, prot, backing, on_fork: OnFork::Copy, name: None, uffd: None });
         Ok(start)
     }
 
@@ -421,6 +441,11 @@ impl AddressSpace {
                 && a.prot == b.prot
                 && a.on_fork == b.on_fork
                 && a.name == b.name
+                && match (a.uffd(), b.uffd()) {
+                    (None, None) => true,
+                    (Some(x), Some(y)) => Arc::ptr_eq(x, y),
+                    _ => false,
+                }
                 && match (&a.backing, &b.backing) {
                     (Backing::Anon, Backing::Anon) => true,
                     (Backing::File { data: d1, offset: o1 }, Backing::File { data: d2, offset: o2 }) => Arc::ptr_eq(d1, d2) && contiguous(o1, o2),
@@ -655,8 +680,9 @@ impl AddressSpace {
         Ok(())
     }
 
-    /// Moves (or resizes) a mapping, carrying its pages along.
-    pub fn remap(&mut self, old: u64, old_len: u64, new_len: u64, may_move: bool, fixed: Option<u64>) -> Result<u64, i64> {
+    /// Moves (or resizes) a mapping, carrying its pages along. With `dont_unmap`
+    /// (MREMAP_DONTUNMAP) the source stays mapped, without its pages.
+    pub fn remap(&mut self, old: u64, old_len: u64, new_len: u64, may_move: bool, fixed: Option<u64>, dont_unmap: bool) -> Result<u64, i64> {
         let (old_len, new_len) = (page_up(old_len), page_up(new_len));
         if !old.is_multiple_of(PAGE) || new_len == 0 {
             return Err(EINVAL);
@@ -668,12 +694,15 @@ impl AddressSpace {
         if old_len == 0 && !matches!(vma.backing, Backing::Shared { .. } | Backing::Dev { .. }) {
             return Err(EINVAL);
         }
+        if dont_unmap && (old_len != new_len || !matches!(vma.backing, Backing::Anon)) {
+            return Err(EINVAL);
+        }
         let (prot, on_fork, mut backing, vma_name) = (vma.prot, vma.on_fork, vma.backing.clone(), vma.name.clone());
-        if fixed.is_none() && new_len <= old_len {
+        if !dont_unmap && fixed.is_none() && new_len <= old_len {
             self.unmap(old + new_len, old_len - new_len)?;
             return Ok(old);
         }
-        if fixed.is_none() && self.is_free(old + old_len, old + new_len) {
+        if !dont_unmap && fixed.is_none() && self.is_free(old + old_len, old + new_len) {
             self.split(old);
             self.split(old + old_len);
             self.vmas.get_mut(&old).unwrap().end = old + new_len; // grow in place
@@ -706,14 +735,97 @@ impl AddressSpace {
         // Drop the old range while its VMA still says whether leftover pages are
         // shared; moved pages are no longer in the tables. old_len 0 keeps the
         // source, which is how Linux duplicates a shared mapping.
-        self.unmap(old, old_len)?;
-        self.vmas.insert(dst, Vma { end: dst + new_len, prot, backing, on_fork, name: vma_name });
+        if !dont_unmap {
+            self.unmap(old, old_len)?;
+        }
+        self.vmas.insert(dst, Vma { end: dst + new_len, prot, backing, on_fork, name: vma_name, uffd: None });
         for (off, e) in moves {
             let slot = walk(&self.phys, &mut self.tables, self.root.root, 0, dst + off, true)?.unwrap();
             self.phys.write_u64(slot, e);
         }
         self.tlb_gen += 1;
         Ok(dst)
+    }
+
+    /// UFFDIO_REGISTER: `ctx` supplies the missing pages of [start, start+len). Only
+    /// private anonymous memory can be registered: all ART asks for.
+    pub fn uffd_register(&mut self, ctx: &Arc<UffdCtx>, start: u64, len: u64) -> Result<(), i64> {
+        let end = start.saturating_add(len);
+        let mut any = false;
+        for (&s, v) in self.vmas.range(..end).rev() {
+            if v.end <= start {
+                break;
+            }
+            let _ = s;
+            any = true;
+            if !matches!(v.backing, Backing::Anon) {
+                return Err(EINVAL);
+            }
+            if v.uffd().is_some_and(|c| !Arc::ptr_eq(c, ctx)) {
+                return Err(EBUSY);
+            }
+        }
+        if !any {
+            return Err(EINVAL);
+        }
+        self.split(start);
+        self.split(end);
+        for (_, v) in self.vmas.range_mut(start..end) {
+            v.uffd = Some(ctx.clone());
+        }
+        self.merge(start, end);
+        Ok(())
+    }
+
+    /// UFFDIO_UNREGISTER. Missing pages become ordinary zero pages again, and the
+    /// mapping rejoins its neighbours: the next GC cycle's mremap needs it whole.
+    pub fn uffd_unregister(&mut self, ctx: &Arc<UffdCtx>, start: u64, len: u64) -> Result<(), i64> {
+        let end = start.saturating_add(len);
+        self.split(start);
+        self.split(end);
+        for (_, v) in self.vmas.range_mut(start..end) {
+            if v.uffd().is_some_and(|c| Arc::ptr_eq(c, ctx)) {
+                v.uffd = None;
+            }
+        }
+        self.merge(start, end);
+        Ok(())
+    }
+
+    /// UFFDIO_COPY (with `src`) and UFFDIO_ZEROPAGE (without): maps the missing pages
+    /// of [dst, dst+len). What was done, and if that is not everything, why not.
+    pub fn uffd_fill(&mut self, ctx: &Arc<UffdCtx>, dst: u64, len: u64, src: Option<u64>) -> (u64, Option<i64>) {
+        let mut done = 0;
+        let mut page = [0u8; PAGE as usize];
+        while done < len {
+            let at = dst + done;
+            let filled = (|| {
+                let (_, vma) = self.find(at).ok_or(ENOENT)?;
+                if !vma.uffd().is_some_and(|c| Arc::ptr_eq(c, ctx)) {
+                    return Err(ENOENT);
+                }
+                let prot = vma.prot;
+                let slot = walk(&self.phys, &mut self.tables, self.root.root, 0, at, true)?.unwrap();
+                if paging::is_valid(self.phys.read_u64(slot)) {
+                    return Err(EEXIST);
+                }
+                if let Some(src) = src {
+                    self.read(src + done, &mut page)?;
+                }
+                let frame = self.phys.alloc()?;
+                if src.is_some() {
+                    unsafe { std::ptr::copy_nonoverlapping(page.as_ptr(), self.phys.host(frame), page.len()) };
+                }
+                // It wasn't valid before, so no TLB holds it.
+                self.phys.write_u64(slot, paging::user_page(frame, prot));
+                Ok(())
+            })();
+            if let Err(e) = filled {
+                return (done, Some(e));
+            }
+            done += PAGE;
+        }
+        (done, None)
     }
 
     pub fn set_brk(&mut self, want: u64) -> u64 {
@@ -784,6 +896,9 @@ impl AddressSpace {
         let (prot, vma) = (vma.prot, vma.clone());
         let slot = walk(&self.phys, &mut self.tables, self.root.root, 0, page, true).map_err(|_| SEGV_MAPERR)?.unwrap();
         let e = self.phys.read_u64(slot);
+        if !paging::is_valid(e) && vma.uffd().is_some() {
+            return Err(FAULT_UFFD);
+        }
         if paging::is_valid(e) {
             let (frame, shared) = (paging::addr(e), matches!(vma.backing, Backing::Shared { .. } | Backing::Dev { .. }));
             if !paging::permits(e, write, exec) {
@@ -842,6 +957,11 @@ impl AddressSpace {
         let slot = walk(&self.phys, &mut self.tables, self.root.root, 0, page, true)?.unwrap();
         let mut e = self.phys.read_u64(slot);
         if !paging::is_valid(e) {
+            // Only the userfaultfd may supply it, and all it knows of are the guest's
+            // own faults (UFFD_USER_MODE_ONLY).
+            if vma.uffd().is_some() {
+                return Err(EFAULT);
+            }
             let frame = self.populate(start, &vma, page)?;
             e = paging::user_page(frame, vma.prot);
             self.phys.write_u64(slot, e);
@@ -949,7 +1069,8 @@ impl AddressSpace {
     /// for what is now read-only, and a copy made meanwhile would lose their writes.
     pub fn fork(&mut self, kernel: &KernelWindow, asid: u16) -> Result<AddressSpace, i64> {
         let mut child = AddressSpace::new(self.phys.clone(), kernel, asid)?;
-        child.vmas = self.vmas.iter().filter(|(_, v)| v.on_fork != OnFork::Drop).map(|(&s, v)| (s, v.clone())).collect();
+        // A userfaultfd is the parent's: the child's pages are its own to fault in.
+        child.vmas = self.vmas.iter().filter(|(_, v)| v.on_fork != OnFork::Drop).map(|(&s, v)| (s, Vma { uffd: None, ..v.clone() })).collect();
         child.brk_start = self.brk_start;
         child.start_stack = self.start_stack;
         (child.arg_start, child.arg_end) = (self.arg_start, self.arg_end);

@@ -16,6 +16,7 @@ mod control;
 mod creds;
 mod drm;
 pub mod evdev;
+mod uffd;
 mod epoll;
 mod files;
 mod futex;
@@ -954,7 +955,13 @@ impl Kernel {
                 }
                 Exit::PageFault { pc, addr, write, exec } => {
                     let faulted = t.proc.mm().fault(addr, write, exec);
-                    if let Err(code) = faulted {
+                    if faulted == Err(crate::mm::FAULT_UFFD) {
+                        const BUS_ADRERR: i32 = 2;
+                        if !self.signal_caught(t, signal::SIGBUS) {
+                            self.crash_report(t, vcpu.as_ref(), "SIGBUS", pc, addr, write);
+                        }
+                        self.force_signal(t, signal::SIGBUS, SigInfo::fault(signal::SIGBUS, BUS_ADRERR, addr), pc);
+                    } else if let Err(code) = faulted {
                         if let CpuState::Aarch64(s) = vcpu.state() {
                             *t.last_fault.lock().unwrap() = Some(FaultRegs { pc, lr: s.x[30], fp: s.x[29], addr, write });
                         }

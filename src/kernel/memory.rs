@@ -129,11 +129,13 @@ impl Kernel {
     }
 
     pub(super) fn sys_mremap(&self, t: &Thread, old: u64, old_len: u64, new_len: u64, flags: u64, new_addr: u64) -> i64 {
-        if flags & !(MREMAP_MAYMOVE | MREMAP_FIXED) != 0 || (flags & MREMAP_FIXED != 0 && flags & MREMAP_MAYMOVE == 0) {
+        const MREMAP_DONTUNMAP: u64 = 4;
+        let may_move = flags & MREMAP_MAYMOVE != 0;
+        if flags & !(MREMAP_MAYMOVE | MREMAP_FIXED | MREMAP_DONTUNMAP) != 0 || (flags & (MREMAP_FIXED | MREMAP_DONTUNMAP) != 0 && !may_move) {
             return -EINVAL;
         }
         let fixed = (flags & MREMAP_FIXED != 0).then_some(new_addr);
-        match t.proc.mm().remap(crate::arch::untag(old), old_len, new_len, flags & MREMAP_MAYMOVE != 0, fixed) {
+        match t.proc.mm().remap(crate::arch::untag(old), old_len, new_len, may_move, fixed, flags & MREMAP_DONTUNMAP != 0) {
             Ok(a) => a as i64,
             Err(e) => -e,
         }

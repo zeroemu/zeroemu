@@ -68,7 +68,7 @@ pub fn handles(no: Sysno) -> bool {
         no,
         openat | close | read | pread64 | readv | write | writev | pwrite64 | lseek | fstat | newfstatat | statx | faccessat
             | faccessat2 | readlinkat | getdents64 | getcwd | chdir | fchdir | dup | dup2 | dup3 | fcntl | ioctl | statfs
-            | fstatfs | umask | pipe2 | ppoll | eventfd2 | epoll_create1 | epoll_ctl | epoll_pwait | epoll_pwait2 | timerfd_create
+            | fstatfs | umask | pipe2 | ppoll | eventfd2 | epoll_create1 | epoll_ctl | epoll_pwait | epoll_pwait2 | timerfd_create | userfaultfd
             | timerfd_settime | timerfd_gettime | signalfd4 | mknodat | mkdirat | unlinkat | symlinkat | linkat | renameat
             | renameat2 | truncate | ftruncate | fallocate | fchmod | fchmodat | fchown | fchownat | sync | fsync | fdatasync
             | utimensat | memfd_create | flock | pselect6 | sendfile | copy_file_range | inotify_init1 | inotify_add_watch | inotify_rm_watch
@@ -105,6 +105,8 @@ pub enum Kind {
     Tun(super::net::Tun),
     /// /dev/input/event* (evdev.rs).
     Evdev(Arc<super::evdev::Client>),
+    /// userfaultfd (uffd.rs).
+    Uffd(Arc<super::uffd::Uffd>),
     Binder(BinderFile),
     /// A loop or device-mapper device (block.rs).
     Block(BlockOpen),
@@ -458,6 +460,7 @@ pub(super) fn poll_ready(f: &File, t: &Thread, depth: u32) -> u16 {
         Kind::Vsock(v) => POLLOUT | if v.readable() { POLLIN } else { 0 },
         Kind::Tun(_) => POLLOUT,
         Kind::Evdev(c) => POLLOUT | if c.readable() { POLLIN } else { 0 },
+        Kind::Uffd(_) => 0, // no events: it works in SIGBUS mode
         Kind::Binder(b) => {
             (if binder::readable(b, t.tid) { POLLIN } else { 0 }) | POLLOUT
         }
@@ -830,6 +833,7 @@ impl Kernel {
                     Kind::Binder(b) => return self.binder_ioctl(t, &f, b, cmd, a[2]),
                     Kind::Ashmem(m) => return m.ioctl(cmd, a[2], &mut AshmemIo { t }),
                     Kind::Tun(n) => return n.ioctl(cmd, a[2], &mut AshmemIo { t }),
+                    Kind::Uffd(u) => return u.ioctl(t, cmd, a[2]),
                     Kind::Evdev(c) => {
                         let (ret, bytes) = c.ioctl(cmd, || t.proc.mm().read_u32(a[2]).map(|v| v as i32))?;
                         if !bytes.is_empty() {
@@ -1004,6 +1008,10 @@ impl Kernel {
             epoll_pwait2 => {
                 let ms = epoll_timespec_ms(t, a[3])?;
                 self.epoll_pwait(t, int(a[0]), a[1], int(a[2]), ms, a[4])
+            }
+            userfaultfd => {
+                let f = File::new(Kind::Uffd(super::uffd::create(a[0])?), a[0] as u32 & O_NONBLOCK);
+                t.files().alloc(f, a[0] & O_CLOEXEC != 0, 0)
             }
             timerfd_create => {
                 let tf = TimerFd::new(a[0], self.boot)?;
@@ -1496,6 +1504,7 @@ impl Kernel {
             Kind::Inotify(i) => i.read(t, count, f.nonblock())?,
             Kind::Vsock(v) => v.read(t, count, f.nonblock())?,
             Kind::Evdev(c) => c.read(t, count, f.nonblock())?,
+            Kind::Uffd(_) => return Err(EAGAIN), // nothing ever waits to be read
             // No packets ever come in.
             Kind::Tun(_) if f.nonblock() => return Err(EAGAIN),
             Kind::Tun(_) => loop {
@@ -1593,6 +1602,7 @@ impl Kernel {
             Kind::Vsock(v) => v.write(&data)?,
             Kind::Tun(_) => data.len(), // sent nowhere
             Kind::Evdev(_) => data.len(), // LEDs and the like: there are none
+            Kind::Uffd(_) => return Err(EINVAL),
             Kind::Pty(p) => p.write(t, &data, f.nonblock())?,
             Kind::Mem(m) => {
                 if !m.writable {
@@ -1645,7 +1655,7 @@ impl Kernel {
             Kind::Kmsg => chr(0x010b),
             Kind::Pipe(_) => Stat { mode: 0o010600, nlink: 1, ..Default::default() },
             Kind::Socket(_) | Kind::Netlink(_) | Kind::Inet(_) | Kind::Vsock(_) => Stat { mode: 0o140777, nlink: 1, ..Default::default() },
-            Kind::Event(_) | Kind::Timer(_) | Kind::Signal(_) | Kind::Epoll(_) | Kind::Bpf(_) | Kind::Sync(_) | Kind::Inotify(_) => Stat { mode: 0o600, nlink: 1, ..Default::default() }, // anon_inode
+            Kind::Event(_) | Kind::Timer(_) | Kind::Signal(_) | Kind::Epoll(_) | Kind::Bpf(_) | Kind::Sync(_) | Kind::Inotify(_) | Kind::Uffd(_) => Stat { mode: 0o600, nlink: 1, ..Default::default() }, // anon_inode
             Kind::Drm(d) => Stat { mode: 0o020666, rdev: d.rdev(), nlink: 1, ..Default::default() },
             Kind::Ashmem(a) => Stat { mode: 0o020666, rdev: super::ashmem::rdev(), nlink: 1, size: a.size(), ..Default::default() },
             Kind::Evdev(_) => Stat { mode: 0o020660, nlink: 1, ..Default::default() },
@@ -2016,6 +2026,7 @@ pub(super) fn file_name(f: &File) -> String {
         Kind::Vsock(v) => format!("socket:[{}]", Arc::as_ptr(v) as usize % 100_000),
         Kind::Event(_) => "anon_inode:[eventfd]".into(),
         Kind::Timer(_) => "anon_inode:[timerfd]".into(),
+        Kind::Uffd(_) => "anon_inode:[userfaultfd]".into(),
         Kind::Signal(_) => "anon_inode:[signalfd]".into(),
         Kind::Epoll(_) => "anon_inode:[eventpoll]".into(),
         Kind::Binder(_) => "/dev/binder".into(),

@@ -13,6 +13,7 @@ use std::sync::atomic::Ordering;
 
 pub const SIGILL: u32 = 4;
 pub const SIGKILL: u32 = 9;
+pub const SIGBUS: u32 = 7;
 pub const SIGSEGV: u32 = 11;
 pub const SIGPIPE: u32 = 13;
 pub const SIGCHLD: u32 = 17;
@@ -239,7 +240,7 @@ impl Thread {
     fn take_signal(&self) -> Option<(u32, SigInfo)> {
         // Synchronous signals first, as Linux's next_signal does: a fault's frame
         // must be the one the guest runs, with the faulting PC in it.
-        const SYNCHRONOUS: [u32; 6] = [SIGSEGV, 7 /* SIGBUS */, SIGILL, 5 /* SIGTRAP */, 8 /* SIGFPE */, 31 /* SIGSYS */];
+        const SYNCHRONOUS: [u32; 6] = [SIGSEGV, SIGBUS, SIGILL, 5 /* SIGTRAP */, 8 /* SIGFPE */, 31 /* SIGSYS */];
         let mask = self.mask.load(Ordering::Relaxed) & !UNBLOCKABLE;
         for pending in [&self.pending, &self.proc.pending] {
             let mut p = pending.lock().unwrap();

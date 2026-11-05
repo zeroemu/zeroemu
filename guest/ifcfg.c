@@ -13,8 +13,10 @@ typedef unsigned char u8;
 #define NR_read 63
 #define NR_write 64
 #define NR_exit_group 94
+#define NR_setresuid 147
 #define NR_socket 198
 #define NR_bind 200
+#define NR_connect 203
 #define NR_sendto 206
 #define NR_recvfrom 207
 
@@ -46,6 +48,8 @@ static void check(int cond, const char *name) {
     if (!cond) failures++;
 }
 
+#define EPERM 1
+#define ENETUNREACH 101
 #define EAGAIN 11
 #define EADDRNOTAVAIL 99
 #define AF_INET 2
@@ -73,6 +77,7 @@ static void check(int cond, const char *name) {
 #define IFF_RUNNING 0x40
 #define IFF_LOWER_UP 0x10000
 #define SIOCGIFFLAGS 0x8913
+#define SIOCSIFFLAGS 0x8914
 #define SIOCGIFADDR 0x8915
 #define SIOCSIFADDR 0x8916
 #define SIOCGIFNETMASK 0x891b
@@ -258,6 +263,87 @@ int cmain(void) {
     check(ack(rt) == 0, "and acknowledged");
     name(&r);
     check(sys(NR_ioctl, s, SIOCGIFADDR, &r) == -EADDRNOTAVAIL, "it's gone");
+
+    // ---- more than one address, and which one a delete means
+    u8 second[4] = { 10, 0, 2, 16 }, other[4] = { 192, 0, 2, 1 };
+    address(rt, RTM_NEWADDR, IP, 24, 2);
+    sys(NR_recvfrom, rt, rbuf, sizeof rbuf, MSG_DONTWAIT, 0, 0);
+    check(ack(rt) == 0, "the address again");
+    address(rt, RTM_NEWADDR, second, 24, 2);
+    n = sys(NR_recvfrom, rt, rbuf, sizeof rbuf, MSG_DONTWAIT, 0, 0);
+    check(n > 0 && h->type == RTM_NEWADDR, "a second is announced, with no word of removing the first");
+    check(ack(rt) == 0, "and acknowledged");
+    name(&r);
+    check(sys(NR_ioctl, s, SIOCGIFADDR, &r) == 0 && same(r.u.in.addr, IP, 4), "the first stays primary");
+    address(rt, RTM_DELADDR, other, 32, 2);
+    check(ack(rt) == -EADDRNOTAVAIL, "deleting one it doesn't have: EADDRNOTAVAIL");
+    name(&r);
+    check(sys(NR_ioctl, s, SIOCGIFADDR, &r) == 0 && same(r.u.in.addr, IP, 4), "and nothing's gone");
+    address(rt, RTM_DELADDR, second, 24, 2);
+    n = sys(NR_recvfrom, rt, rbuf, sizeof rbuf, MSG_DONTWAIT, 0, 0);
+    u8 *gone = rta(rbuf, 8, IFA_LOCAL, 0);
+    check(n > 0 && h->type == RTM_DELADDR && gone && same(gone, second, 4), "the second goes, and that's what's announced");
+    check(ack(rt) == 0, "and acknowledged");
+    name(&r);
+    check(sys(NR_ioctl, s, SIOCGIFADDR, &r) == 0 && same(r.u.in.addr, IP, 4), "the first is still there");
+
+    // ---- flags set the old way are announced too
+    name(&r);
+    sys(NR_ioctl, s, SIOCGIFFLAGS, &r);
+    r.u.flags = (u16)(r.u.flags & ~IFF_UP);
+    check(sys(NR_ioctl, s, SIOCSIFFLAGS, &r) == 0, "SIOCSIFFLAGS: down");
+    n = sys(NR_recvfrom, rt, rbuf, sizeof rbuf, MSG_DONTWAIT, 0, 0);
+    check(n > 0 && h->type == RTM_NEWLINK && (*(unsigned *)(rbuf + sizeof *h + 8) & IFF_RUNNING) == 0, "announced, no longer running");
+    struct { u16 family; u16 port; u8 addr[4]; u8 pad[8]; } far = { AF_INET, 0x3500, { 8, 8, 8, 8 }, { 0 } };
+    int probe = (int)sys(NR_socket, AF_INET, SOCK_DGRAM, 0);
+    check(sys(NR_connect, probe, &far, sizeof far) == -ENETUNREACH, "and an interface that's down has no route");
+    name(&r);
+    sys(NR_ioctl, s, SIOCGIFFLAGS, &r);
+    r.u.flags = (u16)(r.u.flags | IFF_UP);
+    sys(NR_ioctl, s, SIOCSIFFLAGS, &r);
+    n = sys(NR_recvfrom, rt, rbuf, sizeof rbuf, MSG_DONTWAIT, 0, 0);
+    check(n > 0 && h->type == RTM_NEWLINK && (*(unsigned *)(rbuf + sizeof *h + 8) & IFF_RUNNING) != 0, "up again, running again");
+    check(sys(NR_connect, probe, &far, sizeof far) == 0, "with its route");
+
+    // ---- a TUN device's name is a directory under /sys
+    {
+        int tun = (int)sys(NR_openat, -100, "/dev/tun", 2, 0);
+        struct ifreq tr;
+        memset(&tr, 0, sizeof tr);
+        memcpy(tr.name, "..", 3);
+        tr.u.flags = 1; // IFF_TUN
+        if (tun >= 0) check(sys(NR_ioctl, tun, 0x400454ca /* TUNSETIFF */, &tr) == -22, "a TUN device can't be called ..");
+    }
+
+    // ---- none of that without the capability
+    check(sys(NR_setresuid, 10100, 10100, 10100) == 0, "become an app");
+    name(&r);
+    r.u.in.family = AF_INET;
+    check(sys(NR_ioctl, s, SIOCSIFADDR, &r) == -EPERM, "SIOCSIFADDR: EPERM");
+    name(&r);
+    check(sys(NR_ioctl, s, SIOCSIFFLAGS, &r) == -EPERM, "SIOCSIFFLAGS: EPERM");
+    name(&r);
+    check(sys(NR_ioctl, s, SIOCGIFADDR, &r) == 0 && same(r.u.in.addr, IP, 4), "asking is fine, and the address is still there");
+    int app = (int)sys(NR_socket, AF_NETLINK, SOCK_RAW, 0);
+    struct sockaddr_nl none = { AF_NETLINK };
+    sys(NR_bind, app, &none, sizeof none);
+    address(app, RTM_DELADDR, IP, 24, 2);
+    check(ack(app) == -EPERM, "RTM_DELADDR: EPERM");
+    address(app, RTM_NEWADDR, second, 24, 2);
+    check(ack(app) == -EPERM, "RTM_NEWADDR: EPERM");
+    u8 link2[16] = { 0 };
+    *(int *)(link2 + 4) = 2;
+    *(unsigned *)(link2 + 12) = IFF_UP;
+    request(app, RTM_NEWLINK, NLM_F_REQUEST | NLM_F_ACK, link2, 16);
+    check(ack(app) == -EPERM, "RTM_NEWLINK: EPERM");
+    u8 fam[1] = { AF_INET };
+    request(app, RTM_GETADDR, NLM_F_REQUEST | NLM_F_DUMP, fam, 1);
+    n = sys(NR_recvfrom, app, rbuf, sizeof rbuf, MSG_DONTWAIT, 0, 0);
+    check(n > 0 && h->type != NLMSG_ERROR, "a dump is for anyone");
+    struct sockaddr_nl group = { AF_NETLINK, 0, 0, 1 << 4 };
+    u8 forged[32] = { 0 };
+    check(sys(NR_sendto, app, forged, sizeof forged, 0, &group, sizeof group) == -EPERM, "forging a group's news: EPERM");
+    check(sys(NR_socket, AF_INET, SOCK_RAW, 255) == -EPERM, "a raw socket: EPERM");
 
     puts_(failures ? "SOME CHECKS FAILED\n" : "all checks passed\n");
     return failures;

@@ -1,7 +1,7 @@
 // Freestanding arm64 test of sockets with a network behind them: the name server, and
 // TCP to servers on the host through 10.0.2.2. Run by scripts/test-tcp.py with
 // DROIDRT_NET=1, which starts the servers and passes their ports:
-//   tcp echo silent closes resets refused sink pieces adb-server
+//   tcp echo silent closes resets refused sink pieces adb-server half-resets
 
 typedef unsigned long u64;
 typedef long i64;
@@ -13,6 +13,9 @@ typedef unsigned char u8;
 #define NR_close 57
 #define NR_read 63
 #define NR_write 64
+#define NR_epoll_create1 20
+#define NR_epoll_ctl 21
+#define NR_epoll_pwait 22
 #define NR_ppoll 73
 #define NR_exit_group 94
 #define NR_setitimer 103
@@ -219,15 +222,16 @@ static void through_echo(u16 port) {
 }
 
 int cmain(int argc, char **argv) {
-    u16 ports[8];
-    if (argc < 9) { puts_("usage: tcp echo silent closes resets refused sink pieces adb-server\n"); return 1; }
-    for (int i = 0; i < 8; i++) {
+    u16 ports[9];
+    if (argc < 10) { puts_("usage: tcp echo silent closes resets refused sink pieces adb-server half-resets\n"); return 1; }
+    for (int i = 0; i < 9; i++) {
         u32 v = 0;
         for (char *c = argv[i + 1]; *c; c++) v = v * 10 + (u32)(*c - '0');
         ports[i] = (u16)v;
     }
-    u16 echo = ports[0], silent = ports[1], closes = ports[2], resets = ports[3], refused = ports[4], sink = ports[5], pieces = ports[6], adb_server = ports[7];
+    u16 echo = ports[0], silent = ports[1], closes = ports[2], resets = ports[3], refused = ports[4], sink = ports[5], pieces = ports[6], adb_server = ports[7], half_resets = ports[8];
     char buf[256];
+    struct in4 test_net = v4(192, 0, 2, 1, 80);
 
     // ---- what the resolver does, once there's an address
     int sf = (int)sys(NR_socket, AF_INET, SOCK_DGRAM, 0);
@@ -379,6 +383,12 @@ int cmain(int argc, char **argv) {
     expect(sys(NR_connect, fd, &to, sizeof to), -ECONNREFUSED, "or connect again and it reports it");
     sys(NR_close, fd);
 
+    // ---- the usual adb server port, whatever this process was told
+    fd = (int)sys(NR_socket, AF_INET, SOCK_STREAM, 0);
+    to = host(5037);
+    expect(sys(NR_connect, fd, &to, sizeof to), -ECONNREFUSED, "port 5037: refused without asking");
+    sys(NR_close, fd);
+
     // ---- what apps mustn't get at
     fd = (int)sys(NR_socket, AF_INET, SOCK_STREAM, 0);
     to = host(adb_server);
@@ -426,7 +436,6 @@ int cmain(int argc, char **argv) {
 
     // A connect nothing answers for, if the host's network has no opinion.
     fd = (int)sys(NR_socket, AF_INET, SOCK_STREAM, 0);
-    struct in4 test_net = v4(192, 0, 2, 1, 80);
     alarm_soon();
     r = sys(NR_connect, fd, &test_net, sizeof test_net);
     check(r == -EINTR || r == -ENETUNREACH || r == -EHOSTUNREACH || r == -ETIMEDOUT || r == -EACCES, "a blocking connect ends on a signal, or the host says no");
@@ -471,9 +480,82 @@ int cmain(int argc, char **argv) {
 
     // ---- MSG_WAITALL across pieces
     fd = connected(pieces);
+    expect(sys(NR_recvfrom, fd, big, 1500, MSG_PEEK | MSG_WAITALL, 0, 0), 1500, "MSG_PEEK with MSG_WAITALL waits for it all too");
     expect(sys(NR_recvfrom, fd, big, 2000, MSG_WAITALL, 0, 0), 2000, "MSG_WAITALL waits through two sends");
     expect(sys(NR_recvfrom, fd, big, 100, MSG_WAITALL, 0, 0), 0, "and returns what there is at the end");
+    expect(sys(NR_recvfrom, fd, big, 100, MSG_PEEK | MSG_WAITALL, 0, 0), 0, "as does a peek");
     sys(NR_close, fd);
+
+    // ---- an error isn't lost on a call that had something to return
+    fd = connected(half_resets);
+    expect(sys(NR_recvfrom, fd, big, 200, MSG_WAITALL, 0, 0), 100, "MSG_WAITALL: what arrived before the reset");
+    expect(sys(NR_recvfrom, fd, big, 200, 0, 0, 0), -ECONNRESET, "and the next call hears of it");
+    expect(sys(NR_recvfrom, fd, big, 200, 0, 0, 0), 0, "then the end");
+    sys(NR_close, fd);
+
+    // ---- both ways shut: hung up, though the peer's still there
+    fd = connected(silent);
+    expect(wait_for(fd, 0, 0), 0, "a live connection: no POLLHUP");
+    sys(NR_shutdown, fd, 2);
+    check(wait_for(fd, 0, 1000) & POLLHUP, "shutdown both ways: POLLHUP at once");
+    sys(NR_close, fd);
+
+    // ---- no bytes at all
+    fd = connected(silent);
+    expect(sys(NR_read, fd, big, 0), 0, "read of no bytes returns at once, with nothing to read");
+    sys(NR_close, fd);
+
+    // ---- urgent data doesn't exist here, but sendUrgentData mustn't fail
+    fd = connected(echo);
+    expect(sys(NR_sendto, fd, "ab", 2, 1 /* MSG_OOB */, 0, 0), 2, "MSG_OOB: both bytes taken");
+    expect(sys(NR_recvfrom, fd, buf, 1, MSG_WAITALL, 0, 0), 1, "the first goes through");
+    check(buf[0] == 'a', "the ordinary one");
+    expect(wait_for(fd, POLLIN, 100), 0, "and the urgent one isn't mixed in with the rest");
+    sys(NR_close, fd);
+
+    // ---- changing its mind
+    fd = connected(echo);
+    struct { u16 family; u8 pad[14]; } unspec = { 0, { 0 } };
+    expect(sys(NR_connect, fd, &unspec, sizeof unspec), 0, "connect(AF_UNSPEC) ends a connection");
+    expect(sock_error(fd), ECONNRESET, "leaving ECONNRESET to find");
+    len = sizeof peer;
+    expect(sys(NR_getpeername, fd, &peer, &len), -ENOTCONN, "no peer");
+    to = host(echo);
+    expect(sys(NR_connect, fd, &to, sizeof to), 0, "the socket can connect again");
+    expect(sys(NR_write, fd, "ok", 2), 2, "and works");
+    expect(sys(NR_recvfrom, fd, buf, 2, MSG_WAITALL, 0, 0), 2, "both ways");
+    sys(NR_close, fd);
+
+    // A connect that's still going, if the host's network lets one be: shut down.
+    fd = (int)sys(NR_socket, AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    r = sys(NR_connect, fd, &test_net, sizeof test_net);
+    if (r == -EINPROGRESS && wait_for(fd, POLLOUT | POLLIN, 0) == 0) {
+        expect(sys(NR_shutdown, fd, 2), 0, "shutdown of a connect in progress");
+        check((wait_for(fd, POLLOUT, 0) & (POLLERR | POLLHUP)) == (POLLERR | POLLHUP), "poll says it's over, with an error");
+        expect(sock_error(fd), ECONNRESET, "which is ECONNRESET");
+        to = host(echo);
+        expect(sys(NR_connect, fd, &to, sizeof to), -EINPROGRESS, "the socket can start again");
+        check(wait_for(fd, POLLOUT, 5000) & POLLOUT, "and connect");
+        expect(sock_error(fd), 0, "with nothing left over");
+    }
+    sys(NR_close, fd);
+
+    // ---- edge-triggered: each arrival is news, even with some still unread
+    {
+        struct { u32 events; u32 pad; u64 data; } ev = { POLLIN | 1u << 31, 0, 5 }, out_ev[2];
+        int ep = (int)sys(NR_epoll_create1, 0);
+        fd = connected(echo);
+        expect(sys(NR_epoll_ctl, ep, 1, fd, &ev), 0, "EPOLLET on a connection");
+        expect(sys(NR_epoll_pwait, ep, out_ev, 2, 0, 0, 8), 0, "nothing yet");
+        sys(NR_write, fd, "abcd", 4);
+        expect(sys(NR_epoll_pwait, ep, out_ev, 2, 5000, 0, 8), 1, "the echo arrives: an edge");
+        expect(sys(NR_recvfrom, fd, buf, 1, 0, 0, 0), 1, "take a little of it");
+        expect(sys(NR_epoll_pwait, ep, out_ev, 2, 0, 0, 8), 0, "no news");
+        sys(NR_write, fd, "efgh", 4);
+        expect(sys(NR_epoll_pwait, ep, out_ev, 2, 5000, 0, 8), 1, "more arrives, on top of what's unread: another edge");
+        sys(NR_close, fd);
+        sys(NR_close, ep);
+    }
 
     // ---- a closing socket's bytes still arrive: the script counts them
     fd = connected(sink);

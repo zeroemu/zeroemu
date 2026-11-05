@@ -5,6 +5,7 @@
 //! someone broadcasts one (`uevent`). Sockets of one protocol reach each
 //! other by port id (unicast) and by group (multicast).
 
+use super::creds::CAP_NET_ADMIN;
 use super::files::{File, Kind};
 use super::wait::EVENTS;
 use super::{ERESTARTSYS, Kernel, POLL, Thread, int};
@@ -248,6 +249,12 @@ impl Netlink {
             let st = self.st.lock().unwrap();
             (dest.unwrap_or(st.dst), st.sndbuf)
         };
+        let admin = t.proc.creds.lock().unwrap().capable(CAP_NET_ADMIN);
+        // Speaking as the kernel, to a group or another socket: none of these protocols
+        // lets just anyone, or an app could tell IpClient its address had gone.
+        if (dst.0 != 0 || dst.1 != 0) && !admin {
+            return Err(EPERM);
+        }
         let port = self.bind_port(t.proc.pid, 0)?;
         if data.len() + 32 > sndbuf as usize {
             return Err(EMSGSIZE);
@@ -258,7 +265,7 @@ impl Netlink {
             multicast(self.proto, &p, dst.0);
         }
         if dst.0 == 0 {
-            self.kernel_input(&p.data, port)?;
+            self.kernel_input(&p.data, port, admin)?;
             return Ok(len);
         }
         let target = REG.lock().unwrap().ports.get(&(self.proto, dst.0)).and_then(Weak::upgrade).ok_or(ECONNREFUSED)?;
@@ -286,7 +293,7 @@ impl Netlink {
 
     /// The kernel's end: each request in the buffer is answered as Linux's
     /// netlink_rcv_skb would (requests only; an ack when asked or on error).
-    fn kernel_input(&self, data: &[u8], port: u32) -> Result<(), i64> {
+    fn kernel_input(&self, data: &[u8], port: u32, admin: bool) -> Result<(), i64> {
         if self.proto == NETLINK_SELINUX {
             return Err(ECONNREFUSED); // selinuxfs's netlink only multicasts
         }
@@ -299,7 +306,7 @@ impl Netlink {
                 break;
             }
             let (ty, flags, seq) = (u16::from_le_bytes([m[4], m[5]]), u16::from_le_bytes([m[6], m[7]]), u32::from_le_bytes(m[8..12].try_into().unwrap()));
-            let reply = if flags & NLM_F_REQUEST == 0 || ty < NLMSG_MIN_TYPE { Reply::Ok(Vec::new()) } else { self.request(ty, flags, seq, port, &m[16..len]) };
+            let reply = if flags & NLM_F_REQUEST == 0 || ty < NLMSG_MIN_TYPE { Reply::Ok(Vec::new()) } else { self.request(ty, flags, seq, port, &m[16..len], admin) };
             let (msgs, err, ack) = match reply {
                 Reply::Ok(msgs) => (msgs, 0, flags & NLM_F_ACK != 0),
                 Reply::Dump(mut msgs) => {
@@ -323,12 +330,16 @@ impl Netlink {
         Ok(())
     }
 
-    fn request(&self, ty: u16, flags: u16, seq: u32, port: u32, body: &[u8]) -> Reply {
+    fn request(&self, ty: u16, flags: u16, seq: u32, port: u32, body: &[u8], admin: bool) -> Reply {
         let dump = flags & NLM_F_DUMP != 0;
         match self.proto {
             NETLINK_ROUTE => {
                 if ty > RTM_MAX {
                     return Reply::Err(EOPNOTSUPP);
+                }
+                // Anyone can ask (GET). Changing anything takes this.
+                if (ty - 16) & 3 != 2 && !admin {
+                    return Reply::Err(EPERM);
                 }
                 if body.is_empty() {
                     return Reply::Ok(Vec::new());
@@ -384,6 +395,9 @@ fn address_request(ty: u16, body: &[u8]) -> Reply {
         return Reply::Ok(Vec::new());
     }
     let prefix = body[1];
+    if prefix > 32 {
+        return Reply::Err(EINVAL);
+    }
     let index = i32::from_le_bytes(body[4..8].try_into().unwrap());
     let (mut local, mut address) = (None, None);
     let mut off = 8;
@@ -403,22 +417,27 @@ fn address_request(ty: u16, body: &[u8]) -> Reply {
         }
         off += len.next_multiple_of(4);
     }
+    if ty == RTM_DELADDR {
+        return match super::net::del_address(index, local, address.map(|a| (a, prefix))) {
+            Ok(message) => {
+                announce_address(false, &message);
+                Reply::Ok(Vec::new())
+            }
+            Err(e) => Reply::Err(e),
+        };
+    }
     let ip = local.or(address).unwrap_or([0; 4]);
-    if ty == RTM_NEWADDR && ip == [0; 4] {
+    if ip == [0; 4] {
         // netd's setCfg sends this when clearing an address. It is not an address.
         return Reply::Ok(Vec::new());
     }
-    let change = if ty == RTM_NEWADDR {
-        super::net::set_address(index, Some((ip, prefix)))
-    } else {
-        super::net::set_address(index, None).and_then(|c| if c.is_some() || index == 1 { Ok(c) } else { Err(EADDRNOTAVAIL) })
-    };
-    match change {
-        Ok(Some((new, message))) => {
-            announce_address(new, &message);
+    match super::net::add_address(index, ip, prefix) {
+        Ok(message) => {
+            if let Some(message) = message {
+                announce_address(true, &message);
+            }
             Reply::Ok(Vec::new())
         }
-        Ok(None) => Reply::Ok(Vec::new()),
         Err(e) => Reply::Err(e),
     }
 }
@@ -426,6 +445,11 @@ fn address_request(ty: u16, body: &[u8]) -> Reply {
 fn multicast_kernel(group: u32, ty: u16, payload: &[u8]) {
     let data = nlmsg(ty, 0, 0, 0, payload);
     multicast(NETLINK_ROUTE, &Packet { data, from: 0, group, cred: [0; 3] }, 0);
+}
+
+/// A link's flags changed.
+pub fn announce_link(payload: &[u8]) {
+    multicast_kernel(RTNLGRP_LINK, RTM_NEWLINK, payload);
 }
 
 /// An address came or went: what IpClient waits to hear.

@@ -15,6 +15,7 @@
 //! is kept and has no effect, so per-network routing, VPNs and per-UID firewalls don't
 //! apply to anything, and 10.0.2.2 is open to every app, as on the emulator.
 
+use super::creds::{CAP_NET_ADMIN, CAP_NET_BIND_SERVICE, CAP_NET_RAW};
 use super::files::{File, Kind};
 use super::hostio::{self, Io, Link};
 use super::unix::{SockOpts, deadline, sockopt_bytes, wait_or_give_up};
@@ -94,8 +95,6 @@ const SO_SET_REPLACE: u64 = 64;
 const SO_SET_ADD_COUNTERS: u64 = 65;
 const SO_GET_INFO: u64 = 64;
 const SO_GET_ENTRIES: u64 = 65;
-
-const CAP_NET_BIND_SERVICE: u32 = 10;
 
 const IO_MAX: u64 = 1 << 31;
 /// As `ip_local_port_range`.
@@ -209,7 +208,7 @@ fn route(dest: SocketAddr, stream: bool, broadcast_ok: bool) -> Result<Route, i6
         }
         SocketAddr::V4(a) => *a.ip(),
     };
-    if ip.is_loopback() || ip.is_unspecified() || (ip.octets() == net::ETH_ADDRESS && net::ipv4_up()) {
+    if ip.is_loopback() || ip.is_unspecified() || net::is_local_v4(ip.octets()) {
         return Ok(Route::Local);
     }
     if ip.is_multicast() {
@@ -242,9 +241,9 @@ fn route(dest: SocketAddr, stream: bool, broadcast_ok: bool) -> Result<Route, i6
 fn source_for(route: &Route, dest: SocketAddr) -> IpAddr {
     match (route, dest) {
         (Route::Local, SocketAddr::V6(_)) => IpAddr::V6(Ipv6Addr::LOCALHOST),
-        (Route::Local, SocketAddr::V4(a)) if a.ip().octets() == net::ETH_ADDRESS => IpAddr::V4(*a.ip()),
+        (Route::Local, SocketAddr::V4(a)) if !a.ip().is_loopback() && !a.ip().is_unspecified() => IpAddr::V4(*a.ip()),
         (Route::Local, SocketAddr::V4(_)) => IpAddr::V4(Ipv4Addr::LOCALHOST),
-        _ => IpAddr::from(net::ETH_ADDRESS),
+        _ => IpAddr::from(net::eth_address().unwrap_or(net::ETH_ADDRESS)),
     }
 }
 
@@ -330,6 +329,24 @@ impl Source<'_> {
         match self {
             Source::Guest(iov) => iov.iter().map(|v| v.1).sum::<u64>() as usize,
             Source::Bytes(b) => b.len(),
+        }
+    }
+
+    /// The same, a byte short. Only for what isn't empty.
+    fn without_last(&self) -> Source<'_> {
+        match self {
+            Source::Bytes(b) => Source::Bytes(&b[..b.len() - 1]),
+            Source::Guest(iov) => {
+                let mut iov = iov.clone();
+                while let Some(last) = iov.last_mut() {
+                    if last.1 > 0 {
+                        last.1 -= 1;
+                        break;
+                    }
+                    iov.pop();
+                }
+                Source::Guest(iov)
+            }
         }
     }
 
@@ -513,7 +530,7 @@ impl Inet {
             match (&st.io, st.phase) {
                 (_, Phase::Listening) => 0,
                 (Some(io), _) => io.readiness(),
-                (None, _) => POLLOUT | POLLHUP | if st.shut_rd { POLLIN | POLLRDHUP } else { 0 },
+                (None, _) => POLLOUT | POLLHUP | if st.shut_rd { POLLIN | POLLRDHUP } else { 0 } | if st.err != 0 { POLLERR } else { 0 },
             }
         } else {
             let mut r = POLLOUT;
@@ -568,23 +585,38 @@ impl Inet {
 
     fn stream_recv(&self, t: &Thread, max: usize, flags: u64, nonblock: bool) -> Result<Received, i64> {
         let (io, until) = {
-            let st = self.st.lock().unwrap();
+            let mut st = self.st.lock().unwrap();
             if st.phase == Phase::Listening {
                 return Err(ENOTCONN);
             }
-            match &st.io {
-                Some(io) => (io.clone(), deadline(st.opts.rcvtimeo)),
+            match st.io.clone() {
+                Some(io) => (io, deadline(st.opts.rcvtimeo)),
+                None if st.err != 0 => return Err(std::mem::take(&mut st.err)),
                 None if st.shut_rd => return Ok(Received { data: Vec::new(), real: 0, from: None }),
                 None => return Err(ENOTCONN),
             }
         };
         let peek = flags & MSG_PEEK != 0;
-        let all = flags & MSG_WAITALL != 0 && !peek && !nonblock;
+        let all = flags & MSG_WAITALL != 0 && !nonblock;
         let mut got = Vec::new();
         let result = loop {
             let seen = EVENTS.watch_key(self.key);
             let want = max - got.len();
-            match if peek { io.peek(want) } else { io.read(want) } {
+            let read = if peek {
+                // Each look starts at the beginning again, and takes nothing.
+                io.peek(max).map(|data| {
+                    got = data;
+                    Vec::new()
+                })
+            } else {
+                io.read(want, !got.is_empty())
+            };
+            match read {
+                Ok(_) if peek => {
+                    if !all || got.len() == max || got.is_empty() || io.ended() {
+                        break Ok(());
+                    }
+                }
                 Ok(data) if data.is_empty() && want > 0 => break Ok(()),
                 Ok(data) => {
                     got.extend_from_slice(&data);
@@ -644,9 +676,10 @@ impl Inet {
     /// than an error if any of it went.
     fn stream_send(&self, t: &Thread, src: &Source, nonblock: bool) -> Result<usize, i64> {
         let (io, until) = {
-            let st = self.st.lock().unwrap();
-            match (&st.io, st.phase) {
-                (Some(io), Phase::Connecting | Phase::Connected | Phase::Idle) => (io.clone(), deadline(st.opts.sndtimeo)),
+            let mut st = self.st.lock().unwrap();
+            match (st.io.clone(), st.phase) {
+                (Some(io), Phase::Connecting | Phase::Connected | Phase::Idle) => (io, deadline(st.opts.sndtimeo)),
+                _ if st.err != 0 => return Err(std::mem::take(&mut st.err)),
                 _ => return Err(EPIPE),
             }
         };
@@ -655,7 +688,8 @@ impl Inet {
         let stop = |done: usize, e: i64| if done > 0 { Ok(done) } else { Err(e) };
         loop {
             let seen = EVENTS.watch_key(self.key);
-            match io.room() {
+            // Once some of it's gone, an error is for the next call to report.
+            match io.room(done > 0) {
                 Ok(room) => {
                     let n = room.min(total - done);
                     if n > 0 {
@@ -663,8 +697,16 @@ impl Inet {
                             Ok(data) => data,
                             Err(e) => return stop(done, e),
                         };
-                        match io.write(&data) {
-                            Ok(sent) => done += sent,
+                        match io.write(&data, done > 0) {
+                            Ok(sent) => {
+                                done += sent;
+                                if done == total {
+                                    return Ok(done);
+                                }
+                                // The queue may have emptied while this was copying. Only
+                                // a sender that sees it full is sure of being told of room.
+                                continue;
+                            }
                             Err(EAGAIN) => {}
                             Err(e) => return stop(done, e),
                         }
@@ -734,6 +776,9 @@ impl Inet {
 
 /// read(2).
 pub fn read(s: &Inet, t: &Thread, count: usize, nonblock: bool) -> Result<Vec<u8>, i64> {
+    if count == 0 {
+        return Ok(Vec::new()); // sock_read_iter stops here, whatever the socket's state
+    }
     if s.raw() {
         return Err(ENOTCONN);
     }
@@ -825,7 +870,9 @@ impl Kernel {
         let ty = (a[1] & 0xf) as u32;
         let proto = a[2] as u32;
         let proto = match (a[0], ty, proto) {
-            (AF_KEY, _, _) | (_, SOCK_RAW, _) => proto,
+            (AF_KEY, _, _) => proto,
+            (_, SOCK_RAW, _) if !self.creds(t).capable(CAP_NET_RAW) => return Err(EPERM),
+            (_, SOCK_RAW, _) => proto,
             (_, SOCK_STREAM, 0 | IPPROTO_TCP) => IPPROTO_TCP,
             (_, SOCK_DGRAM, 0 | IPPROTO_UDP) => IPPROTO_UDP,
             (AF_INET, SOCK_DGRAM, IPPROTO_ICMP) | (AF_INET6, SOCK_DGRAM, IPPROTO_ICMPV6) => proto,
@@ -986,10 +1033,19 @@ impl Kernel {
     fn inet_send(&self, t: &Arc<Thread>, s: &Arc<Inet>, f: &File, src: &Source, dest: Option<&[u8]>, flags: u64) -> Result<i64, i64> {
         let nonblock = f.nonblock() || flags & MSG_DONTWAIT != 0;
         let result = if s.is_stream() {
-            if flags & (MSG_OOB | MSG_FASTOPEN) != 0 {
+            if flags & MSG_FASTOPEN != 0 {
                 return Err(EOPNOTSUPP);
             }
-            let r = s.stream_send(t, src, nonblock);
+            // std has no urgent data. The last byte is the urgent one, and a peer that
+            // isn't asking for it mustn't find it among the rest, so it goes nowhere.
+            // An app's sendUrgentData, usually a check that the line's alive, still works.
+            let urgent = flags & MSG_OOB != 0 && src.len() > 0;
+            let r = if urgent {
+                let rest = src.len() - 1;
+                s.stream_send(t, &src.without_last(), nonblock).map(|n| if n == rest { n + 1 } else { n })
+            } else {
+                s.stream_send(t, src, nonblock)
+            };
             if r == Err(EPIPE) && flags & MSG_NOSIGNAL == 0 {
                 self.send_thread_signal(t, super::signal::SIGPIPE, super::signal::SigInfo::user(super::signal::SIGPIPE, t.proc.pid));
             }
@@ -1006,7 +1062,7 @@ impl Kernel {
         let mut st = s.st.lock().unwrap();
         let addr = s.parse_addr(&raw, AddrUse::Bind, Inet::v6only(&st))?;
         let ours = match addr.ip() {
-            IpAddr::V4(ip) => ip.is_unspecified() || ip.is_loopback() || ip.is_multicast() || (ip.octets() == net::ETH_ADDRESS && net::ipv4_up()),
+            IpAddr::V4(ip) => ip.is_unspecified() || ip.is_loopback() || ip.is_multicast() || net::is_local_v4(ip.octets()),
             IpAddr::V6(ip) => ip.is_unspecified() || ip.is_loopback() || ip.is_multicast(),
         };
         if !ours {
@@ -1094,6 +1150,7 @@ impl Kernel {
                     Ok(0)
                 }
                 (_, Some(io)) => {
+                    // SHUT_RD alone leaves the socket as far as the peer's concerned.
                     io.shutdown(how);
                     Ok(0)
                 }
@@ -1166,12 +1223,13 @@ impl Kernel {
                     Route::Local | Route::Refused | Route::Dns | Route::Lost => return Err(ECONNREFUSED),
                 };
                 s.autobind(&mut st, uid)?;
-                st.source = Some(IpAddr::from(net::ETH_ADDRESS));
+                st.source = Some(IpAddr::from(net::eth_address().unwrap_or(net::ETH_ADDRESS)));
                 let nodelay = st.stored.get(&(SOL_TCP, TCP_NODELAY)).is_some_and(|v| v.iter().any(|&b| b != 0));
                 let io = Io::with_key(s.key);
-                io.connect(host, CONNECT_TIMEOUT, nodelay).map_err(|_| ENOBUFS)?;
+                io.connect(host, CONNECT_TIMEOUT, nodelay, uid)?;
                 st.io = Some(io);
                 st.peer = Some(addr);
+                st.err = 0;
                 st.phase = Phase::Connecting;
                 EINPROGRESS
             }
@@ -1181,17 +1239,22 @@ impl Kernel {
         drop(st);
         loop {
             let seen = EVENTS.watch_key(s.key);
-            match io.link() {
-                Link::Connecting => {}
-                Link::Up => {
-                    s.st.lock().unwrap().phase = Phase::Connected;
-                    return Ok(0);
-                }
-                Link::Down => {
-                    let e = io.take_err();
-                    Inet::disconnect(&mut s.st.lock().unwrap());
+            let link = io.link();
+            if link != Link::Connecting {
+                let mut st = s.st.lock().unwrap();
+                // Another thread may have disconnected this socket, and even connected it
+                // somewhere else since. This call has nothing to say about that one.
+                if !st.io.as_ref().is_some_and(|current| Arc::ptr_eq(current, &io)) {
+                    let e = std::mem::take(&mut st.err);
                     return Err(if e != 0 { e } else { ECONNABORTED });
                 }
+                if link == Link::Up {
+                    st.phase = Phase::Connected;
+                    return Ok(0);
+                }
+                let e = io.take_err();
+                Inet::disconnect(&mut st);
+                return Err(if e != 0 { e } else { ECONNABORTED });
             }
             if f.nonblock() {
                 return Err(waiting);
@@ -1228,6 +1291,10 @@ impl Kernel {
             }
             mm.write_u32(arg, used as u32)?;
             return Ok(0);
+        }
+        // SIOCSIFFLAGS, SIOCSIFADDR, SIOCSIFMTU: anyone can ask, and only this can change.
+        if matches!(cmd, 0x8914 | 0x8916 | 0x8922) && !self.creds(t).capable(CAP_NET_ADMIN) {
+            return Err(EPERM);
         }
         let mut req = [0u8; 40];
         t.proc.mm().read(arg, &mut req)?;
@@ -1371,9 +1438,14 @@ impl Kernel {
 }
 
 impl Inet {
-    /// Back to how a new socket is, as a connection failing or AF_UNSPEC leaves it.
+    /// Back to how a new socket is, as a connection failing or AF_UNSPEC leaves it. As
+    /// tcp_disconnect: one that was going or up leaves an error to find. That includes a
+    /// thread in connect(), which an abort wakes.
     fn disconnect(st: &mut State) {
         if let Some(io) = st.io.take() {
+            if io.link() != Link::Down {
+                st.err = ECONNRESET;
+            }
             io.abort();
         }
         st.phase = Phase::Idle;
@@ -1509,16 +1581,17 @@ impl Inet {
 fn default_option(level: u64, name: u64) -> Option<i32> {
     Some(match (level, name) {
         // IP_TOS, IP_TTL, IP_HDRINCL, IP_PKTINFO, IP_MTU_DISCOVER, IP_RECVERR, IP_RECVTTL,
-        // IP_RECVTOS, IP_MULTICAST_TTL, IP_MULTICAST_LOOP
+        // IP_RECVTOS, IP_MULTICAST_IF, IP_MULTICAST_TTL, IP_MULTICAST_LOOP
         (SOL_IP, 1) => 0,
         (SOL_IP, 2) => 64,
-        (SOL_IP, 3 | 8 | 11 | 12 | 13) => 0,
+        (SOL_IP, 3 | 8 | 11 | 12 | 13 | 32) => 0,
         (SOL_IP, 10) => 1,
         (SOL_IP, 33 | 34) => 1,
-        // IPV6_UNICAST_HOPS, IPV6_MULTICAST_HOPS, IPV6_MULTICAST_LOOP, IPV6_MTU_DISCOVER,
-        // IPV6_RECVERR, IPV6_V6ONLY, IPV6_RECVPKTINFO, IPV6_RECVHOPLIMIT, IPV6_RECVTCLASS,
-        // IPV6_TCLASS
+        // IPV6_UNICAST_HOPS, IPV6_MULTICAST_IF, IPV6_MULTICAST_HOPS, IPV6_MULTICAST_LOOP,
+        // IPV6_MTU_DISCOVER, IPV6_RECVERR, IPV6_V6ONLY, IPV6_RECVPKTINFO, IPV6_RECVHOPLIMIT,
+        // IPV6_RECVTCLASS, IPV6_TCLASS
         (SOL_IPV6, 16) => 64,
+        (SOL_IPV6, 17) => 0,
         (SOL_IPV6, 18 | 19) => 1,
         (SOL_IPV6, 23) => 1,
         (SOL_IPV6, 25 | 26 | 49 | 51 | 66 | 67) => 0,

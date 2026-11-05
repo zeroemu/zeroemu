@@ -35,13 +35,25 @@ struct Interest {
 }
 
 impl Interest {
-    /// For an edge-triggered registration, its file's announcements so far. A timer
-    /// comes due with nobody announcing it, so it goes by readiness alone.
+    /// For an edge-triggered registration, how far its file's news has got.
     fn generation(&self, f: &File, t: &Thread, depth: u32) -> Option<u64> {
-        if self.events & EPOLLET == 0 || matches!(f.kind, Kind::Timer(_)) {
+        if self.events & EPOLLET == 0 {
             return None;
         }
-        Some(super::wait::EVENTS.generation(poll_mask(f, t, depth)))
+        Some(super::wait::EVENTS.generation(poll_mask(f, t, depth)).wrapping_add(timers_fired(f, depth)))
+    }
+}
+
+/// A timer comes due with nobody announcing it, so these count for news too, and those
+/// under a nested epoll.
+fn timers_fired(f: &File, depth: u32) -> u64 {
+    match &f.kind {
+        Kind::Timer(tf) => tf.fired(),
+        Kind::Epoll(ep) if depth <= 4 => {
+            let list = ep.interest.lock().unwrap();
+            list.values().filter_map(|i| i.file.upgrade()).fold(0, |n, child| n.wrapping_add(timers_fired(&child, depth + 1)))
+        }
+        _ => 0,
     }
 }
 
@@ -139,11 +151,16 @@ impl Epoll {
 
     /// The earliest timerfd expiry among the registrations.
     pub fn deadline(&self) -> Option<Instant> {
+        self.deadline_within(0)
+    }
+
+    fn deadline_within(&self, depth: u32) -> Option<Instant> {
         let list = self.interest.lock().unwrap();
         list.values()
             .filter_map(|i| i.file.upgrade())
             .filter_map(|f| match &f.kind {
                 Kind::Timer(tf) => tf.deadline(),
+                Kind::Epoll(ep) if depth < 4 => ep.deadline_within(depth + 1),
                 _ => None,
             })
             .min()

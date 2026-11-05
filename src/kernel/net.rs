@@ -10,6 +10,7 @@
 
 use crate::errno::*;
 use crate::vfs::FileSystem;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 const ARPHRD_LOOPBACK: u16 = 772;
@@ -33,8 +34,8 @@ struct Iface {
     mtu: u32,
     flags: u32,
     mac: [u8; 6],
-    /// Its IPv4 address and prefix length, once it has one.
-    ipv4: Option<([u8; 4], u8)>,
+    /// Its IPv4 addresses and prefix lengths, the primary one first.
+    ipv4: Vec<([u8; 4], u8)>,
 }
 
 /// The network interface's name, and what a device's static configuration gives it.
@@ -44,17 +45,22 @@ const ETH_MAC: [u8; 6] = [0x52, 0x54, 0, 0x12, 0x34, 0x56];
 
 static IFACES: Mutex<Vec<Iface>> = Mutex::new(Vec::new());
 static NEXT_INDEX: Mutex<i32> = Mutex::new(2);
-/// Whether the device has a network: eth1 has an address.
-static IPV4_UP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// eth1's address, while it's up and has one, or else 0: whether the device has a network.
+static ETH_PRIMARY: AtomicU32 = AtomicU32::new(0);
+
+/// What this device shows as the source of what it sends beyond itself, if it can.
+pub fn eth_address() -> Option<[u8; 4]> {
+    Some(ETH_PRIMARY.load(Ordering::Relaxed)).filter(|&ip| ip != 0).map(u32::to_be_bytes)
+}
 
 /// Whether the device has a route to anywhere but itself.
 pub fn ipv4_up() -> bool {
-    IPV4_UP.load(std::sync::atomic::Ordering::Relaxed)
+    eth_address().is_some()
 }
 static SYS: OnceLock<Arc<dyn FileSystem>> = OnceLock::new();
 
 fn lo() -> Iface {
-    Iface { name: "lo".into(), index: 1, ty: ARPHRD_LOOPBACK, mtu: 65536, flags: IFF_UP | IFF_LOOPBACK | IFF_RUNNING, mac: [0; 6], ipv4: Some(([127, 0, 0, 1], 8)) }
+    Iface { name: "lo".into(), index: 1, ty: ARPHRD_LOOPBACK, mtu: 65536, flags: IFF_UP | IFF_LOOPBACK | IFF_RUNNING, mac: [0; 6], ipv4: vec![([127, 0, 0, 1], 8)] }
 }
 
 /// The interfaces, `lo` first.
@@ -97,7 +103,7 @@ pub fn publish(sys: Arc<dyn FileSystem>, network: bool) {
     publish_iface(sys.as_ref(), &lo());
     if network {
         let mut next = NEXT_INDEX.lock().unwrap();
-        let eth = Iface { name: ETH.into(), index: *next, ty: ARPHRD_ETHER, mtu: 1500, flags: IFF_UP | IFF_BROADCAST | IFF_RUNNING | IFF_MULTICAST, mac: ETH_MAC, ipv4: None };
+        let eth = Iface { name: ETH.into(), index: *next, ty: ARPHRD_ETHER, mtu: 1500, flags: IFF_UP | IFF_BROADCAST | IFF_RUNNING | IFF_MULTICAST, mac: ETH_MAC, ipv4: Vec::new() };
         *next += 1;
         publish_iface(sys.as_ref(), &eth);
         IFACES.lock().unwrap().push(eth);
@@ -107,6 +113,10 @@ pub fn publish(sys: Arc<dyn FileSystem>, network: bool) {
 
 /// TUNSETIFF: a new TUN (or TAP) interface. `name` may hold a %d to number.
 pub fn add_tun(name: &str, tap: bool) -> Result<String, i64> {
+    // The name becomes a directory under /sys/class/net.
+    if name == "." || name == ".." || name.contains('/') {
+        return Err(EINVAL);
+    }
     let mut list = IFACES.lock().unwrap();
     let name = if name.is_empty() || name.contains("%d") {
         let pattern = if name.is_empty() { if tap { "tap%d" } else { "tun%d" } } else { name };
@@ -128,7 +138,7 @@ pub fn add_tun(name: &str, tap: bool) -> Result<String, i64> {
         mtu: 1500,
         flags: if tap { IFF_MULTICAST } else { IFF_POINTOPOINT | IFF_NOARP | IFF_MULTICAST },
         mac: [0; 6],
-        ipv4: None,
+        ipv4: Vec::new(),
     };
     *next += 1;
     if let Some(sys) = SYS.get() {
@@ -216,21 +226,20 @@ pub fn addr_payloads(family: u8) -> Vec<Vec<u8>> {
         out.push(p);
     }
     if family == 0 || family == 2 {
-        out.extend(IFACES.lock().unwrap().iter().filter_map(address_message));
+        out.extend(IFACES.lock().unwrap().iter().flat_map(|i| i.ipv4.iter().map(|&(ip, prefix)| address_message(i, ip, prefix))));
     }
     out
 }
 
 /// RTM_NEWADDR or RTM_DELADDR for an interface's IPv4 address. IpClient won't read one
 /// without IFA_ADDRESS and IFA_FLAGS, and this is its only source for the address.
-fn address_message(i: &Iface) -> Option<Vec<u8>> {
+fn address_message(i: &Iface, ip: [u8; 4], prefix: u8) -> Vec<u8> {
     const IFA_ADDRESS: u16 = 1;
     const IFA_LOCAL: u16 = 2;
     const IFA_LABEL: u16 = 3;
     const IFA_BROADCAST: u16 = 4;
     const IFA_FLAGS: u16 = 8;
     const IFA_F_PERMANENT: u32 = 0x80;
-    let (ip, prefix) = i.ipv4?;
     let mut p = vec![2u8, prefix, IFA_F_PERMANENT as u8, 0];
     p.extend_from_slice(&i.index.to_le_bytes());
     attr(&mut p, IFA_ADDRESS, &ip);
@@ -241,48 +250,83 @@ fn address_message(i: &Iface) -> Option<Vec<u8>> {
     label.push(0);
     attr(&mut p, IFA_LABEL, &label);
     attr(&mut p, IFA_FLAGS, &IFA_F_PERMANENT.to_le_bytes());
-    Some(p)
+    p
 }
 
-/// Gives interface `index` an address, or takes it away. What to announce, if
-/// anything changed: (is it new, the message). The caller holds no lock of ours then.
-pub fn set_address(index: i32, ip: Option<([u8; 4], u8)>) -> Result<Option<(bool, Vec<u8>)>, i64> {
+/// What the rest of the kernel goes by: eth1's first address, if it's up.
+fn refresh_eth(i: &Iface) {
+    if i.name == ETH {
+        let usable = if i.flags & IFF_UP != 0 { i.ipv4.first().map_or(0, |&(ip, _)| u32::from_be_bytes(ip)) } else { 0 };
+        ETH_PRIMARY.store(usable, Ordering::Relaxed);
+    }
+}
+
+/// Gives interface `index` another address. The message to announce, if that's news.
+pub fn add_address(index: i32, ip: [u8; 4], prefix: u8) -> Result<Option<Vec<u8>>, i64> {
     let mut list = IFACES.lock().unwrap();
     let Some(i) = list.iter_mut().find(|i| i.index == index) else {
         return if index == 1 { Ok(None) } else { Err(ENODEV) };
     };
-    if i.ipv4 == ip {
-        return Ok(None);
+    match i.ipv4.iter_mut().find(|a| a.0 == ip) {
+        Some(a) if a.1 == prefix => return Ok(None),
+        Some(a) => a.1 = prefix,
+        None => i.ipv4.push((ip, prefix)),
     }
-    let old = address_message(i);
-    i.ipv4 = ip;
-    if i.name == ETH {
-        IPV4_UP.store(ip.is_some(), std::sync::atomic::Ordering::Relaxed);
-    }
-    Ok(match ip {
-        Some(_) => address_message(i).map(|m| (true, m)),
-        None => old.map(|m| (false, m)),
-    })
+    refresh_eth(i);
+    Ok(Some(address_message(i, ip, prefix)))
 }
 
-/// RTM_NEWLINK: changes the flags `change` selects. The new link message, if they moved.
+/// Takes from interface `index` the first address that fits what's named, as
+/// inet_rtm_deladdr does. The message to announce.
+pub fn del_address(index: i32, local: Option<[u8; 4]>, network: Option<([u8; 4], u8)>) -> Result<Vec<u8>, i64> {
+    let mut list = IFACES.lock().unwrap();
+    let i = list.iter_mut().find(|i| i.index == index).ok_or(if index == 1 { EADDRNOTAVAIL } else { ENODEV })?;
+    let fits = |&(ip, prefix): &([u8; 4], u8)| {
+        local.is_none_or(|l| l == ip)
+            && network.is_none_or(|(n, p)| {
+                let mask = (!u32::MAX.checked_shr(p as u32).unwrap_or(0)) as u32;
+                p == prefix && u32::from_be_bytes(n) & mask == u32::from_be_bytes(ip) & mask
+            })
+    };
+    let at = i.ipv4.iter().position(fits).ok_or(EADDRNOTAVAIL)?;
+    let (ip, prefix) = i.ipv4.remove(at);
+    refresh_eth(i);
+    Ok(address_message(i, ip, prefix))
+}
+
+/// RTM_NEWLINK or SIOCSIFFLAGS: changes the flags `change` selects, all of them if it's
+/// 0, among those anyone may change. The new link message, if they moved.
 pub fn set_flags(index: i32, flags: u32, change: u32) -> Option<Vec<u8>> {
+    // IFF_DEBUG, NOTRAILERS, NOARP, PROMISC, ALLMULTI, MULTICAST, PORTSEL, AUTOMEDIA, DYNAMIC
+    const SETTABLE: u32 = IFF_UP | 0x4 | 0x20 | 0x80 | 0x100 | 0x200 | IFF_MULTICAST | 0x2000 | 0x4000 | 0x8000;
+    if flags == 0 && change == 0 {
+        return None;
+    }
+    let change = if change == 0 { SETTABLE } else { change & SETTABLE };
     let mut list = IFACES.lock().unwrap();
     let i = list.iter_mut().find(|i| i.index == index)?;
-    let new = (i.flags & !change) | (flags & change);
+    let mut new = (i.flags & !change) | (flags & change);
+    // There's no cable to look at: running is just being up.
+    new = if new & IFF_UP != 0 { new | IFF_RUNNING } else { new & !IFF_RUNNING };
     if new == i.flags {
         return None;
     }
     i.flags = new;
+    refresh_eth(i);
     if let Some(sys) = SYS.get() {
         publish_iface(sys.as_ref(), i);
     }
     Some(link_payload(i))
 }
 
+/// Whether `ip` is one of this device's own addresses on an interface other than lo.
+pub fn is_local_v4(ip: [u8; 4]) -> bool {
+    IFACES.lock().unwrap().iter().any(|i| i.flags & IFF_UP != 0 && i.ipv4.iter().any(|a| a.0 == ip))
+}
+
 /// Addresses for SIOCGIFCONF: each interface's IPv4 address, `lo`'s first.
 pub fn ipv4_addresses() -> Vec<(String, [u8; 4])> {
-    all().into_iter().filter_map(|i| i.ipv4.map(|(ip, _)| (i.name, ip))).collect()
+    all().into_iter().flat_map(|i| i.ipv4.iter().map(|&(ip, _)| (i.name.clone(), ip)).collect::<Vec<_>>()).collect()
 }
 
 /// The interface an RTM_GETLINK request names (by index, or IFLA_IFNAME).
@@ -354,7 +398,7 @@ pub fn ifreq_ioctl(cmd: u64, req: &mut [u8; 40]) -> Result<(), i64> {
             u[2..8].copy_from_slice(&i.mac);
         }
         SIOCGIFADDR | SIOCGIFNETMASK => {
-            let (ip, prefix) = i.ipv4.ok_or(EADDRNOTAVAIL)?;
+            let &(ip, prefix) = i.ipv4.first().ok_or(EADDRNOTAVAIL)?;
             u.fill(0);
             u[..2].copy_from_slice(&2u16.to_le_bytes()); // AF_INET
             let value = if cmd == SIOCGIFADDR { ip } else { (!u32::MAX.checked_shr(prefix as u32).unwrap_or(0)).to_be_bytes() };
@@ -363,9 +407,19 @@ pub fn ifreq_ioctl(cmd: u64, req: &mut [u8; 40]) -> Result<(), i64> {
         // netd clears an interface with this before configuring it.
         SIOCSIFADDR => {
             let ip: [u8; 4] = u[4..8].try_into().unwrap();
-            let address = if ip == [0; 4] { None } else { Some((ip, i.ipv4.map_or(24, |(_, p)| p))) };
-            if let Some((new, message)) = set_address(i.index, address)? {
-                super::netlink::announce_address(new, &message);
+            if i.index == 1 || i.ipv4.first().is_some_and(|a| a.0 == ip) {
+                return Ok(());
+            }
+            // 0 takes every address, and anything else replaces the primary one.
+            let prefix = i.ipv4.first().map_or(24, |a| a.1);
+            let gone = if ip == [0; 4] { i.ipv4.len() } else { i.ipv4.len().min(1) };
+            for _ in 0..gone {
+                super::netlink::announce_address(false, &del_address(i.index, None, None)?);
+            }
+            if ip != [0; 4]
+                && let Some(message) = add_address(i.index, ip, prefix)?
+            {
+                super::netlink::announce_address(true, &message);
             }
         }
         // Drivers answer for themselves, and there isn't one.
@@ -373,7 +427,9 @@ pub fn ifreq_ioctl(cmd: u64, req: &mut [u8; 40]) -> Result<(), i64> {
         // lo stays up at its MTU; others take what they are given.
         SIOCSIFFLAGS => {
             let flags = u16::from_le_bytes([u[0], u[1]]) as u32;
-            set(&|x| x.flags = (x.flags & !0xffff) | flags | if flags & IFF_UP != 0 { IFF_RUNNING } else { 0 });
+            if let Some(payload) = set_flags(i.index, flags, 0xffff) {
+                super::netlink::announce_link(&payload);
+            }
         }
         SIOCSIFMTU => {
             let mtu = u32::from_le_bytes(u[..4].try_into().unwrap());

@@ -20,7 +20,9 @@ const LAST_CONSOLE: u16 = 5584;
 /// commands for any device from anyone who can connect, with the host's key, and
 /// these are devices' own ports.
 pub fn reserved_host_port(port: u16) -> bool {
-    port == server_port() || (FIRST_CONSOLE..=LAST_CONSOLE + 1).contains(&port) || port == HOST_PORT.load(Ordering::Relaxed)
+    // A server on the usual port counts whatever this process was told about another.
+    let socket_port = std::env::var("ADB_SERVER_SOCKET").ok().and_then(|s| s.rsplit(':').next()?.parse().ok());
+    port == 5037 || port == server_port() || Some(port) == socket_port || (FIRST_CONSOLE..=LAST_CONSOLE + 1).contains(&port) || port == HOST_PORT.load(Ordering::Relaxed)
 }
 
 fn server_port() -> u16 {
@@ -132,5 +134,17 @@ fn refresh_key() {
         file.truncate(0);
         let _ = file.write_at(0, &key);
         *last = key;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_adb_server_and_device_ports_are_kept_from_guests() {
+        assert!(reserved_host_port(5037), "the usual server, whatever the environment says");
+        assert!(reserved_host_port(5554) && reserved_host_port(5585));
+        assert!(!reserved_host_port(5586) && !reserved_host_port(80) && !reserved_host_port(8080));
     }
 }

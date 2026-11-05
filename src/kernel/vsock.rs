@@ -89,6 +89,10 @@ pub fn offer(port: u32, io: Arc<Io>) -> Result<(), Arc<Io>> {
     Ok(())
 }
 
+/// A host service's name, and the most a message to or from a simple one can come to.
+const MAX_NAME: usize = 256;
+const MAX_MESSAGE: usize = 64 << 10;
+
 enum Service {
     Sensors(Sensors),
     /// Answers a list request with an empty list.
@@ -203,6 +207,11 @@ impl Vsock {
         if st.service.is_none() {
             let end = rest.iter().position(|&b| b == 0);
             st.name.extend_from_slice(&rest[..end.unwrap_or(rest.len())]);
+            if st.name.len() > MAX_NAME {
+                st.closed = true;
+                EVENTS.bump_key(Arc::as_ptr(self) as usize);
+                return Ok(data.len());
+            }
             let Some(end) = end else { return Ok(data.len()) };
             rest = &rest[end + 1..];
             let name = String::from_utf8_lossy(&st.name).into_owned();
@@ -224,31 +233,44 @@ impl Vsock {
         }
         st.inbuf.extend_from_slice(rest);
         if matches!(st.service, Some(Service::Misc)) {
-            while st.inbuf.len() >= 4 {
-                let len = u32::from_le_bytes(st.inbuf[..4].try_into().unwrap()) as usize;
-                if st.inbuf.len() - 4 < len {
+            let mut at = 0;
+            while st.inbuf.len() - at >= 4 {
+                let len = u32::from_le_bytes(st.inbuf[at..at + 4].try_into().unwrap()) as usize;
+                // Nonsense, or a client that isn't reading what it's sent: real messages
+                // are a few words, and answered before the next.
+                if len > MAX_MESSAGE || st.out.len() > MAX_MESSAGE {
+                    st.closed = true;
                     break;
                 }
-                st.inbuf.drain(..4 + len);
+                if st.inbuf.len() - at - 4 < len {
+                    break;
+                }
+                at += 4 + len;
                 st.out.extend(3u32.to_le_bytes());
                 st.out.extend(b"OK\0");
             }
+            st.inbuf.drain(..at);
             drop(st);
             EVENTS.bump_key(Arc::as_ptr(self) as usize);
             return Ok(data.len());
         }
         let mut start_stream = false;
-        while st.inbuf.len() >= 4 {
-            let len = std::str::from_utf8(&st.inbuf[..4]).ok().and_then(|h| usize::from_str_radix(h, 16).ok());
+        let mut at = 0;
+        while st.inbuf.len() - at >= 4 {
+            let len = std::str::from_utf8(&st.inbuf[at..at + 4]).ok().and_then(|h| usize::from_str_radix(h, 16).ok());
             let Some(len) = len else {
                 st.closed = true; // a binary-length frame, or garbage: hang up
                 break;
             };
-            if st.inbuf.len() < 4 + len {
+            if st.out.len() > MAX_MESSAGE && matches!(st.service, Some(Service::BootProperties)) {
+                st.closed = true; // asking over and over, and reading none of it
                 break;
             }
-            let msg = String::from_utf8_lossy(&st.inbuf[4..4 + len]).into_owned();
-            st.inbuf.drain(..4 + len);
+            if st.inbuf.len() - at - 4 < len {
+                break;
+            }
+            let msg = String::from_utf8_lossy(&st.inbuf[at + 4..at + 4 + len]).into_owned();
+            at += 4 + len;
             let State { service, out, .. } = &mut *st;
             match service {
                 Some(Service::Sensors(s)) => start_stream |= sensors_message(s, out, &msg),
@@ -257,6 +279,7 @@ impl Vsock {
                 _ => {}
             }
         }
+        st.inbuf.drain(..at);
         drop(st);
         if start_stream {
             stream(Arc::downgrade(self));
@@ -302,7 +325,7 @@ impl Vsock {
 fn read_stream(io: &Arc<Io>, t: &Thread, count: usize, nonblock: bool) -> Result<Vec<u8>, i64> {
     loop {
         let seen = EVENTS.watch_key(io.key());
-        match io.read(count) {
+        match io.read(count, false) {
             Err(EAGAIN) if !nonblock => {}
             r => return r,
         }
@@ -317,12 +340,15 @@ fn write_stream(io: &Arc<Io>, t: &Thread, data: &[u8], nonblock: bool) -> Result
     let mut done = 0;
     loop {
         let seen = EVENTS.watch_key(io.key());
-        match io.write(&data[done..]) {
+        match io.write(&data[done..], done > 0) {
             Ok(n) => {
                 done += n;
                 if done == data.len() {
                     return Ok(done);
                 }
+                // Look again: what's going out may have made room since. Only a sender
+                // that saw the queue full is sure of being told.
+                continue;
             }
             Err(EAGAIN) => {}
             Err(_) if done > 0 => return Ok(done),

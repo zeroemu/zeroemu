@@ -309,7 +309,11 @@ impl Kernel {
             self.exit_group(&th.proc, SIGKILL as i32, None);
             return;
         }
+        let blocked = th.mask.load(Ordering::Relaxed) & bit(sig) != 0;
         th.pending.lock().unwrap().insert(sig, info);
+        if blocked {
+            super::wait::EVENTS.bump_key(Arc::as_ptr(&th.proc) as usize); // a signalfd reader may be polling for it
+        }
         th.kick();
     }
 

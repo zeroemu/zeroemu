@@ -42,6 +42,13 @@ def sink(c):
     sink_done.set()
 
 
+def half_resets(c):
+    # Some bytes, time for them to arrive, then a reset.
+    c.sendall(b"x" * 100)
+    time.sleep(0.2)
+    c.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+
+
 def pieces(c):
     c.sendall(b"a" * 1000)
     time.sleep(0.1)
@@ -80,7 +87,8 @@ ports = [p for _, p in servers] + [free_port()]
 keep_sink = server(sink)
 keep_pieces = server(pieces)
 keep_adb = server(echo)
-ports += [keep_sink[1], keep_pieces[1], keep_adb[1]]
+keep_half = server(half_resets)
+ports += [keep_sink[1], keep_pieces[1], keep_adb[1], keep_half[1]]
 
 env = dict(os.environ, DROIDRT_GPU="fake", DROIDRT_NET="1", ANDROID_ADB_SERVER_PORT=str(keep_adb[1]))
 started = time.time()

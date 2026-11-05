@@ -14,6 +14,12 @@ typedef unsigned int u32;
 #define NR_sendfile 71
 #define NR_exit_group 94
 #define NR_eventfd2 19
+#define NR_timerfd_create 85
+#define NR_timerfd_settime 86
+#define NR_signalfd4 74
+#define NR_rt_sigprocmask 135
+#define NR_gettid 178
+#define NR_tkill 130
 #define NR_epoll_create1 20
 #define NR_epoll_ctl 21
 #define NR_epoll_pwait 22
@@ -187,6 +193,42 @@ int cmain(void) {
         sys(NR_write, pfd[1], "z", 1);
         check(sys(NR_ppoll, &pollep, 1, &zero, 0, 8) == 1, "until there's news");
         check(sys(NR_epoll_pwait, pe, out, 2, 0, 0, 8) == 1, "which polling didn't use up");
+
+        // A timer: one edge per expiry, read or not, and through a nested epoll too.
+        int te = (int)sys(NR_epoll_create1, 0), tfd = (int)sys(NR_timerfd_create, 1, 0);
+        struct { u32 events; u32 pad; u64 data; } tin = { 1u | 1u << 31, 0, 11 };
+        sys(NR_epoll_ctl, te, 1, tfd, &tin);
+        struct { i64 is, ins, vs, vns; } every = { 0, 20000000, 0, 20000000 };
+        sys(NR_timerfd_settime, tfd, 0, &every, 0);
+        check(sys(NR_epoll_pwait, te, out, 2, 2000, 0, 8) == 1, "a periodic timer under EPOLLET: an edge");
+        check(sys(NR_epoll_pwait, te, out, 2, 0, 0, 8) == 0, "unread and not yet due again: no report, not a spin");
+        check(sys(NR_epoll_pwait, te, out, 2, 2000, 0, 8) == 1, "the next expiry, unread: another");
+        int outer = (int)sys(NR_epoll_create1, 0);
+        struct { u32 events; u32 pad; u64 data; } oin = { 1u | 1u << 31, 0, 12 };
+        sys(NR_epoll_ctl, outer, 1, te, &oin);
+        check(sys(NR_epoll_pwait, outer, out, 2, 2000, 0, 8) == 1, "through a nested epoll: an edge");
+        check(sys(NR_epoll_pwait, te, out, 2, 2000, 0, 8) == 1, "drain the inner one");
+        check(sys(NR_epoll_pwait, outer, out, 2, 2000, 0, 8) == 1, "and the next expiry reaches the outer");
+        struct { i64 is, ins, vs, vns; } never = { 0, 0, 0, 0 };
+        sys(NR_timerfd_settime, tfd, 0, &never, 0);
+
+        // A signal for this one thread, waiting on a signalfd.
+        u64 usr1 = 1ul << 9;
+        sys(NR_rt_sigprocmask, 0, &usr1, 0, 8);
+        int sfd = (int)sys(NR_signalfd4, -1, &usr1, 8, 0);
+        int se = (int)sys(NR_epoll_create1, 0);
+        struct { u32 events; u32 pad; u64 data; } sin = { 1u | 1u << 31, 0, 13 };
+        sys(NR_epoll_ctl, se, 1, sfd, &sin);
+        check(sys(NR_epoll_pwait, se, out, 2, 0, 0, 8) == 0, "a signalfd under EPOLLET: nothing yet");
+        i64 me = sys(NR_gettid, 0);
+        sys(NR_tkill, me, 10);
+        check(sys(NR_epoll_pwait, se, out, 2, 0, 0, 8) == 1, "a signal to this thread: an edge");
+        char sinfo[128];
+        sys(NR_read, sfd, sinfo, 128);
+        sys(NR_tkill, me, 10);
+        check(sys(NR_epoll_pwait, se, out, 2, 0, 0, 8) == 1, "another, after reading the first: another");
+        sys(NR_read, sfd, sinfo, 128);
+        sys(NR_rt_sigprocmask, 1, &usr1, 0, 8);
 
         struct { u32 events; u32 pad; u64 data; } lvl = { 1, 0, 99 };
         int le = (int)sys(NR_epoll_create1, 0);

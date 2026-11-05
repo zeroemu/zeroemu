@@ -7,12 +7,24 @@
 
 use super::wait::EVENTS;
 use crate::errno::*;
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
+
+/// A connect can't be cancelled, so a dropped SYN holds a thread for a minute or more,
+/// whether or not the socket's still open. Without these an app connecting to somewhere
+/// that doesn't answer could use up the host's threads, which everything needs.
+const MAX_CONNECTING_PER_UID: usize = 512;
+const MAX_CONNECTING: usize = 1024;
+static CONNECTING: std::sync::Mutex<BTreeMap<u32, usize>> = std::sync::Mutex::new(BTreeMap::new());
+
+/// How long a closed socket's queued bytes wait for a peer that isn't reading. Linux
+/// bounds this too. A write timeout isn't an option: on Windows it leaves the socket
+/// undefined, and write_all would lose count anyway.
+const ORPHAN: Duration = Duration::from_secs(60);
 
 /// Bytes queued each way. Past this the guest gets EAGAIN or sleeps, and the host's
 /// sender finds the connection's window closed.
@@ -83,7 +95,10 @@ struct State {
     connecting: bool,
     nodelay: bool,
     stream: Option<Arc<TcpStream>>,
+    /// The writing thread is running.
     writing: bool,
+    /// It has bytes that aren't in `tx` any more, in a host call.
+    sending: bool,
 }
 
 pub struct Io {
@@ -112,7 +127,9 @@ impl Io {
     }
 
     /// Up to `max` bytes; empty at the end of the stream; EAGAIN if there is nothing yet.
-    pub fn read(self: &Arc<Self>, max: usize) -> Result<Vec<u8>, i64> {
+    /// `keep_err`: a call that's already got something to return leaves an error for
+    /// the next, rather than clearing it for one that won't report it.
+    pub fn read(self: &Arc<Self>, max: usize, keep_err: bool) -> Result<Vec<u8>, i64> {
         let mut st = self.st.lock().unwrap();
         if !st.rx.is_empty() {
             let n = max.min(st.rx.len());
@@ -121,7 +138,7 @@ impl Io {
             self.pumps.notify_all();
             return Ok(out);
         }
-        Self::nothing_to_read(&mut st)
+        Self::nothing_to_read(&mut st, keep_err)
     }
 
     /// As `read`, leaving the bytes where they are.
@@ -130,13 +147,21 @@ impl Io {
         if !st.rx.is_empty() {
             return Ok(st.rx.iter().take(max).copied().collect());
         }
-        Self::nothing_to_read(&mut st)
+        Self::nothing_to_read(&mut st, false)
+    }
+
+    /// Nothing more will come: no reason for a reader who wants more than there is to wait.
+    pub fn ended(&self) -> bool {
+        let st = self.st.lock().unwrap();
+        st.rx_eof || st.shut_rd || st.err != 0
     }
 
     /// With no data left: the error if there is one, once, then the end of the stream.
-    fn nothing_to_read(st: &mut State) -> Result<Vec<u8>, i64> {
-        if st.err != 0 {
-            return Err(std::mem::take(&mut st.err));
+    /// Only at the end of it: a failed send mustn't hide what the reader thread has yet
+    /// to bring in, like a reply sent before a reset.
+    fn nothing_to_read(st: &mut State, keep_err: bool) -> Result<Vec<u8>, i64> {
+        if st.err != 0 && st.rx_eof {
+            return Err(if keep_err { st.err } else { std::mem::take(&mut st.err) });
         }
         if st.rx_eof || st.shut_rd {
             return Ok(Vec::new());
@@ -146,10 +171,13 @@ impl Io {
 
     /// How much `write` would take now; an error if none ever will; EAGAIN if it's not
     /// connected yet. No bytes need copying from the guest to find out.
-    pub fn room(&self) -> Result<usize, i64> {
-        let mut st = self.st.lock().unwrap();
+    pub fn room(&self, keep_err: bool) -> Result<usize, i64> {
+        Self::room_in(&mut self.st.lock().unwrap(), keep_err)
+    }
+
+    fn room_in(st: &mut State, keep_err: bool) -> Result<usize, i64> {
         if st.err != 0 {
-            return Err(std::mem::take(&mut st.err));
+            return Err(if keep_err { st.err } else { std::mem::take(&mut st.err) });
         }
         if st.dead || st.shut_wr {
             return Err(EPIPE);
@@ -161,13 +189,12 @@ impl Io {
     }
 
     /// As many bytes as there is room for; EAGAIN for none; EPIPE if they can't go.
-    pub fn write(self: &Arc<Self>, data: &[u8]) -> Result<usize, i64> {
-        let room = self.room()?;
-        let n = data.len().min(room);
+    pub fn write(self: &Arc<Self>, data: &[u8], keep_err: bool) -> Result<usize, i64> {
+        let mut st = self.st.lock().unwrap();
+        let n = data.len().min(Self::room_in(&mut st, keep_err)?);
         if n == 0 {
             return if data.is_empty() { Ok(0) } else { Err(EAGAIN) };
         }
-        let mut st = self.st.lock().unwrap();
         st.tx.extend(&data[..n]);
         self.ensure_writer(&mut st)?;
         drop(st);
@@ -209,7 +236,8 @@ impl Io {
         if st.tx.len() < WRITABLE || st.dead || st.shut_wr {
             r |= POLLOUT;
         }
-        if st.dead || (st.rx_eof && st.shut_wr) {
+        // Each way shut, by this end or the other.
+        if st.dead || (st.shut_wr && (st.rx_eof || st.shut_rd)) {
             r |= POLLHUP;
         }
         if st.err != 0 {
@@ -269,13 +297,29 @@ impl Io {
     }
 
     /// The guest's last close: what is queued goes out, then the connection closes.
-    pub fn close(&self) {
+    pub fn close(self: &Arc<Self>) {
+        self.close_within(ORPHAN);
+    }
+
+    fn close_within(self: &Arc<Self>, limit: Duration) {
         let mut st = self.st.lock().unwrap();
         st.closed = true;
-        if !st.writing
-            && let Some(stream) = &st.stream
-        {
-            let _ = stream.shutdown(Shutdown::Both); // wakes the reader
+        if let Some(stream) = st.stream.clone() {
+            if !st.writing {
+                let _ = stream.shutdown(Shutdown::Both); // wakes the reader
+            } else if st.sending || !st.tx.is_empty() {
+                // The writing thread could be in a host call for as long as the peer
+                // doesn't read. If it hasn't finished in time, cut it off. An idle one
+                // is about to see `closed`, so this only costs a thread when it matters.
+                let io = self.clone();
+                let _ = std::thread::Builder::new().name("hostio-reap".into()).stack_size(STACK).spawn(move || {
+                    let st = io.st.lock().unwrap();
+                    let (_st, wait) = io.pumps.wait_timeout_while(st, limit, |st| st.writing).unwrap();
+                    if wait.timed_out() {
+                        let _ = stream.shutdown(Shutdown::Both);
+                    }
+                });
+            }
         }
         drop(st);
         self.pumps.notify_all();
@@ -288,6 +332,8 @@ impl Io {
         st.tx.clear();
         st.dead = true;
         st.rx_eof = true;
+        // A thread sleeping in connect() on this hears now. The one making it is ignored.
+        st.connecting = false;
         if let Some(stream) = &st.stream {
             let _ = stream.shutdown(Shutdown::Both);
         }
@@ -313,8 +359,25 @@ impl Io {
     }
 
     /// Connects to `to` in the background; link() says how it went. Nothing can cancel
-    /// this: a socket closed meanwhile leaves the thread until the connect ends.
-    pub fn connect(self: &Arc<Self>, to: SocketAddr, timeout: Duration, nodelay: bool) -> std::io::Result<()> {
+    /// this: a socket closed meanwhile leaves the thread until the connect ends. ENOBUFS
+    /// if `uid` or everybody has too many going.
+    pub fn connect(self: &Arc<Self>, to: SocketAddr, timeout: Duration, nodelay: bool, uid: u32) -> Result<(), i64> {
+        {
+            let mut going = CONNECTING.lock().unwrap();
+            if going.values().sum::<usize>() >= MAX_CONNECTING || going.get(&uid).is_some_and(|&n| n >= MAX_CONNECTING_PER_UID) {
+                return Err(ENOBUFS);
+            }
+            *going.entry(uid).or_default() += 1;
+        }
+        let finished = move || {
+            let mut going = CONNECTING.lock().unwrap();
+            if let Some(n) = going.get_mut(&uid) {
+                *n -= 1;
+                if *n == 0 {
+                    going.remove(&uid);
+                }
+            }
+        };
         {
             let mut st = self.st.lock().unwrap();
             st.connecting = true;
@@ -323,12 +386,15 @@ impl Io {
         let io = self.clone();
         let spawned = std::thread::Builder::new().name("hostio-connect".into()).stack_size(STACK).spawn(move || {
             let result = TcpStream::connect_timeout(&to, timeout);
+            finished();
             io.connected(result);
         });
         if spawned.is_err() {
+            finished();
             self.st.lock().unwrap().connecting = false;
+            return Err(ENOBUFS);
         }
-        spawned.map(|_| ())
+        Ok(())
     }
 
     fn connected(self: &Arc<Self>, result: std::io::Result<TcpStream>) {
@@ -382,14 +448,10 @@ impl Io {
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(e) => break Some(e),
                 Ok(n) => {
-                    let mut st = self.st.lock().unwrap();
-                    let was_empty = st.rx.is_empty();
-                    st.rx.extend(&buf[..n]);
-                    drop(st);
-                    // Each guest waiting has seen an empty queue.
-                    if was_empty {
-                        self.changed();
-                    }
+                    self.st.lock().unwrap().rx.extend(&buf[..n]);
+                    // Every time, not only when it was empty. An edge-triggered reader
+                    // is told of each arrival, as on Linux, and can leave some unread.
+                    self.changed();
                 }
             }
         };
@@ -416,12 +478,17 @@ impl Io {
                     st = self.pumps.wait(st).unwrap();
                 }
                 if st.dead {
+                    st.writing = false;
+                    drop(st);
+                    self.pumps.notify_all();
                     return;
                 }
                 if st.tx.is_empty() {
                     if st.closed {
+                        st.writing = false;
                         drop(st);
                         let _ = stream.shutdown(Shutdown::Both); // wakes the reader
+                        self.pumps.notify_all();
                         return;
                     }
                     drop(st);
@@ -432,26 +499,76 @@ impl Io {
                 let before = st.tx.len();
                 let n = before.min(CHUNK);
                 let chunk = st.tx.drain(..n).collect();
+                st.sending = true;
                 drop(st);
                 // Only when it matters: a sender sleeps with the queue full, and poll
                 // goes by the mark. Each wakeup costs a look at every guest thread.
-                if before == LIMIT || (before >= WRITABLE && before - n < WRITABLE) {
+                if before >= LIMIT || (before >= WRITABLE && before - n < WRITABLE) {
                     self.changed();
                 }
                 chunk
             };
-            if let Err(e) = (&mut &*stream).write_all(&chunk) {
-                let mut st = self.st.lock().unwrap();
+            let sent = (&mut &*stream).write_all(&chunk);
+            let mut st = self.st.lock().unwrap();
+            st.sending = false;
+            if let Err(e) = sent {
                 if !st.closed && !st.dead {
                     st.err = linux_errno(&e);
                 }
+                // Not the end of the input: the reader thread may have a reply to bring
+                // in, and it's the one to say so. A socket this broken wakes it.
                 st.dead = true;
-                st.rx_eof = true;
                 st.tx.clear();
+                st.writing = false;
                 drop(st);
+                self.pumps.notify_all();
                 self.changed();
                 return;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::TcpListener;
+
+    #[test]
+    fn a_closed_socket_gives_up_on_a_peer_that_wont_read() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (_peer, _) = listener.accept().unwrap(); // never read
+        let io = Io::new();
+        io.attach(client).unwrap();
+        // Enough to fill the host's buffers, then the queue.
+        let chunk = vec![0u8; CHUNK];
+        let start = std::time::Instant::now();
+        loop {
+            match io.write(&chunk, false) {
+                Ok(_) => {}
+                Err(EAGAIN) if io.st.lock().unwrap().sending => break,
+                Err(EAGAIN) => std::thread::sleep(Duration::from_millis(1)),
+                Err(e) => panic!("write: {e}"),
+            }
+            assert!(start.elapsed() < Duration::from_secs(20), "the writer never blocked");
+        }
+        io.close_within(Duration::from_millis(50));
+        let start = std::time::Instant::now();
+        while io.st.lock().unwrap().writing {
+            assert!(start.elapsed() < Duration::from_secs(10), "the writer is still stuck");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn connects_in_progress_are_limited() {
+        // Nothing listens, but they all fail fast: what matters is the count, from a uid
+        // nothing else here uses.
+        const UID: u32 = 4_000_000;
+        CONNECTING.lock().unwrap().insert(UID, MAX_CONNECTING_PER_UID);
+        let refused = Io::new().connect(SocketAddr::from(([127, 0, 0, 1], 9)), Duration::from_secs(1), false, UID);
+        CONNECTING.lock().unwrap().remove(&UID);
+        assert_eq!(refused, Err(ENOBUFS));
     }
 }

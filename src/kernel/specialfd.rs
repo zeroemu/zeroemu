@@ -87,6 +87,8 @@ impl EventFd {
 const TFD_TIMER_ABSTIME: u64 = 1;
 
 struct TimerState {
+    /// Times it has fired, read or not, and whatever settime did.
+    fired: u64,
     next: Option<Instant>,
     interval: Duration,
     expirations: u64,
@@ -135,7 +137,7 @@ impl TimerFd {
         if !matches!(clock, 0 | 1 | 7 | 8 | 9) {
             return Err(EINVAL);
         }
-        Ok(TimerFd { clock, boot, st: Mutex::new(TimerState { next: None, interval: Duration::ZERO, expirations: 0 }) })
+        Ok(TimerFd { clock, boot, st: Mutex::new(TimerState { fired: 0, next: None, interval: Duration::ZERO, expirations: 0 }) })
     }
 
     fn tick(st: &mut TimerState) {
@@ -144,6 +146,7 @@ impl TimerFd {
         if now < next {
             return;
         }
+        st.fired = st.fired.wrapping_add(1);
         if st.interval.is_zero() {
             st.expirations += 1;
             st.next = None;
@@ -159,6 +162,14 @@ impl TimerFd {
         let mut st = self.st.lock().unwrap();
         Self::tick(&mut st);
         st.expirations > 0
+    }
+
+    /// A number that moves each time it fires, for an edge-triggered epoll: nothing
+    /// announces that a timer has come due.
+    pub fn fired(&self) -> u64 {
+        let mut st = self.st.lock().unwrap();
+        Self::tick(&mut st);
+        st.fired
     }
 
     /// When this timer next fires (bounds how long a poll may sleep).

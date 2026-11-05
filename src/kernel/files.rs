@@ -8,6 +8,7 @@ use super::netlink::{self, Netlink};
 use super::specialfd::{EventFd, SignalFd, TimerFd};
 use super::unix::{self, Socket};
 use super::wait::EVENTS;
+use std::sync::OnceLock;
 use super::inet;
 use super::inotify;
 use super::{ERESTARTSYS, IDLE, Kernel, Thread, int};
@@ -152,11 +153,13 @@ pub struct BlockOpen {
 pub struct File {
     pub kind: Kind,
     flags: AtomicU32,
+    /// O_RDONLY, O_WRONLY or O_RDWR, if open(2) made this.
+    opened_for: OnceLock<u32>,
 }
 
 impl File {
     pub(super) fn new(kind: Kind, flags: u32) -> Arc<File> {
-        Arc::new(File { kind, flags: AtomicU32::new(flags) })
+        Arc::new(File { kind, flags: AtomicU32::new(flags), opened_for: OnceLock::new() })
     }
 
     /// The inode advisory locks are on. Every BPF fd shares one, as Linux's
@@ -805,10 +808,10 @@ impl Kernel {
                         // bionic's fdopen goes by this: it refuses "r+" on a descriptor
                         // that's not O_RDWR, and a socket always is. getaddrinfo needs that.
                         let acc = match &f.kind {
+                            _ if f.opened_for.get().is_some() => *f.opened_for.get().unwrap(),
                             Kind::Stdout | Kind::Stderr => O_WRONLY,
                             Kind::Pipe(p) if p.write => O_WRONLY,
-                            Kind::Mem(m) if m.readable && m.writable => O_RDWR,
-                            Kind::Mem(m) if m.writable => O_WRONLY,
+                            Kind::Mem(m) if m.writable => O_RDWR, // made, not opened: a memfd
                             Kind::Socket(_) | Kind::Netlink(_) | Kind::Inet(_) | Kind::Vsock(_) | Kind::Event(_) | Kind::Timer(_) | Kind::Signal(_) | Kind::Epoll(_) | Kind::Pty(_) | Kind::Binder(_) => O_RDWR,
                             _ => 0,
                         };
@@ -1242,7 +1245,9 @@ impl Kernel {
             _ if access != 0 => return Err(EROFS),
             _ => Kind::Node(NodeFile::open(vfs, node, stat, false)),
         };
-        t.files().alloc(File::new(kind, status), cloexec, 0)
+        let file = File::new(kind, status);
+        let _ = file.opened_for.set(access);
+        t.files().alloc(file, cloexec, 0)
     }
 
     /// (directory, final name) of a path relative to `dirfd`.

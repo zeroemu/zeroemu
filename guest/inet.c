@@ -127,6 +127,7 @@ __asm__(".global _start\n_start:\n bl cstart\n");
 #define EISCONN 106
 #define EOPNOTSUPP 95
 #define NR_fchown 55
+#define NR_openat 56
 #define NR_fcntl 25
 #define NR_memfd_create 279
 #define NR_getsockopt 209
@@ -187,6 +188,9 @@ int cmain(void) {
     check(sys(NR_fcntl, blocking_not, 3, 0) == (2 | SOCK_NONBLOCK), "with O_NONBLOCK alongside");
     int mem = (int)sys(NR_memfd_create, "x", 0);
     check(sys(NR_fcntl, mem, 3, 0) == 2, "and any file open for both");
+    int wnull = (int)sys(NR_openat, -100, "/dev/null", 1, 0), rnull = (int)sys(NR_openat, -100, "/dev/null", 0, 0), rwnull = (int)sys(NR_openat, -100, "/dev/null", 2, 0);
+    check(sys(NR_fcntl, wnull, 3, 0) == 1 && sys(NR_fcntl, rnull, 3, 0) == 0 && sys(NR_fcntl, rwnull, 3, 0) == 2, "a device says how it was opened");
+    check(sys(NR_fcntl, wnull, 4, SOCK_NONBLOCK) == 0 && sys(NR_fcntl, wnull, 3, 0) == (1 | SOCK_NONBLOCK), "and F_SETFL doesn't change that");
 
     // ---- which sockets there are
     check(sys(NR_socket, AF_INET, SOCK_STREAM, 17) == -EPROTONOSUPPORT, "a stream socket for UDP: EPROTONOSUPPORT");

@@ -37,6 +37,7 @@ arm64 Android on Apple Silicon and Windows on ARM, x86_64 Android on x86_64 PCs.
 | M4: SurfaceFlinger, with Android's graphics stack unmodified on a virtio-gpu device backed by the Android Emulator's gfxstream renderer | done (macOS) |
 | M5: zygote, ART, `system_server`, launcher, apps | done (macOS): Android 16's Pixel launcher in the window about 24 s after start on a first boot and about 11 s after that |
 | M6: input from the window | done (macOS): mouse as touch, scroll as a finger drag, keyboard; Chrome and Play Store open and draw from a tap |
+| Network | done for what a browser needs (macOS): Android validates the network, Chrome loads HTTP and HTTPS sites. No UDP beyond DNS yet: see below |
 | Smoothness | in progress: see below |
 | Windows | no window and never run; compiles (`cargo check --target x86_64-pc-windows-msvc`) |
 
@@ -55,8 +56,20 @@ jobs, `trap`, and `kill` all work. 40 rounds of `$(ls /system/bin | wc -l)`
 
 Known gaps:
 
-- No network: AF_INET sockets exist, for netd's iptables, but connecting fails as
-  on a device with no route. Netlink answers like a machine with no interfaces.
+- The network has no packets. Guest sockets connect to host sockets directly, so
+  what depends on seeing traffic doesn't apply: `VpnService` (a VPN app's traffic goes
+  straight out while Android believes it's tunnelled), packet capture, and per-app
+  firewalling. An app without the INTERNET permission still gets out. A background
+  restriction can block an app's DNS while its TCP still works.
+- 10.0.2.2 is the host's loopback for every app on the device, as on the emulator,
+  except for the adb server and devices' own ports.
+- UDP only reaches the name server for now, so sites offering QUIC use TCP; sockets on
+  the device can't yet reach each other over loopback; and there's no IPv6, no ICMP
+  (`ping` resolves and never hears back) and no incoming connections.
+- The name server answers from the host's resolver: A records only, with a made-up TTL,
+  no CNAMEs or HTTPS records, and every failure is SERVFAIL.
+- Android thinks eth1 is unmetered, so Google's services download what they like once
+  it's up, into a `/data` that's saved whole.
 - `/data` is only saved at a clean exit, and held in memory while running. A kill or
   a crash loses what happened since the last boot's save.
 - userfaultfd has only what ART's compacting collector uses: SIGBUS mode, on private
@@ -101,6 +114,7 @@ cargo run --release -- --system $IMG /system/bin/sh      # Android's mksh, readi
 cargo run --release -- --system $IMG --ls /system/bin    # inspect the image without running anything
 ./scripts/test-android.sh                                # end-to-end checks against the image
 ./scripts/test-net.py                                    # host connections, from the host side
+./scripts/test-tcp.py                                    # guest sockets, against real servers on the host
 ./scripts/test-adb.sh                                    # boots, and uses real adb against it
 ```
 
@@ -127,6 +141,10 @@ next pair of ports free. adbd keeps its RSA check, and the key in `~/.android/ad
 is offered as `/adb_keys`, so the user's own adb is authorized and no other is. Guest
 networking isn't involved. `--adb-port <port>` picks the port and `--no-adb` turns this off.
 
+A device has a network, as `eth1` at 10.0.2.15 with the name server at 10.0.2.3. It's a
+NAT without packets: a guest's sockets and ports are its own, and a host socket appears
+only when a connection really goes out. `--no-net` leaves the network out altogether.
+
 In the window, the mouse is a finger and scrolling drags one (a person's flick
 becomes a fling). F1 is Home, Escape is Back, F2 is recent apps.
 
@@ -152,6 +170,9 @@ for tests that must not touch the host's mouse: `down X Y`, `move X Y`, `up X Y`
 `shot PATH`, which writes the frame on show as a BMP. `DROIDRT_GPU_STATS=1` prints
 the display's frame rate and black frames every five seconds, and
 `DROIDRT_SCHED_TRACE=1` each change in a thread's host priority.
+`DROIDRT_NET_TRACE=1` logs each network socket call and where connections go.
+`DROIDRT_SYSCOUNT=1` adds to each thread dump what each thread has called since the
+last, which finds a thread in a loop: send `SIGUSR1` twice, a few seconds apart.
 `DROIDRT_DRM_TRACE=1` logs GPU ioctls, transfers and fences;
 `DROIDRT_GPU_LOG=<E|W|I|D>` shows the renderer's own log; `DROIDRT_SAVE_FRAMES=<dir>`
 and `DROIDRT_DUMP_RES=<dir>` save displayed frames and GPU buffers as raw pixels.

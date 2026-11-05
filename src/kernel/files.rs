@@ -694,9 +694,26 @@ impl Kernel {
                 Ok(0)
             }
             faccessat | faccessat2 => {
-                let path = t.proc.mm().read_cstr(a[1])?;
-                let node = self.resolve(t, int(a[0]), &path, true)?;
-                if a[2] & 2 != 0 && !self.vfs()?.writable(&node) { Err(EROFS) } else { Ok(0) } // W_OK
+                const AT_EACCESS: u64 = 0x200;
+                let flags = if no == faccessat2 { a[3] } else { 0 };
+                if a[2] & !7 != 0 {
+                    return Err(EINVAL);
+                }
+                let node = self.target(t, int(a[0]), a[1], flags)?;
+                let vfs = self.vfs()?;
+                if a[2] & 2 != 0 && !vfs.writable(&node) {
+                    return Err(EROFS);
+                }
+                // Files and directories answer as Linux would. ART refuses to load a
+                // dex file its app could write, and only this tells it the app can't.
+                // Kernel files and device nodes keep their synthetic modes out of it:
+                // nothing has set those up for their real owners.
+                let st = vfs.stat(&node)?;
+                let real = matches!(vfs.fs_type(&node), "tmpfs" | "ext4" | "erofs") && matches!(st.mode & S_IFMT, S_IFREG | S_IFDIR);
+                if real && !self.creds(t).may_access(&st, a[2] as u32, flags & AT_EACCESS != 0) {
+                    return Err(EACCES);
+                }
+                Ok(0)
             }
             readlinkat => self.readlinkat(t, int(a[0]), a[1], a[2], a[3]),
             getdents64 => self.getdents64(t, int(a[0]), a[1], a[2]),
@@ -1091,6 +1108,7 @@ impl Kernel {
                     let (dir, name) = self.parent(t, dirfd, &path)?;
                     match self.vfs()?.create(&dir, &name, S_IFREG | (mode as u32 & 0o7777 & !t.proc.umask.load(Ordering::Relaxed)), 0) {
                         Ok(node) => {
+                            self.init_owner(t, &dir, &node);
                             inotify::notify(&inotify::join(&dir.path, &name), inotify::IN_CREATE, 0);
                             break node;
                         }
@@ -1164,6 +1182,23 @@ impl Kernel {
         self.vfs()?.resolve_parent(&base, path)
     }
 
+    /// A new node belongs to its creator; a set-gid directory passes on its group,
+    /// and to subdirectories the bit itself (inode_init_owner).
+    fn init_owner(&self, t: &Thread, dir: &Node, node: &Node) {
+        const S_ISGID: u32 = 0o2000;
+        let Ok(vfs) = self.vfs() else { return };
+        let (Ok(parent), Ok(new)) = (vfs.stat(dir), vfs.stat(node)) else { return };
+        let c = self.creds(t);
+        let inherits = parent.mode & S_ISGID != 0;
+        let gid = if inherits { parent.gid } else { c.fsgid };
+        if (c.fsuid, gid) != (new.uid, new.gid) {
+            let _ = vfs.set_attr(node, None, Some((c.fsuid, gid)), None);
+        }
+        if inherits && new.mode & S_IFMT == S_IFDIR {
+            let _ = vfs.set_attr(node, Some(new.mode & 0o7777 | S_ISGID), None, None);
+        }
+    }
+
     /// The node a path-or-fd syscall (fchmodat, utimensat…) refers to.
     pub(super) fn target(&self, t: &Thread, dirfd: i64, path: u64, flags: u64) -> Result<Node, i64> {
         let p = if path == 0 { String::new() } else { t.proc.mm().read_cstr(path)? };
@@ -1196,11 +1231,13 @@ impl Kernel {
                 let path = t.proc.mm().read_cstr(a[1])?;
                 let (dir, name) = self.parent(t, int(a[0]), &path)?;
                 let mask = t.proc.umask.load(Ordering::Relaxed);
-                if no == mkdirat {
+                let node = if no == mkdirat {
                     vfs.mkdir(&dir, &name, a[2] as u32 & !mask)?;
+                    vfs.resolve(&dir.path, &name, false)?
                 } else {
-                    vfs.create(&dir, &name, a[2] as u32 & !mask, a[3])?;
-                }
+                    vfs.create(&dir, &name, a[2] as u32 & !mask, a[3])?
+                };
+                self.init_owner(t, &dir, &node);
                 let isdir = if no == mkdirat { inotify::IN_ISDIR } else { 0 };
                 inotify::notify(&inotify::join(&dir.path, &name), inotify::IN_CREATE | isdir, 0);
                 Ok(0)
@@ -1222,6 +1259,7 @@ impl Kernel {
                 let path = t.proc.mm().read_cstr(a[2])?;
                 let (dir, name) = self.parent(t, int(a[1]), &path)?;
                 vfs.symlink(&dir, &name, &target)?;
+                self.init_owner(t, &dir, &vfs.resolve(&dir.path, &name, false)?);
                 inotify::notify(&inotify::join(&dir.path, &name), inotify::IN_CREATE, 0);
                 Ok(0)
             }

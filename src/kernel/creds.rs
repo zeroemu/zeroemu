@@ -8,6 +8,7 @@
 use super::{Kernel, Thread};
 use crate::arch::Sysno;
 use crate::errno::*;
+use crate::vfs::{S_IFDIR, S_IFMT, Stat};
 use std::sync::Arc;
 
 pub const CAP_LAST_CAP: u32 = 40;
@@ -68,6 +69,38 @@ impl Creds {
 
     pub fn capable(&self, cap: u32) -> bool {
         self.eff & 1 << cap != 0
+    }
+
+    /// access(2) for a file with attributes `st`; `want` is R_OK|W_OK|X_OK. Unlike
+    /// open, it asks about the real ids, whose only capabilities are root's,
+    /// unless `effective` (AT_EACCESS).
+    pub fn may_access(&self, st: &Stat, want: u32, effective: bool) -> bool {
+        const NO_SETUID_FIXUP: u32 = 1 << 2;
+        const DAC_OVERRIDE: u64 = 1 << 1;
+        const DAC_READ_SEARCH: u64 = 1 << 2;
+        let (uid, gid, caps) = if effective {
+            (self.fsuid, self.fsgid, self.eff)
+        } else if self.secure(NO_SETUID_FIXUP) {
+            (self.uid, self.gid, self.eff)
+        } else {
+            (self.uid, self.gid, if self.uid == 0 { self.prm } else { 0 })
+        };
+        let class = if st.uid == uid {
+            st.mode >> 6
+        } else if st.gid == gid || self.groups.contains(&st.gid) {
+            st.mode >> 3
+        } else {
+            st.mode
+        };
+        if want & !class & 7 == 0 {
+            return true;
+        }
+        let dir = st.mode & S_IFMT == S_IFDIR;
+        // Even DAC_OVERRIDE only runs what something could run.
+        if caps & DAC_OVERRIDE != 0 && (want & 1 == 0 || dir || st.mode & 0o111 != 0) {
+            return true;
+        }
+        caps & DAC_READ_SEARCH != 0 && want & !(4 | if dir { 1 } else { 0 }) == 0
     }
 
     fn secure(&self, bit: u32) -> bool {

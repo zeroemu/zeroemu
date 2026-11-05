@@ -14,6 +14,13 @@ typedef unsigned short u16;
 #define NR_ioprio_set 30
 #define NR_ioprio_get 31
 #define NR_fcntl 25
+#define NR_mkdirat 34
+#define NR_symlinkat 36
+#define NR_faccessat 48
+#define NR_fchmodat 53
+#define NR_fchownat 54
+#define NR_newfstatat 79
+#define NR_faccessat2 439
 #define NR_dup3 24
 #define NR_openat 56
 #define NR_close 57
@@ -793,6 +800,75 @@ static void cross_cred(void) {
     sys(NR_close, q[1]);
 }
 
+// access(2) goes by the mode and the real ids. ART refuses to load a dex file the
+// app could write, so a read-only file has to look read-only to its owner.
+static void file_access(void) {
+    enum { R = 4, W = 2, X = 1, AT_EACCESS = 0x200 };
+    #define ACC(mode) sys(NR_faccessat, -100, "/tmp/acc/f", mode)
+    char st[128];
+    #define ST_UID (*(unsigned *)(st + 24))
+    #define ST_GID (*(unsigned *)(st + 28))
+    i64 mid = fork_();
+    if (mid == 0) {
+        failures = 0;
+        check(sys(NR_mkdirat, -100, "/tmp/acc", 0777) == 0 && sys(NR_fchmodat, -100, "/tmp/acc", 0777) == 0, "a directory anyone can use");
+        sys(NR_setresgid, 500, 500, 500);
+        sys(NR_setresuid, 1000, 1000, 1000);
+        int fd = (int)sys(NR_openat, -100, "/tmp/acc/f", 0101 /* O_WRONLY|O_CREAT */, 0644);
+        check(fd >= 0, "unprivileged create");
+        sys(NR_close, fd);
+        sys(NR_newfstatat, -100, "/tmp/acc/f", st, 0);
+        check(ST_UID == 1000 && ST_GID == 500, "a new file belongs to its creator");
+        check(ACC(R | W) == 0 && ACC(X) == -EACCES && ACC(0) == 0, "owner of 0644: read and write, no execute");
+        check(sys(NR_fchmodat, -100, "/tmp/acc/f", 0444) == 0 && ACC(W) == -EACCES && ACC(R) == 0, "owner of 0444 can't write it");
+        check(sys(NR_faccessat, -100, "/tmp/acc/f", 8) == -EINVAL, "unknown access bits: EINVAL");
+        check(sys(NR_fchmodat, -100, "/tmp/acc/f", 0060) == 0 && ACC(R) == -EACCES, "the owner class decides, even with less than the group");
+        check(sys(NR_mkdirat, -100, "/tmp/acc/d", 0755) == 0 && sys(NR_newfstatat, -100, "/tmp/acc/d", st, 0) == 0 && ST_UID == 1000 && ST_GID == 500, "a new directory too");
+        check(sys(NR_symlinkat, "f", -100, "/tmp/acc/l") == 0 && sys(NR_newfstatat, -100, "/tmp/acc/l", st, 0x100) == 0 && ST_UID == 1000, "a new symlink too");
+        check(sys(NR_faccessat, -100, "/tmp/acc/d", W | X) == 0, "owner of a directory");
+        exit_(failures);
+    }
+    child_passed(mid);
+    check(sys(NR_fchmodat, -100, "/tmp/acc/f", 0640) == 0, "group can read, others nothing");
+    mid = fork_();
+    if (mid == 0) {
+        failures = 0;
+        unsigned g[1] = { 500 };
+        check(ACC(R | W) == 0 && ACC(X) == -EACCES, "root reads and writes anything, runs only what's executable");
+        check(sys(NR_fchmodat, -100, "/tmp/acc/f", 0740) == 0 && ACC(X) == 0 && sys(NR_fchmodat, -100, "/tmp/acc/f", 0640) == 0, "root runs a file with an x bit");
+        sys(NR_setgroups, 1, g);
+        sys(NR_setresgid, 501, 501, 501);
+        sys(NR_setresuid, 2000, 2000, 2000);
+        check(ACC(R) == 0 && ACC(W) == -EACCES, "a supplementary group counts");
+        exit_(failures);
+    }
+    child_passed(mid);
+    mid = fork_();
+    if (mid == 0) {
+        failures = 0;
+        sys(NR_setresgid, 501, 501, 501);
+        sys(NR_setresuid, 2000, 2000, 2000);
+        check(ACC(R) == -EACCES, "others get what's left: nothing");
+        exit_(failures);
+    }
+    child_passed(mid);
+    mid = fork_();
+    if (mid == 0) {
+        failures = 0;
+        // Real id 2000, effective 1000 (the owner): access asks about the real one.
+        sys(NR_setresuid, 2000, 1000, 0);
+        check(ACC(R) == -EACCES, "access uses the real uid");
+        check(sys(NR_faccessat2, -100, "/tmp/acc/f", R, AT_EACCESS) == 0, "AT_EACCESS uses the effective one");
+        exit_(failures);
+    }
+    child_passed(mid);
+    check(sys(NR_fchmodat, -100, "/tmp/acc", 02777) == 0 && sys(NR_fchownat, -100, "/tmp/acc", 0, 777, 0) == 0, "a set-gid directory");
+    check(sys(NR_mkdirat, -100, "/tmp/acc/sub", 0755) == 0 && sys(NR_newfstatat, -100, "/tmp/acc/sub", st, 0) == 0 && ST_GID == 777 && (*(unsigned *)(st + 16) & 02000), "passes on its group and the bit to a subdirectory");
+    int fd = (int)sys(NR_openat, -100, "/tmp/acc/g", 0101, 0644);
+    sys(NR_close, fd);
+    check(sys(NR_newfstatat, -100, "/tmp/acc/g", st, 0) == 0 && ST_GID == 777 && !(*(unsigned *)(st + 16) & 02000), "and its group alone to a file");
+}
+
 static void vm_access(void) {
     char src[32] = "process_vm_readv works", dst[32] = { 0 };
     struct iovec l[2] = { { dst, 10 }, { dst + 10, 12 } }, r = { src, 22 };
@@ -829,6 +905,7 @@ int cmain(void) {
     prctls();
     groups_and_sessions();
     process_tree();
+    file_access();
     vm_access();
     cross_cred();
     check(sys(NR_reboot, MAGIC1, MAGIC2, 0 /* CAD_OFF */, 0) == 0, "reboot CAD_OFF");

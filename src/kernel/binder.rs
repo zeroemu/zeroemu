@@ -205,6 +205,10 @@ struct BProc {
     /// Who opened the device: what its calls report, as Linux's proc->cred.
     euid: u32,
     sid: u32,
+    /// BR_DEAD_BINDERs not yet acknowledged, by cookie; true once a clear asked for
+    /// its DONE. That must wait: libbinder frees the proxy when it reads the DONE,
+    /// and the obituary still names it.
+    deaths_pending: HashMap<u64, bool>,
 }
 
 #[derive(Default)]
@@ -313,6 +317,7 @@ pub fn open(t: &Thread, rdev: u64) -> Option<BinderFile> {
             polled: false,
             euid: t.proc.creds.lock().unwrap().euid,
             sid: t.proc.sec.current(),
+            deaths_pending: HashMap::new(),
         },
     );
     Some(BinderFile { id })
@@ -383,6 +388,15 @@ impl World {
 
     fn thread(&mut self, p: ProcId, tid: i32) -> &mut BThread {
         self.procs.get_mut(&p).unwrap().threads.entry(tid).or_default()
+    }
+
+    /// The reply to `call` cannot be delivered: the caller's wait is over and the
+    /// call leaves its stack, or its own reply to whoever called it would pop this
+    /// one instead and be lost.
+    fn fail_reply(&mut self, caller: ProcId, tid: i32, call: TxnId) {
+        let th = self.thread(caller, tid);
+        th.stack.retain(|&x| x != call);
+        th.todo.push_back(Work::FailedReply);
     }
 
     /// The node for `ptr` in process `p`, created on first use.
@@ -608,6 +622,7 @@ impl World {
             let unreferenced = node.refs == 0;
             for (watcher, cookie) in std::mem::take(&mut node.deaths) {
                 if let Some(w) = self.procs.get_mut(&watcher) {
+                    w.deaths_pending.insert(cookie, false);
                     w.todo.push_back(Work::DeadBinder(cookie));
                 }
             }
@@ -631,6 +646,16 @@ impl World {
         let pending: Vec<TxnId> = self.txns.iter().filter(|(_, t)| t.to == id && !t.reply && t.flags & TF_ONE_WAY == 0).map(|(&k, _)| k).collect();
         let stacks: Vec<TxnId> = p.threads.values().flat_map(|t| t.stack.iter().copied()).collect();
         for t in pending.into_iter().chain(stacks) {
+            // Its own call to a live process is still delivered: only the receiver
+            // can free that buffer. Its reply will find the caller gone.
+            if let Some(txn) = self.txns.get_mut(&t)
+                && !txn.reply
+                && txn.from.is_some_and(|(fp, _)| fp == id)
+                && self.procs.contains_key(&txn.to)
+            {
+                txn.sender_pid = 0;
+                continue;
+            }
             if let Some(txn) = self.txns.remove(&t)
                 && !txn.reply
                 && let Some((fp, ft)) = txn.from
@@ -802,7 +827,16 @@ impl Kernel {
                     w.dec_node(n, cmd == BC_ACQUIRE_DONE, false);
                 }
             }
-            BC_DEAD_BINDER_DONE => {}
+            BC_DEAD_BINDER_DONE => {
+                let cookie = u64_at(a, 0);
+                let mut g = world();
+                let w = g.as_mut().unwrap();
+                let cleared = w.procs.get_mut(&b.id).and_then(|p| p.deaths_pending.remove(&cookie));
+                if cleared == Some(true) {
+                    w.thread(b.id, t.tid).todo.push_back(Work::ClearDeathDone(cookie));
+                    w.wake(b.id);
+                }
+            }
             BC_REGISTER_LOOPER | BC_ENTER_LOOPER | BC_EXIT_LOOPER => {
                 let mut g = world();
                 let w = g.as_mut().unwrap();
@@ -826,13 +860,26 @@ impl Kernel {
                 let n = w.nodes.get_mut(&node).unwrap();
                 if cmd == BC_REQUEST_DEATH_NOTIFICATION {
                     if n.dead {
-                        w.procs.get_mut(&b.id).unwrap().todo.push_back(Work::DeadBinder(cookie));
+                        let p = w.procs.get_mut(&b.id).unwrap();
+                        p.deaths_pending.insert(cookie, false);
+                        p.todo.push_back(Work::DeadBinder(cookie));
                     } else {
                         n.deaths.push((b.id, cookie));
                     }
                 } else {
                     n.deaths.retain(|&(p, c)| !(p == b.id && c == cookie));
-                    w.thread(b.id, t.tid).todo.push_back(Work::ClearDeathDone(cookie));
+                    let p = w.procs.get_mut(&b.id).unwrap();
+                    if let Some(clear) = p.deaths_pending.get_mut(&cookie) {
+                        *clear = true;
+                    } else {
+                        // A thread outside the pool may never read again, and
+                        // BINDER_THREAD_EXIT discards its list. libbinder holds a
+                        // weak count on the proxy until this arrives.
+                        match p.threads.get_mut(&t.tid) {
+                            Some(th) if th.looper != 0 => th.todo.push_back(Work::ClearDeathDone(cookie)),
+                            _ => p.todo.push_back(Work::ClearDeathDone(cookie)),
+                        }
+                    }
                 }
                 w.wake(b.id);
                 drop(g);
@@ -863,7 +910,7 @@ impl Kernel {
         if sg {
             for &o in &offsets {
                 let o = o as usize;
-                if o + 40 <= data.len() && u32_at(&data, o) == TYPE_PTR {
+                if o.saturating_add(40) <= data.len() && u32_at(&data, o) == TYPE_PTR {
                     let (buf, len) = (u64_at(&data, o + 8), u64_at(&data, o + 16));
                     if len > MAX_AREA {
                         return Ok(too_big);
@@ -883,6 +930,7 @@ impl Kernel {
         let ctx = w.procs[&me].ctx;
 
         // Where is it going?
+        let mut answering: Option<TxnId> = None;
         let (to, to_thread, node) = if out.reply {
             let Some(&txn) = w.thread(me, t.tid).stack.last() else {
                 w.thread(me, t.tid).todo.push_back(Work::FailedReply);
@@ -894,6 +942,7 @@ impl Kernel {
                 return;
             }
             w.thread(me, t.tid).stack.pop();
+            answering = Some(txn);
             match w.txns.remove(&txn).and_then(|x| x.from) {
                 Some((fp, ft)) if w.procs.contains_key(&fp) => (fp, Some(ft), None),
                 _ => {
@@ -936,8 +985,8 @@ impl Kernel {
             eprintln!("[droidrt] binder: no receive buffer space in pid {}", w.procs[&to].pid);
             w.thread(me, t.tid).todo.push_back(Work::FailedReply);
             // The caller is waiting for this reply: it fails too, rather than hang.
-            if let (true, Some(ft)) = (out.reply, to_thread) {
-                w.thread(to, ft).todo.push_back(Work::FailedReply);
+            if let (Some(call), Some(ft)) = (answering, to_thread) {
+                w.fail_reply(to, ft, call);
             }
             w.wake(to);
             drop(g);
@@ -956,7 +1005,8 @@ impl Kernel {
         let mut held: Vec<Held> = Vec::new();
         for &o in &offsets {
             let o = o as usize;
-            if o + 8 > out.data.len() {
+            // Offsets come from the guest, and may be anything.
+            if o.saturating_add(8) > out.data.len() {
                 failed = true;
                 break;
             }
@@ -1039,8 +1089,8 @@ impl Kernel {
                 w.release_held(to, held);
                 w.thread(me, t.tid).todo.push_back(Work::FailedReply);
                 // The caller is waiting for this reply: it fails too, rather than hang.
-                if let (true, Some(ft)) = (out.reply, to_thread) {
-                    w.thread(to, ft).todo.push_back(Work::FailedReply);
+                if let (Some(call), Some(ft)) = (answering, to_thread) {
+                    w.fail_reply(to, ft, call);
                 }
                 w.wake(to);
                 drop(g);
@@ -1056,8 +1106,8 @@ impl Kernel {
             for &(po, off, n) in &fda_work {
                 let buf = &out.sg[&po];
                 for i in 0..n {
-                    let at = off as usize + i * 4;
-                    if at + 4 > buf.len() {
+                    let at = (off as usize).saturating_add(i * 4);
+                    if at.saturating_add(4) > buf.len() {
                         failed = true;
                         break;
                     }
@@ -1109,8 +1159,8 @@ impl Kernel {
             w.release_held(to, held);
             w.thread(me, t.tid).todo.push_back(Work::FailedReply);
             // The caller is waiting for this reply: it fails too, rather than hang.
-            if let (true, Some(ft)) = (out.reply, to_thread) {
-                w.thread(to, ft).todo.push_back(Work::FailedReply);
+            if let (Some(call), Some(ft)) = (answering, to_thread) {
+                w.fail_reply(to, ft, call);
             }
             w.wake(to);
             drop(g);

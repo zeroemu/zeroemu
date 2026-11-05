@@ -14,6 +14,7 @@ typedef unsigned int u32;
 #define NR_clone 220
 #define NR_mmap 222
 #define NR_wait4 260
+#define NR_nanosleep 101
 
 static i64 sys6(i64 n, i64 a, i64 b, i64 c, i64 d, i64 e, i64 f) {
     register i64 x8 __asm__("x8") = n;
@@ -57,6 +58,12 @@ static void check(int cond, const char *name) {
 #define BR_TRANSACTION 0x80407202
 #define BR_REPLY 0x80407203
 #define BR_DEAD_REPLY 0x7205
+#define BR_FAILED_REPLY 0x7211
+#define BR_DEAD_BINDER 0x8008720f
+#define BR_CLEAR_DEATH_DONE 0x80087210
+#define BC_REQUEST_DEATH 0x400c630e
+#define BC_CLEAR_DEATH 0x400c630f
+#define BC_DEAD_BINDER_DONE 0x40086310
 #define BR_INCREFS 0x80107207
 #define BR_ACQUIRE 0x80107208
 #define BR_RELEASE 0x80107209
@@ -226,6 +233,51 @@ int cmain(void) {
     nsaid = 0;
     send_txn(mgr, BC_TRANSACTION, handle, 2, "x", 1, 0, 0);
     check(await(mgr, BR_DEAD_REPLY, 0) >= 0, "a released handle is gone");
+
+    // An offset near the top of the address space must fail, not take down binder.
+    nsaid = 0;
+    {
+        char data[32] = {0};
+        u64 bad[1] = { 0xfffffffffffffff8ul };
+        send_txn(mgr, BC_TRANSACTION, 0, 3, data, sizeof data, bad, sizeof bad);
+        check(await(mgr, BR_FAILED_REPLY, 0) >= 0, "a wild object offset fails the call");
+    }
+
+    // An obituary must arrive before the DONE of a clear sent while it was on its
+    // way: libbinder frees the proxy on the DONE, and the obituary names it.
+    nsaid = 0;
+    i64 pid2 = sys(NR_clone, 17, 0, 0, 0, 0);
+    if (pid2 == 0) {
+        int fd = open_binder();
+        struct flat obj = { TYPE_BINDER, 0, 0x7777, 0x8888 };
+        u64 offs[1] = { 0 };
+        send_txn(fd, BC_TRANSACTION, 0, 4, &obj, sizeof obj, offs, sizeof offs);
+        sys(NR_exit_group, 0);
+    }
+    t = await(mgr, BR_TRANSACTION, 0);
+    if (t >= 0) {
+        u32 h2 = (u32)((struct flat *)said[t].t.buffer)->binder_or_handle;
+        struct { u32 cmd; u32 handle; u64 cookie; } __attribute__((packed)) req = { BC_REQUEST_DEATH, h2, 0xd1 };
+        command(mgr, BC_ACQUIRE, h2);
+        bw(mgr, &req, sizeof req, 0, 0, 0);
+        u64 buffer = said[t].t.buffer;
+        // Answer it, caller or no caller: until then this thread takes no process work.
+        send_txn(mgr, BC_REPLY, 0, 0, "", 0, 0, 0);
+        free_buffer(mgr, buffer);
+        sys(NR_wait4, pid2, &st, 0, 0);
+        // The caller is gone. Wait for its binder fd to be released: the node dies.
+        struct timespec_k { i64 s, ns; } nap = {0, 200000000};
+        sys(NR_nanosleep, &nap, 0);
+        req.cmd = BC_CLEAR_DEATH;
+        bw(mgr, &req, sizeof req, 0, 0, 0);
+        nsaid = 0;
+        int dead = await(mgr, BR_DEAD_BINDER, 0);
+        check(dead >= 0, "the obituary still comes");
+        check(find(BR_CLEAR_DEATH_DONE, 0) < 0, "and the clear's DONE waits for it");
+        struct { u32 cmd; u64 cookie; } __attribute__((packed)) done = { BC_DEAD_BINDER_DONE, 0xd1 };
+        bw(mgr, &done, sizeof done, 0, 0, 0);
+        check(await(mgr, BR_CLEAR_DEATH_DONE, 0) >= 0, "BC_DEAD_BINDER_DONE releases it");
+    }
 
     puts_(failures ? "SOME CHECKS FAILED\n" : "all checks passed\n");
     return failures;

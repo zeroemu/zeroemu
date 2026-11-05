@@ -78,7 +78,8 @@ const BUFFER_FLAG_HAS_PARENT: u32 = 1;
 const LOOPER_REGISTERED: u32 = 1;
 const LOOPER_ENTERED: u32 = 2;
 /// The security context servicemanager is handed with each call.
-const SECCTX: &[u8] = b"u:r:su:s0\0";
+/// For a caller with no SELinux label yet.
+const SECCTX_UNLABELED: &[u8] = b"u:r:kernel:s0\0";
 
 /// /dev/binder, /dev/hwbinder, /dev/vndbinder (misc major 10).
 pub const DEVICES: [(&str, u64); 3] = [("binder", 0xa36), ("hwbinder", 0xa37), ("vndbinder", 0xa38)];
@@ -132,7 +133,9 @@ struct Txn {
     node: Option<NodeId>,
     code: u32,
     flags: u32,
+    /// 0 for one-way calls and replies, which have no one waiting.
     sender_pid: i32,
+    sender_euid: u32,
     buffer: u64,
     data_size: u64,
     offsets_size: u64,
@@ -647,9 +650,11 @@ impl Kernel {
 
         // Room in the receiver's buffer: data, offsets, sg buffers, secctx.
         let want_secctx = node.is_some_and(|n| w.nodes[&n].flags & FLAT_BINDER_FLAG_TXN_SECURITY_CTX != 0);
+        let caller_ctx = if want_secctx { super::selinux::context_bytes(t.proc.sec.current()) } else { None };
+        let caller_ctx = caller_ctx.as_deref().unwrap_or(SECCTX_UNLABELED);
         let data_len = align8(out.data.len() as u64);
         let offs_len = align8(out.offsets.len() as u64 * 8);
-        let total = data_len + offs_len + out.sg_size + if want_secctx { align8(SECCTX.len() as u64) } else { 0 };
+        let total = data_len + offs_len + out.sg_size + if want_secctx { align8(caller_ctx.len() as u64) } else { 0 };
         let Some(buffer) = w.alloc(to, total) else {
             eprintln!("[droidrt] binder: no receive buffer space in pid {}", w.procs[&to].pid);
             w.thread(me, t.tid).todo.push_back(Work::FailedReply);
@@ -808,7 +813,7 @@ impl Kernel {
                 mm.write_force(*at, &v.to_le_bytes())?;
             }
             if want_secctx {
-                mm.write_force(secctx, SECCTX)?;
+                mm.write_force(secctx, caller_ctx)?;
             }
             Ok(())
         })();
@@ -862,7 +867,8 @@ impl Kernel {
                 node,
                 code: out.code,
                 flags: out.flags,
-                sender_pid: t.proc.pid,
+                sender_pid: if out.reply || oneway { 0 } else { t.proc.pid },
+                sender_euid: t.proc.creds.lock().unwrap().euid,
                 buffer,
                 data_size: out.data.len() as u64,
                 offsets_size: out.offsets.len() as u64 * 8,
@@ -995,7 +1001,7 @@ impl Kernel {
                 put32(out, x.code);
                 put32(out, x.flags);
                 put32(out, x.sender_pid as u32);
-                put32(out, 0); // sender_euid: root
+                put32(out, x.sender_euid);
                 put64(out, x.data_size);
                 put64(out, x.offsets_size);
                 put64(out, x.buffer);

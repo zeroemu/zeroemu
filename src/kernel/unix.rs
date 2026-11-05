@@ -802,6 +802,11 @@ impl Kernel {
                     wait_or_give_up(t, seen, until)?;
                 };
                 EVENTS.bump();
+                // A connection takes SO_PASSCRED from its listener: init sets it
+                // on sockets declared "passcred", and lmkd counts on it.
+                if sock.st.lock().unwrap().passcred {
+                    conn.st.lock().unwrap().passcred = true;
+                }
                 let peer_name = conn.peer().and_then(|p| p.st.lock().unwrap().name.clone());
                 let f = File::new(Kind::Socket(conn), (flags & SOCK_NONBLOCK) as u32);
                 let fd = t.files().alloc(f, flags & SOCK_CLOEXEC != 0, 0)?;

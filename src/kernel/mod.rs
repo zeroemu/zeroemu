@@ -37,6 +37,7 @@ mod selinux;
 mod signal;
 mod specialfd;
 mod sysctl;
+mod timers;
 mod unix;
 mod vcpus;
 mod vsock;
@@ -91,6 +92,7 @@ pub struct Kernel {
     pub kwin: KernelWindow,
     pub strace: bool,
     pub boot: Instant,
+    timers: Arc<timers::TimerQueue>,
     procs: Mutex<HashMap<i32, Arc<Process>>>,
     next_id: AtomicI32,
     next_asid: AtomicU32,
@@ -260,6 +262,7 @@ pub struct Process {
     exiting: Mutex<Option<i32>>,
     /// Process-directed pending signals.
     pending: Mutex<HashMap<u32, SigInfo>>,
+    timers: Mutex<timers::ProcTimers>,
     knobs: Mutex<procfs::Knobs>,
     pub creds: Mutex<creds::Creds>,
     /// Process group, session, limits, and other process-wide control state.
@@ -495,6 +498,7 @@ impl Kernel {
             kwin,
             strace,
             boot: Instant::now(),
+            timers: timers::TimerQueue::new(me.clone()),
             procs: Mutex::new(HashMap::new()),
             next_id: AtomicI32::new(1),
             next_asid: AtomicU32::new(1),
@@ -619,6 +623,7 @@ impl Kernel {
             mm: Mutex::new(Some(mm)),
             files: Mutex::new(FdTable::stdio()),
             cwd: Mutex::new("/".into()),
+            timers: Mutex::default(),
             exe: Mutex::new(exe),
             cmdline: Mutex::new(cmdline_bytes(argv)),
             sig: Mutex::new(Actions::default()),
@@ -808,8 +813,9 @@ impl Kernel {
             kill => self.sys_kill(int(a[0]) as i32, a[1] as u32, t),
             tgkill => self.sys_tgkill(int(a[0]) as i32, int(a[1]) as i32, a[2] as u32, t),
             tkill => self.sys_tgkill(-1, int(a[0]) as i32, a[1] as u32, t),
-            rt_tgsigqueueinfo => self.sys_tgkill(int(a[0]) as i32, int(a[1]) as i32, a[2] as u32, t),
-            rt_sigqueueinfo => self.sys_kill(int(a[0]) as i32, a[1] as u32, t),
+            rt_tgsigqueueinfo => self.sys_sigqueueinfo(t, int(a[0]) as i32, int(a[1]) as i32, a[2] as u32, a[3]).unwrap_or_else(|e| -e),
+            rt_sigqueueinfo => self.sys_sigqueueinfo(t, int(a[0]) as i32, 0, a[1] as u32, a[2]).unwrap_or_else(|e| -e),
+            timer_create | timer_settime | timer_gettime | timer_getoverrun | timer_delete | setitimer | getitimer | alarm => self.timer_syscall(no, t, a).unwrap_or_else(|e| -e),
             getpid => t.proc.pid as i64,
             gettid => t.tid as i64,
             getppid => t.proc.ppid.load(Ordering::Relaxed) as i64,

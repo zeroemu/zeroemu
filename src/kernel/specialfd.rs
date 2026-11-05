@@ -100,9 +100,23 @@ fn timespec(b: &[u8]) -> Duration {
     Duration::new(s, ns.min(999_999_999) as u32)
 }
 
-fn put_timespec(b: &mut [u8], d: Duration) {
+pub(super) fn put_timespec(b: &mut [u8], d: Duration) {
     b[0..8].copy_from_slice(&d.as_secs().to_le_bytes());
     b[8..16].copy_from_slice(&(d.subsec_nanos() as u64).to_le_bytes());
+}
+
+/// When a timer set to `value` expires. An absolute value is on `clock`:
+/// wall-clock for REALTIME, REALTIME_ALARM and TAI, else time since boot.
+/// Far-future values stop at a century, which Instant can always represent.
+pub(super) fn deadline_for(clock: u64, boot: Instant, value: Duration, abstime: bool) -> Instant {
+    let delay = if !abstime {
+        value
+    } else if matches!(clock, 0 | 8 | 11) {
+        value.saturating_sub(SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default())
+    } else {
+        value.saturating_sub(boot.elapsed())
+    };
+    Instant::now() + delay.min(Duration::from_secs(100 * 365 * 86400))
 }
 
 impl TimerFd {
@@ -148,18 +162,7 @@ impl TimerFd {
         let mut st = self.st.lock().unwrap();
         st.expirations = 0;
         st.interval = interval;
-        st.next = if value.is_zero() {
-            None
-        } else if flags & TFD_TIMER_ABSTIME != 0 {
-            let now = if matches!(self.clock, 0 | 8) {
-                SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default()
-            } else {
-                self.boot.elapsed()
-            };
-            Some(Instant::now() + value.saturating_sub(now))
-        } else {
-            Some(Instant::now() + value)
-        };
+        st.next = (!value.is_zero()).then(|| deadline_for(self.clock, self.boot, value, flags & TFD_TIMER_ABSTIME != 0));
         drop(st);
         EVENTS.bump();
         old

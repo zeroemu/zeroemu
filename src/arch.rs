@@ -121,6 +121,13 @@ syscalls! {
     pselect6 = 72, 270;
     signalfd4 = 74, 289;
     timerfd_create = 85, 283;
+    getitimer = 102, 36;
+    setitimer = 103, 38;
+    timer_create = 107, 222;
+    timer_gettime = 108, 224;
+    timer_getoverrun = 109, 225;
+    timer_settime = 110, 223;
+    timer_delete = 111, 226;
     timerfd_settime = 86, 286;
     timerfd_gettime = 87, 287;
     utimensat = 88, 280;
@@ -269,6 +276,7 @@ syscalls! {
     fork = 0xffff_0002, 57;
     vfork = 0xffff_0003, 58;
     pipe = 0xffff_0004, 22;
+    alarm = 0xffff_0005, 37;
 }
 
 /// Open flags whose values differ between the generic (arm64) and x86_64 ABIs.

@@ -9,11 +9,13 @@ use super::{Kernel, Thread};
 use crate::arch::Sysno;
 use crate::errno::*;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 
 pub const AF_INET: u64 = 2;
 pub const AF_INET6: u64 = 10;
 pub const AF_KEY: u64 = 15;
+const SOCK_DGRAM: u32 = 2;
 const SOCK_RAW: u32 = 3;
 const SOCK_NONBLOCK: u64 = 0o4000;
 const SOCK_CLOEXEC: u64 = 0o2000000;
@@ -37,6 +39,17 @@ pub struct Inet {
     pub ty: u32,
     pub proto: u32,
     opts: Mutex<super::unix::SockOpts>,
+    /// connect() named a loopback or multicast address.
+    connected_local: AtomicBool,
+}
+
+/// 127/8, 224/4, ::1, ff00::/8.
+fn reaches_loopback(addr: &[u8]) -> bool {
+    match addr.get(0..2).map(|f| u16::from_le_bytes([f[0], f[1]]) as u64) {
+        Some(AF_INET) => addr.get(4).is_some_and(|&b| b == 127 || (224..240).contains(&b)),
+        Some(AF_INET6) => addr.get(8..24).is_some_and(|ip| ip[0] == 0xff || (ip[..15].iter().all(|&b| b == 0) && ip[15] == 1)),
+        _ => false,
+    }
 }
 
 impl Inet {
@@ -122,9 +135,42 @@ impl Kernel {
         if !(1..=3).contains(&ty) && ty != 5 {
             return Err(EINVAL);
         }
-        let sock = Inet { family: a[0], ty, proto: a[2] as u32, opts: Mutex::default() };
+        let sock = Inet { family: a[0], ty, proto: a[2] as u32, opts: Mutex::default(), connected_local: AtomicBool::new(false) };
         let file = File::new(Kind::Inet(Arc::new(sock)), (a[1] & SOCK_NONBLOCK) as u32);
         t.files().alloc(file, a[1] & SOCK_CLOEXEC != 0, 0)
+    }
+
+    /// With only lo up, a datagram to loopback or a multicast group goes out
+    /// and nobody is listening. Everything else has no route.
+    fn inet_send(&self, no: Sysno, t: &Arc<Thread>, s: &Inet, a: [u64; 6]) -> Result<i64, i64> {
+        use Sysno::*;
+        if s.ty != SOCK_DGRAM {
+            return Err(ENETUNREACH);
+        }
+        let mut mm = t.proc.mm();
+        let (name, namelen, sent) = match no {
+            connect => (a[1], a[2], 0),
+            sendto => (a[4], a[5], a[2] as i64),
+            _ => {
+                let msg = mm.read_vec(a[1], 32)?;
+                let word = |at: usize| u64::from_le_bytes(msg[at..at + 8].try_into().unwrap());
+                let iov = mm.read_vec(word(16), word(24).min(1024) as usize * 16)?;
+                let total: u64 = iov.chunks(16).map(|v| u64::from_le_bytes(v[8..16].try_into().unwrap())).sum();
+                (word(0), word(8) & 0xffff_ffff, total as i64)
+            }
+        };
+        let local = if name == 0 {
+            s.connected_local.load(Ordering::Relaxed)
+        } else {
+            reaches_loopback(&mm.read_vec(name, namelen.min(128) as usize)?)
+        };
+        if !local {
+            return Err(ENETUNREACH);
+        }
+        if no == connect {
+            s.connected_local.store(true, Ordering::Relaxed);
+        }
+        Ok(sent)
     }
 
     pub(super) fn inet_syscall(&self, no: Sysno, t: &Arc<Thread>, s: &Inet, a: [u64; 6]) -> Result<i64, i64> {
@@ -134,7 +180,7 @@ impl Kernel {
             setsockopt => self.inet_setsockopt(t, s, a),
             // Options, binds and listens succeed; nothing can reach the socket.
             bind | listen | shutdown => Ok(0),
-            connect | sendto | sendmsg => Err(ENETUNREACH),
+            connect | sendto | sendmsg => self.inet_send(no, t, s, a),
             getsockname => {
                 let len = if s.v6() { 28 } else { 16 };
                 let mut addr = vec![0u8; len];

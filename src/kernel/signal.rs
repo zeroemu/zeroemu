@@ -122,6 +122,24 @@ impl SigInfo {
         s.0[16..20].copy_from_slice(&pid.to_le_bytes());
         s
     }
+    /// A timer's expiry: si_tid, si_overrun, si_value.
+    pub fn timer(sig: u32, code: i32, id: i32, overrun: i32, value: u64) -> SigInfo {
+        let mut s = SigInfo::base(sig, code);
+        s.0[16..20].copy_from_slice(&id.to_le_bytes());
+        s.0[20..24].copy_from_slice(&overrun.to_le_bytes());
+        s.0[24..32].copy_from_slice(&value.to_le_bytes());
+        s
+    }
+    /// Whether this is the expiry of POSIX timer `id`.
+    pub fn is_timer(&self, id: i32) -> bool {
+        self.0[8..12] == (-2i32).to_le_bytes() && self.0[16..20] == id.to_le_bytes()
+    }
+    /// Sent by tgkill or tkill rather than kill: bionic's timer threads tell
+    /// their shutdown from an expiry by this.
+    pub fn tkill(mut self) -> SigInfo {
+        self.0[8..12].copy_from_slice(&(-6i32).to_le_bytes());
+        self
+    }
     /// Sets si_uid (the sender's, or for SIGCHLD the child's, real uid).
     pub fn with_uid(mut self, uid: u32) -> SigInfo {
         self.0[20..24].copy_from_slice(&uid.to_le_bytes());

@@ -124,6 +124,7 @@ impl Kernel {
             mm: Mutex::new(Some(mm)),
             files: Mutex::new(t.files().fork_copy(pid)),
             cwd: Mutex::new(parent.cwd.lock().unwrap().clone()),
+            timers: Mutex::default(),
             exe: Mutex::new(parent.exe.lock().unwrap().clone()),
             cmdline: Mutex::new(parent.cmdline.lock().unwrap().clone()),
             sig: Mutex::new(parent.sig.lock().unwrap().clone()),
@@ -187,6 +188,7 @@ impl Kernel {
             files.set_traced(super::files::fd_trace_wanted(&exe).then_some(t.proc.pid));
             files.close_on_exec();
         }
+        self.timers_on_exec(&t.proc);
         t.proc.sig.lock().unwrap().reset_on_exec();
         *t.altstack.lock().unwrap() = (0, 0, super::signal::SS_DISABLE);
         *t.proc.exe.lock().unwrap() = exe;
@@ -584,9 +586,44 @@ impl Kernel {
             return -EPERM;
         }
         if sig != 0 {
-            self.send_thread_signal(&th, sig, SigInfo::user(sig, sender.proc.pid).with_uid(creds.uid));
+            self.send_thread_signal(&th, sig, SigInfo::user(sig, sender.proc.pid).with_uid(creds.uid).tkill());
         }
         0
+    }
+
+    /// rt_sigqueueinfo (`tid` 0) and rt_tgsigqueueinfo: the sender writes the
+    /// siginfo, but may only claim to be the kernel or tkill to itself.
+    pub(super) fn sys_sigqueueinfo(&self, sender: &Thread, pid: i32, tid: i32, sig: u32, uinfo: u64) -> Result<i64, i64> {
+        if sig > 64 {
+            return Err(EINVAL);
+        }
+        let mut bytes = [0u8; 128];
+        bytes.copy_from_slice(&sender.proc.mm().read_vec(uinfo, 128)?);
+        let code = i32::from_le_bytes(bytes[8..12].try_into().unwrap());
+        if (code >= 0 || code == -6) && pid != sender.proc.pid {
+            return Err(EPERM);
+        }
+        bytes[0..4].copy_from_slice(&(sig as i32).to_le_bytes());
+        let info = SigInfo(bytes);
+        let creds = self.creds(sender);
+        if tid != 0 {
+            let th = self.task(tid).filter(|th| th.proc.pid == pid).ok_or(ESRCH)?;
+            if !self.may_signal(sender, &creds, &th.proc, sig) {
+                return Err(EPERM);
+            }
+            if sig != 0 {
+                self.send_thread_signal(&th, sig, info);
+            }
+        } else {
+            let proc = self.process(pid).or_else(|| self.live_process(pid)).ok_or(ESRCH)?;
+            if !self.may_signal(sender, &creds, &proc, sig) {
+                return Err(EPERM);
+            }
+            if sig != 0 {
+                self.send_process_signal(&proc, sig, info);
+            }
+        }
+        Ok(0)
     }
 
     /// check_kill_permission: our own process, matching uids, CAP_KILL, or

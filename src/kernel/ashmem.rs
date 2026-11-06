@@ -136,7 +136,7 @@ impl Ashmem {
         Ok(if shared {
             Backing::Shared { obj: file.obj.clone(), offset }
         } else {
-            Backing::File { data: file.read_at(0, size as usize).into(), offset }
+            Backing::File { src: file.obj.clone(), offset }
         })
     }
 }

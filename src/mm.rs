@@ -4,6 +4,7 @@
 
 use crate::errno::*;
 use crate::hv::{KernelPage, PageTableRoot};
+use crate::pagecache::PageSource;
 use crate::paging::{self, KERNEL_WINDOW, PROT_EXEC, PROT_READ, PROT_WRITE, USER_TOP};
 use crate::phys::{PAGE, PhysMem};
 use std::collections::BTreeMap;
@@ -27,8 +28,9 @@ pub fn page_up(v: u64) -> u64 {
 #[derive(Clone)]
 pub enum Backing {
     Anon,
-    /// Private copy of a read-only file; `offset` is the file offset of the VMA start.
-    File { data: Arc<[u8]>, offset: u64 },
+    /// A private mapping of a file: its pages are shared until written, then
+    /// copied; `offset` is the file offset of the VMA start.
+    File { src: Arc<dyn PageSource>, offset: u64 },
     /// MAP_SHARED memory: the object owns the frames, every mapping (in any
     /// address space) points at the same ones.
     Shared { obj: Arc<SharedObject>, offset: u64 },
@@ -131,6 +133,21 @@ impl SharedObject {
             let from = off.saturating_sub(start) as usize;
             unsafe { self.phys.host(f).add(from).write_bytes(0, PAGE as usize - from) };
         }
+    }
+}
+
+/// A private mapping of the object: its pages until they are written. What is
+/// written to the file before that shows through, as on Linux.
+impl PageSource for SharedObject {
+    fn page(&self, idx: u64) -> Result<Option<u64>, i64> {
+        let pages = self.pages.lock().unwrap();
+        Ok(pages.get(idx as usize).copied().filter(|&f| f != 0).inspect(|&f| self.phys.share(f)))
+    }
+
+    fn read_bytes(&self, off: u64, len: usize) -> Result<Vec<u8>, i64> {
+        let mut v = vec![0; len];
+        self.read(off, &mut v);
+        Ok(v)
     }
 }
 
@@ -342,7 +359,7 @@ impl AddressSpace {
         let Some((start, v)) = self.find(addr) else { return "no mapping".into() };
         let kind = match &v.backing {
             Backing::Anon => "anon",
-            Backing::File { .. } => "file copy",
+            Backing::File { .. } => "file",
             Backing::Shared { .. } => "shared",
             Backing::Dev { .. } => "device",
         };
@@ -448,7 +465,7 @@ impl AddressSpace {
                 }
                 && match (&a.backing, &b.backing) {
                     (Backing::Anon, Backing::Anon) => true,
-                    (Backing::File { data: d1, offset: o1 }, Backing::File { data: d2, offset: o2 }) => Arc::ptr_eq(d1, d2) && contiguous(o1, o2),
+                    (Backing::File { src: s1, offset: o1 }, Backing::File { src: s2, offset: o2 }) => std::ptr::addr_eq(Arc::as_ptr(s1), Arc::as_ptr(s2)) && contiguous(o1, o2),
                     (Backing::Shared { obj: s1, offset: o1 }, Backing::Shared { obj: s2, offset: o2 }) => Arc::ptr_eq(s1, s2) && contiguous(o1, o2),
                     _ => false,
                 }
@@ -914,12 +931,37 @@ impl AddressSpace {
             self.tlb_gen += 1;
             return Ok(());
         }
-        let frame = self.populate(start, &vma, page).map_err(|_| SEGV_MAPERR)?;
-        self.phys.write_pte(slot, paging::user_page(frame, prot));
+        let frame = self.populate(start, &vma, page, write).map_err(|_| SEGV_MAPERR)?;
+        let shared = matches!(vma.backing, Backing::Shared { .. } | Backing::Dev { .. });
+        self.phys.write_pte(slot, self.entry_for(frame, prot, shared));
         Ok(())
     }
 
-    fn populate(&self, vma_start: u64, vma: &Vma, page: u64) -> Result<u64, i64> {
+    /// Each page present, as (where its mapping starts, its mapping, its address, its
+    /// frame), and how many frames the tables themselves take. For a memory report.
+    pub fn each_resident(&self, f: &mut dyn FnMut(u64, &Vma, u64, u64)) -> usize {
+        fn go(mm: &AddressSpace, table: u64, level: usize, base: u64, f: &mut dyn FnMut(u64, &Vma, u64, u64)) {
+            let shift = 12 + 9 * (paging::levels() - 1 - level);
+            for i in 0..512u64 {
+                let e = mm.phys.read_u64(table + i * 8);
+                if !paging::is_valid(e) {
+                    continue;
+                }
+                let va = base | i << shift;
+                if level + 1 < paging::levels() {
+                    go(mm, paging::addr(e), level + 1, va, f);
+                } else if let Some((start, vma)) = mm.find(va) {
+                    f(start, vma, va, paging::addr(e));
+                }
+            }
+        }
+        go(self, self.root.root, 0, 0, f);
+        self.tables.len() + 1
+    }
+
+    /// The frame for a page not yet present, with a hold on it for this mapping.
+    /// About to be written, a page of a file is copied at once.
+    fn populate(&self, vma_start: u64, vma: &Vma, page: u64, write: bool) -> Result<u64, i64> {
         if let Backing::Shared { obj, offset } = &vma.backing {
             return obj.frame(((offset + (page - vma_start)) / PAGE) as usize);
         }
@@ -930,15 +972,17 @@ impl AddressSpace {
             }
             return Ok(mem.gpa + off);
         }
-        let frame = self.phys.alloc()?;
-        if let Backing::File { data, offset } = &vma.backing {
-            let off = (offset + (page - vma_start)) as usize;
-            if off < data.len() {
-                let n = (data.len() - off).min(PAGE as usize);
-                unsafe { std::ptr::copy_nonoverlapping(data.as_ptr().add(off), self.phys.host(frame), n) };
-            }
+        let Backing::File { src, offset } = &vma.backing else { return self.phys.alloc() };
+        let Some(frame) = src.page((offset + (page - vma_start)) / PAGE)? else { return self.phys.alloc() };
+        if !write || self.phys.is_sole_owner(frame) {
+            return Ok(frame);
         }
-        Ok(frame)
+        let copy = self.phys.alloc();
+        if let Ok(copy) = copy {
+            unsafe { std::ptr::copy_nonoverlapping(self.phys.host(frame), self.phys.host(copy), PAGE as usize) };
+        }
+        self.phys.free(frame);
+        copy
     }
 
     /// Host pointer to the byte at `va`, faulting the page in. `force` skips
@@ -962,8 +1006,8 @@ impl AddressSpace {
             if vma.uffd().is_some() {
                 return Err(EFAULT);
             }
-            let frame = self.populate(start, &vma, page)?;
-            e = paging::user_page(frame, vma.prot);
+            let frame = self.populate(start, &vma, page, write)?;
+            e = self.entry_for(frame, vma.prot, matches!(vma.backing, Backing::Shared { .. } | Backing::Dev { .. }));
             self.phys.write_pte(slot, e);
         } else if write && !matches!(vma.backing, Backing::Shared { .. } | Backing::Dev { .. }) && !self.phys.is_sole_owner(paging::addr(e)) {
             // The kernel writes past the page tables: it must not reach a frame

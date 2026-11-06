@@ -99,8 +99,8 @@ impl Kernel {
             sysinfo => {
                 let mut b = [0u8; 112];
                 b[0..8].copy_from_slice(&self.boot.elapsed().as_secs().to_le_bytes());
-                b[32..40].copy_from_slice(&phys::PHYS_MAX.to_le_bytes()); // totalram
-                b[40..48].copy_from_slice(&(phys::PHYS_MAX - self.phys.frames_in_use() * phys::PAGE).to_le_bytes());
+                b[32..40].copy_from_slice(&phys::ram().to_le_bytes()); // totalram
+                b[40..48].copy_from_slice(&phys::ram().saturating_sub(self.phys.frames_in_use() * phys::PAGE).to_le_bytes());
                 b[104..108].copy_from_slice(&1u32.to_le_bytes()); // mem_unit
                 t.proc.mm().write(a[0], &b)?;
                 Ok(0)

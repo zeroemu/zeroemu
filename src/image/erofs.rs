@@ -50,7 +50,25 @@ pub struct Erofs {
     xattr_base: u64,
     /// Long xattr name prefixes: (short prefix index, infix).
     prefixes: Vec<(u8, Vec<u8>)>,
-    cache: Mutex<HashMap<u64, Arc<[u8]>>>,
+    /// Directories and symlinks, which every path lookup reads again. File
+    /// contents are the page cache's business.
+    meta: Mutex<HashMap<u64, Arc<[u8]>>>,
+    /// Compressed files' extents, as those read recently need them.
+    extents: Mutex<HashMap<u64, Arc<[Extent]>>>,
+}
+
+/// Holds this many extents' worth of indexes; they are quick to read back.
+const EXTENTS_KEPT: usize = 1 << 20;
+
+/// One compressed extent of a file. It runs up to the next one's `start`.
+#[derive(Clone, Copy, Debug)]
+struct Extent {
+    start: u64,
+    pblk: u32,
+    /// Compressed blocks it takes.
+    blocks: u16,
+    /// LCLUSTER_*: how it is stored.
+    kind: u8,
 }
 
 #[derive(Clone, Debug)]
@@ -112,7 +130,8 @@ impl Erofs {
             xattr_base: (le32(&sb, 44) as u64) << blkbits,
             prefixes: Vec::new(),
             dev,
-            cache: Mutex::new(HashMap::new()),
+            meta: Mutex::default(),
+            extents: Mutex::default(),
         };
         if sb[91] > 0 && incompat & FEATURE_INCOMPAT_XATTR_PREFIXES != 0 {
             let packed = (incompat & FEATURE_INCOMPAT_FRAGMENTS != 0 && compat & FEATURE_COMPAT_PLAIN_XATTR_PFX == 0)
@@ -248,24 +267,44 @@ impl Erofs {
         Ok(ino)
     }
 
-    /// Whole file contents, decompressed and cached.
+    /// Whole file contents. Only directories and symlinks are kept.
     pub fn read(&self, ino: &Inode) -> io::Result<Arc<[u8]>> {
-        if let Some(d) = self.cache.lock().unwrap().get(&ino.nid) {
+        let keep = matches!(ino.mode & 0o170000, 0o040000 | 0o120000);
+        if keep && let Some(d) = self.meta.lock().unwrap().get(&ino.nid) {
             return Ok(d.clone());
         }
-        let data: Arc<[u8]> = match ino.layout {
-            LAYOUT_FLAT_PLAIN => self
-                .dev
-                .read_vec((ino.raw as u64) << self.blkbits, ino.size as usize)?,
+        let mut v = vec![0; ino.size as usize];
+        let n = self.read_range(ino, 0, &mut v)?;
+        v.truncate(n);
+        let data: Arc<[u8]> = v.into();
+        if keep {
+            self.meta.lock().unwrap().insert(ino.nid, data.clone());
+        }
+        Ok(data)
+    }
+
+    /// Bytes of a file from `off`: as many as `buf` holds, unless it ends first.
+    pub fn read_range(&self, ino: &Inode, off: u64, buf: &mut [u8]) -> io::Result<usize> {
+        let n = ino.size.saturating_sub(off).min(buf.len() as u64) as usize;
+        let buf = &mut buf[..n];
+        if n == 0 {
+            return Ok(0);
+        }
+        match ino.layout {
+            LAYOUT_FLAT_PLAIN => self.dev.read_exact_at(((ino.raw as u64) << self.blkbits) + off, buf)?,
             LAYOUT_FLAT_INLINE => {
+                // Whole blocks, then the tail stored just after the inode.
                 let full = ino.size / self.bs() * self.bs();
-                let mut v = self
-                    .dev
-                    .read_vec((ino.raw as u64) << self.blkbits, full as usize)?;
-                v.extend(self.dev.read_vec(ino.end, (ino.size - full) as usize)?);
-                v
+                let in_blocks = full.saturating_sub(off).min(n as u64) as usize;
+                let (head, tail) = buf.split_at_mut(in_blocks);
+                if in_blocks > 0 {
+                    self.dev.read_exact_at(((ino.raw as u64) << self.blkbits) + off, head)?;
+                }
+                if !tail.is_empty() {
+                    self.dev.read_exact_at(ino.end + (off + in_blocks as u64 - full), tail)?;
+                }
             }
-            LAYOUT_COMPRESSED_FULL | LAYOUT_COMPRESSED_COMPACT => self.read_compressed(ino)?,
+            LAYOUT_COMPRESSED_FULL | LAYOUT_COMPRESSED_COMPACT => self.read_compressed(ino, off, buf)?,
             l => {
                 return Err(invalid(format!(
                     "erofs: unsupported data layout {l} (nid {})",
@@ -273,9 +312,7 @@ impl Erofs {
                 )));
             }
         }
-        .into();
-        self.cache.lock().unwrap().insert(ino.nid, data.clone());
-        Ok(data)
+        Ok(n)
     }
 
     pub fn readdir(&self, dir: &Inode) -> io::Result<Vec<DirEntry>> {
@@ -316,8 +353,8 @@ impl Erofs {
             .map(|e| e.nid))
     }
 
-    fn read_compressed(&self, ino: &Inode) -> io::Result<Vec<u8>> {
-        let bs = self.bs();
+    /// A compressed file's extents, from its index.
+    fn extents_of(&self, ino: &Inode) -> io::Result<(Arc<[Extent]>, u8)> {
         let map_header = ino.end.next_multiple_of(8);
         let h = self.dev.read_vec(map_header, 8)?;
         let advise = le16(&h, 4);
@@ -328,6 +365,9 @@ impl Erofs {
                 "erofs: unsupported compression advise {advise:#x} (nid {})",
                 ino.nid
             )));
+        }
+        if let Some(e) = self.extents.lock().unwrap().get(&ino.nid) {
+            return Ok((e.clone(), algorithms));
         }
         let lclusterbits = self.blkbits + (clusterbits & 7) as u32;
         let lsize = 1u64 << lclusterbits;
@@ -341,27 +381,10 @@ impl Erofs {
             }
             self.compact_index(map_header + 8, total, advise, lclusterbits)?
         };
-
-        let mut out = Vec::with_capacity(ino.size as usize);
-        let heads: Vec<usize> = (0..total)
-            .filter(|&i| lclusters[i].kind != LCLUSTER_NONHEAD)
-            .collect();
-        if heads.first() != Some(&0) {
-            return Err(invalid(
-                "erofs: compressed file does not start with a head lcluster",
-            ));
-        }
-        for (k, &lcn) in heads.iter().enumerate() {
+        let heads = (0..total).filter(|&i| lclusters[i].kind != LCLUSTER_NONHEAD);
+        let mut extents = Vec::new();
+        for lcn in heads {
             let head = lclusters[lcn];
-            let start = ((lcn as u64) << lclusterbits) + head.clusterofs as u64;
-            let end = heads.get(k + 1).map_or(ino.size, |&n| {
-                ((n as u64) << lclusterbits) + lclusters[n].clusterofs as u64
-            });
-            let want = (end - start) as usize;
-            if start != out.len() as u64 {
-                return Err(invalid("erofs: non-contiguous extents"));
-            }
-
             let big = match head.kind {
                 LCLUSTER_HEAD1 => advise & ADVISE_BIG_PCLUSTER_1 != 0,
                 _ => advise & ADVISE_BIG_PCLUSTER_2 != 0,
@@ -369,37 +392,77 @@ impl Erofs {
             let blocks = match lclusters.get(lcn + 1) {
                 Some(next) if big && next.kind == LCLUSTER_NONHEAD => next.cblkcnt.unwrap_or(1),
                 _ => 1,
-            } as u64;
-            let pcluster = self.dev.read_vec(head.pblk * bs, (blocks * bs) as usize)?;
-
-            if head.kind == LCLUSTER_PLAIN {
-                out.extend_from_slice(
-                    pcluster
-                        .get(..want)
-                        .ok_or_else(|| invalid("erofs: plain extent overflows pcluster"))?,
-                );
-                continue;
-            }
-            let algorithm = match head.kind {
-                LCLUSTER_HEAD1 => algorithms & 0xf,
-                LCLUSTER_HEAD2 => algorithms >> 4,
-                k => return Err(invalid(format!("erofs: lcluster type {k} cannot head an extent"))),
             };
-            if algorithm != ALGORITHM_LZ4 {
-                return Err(invalid(format!(
-                    "erofs: unsupported compression algorithm {algorithm}"
-                )));
-            }
-            // With zero padding, compressed data is right-aligned in the pcluster.
-            let skip = if self.zero_padding {
-                pcluster.iter().position(|&b| b != 0).unwrap_or(0)
-            } else {
-                0
-            };
-            lz4::decompress_into(&pcluster[skip..], &mut out, want)
-                .map_err(|e| invalid(format!("erofs nid {} extent @{start:#x}: {e}", ino.nid)))?;
+            extents.push(Extent {
+                start: ((lcn as u64) << lclusterbits) + head.clusterofs as u64,
+                pblk: u32::try_from(head.pblk).map_err(|_| invalid("erofs: block number out of range"))?,
+                blocks: u16::try_from(blocks).map_err(|_| invalid("erofs: pcluster too big"))?,
+                kind: head.kind,
+            });
         }
-        Ok(out)
+        if extents.first().is_some_and(|e| e.start != 0) || (extents.is_empty() && ino.size > 0) {
+            return Err(invalid(
+                "erofs: compressed file does not start with a head lcluster",
+            ));
+        }
+        if extents.windows(2).any(|w| w[0].start >= w[1].start) {
+            return Err(invalid("erofs: non-contiguous extents"));
+        }
+        let extents: Arc<[Extent]> = extents.into();
+        let mut kept = self.extents.lock().unwrap();
+        if kept.values().map(|e| e.len()).sum::<usize>() + extents.len() > EXTENTS_KEPT {
+            kept.clear();
+        }
+        kept.insert(ino.nid, extents.clone());
+        Ok((extents, algorithms))
+    }
+
+    /// Reads from a compressed file: decompresses only the extents `buf` falls in.
+    fn read_compressed(&self, ino: &Inode, off: u64, buf: &mut [u8]) -> io::Result<()> {
+        let bs = self.bs();
+        let (extents, algorithms) = self.extents_of(ino)?;
+        let end_of = |i: usize| extents.get(i + 1).map_or(ino.size, |e| e.start);
+        let mut i = extents.partition_point(|e| e.start <= off).saturating_sub(1);
+        let mut done = 0;
+        let mut out = Vec::new();
+        while done < buf.len() {
+            let e = *extents.get(i).ok_or_else(|| invalid("erofs: read past the last extent"))?;
+            let (start, end) = (e.start, end_of(i));
+            let want = (end - start) as usize;
+            let pcluster = self.dev.read_vec(e.pblk as u64 * bs, e.blocks as usize * bs as usize)?;
+            let at = off + done as u64;
+            let n = ((end - at) as usize).min(buf.len() - done);
+            if e.kind == LCLUSTER_PLAIN {
+                let plain = pcluster.get(..want).ok_or_else(|| invalid("erofs: plain extent overflows pcluster"))?;
+                buf[done..done + n].copy_from_slice(&plain[(at - start) as usize..][..n]);
+            } else {
+                let algorithm = match e.kind {
+                    LCLUSTER_HEAD1 => algorithms & 0xf,
+                    LCLUSTER_HEAD2 => algorithms >> 4,
+                    k => return Err(invalid(format!("erofs: lcluster type {k} cannot head an extent"))),
+                };
+                if algorithm != ALGORITHM_LZ4 {
+                    return Err(invalid(format!(
+                        "erofs: unsupported compression algorithm {algorithm}"
+                    )));
+                }
+                // With zero padding, compressed data is right-aligned in the pcluster.
+                let skip = if self.zero_padding {
+                    pcluster.iter().position(|&b| b != 0).unwrap_or(0)
+                } else {
+                    0
+                };
+                out.clear();
+                out.reserve(want);
+                lz4::decompress_into(&pcluster[skip..], &mut out, want)
+                    .map_err(|err| invalid(format!("erofs nid {} extent @{start:#x}: {err}", ino.nid)))?;
+                let got = out.get((at - start) as usize..(at - start) as usize + n).ok_or_else(|| invalid(format!("erofs nid {} extent @{start:#x}: short", ino.nid)))?;
+                buf[done..done + n].copy_from_slice(got);
+            }
+            done += n;
+            i += 1;
+        }
+        Ok(())
     }
 
     fn full_index(&self, map_header: u64, total: usize) -> io::Result<Vec<Lcluster>> {

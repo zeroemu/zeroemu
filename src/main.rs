@@ -11,6 +11,7 @@ mod hv;
 mod image;
 mod kernel;
 mod mm;
+mod pagecache;
 mod paging;
 mod phys;
 mod tmpfs;
@@ -24,7 +25,7 @@ use std::sync::{Arc, Mutex};
 
 const USAGE: &str = "usage: droidrt [--system <system.img>] [--strace] [--display] <program> [args...]
        droidrt --system <system.img> --boot [--headless] [--data <file> | --ephemeral] [--wipe-data]
-               [--adb-port <port> | --no-adb] [--no-net]
+               [--adb-port <port> | --no-adb] [--no-net] [--ram <MB>]
                [--push <host>:<guest>]... [--run <cmd>] [init args...]
        droidrt --system <system.img> --ls <path> | --cat <path>
        droidrt --gpu-selftest";
@@ -99,6 +100,8 @@ fn run() -> Result<i32, String> {
             "--adb-port" => adb_port = Some(args.next().ok_or(USAGE)?.parse().map_err(|_| USAGE)?),
             "--no-adb" => no_adb = true,
             "--no-net" => no_net = true,
+            // As hw.ramSize says in an AVD: what the guest believes it has.
+            "--ram" => phys::set_ram(args.next().ok_or(USAGE)?.parse::<u64>().ok().filter(|mb| (512..=phys::PHYS_MAX >> 20).contains(mb)).ok_or(USAGE)? << 20),
             "--display" => display = true,
             "--headless" => headless = true,
             "--gpu-selftest" => gpu_selftest = true,
@@ -214,10 +217,13 @@ fn boot_guest(
     } else {
         // No image: a freestanding host binary (the test guests).
         let read = |p: &str| std::fs::read(root.join(p.trim_start_matches('/'))).or_else(|_| std::fs::read(p)).map_err(|e| format!("{p}: {e}"));
-        let main = elf::load(&mut mm, &read(&program)?, &program, false)?;
+        let source = |data: Vec<u8>| (data.len() as u64, kernel.bytes_source(data.into()));
+        let (size, src) = source(read(&program)?);
+        let main = elf::load(&mut mm, &src, size, &program, false)?;
         let (entry, base) = match &main.interp {
             Some(i) => {
-                let li = elf::load(&mut mm, &read(i)?, i, true)?;
+                let (size, src) = source(read(i)?);
+                let li = elf::load(&mut mm, &src, size, i, true)?;
                 (li.entry, li.bias)
             }
             None => (main.entry, 0),

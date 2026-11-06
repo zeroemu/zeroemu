@@ -94,9 +94,9 @@ impl Kernel {
             match self.fd_shared_object(t, fd) {
                 Ok(Some(obj)) if shared => Backing::Shared { obj, offset },
                 Err(e) => return -e,
-                // Private mappings, and read-only image files, get a copy.
-                _ => match self.fd_file_data(t, fd) {
-                    Ok(data) => Backing::File { data, offset },
+                // Private mappings, and read-only image files, share pages until written.
+                _ => match self.fd_page_source(t, fd) {
+                    Ok(src) => Backing::File { src, offset },
                     Err(e) => return -e,
                 },
             }

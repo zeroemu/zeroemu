@@ -5,9 +5,11 @@
 use crate::arch::Arch;
 use crate::errno::*;
 use crate::mm::{AddressSpace, Backing, Placement, STACK_SIZE, STACK_TOP, page_down, page_up};
+use crate::pagecache::PageSource;
 use crate::paging::{PROT_EXEC, PROT_READ, PROT_WRITE};
 use crate::phys::{self, PAGE};
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 const PT_LOAD: u32 = 1;
 const PT_INTERP: u32 = 3;
@@ -44,52 +46,59 @@ fn u64_at(b: &[u8], o: usize) -> u64 {
 
 struct Segment {
     vaddr: u64,
-    offset: usize,
-    filesz: usize,
+    offset: u64,
+    filesz: u64,
     memsz: u64,
     prot: u32,
 }
 
-/// Loads an ELF image into `mm`. `is_interp` places a PIE anywhere free;
-/// otherwise PIEs go at MAIN_PIE_BASE.
-pub fn load(mm: &mut AddressSpace, file: &[u8], name: &str, is_interp: bool) -> Result<Image, String> {
+/// Loads an ELF image of `size` bytes into `mm`, its pages to come from the file
+/// as they are touched. `is_interp` places a PIE anywhere free; otherwise PIEs go
+/// at MAIN_PIE_BASE.
+pub fn load(mm: &mut AddressSpace, src: &Arc<dyn PageSource>, size: u64, name: &str, is_interp: bool) -> Result<Image, String> {
     let bad = |what: &str| format!("{name}: {what}");
+    let read = |off: u64, len: usize| src.read_bytes(off, len).map_err(|e| format!("{name}: read: errno {e}"));
+    let file = read(0, size.min(64) as usize)?;
     if file.len() < 64 || &file[0..4] != b"\x7fELF" || file[4] != 2 {
         return Err(bad("not an ELF64 file"));
     }
-    if u16_at(file, 18) != Arch::HOST.elf_machine() {
+    if u16_at(&file, 18) != Arch::HOST.elf_machine() {
         return Err(bad(&format!("not a {:?} binary", Arch::HOST)));
     }
-    let e_type = u16_at(file, 16);
-    let phoff = u64_at(file, 32) as usize;
-    let phentsize = u16_at(file, 54) as usize;
-    let phnum = u16_at(file, 56) as usize;
-    if phoff + phnum * phentsize > file.len() {
+    let e_type = u16_at(&file, 16);
+    let phoff = u64_at(&file, 32);
+    let phentsize = u16_at(&file, 54) as usize;
+    let phnum = u16_at(&file, 56) as usize;
+    if phoff.saturating_add((phnum * phentsize) as u64) > size || phentsize < 56 {
         return Err(bad("program headers out of range"));
     }
+    let headers = read(phoff, phnum * phentsize)?;
 
     let mut segs = Vec::new();
     let mut interp = None;
     let mut phdr_vaddr = None;
     let mut first_load = None;
     for i in 0..phnum {
-        let ph = &file[phoff + i * phentsize..];
+        let ph = &headers[i * phentsize..];
         let (p_type, p_flags) = (u32_at(ph, 0), u32_at(ph, 4));
-        let (offset, vaddr, filesz, memsz) = (u64_at(ph, 8) as usize, u64_at(ph, 16), u64_at(ph, 32) as usize, u64_at(ph, 40));
+        let (offset, vaddr, filesz, memsz) = (u64_at(ph, 8), u64_at(ph, 16), u64_at(ph, 32), u64_at(ph, 40));
         match p_type {
             PT_LOAD => {
-                if offset + filesz > file.len() || filesz as u64 > memsz {
+                if offset.saturating_add(filesz) > size || filesz > memsz || vaddr.checked_add(memsz).is_none() {
                     return Err(bad("segment out of range"));
                 }
-                first_load.get_or_insert(vaddr - offset as u64);
+                first_load.get_or_insert(vaddr.wrapping_sub(offset));
                 let prot = (if p_flags & PF_R != 0 { PROT_READ } else { 0 })
                     | (if p_flags & PF_W != 0 { PROT_WRITE } else { 0 })
                     | (if p_flags & PF_X != 0 { PROT_EXEC } else { 0 });
                 segs.push(Segment { vaddr, offset, filesz, memsz, prot });
             }
             PT_INTERP => {
-                let raw = file.get(offset..offset + filesz).ok_or_else(|| bad("bad PT_INTERP"))?;
-                let s = raw.split(|&b| b == 0).next().unwrap_or(raw);
+                if offset.saturating_add(filesz) > size || filesz > PAGE {
+                    return Err(bad("bad PT_INTERP"));
+                }
+                let raw = read(offset, filesz as usize)?;
+                let s = raw.split(|&b| b == 0).next().unwrap_or(&raw);
                 interp = Some(String::from_utf8_lossy(s).into_owned());
             }
             PT_PHDR => phdr_vaddr = Some(vaddr),
@@ -105,38 +114,56 @@ pub fn load(mm: &mut AddressSpace, file: &[u8], name: &str, is_interp: bool) -> 
         (true, false) => MAIN_PIE_BASE - lo,
         (true, true) => mm.map(Placement::Hint(0), span, 0, Backing::Anon).map_err(|e| bad(&format!("no room (errno {e})")))? - lo,
     };
-    // Reserve the whole span, write every segment, then apply each segment's
-    // protection (pages shared by two segments get both).
-    mm.map(Placement::Fixed(lo + bias), span, PROT_READ | PROT_WRITE, Backing::Anon)
+    // Gaps between segments are inaccessible, as with Linux's loader.
+    mm.map(Placement::Fixed(lo + bias), span, 0, Backing::Anon)
         .map_err(|e| bad(&format!("cannot map at {:#x} (errno {e})", lo + bias)))?;
-    for s in &segs {
-        mm.write_force(s.vaddr + bias, &file[s.offset..s.offset + s.filesz]).map_err(|e| bad(&format!("errno {e}")))?;
-    }
-    let mut prot_of: BTreeMap<u64, u32> = BTreeMap::new();
-    for s in &segs {
-        for page in (page_down(s.vaddr)..page_up(s.vaddr + s.memsz)).step_by(PAGE as usize) {
-            *prot_of.entry(page).or_insert(0) |= s.prot;
+    let in_step = segs.iter().all(|s| (s.vaddr ^ s.offset).is_multiple_of(PAGE));
+    let apart = segs.windows(2).all(|w| page_up(w[0].vaddr + w[0].memsz) <= page_down(w[1].vaddr));
+    if in_step && apart {
+        for s in &segs {
+            let start = page_down(s.vaddr);
+            let (file_end, end) = (page_up(s.vaddr + s.filesz), page_up(s.vaddr + s.memsz));
+            let mut anon_from = start;
+            if s.filesz > 0 {
+                let backing = Backing::File { src: src.clone(), offset: page_down(s.offset) };
+                mm.map(Placement::Fixed(start + bias), file_end - start, s.prot, backing).map_err(|e| bad(&format!("errno {e}")))?;
+                anon_from = file_end;
+                // What follows the segment in the file's last page is the start of its zeros.
+                let zeros = (file_end - (s.vaddr + s.filesz)).min(s.memsz - s.filesz) as usize;
+                if zeros > 0 {
+                    mm.write_force(s.vaddr + s.filesz + bias, &vec![0; zeros]).map_err(|e| bad(&format!("errno {e}")))?;
+                }
+            }
+            if end > anon_from {
+                mm.map(Placement::Fixed(anon_from + bias), end - anon_from, s.prot, Backing::Anon).map_err(|e| bad(&format!("errno {e}")))?;
+            }
         }
-    }
-    let mut runs: Vec<(u64, u64, u32)> = Vec::new();
-    for (&page, &prot) in &prot_of {
-        match runs.last_mut() {
-            Some((_, end, p)) if *end == page && *p == prot => *end += PAGE,
-            _ => runs.push((page, page + PAGE, prot)),
+    } else {
+        // Segments that share pages can't be mapped from the file: pages get both's
+        // contents and both's protection.
+        let mut prot_of: BTreeMap<u64, u32> = BTreeMap::new();
+        for s in &segs {
+            for page in (page_down(s.vaddr)..page_up(s.vaddr + s.memsz)).step_by(PAGE as usize) {
+                *prot_of.entry(page).or_insert(0) |= s.prot;
+            }
         }
-    }
-    // Gaps between segments become inaccessible, as with Linux's loader.
-    mm.protect(lo + bias, span, 0).map_err(|e| bad(&format!("mprotect errno {e}")))?;
-    for (a, b, prot) in runs {
-        mm.protect(a + bias, b - a, prot).map_err(|e| bad(&format!("mprotect errno {e}")))?;
+        for &page in prot_of.keys() {
+            mm.protect(page + bias, PAGE, PROT_READ | PROT_WRITE).map_err(|e| bad(&format!("mprotect errno {e}")))?;
+        }
+        for s in &segs {
+            mm.write_force(s.vaddr + bias, &read(s.offset, s.filesz as usize)?).map_err(|e| bad(&format!("errno {e}")))?;
+        }
+        for (&page, &prot) in &prot_of {
+            mm.protect(page + bias, PAGE, prot).map_err(|e| bad(&format!("mprotect errno {e}")))?;
+        }
     }
 
     Ok(Image {
         lo: lo + bias,
-        entry: u64_at(file, 24) + bias,
+        entry: u64_at(&file, 24) + bias,
         bias,
         // No PT_PHDR: the headers sit at file offset phoff inside the first segment.
-        phdr: phdr_vaddr.unwrap_or(first_load.unwrap_or(0) + phoff as u64) + bias,
+        phdr: phdr_vaddr.unwrap_or(first_load.unwrap_or(0).wrapping_add(phoff)) + bias,
         phnum: phnum as u64,
         end: hi + bias,
         interp,

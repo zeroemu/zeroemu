@@ -51,6 +51,21 @@ pub trait FileSystem: Send + Sync {
     fn readdir(&self, dir: u64) -> io::Result<Vec<Dirent>>;
     fn read_all(&self, ino: u64) -> io::Result<Arc<[u8]>>;
 
+    /// Bytes of a file from `off`: as many as `buf` holds, unless it ends first.
+    fn read_at(&self, ino: u64, off: u64, buf: &mut [u8]) -> io::Result<usize> {
+        let data = self.read_all(ino)?;
+        let from = usize::try_from(off).unwrap_or(usize::MAX).min(data.len());
+        let n = (data.len() - from).min(buf.len());
+        buf[..n].copy_from_slice(&data[from..from + n]);
+        Ok(n)
+    }
+
+    /// Whether its files never change, so that the page cache can hold them
+    /// (the read-only images, as opposed to what is generated on each read).
+    fn paged(&self) -> bool {
+        false
+    }
+
     /// For /proc/mounts.
     fn fs_type(&self) -> &'static str {
         "unknown"
@@ -180,6 +195,12 @@ impl FileSystem for Erofs {
     fn read_all(&self, ino: u64) -> io::Result<Arc<[u8]>> {
         self.read(&self.inode(ino)?)
     }
+    fn read_at(&self, ino: u64, off: u64, buf: &mut [u8]) -> io::Result<usize> {
+        self.read_range(&self.inode(ino)?, off, buf)
+    }
+    fn paged(&self) -> bool {
+        true
+    }
     fn getxattr(&self, ino: u64, name: &str) -> Result<Vec<u8>, i64> {
         find_xattr(self.inode(ino).and_then(|i| self.xattrs(&i)), name)
     }
@@ -233,11 +254,36 @@ impl FileSystem for Ext4 {
     fn read_all(&self, ino: u64) -> io::Result<Arc<[u8]>> {
         self.read(&self.inode(ino)?)
     }
+    fn read_at(&self, ino: u64, off: u64, buf: &mut [u8]) -> io::Result<usize> {
+        self.read_range(&self.inode(ino)?, off, buf)
+    }
+    fn paged(&self) -> bool {
+        true
+    }
     fn getxattr(&self, ino: u64, name: &str) -> Result<Vec<u8>, i64> {
         find_xattr(self.xattrs(ino), name)
     }
     fn listxattr(&self, ino: u64) -> Result<Vec<String>, i64> {
         xattr_names(self.xattrs(ino))
+    }
+}
+
+/// A file in a filesystem as a device, read straight through.
+pub struct FileAsDev {
+    pub fs: Arc<dyn FileSystem>,
+    pub ino: u64,
+    pub size: u64,
+}
+
+impl crate::image::ReadAt for FileAsDev {
+    fn read_exact_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
+        if self.fs.read_at(self.ino, offset, buf)? != buf.len() {
+            return Err(io::ErrorKind::UnexpectedEof.into());
+        }
+        Ok(())
+    }
+    fn len(&self) -> u64 {
+        self.size
     }
 }
 
@@ -326,6 +372,13 @@ impl FileSystem for LazyFs {
     fn read_all(&self, ino: u64) -> io::Result<Arc<[u8]>> {
         let (fs, ino) = self.real(ino)?;
         fs.read_all(ino)
+    }
+    fn read_at(&self, ino: u64, off: u64, buf: &mut [u8]) -> io::Result<usize> {
+        let (fs, ino) = self.real(ino)?;
+        fs.read_at(ino, off, buf)
+    }
+    fn paged(&self) -> bool {
+        true // it only ever opens one of the images
     }
     fn getxattr(&self, ino: u64, name: &str) -> Result<Vec<u8>, i64> {
         let (fs, ino) = self.real(ino).map_err(io_errno)?;
@@ -554,9 +607,11 @@ pub struct Vfs {
     kept: Mutex<Vec<Arc<Super>>>,
     /// Bumped on every change to the table (Linux's mnt_namespace event).
     events: Arc<AtomicU64>,
+    /// Holds the read-only images' pages, once there is guest memory to hold them in.
+    cache: OnceLock<Arc<crate::pagecache::PageCache>>,
 }
 
-fn io_errno(e: io::Error) -> i64 {
+pub(crate) fn io_errno(e: io::Error) -> i64 {
     if let Some(Errno(n)) = e.get_ref().and_then(|i| i.downcast_ref::<Errno>()) {
         return *n;
     }
@@ -1098,6 +1153,36 @@ impl Vfs {
         self.fs(node).read_all(node.ino).map_err(io_errno)
     }
 
+    pub fn set_page_cache(&self, cache: Arc<crate::pagecache::PageCache>) {
+        let _ = self.cache.set(cache);
+    }
+
+    pub fn page_cache(&self) -> Option<&Arc<crate::pagecache::PageCache>> {
+        self.cache.get()
+    }
+
+    /// A file's pages in the page cache, if it is a file the cache holds.
+    pub fn cached(&self, node: &Node) -> Result<Option<Arc<crate::pagecache::CachedFile>>, i64> {
+        let Some(cache) = self.cache.get().filter(|_| self.fs(node).paged()) else { return Ok(None) };
+        let st = self.stat(node)?;
+        if st.mode & S_IFMT != S_IFREG {
+            return Ok(None);
+        }
+        Ok(Some(cache.file(&node.mnt.sb.fs, node.ino, st.size, &node.path)))
+    }
+
+    /// Where a private mapping of a file gets its pages.
+    pub fn page_source(&self, node: &Node) -> Result<Arc<dyn crate::pagecache::PageSource>, i64> {
+        if let Some(f) = self.mem_file(node) {
+            return Ok(f.obj.clone());
+        }
+        if let Some(f) = self.cached(node)? {
+            return Ok(f);
+        }
+        let cache = self.cache.get().ok_or(ENOMEM)?;
+        Ok(Arc::new(crate::pagecache::Bytes::new(cache.phys.clone(), self.read_all(node)?)))
+    }
+
     pub fn fs_type(&self, node: &Node) -> &'static str {
         self.fs(node).fs_type()
     }
@@ -1260,4 +1345,10 @@ impl Vfs {
         }
         Ok(out)
     }
+}
+
+/// DROIDRT_MEMSTAT=1: thread dumps also say where memory has gone.
+pub fn memstat_on() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var("DROIDRT_MEMSTAT").as_deref() == Ok("1"));
+    *ON
 }

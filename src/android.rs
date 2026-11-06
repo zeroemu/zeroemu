@@ -3,7 +3,7 @@
 //! `super`, plus every APEX payload under /apex (unless Android's own init
 //! and apexd are to mount them).
 
-use crate::image::{Dev, FileDev, MemDev, erofs::Erofs, gpt, lp, zip};
+use crate::image::{Dev, FileDev, erofs::Erofs, gpt, lp, zip};
 use crate::vfs::{FileSystem, LazyFs, Vfs, open_fs};
 use std::io;
 use std::path::Path;
@@ -76,7 +76,8 @@ fn mount_apexes(vfs: &mut Vfs, dir: &str) -> io::Result<()> {
         vfs.mount(
             &format!("/apex/{name}"),
             LazyFs::new(move || {
-                let mut apex: Dev = Arc::new(MemDev(fs.read_all(ino)?));
+                let size = fs.stat(ino)?.size;
+                let mut apex: Dev = Arc::new(crate::vfs::FileAsDev { fs, ino, size });
                 // A compressed APEX wraps the real one, deflated, as `original_apex`
                 // (apexd decompresses it at boot on a device).
                 if zip::has_entry(&apex, "original_apex")? {

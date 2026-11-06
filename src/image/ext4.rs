@@ -30,8 +30,18 @@ pub struct Ext4 {
     desc_size: u64,
     desc_table: u64,
     has_64bit: bool,
-    cache: Mutex<HashMap<u64, Arc<[u8]>>>,
+    /// Directories and symlinks, which every path lookup reads again. File
+    /// contents are the page cache's business.
+    meta: Mutex<HashMap<u64, Arc<[u8]>>>,
+    /// Files' block maps, as those read recently need them.
+    maps: Mutex<HashMap<u64, Arc<[Run]>>>,
 }
+
+/// (logical block, physical block, block count), in logical order.
+type Run = (u64, u64, u64);
+
+/// Holds this many runs' worth of block maps; they are quick to read back.
+const RUNS_KEPT: usize = 1 << 20;
 
 #[derive(Clone, Debug)]
 pub struct Inode {
@@ -81,7 +91,8 @@ impl Ext4 {
             desc_table: (le32(&sb, 20) as u64 + 1) * bs,
             has_64bit,
             dev,
-            cache: Mutex::new(HashMap::new()),
+            meta: Mutex::default(),
+            maps: Mutex::default(),
         }))
     }
 
@@ -170,42 +181,74 @@ impl Ext4 {
         Ok(())
     }
 
-    /// Whole file contents (holes read as zeros), cached.
+    /// Whole file contents (holes read as zeros). Only directories and symlinks are kept.
     pub fn read(&self, ino: &Inode) -> io::Result<Arc<[u8]>> {
-        if let Some(d) = self.cache.lock().unwrap().get(&ino.ino) {
+        let keep = matches!(ino.mode & 0o170000, 0o040000 | 0o120000);
+        if keep && let Some(d) = self.meta.lock().unwrap().get(&ino.ino) {
             return Ok(d.clone());
         }
+        let mut v = vec![0; ino.size as usize];
+        let n = self.read_range(ino, 0, &mut v)?;
+        v.truncate(n);
+        let data: Arc<[u8]> = v.into();
+        if keep {
+            self.meta.lock().unwrap().insert(ino.ino, data.clone());
+        }
+        Ok(data)
+    }
+
+    /// Bytes of a file from `off`: as many as `buf` holds, unless it ends first.
+    pub fn read_range(&self, ino: &Inode, off: u64, buf: &mut [u8]) -> io::Result<usize> {
+        let n = ino.size.saturating_sub(off).min(buf.len() as u64) as usize;
+        let buf = &mut buf[..n];
+        if n == 0 {
+            return Ok(0);
+        }
         let is_symlink = ino.mode & 0o170000 == 0o120000;
-        let data: Arc<[u8]> = if is_symlink && ino.size < 60 && ino.flags & EXTENTS_FL == 0 {
-            ino.block[..ino.size as usize].into() // fast symlink: target stored in i_block
-        } else if ino.flags & INLINE_DATA_FL != 0 {
+        if is_symlink && ino.size < 60 && ino.flags & EXTENTS_FL == 0 {
+            // fast symlink: target stored in i_block
+            buf.copy_from_slice(&ino.block[off as usize..off as usize + n]);
+            return Ok(n);
+        }
+        if ino.flags & INLINE_DATA_FL != 0 {
             return Err(invalid(format!(
                 "ext4: inline data not supported (inode {})",
                 ino.ino
             )));
+        }
+        buf.fill(0); // holes
+        let runs = self.runs_of(ino)?;
+        let end = off + n as u64;
+        for &(logical, phys, count) in &runs[runs.partition_point(|r| (r.0 + r.2) * self.bs <= off)..] {
+            let start = logical * self.bs;
+            if start >= end {
+                break;
+            }
+            let (from, to) = (start.max(off), (start + count * self.bs).min(end));
+            self.dev.read_exact_at(phys * self.bs + (from - start), &mut buf[(from - off) as usize..(to - off) as usize])?;
+        }
+        Ok(n)
+    }
+
+    /// A file's block map.
+    fn runs_of(&self, ino: &Inode) -> io::Result<Arc<[Run]>> {
+        if let Some(r) = self.maps.lock().unwrap().get(&ino.ino) {
+            return Ok(r.clone());
+        }
+        let mut runs = Vec::new();
+        if ino.flags & EXTENTS_FL != 0 {
+            self.extent_runs(&ino.block, &mut runs, 0)?;
         } else {
-            let mut out = vec![0u8; ino.size as usize];
-            let mut runs = Vec::new();
-            if ino.flags & EXTENTS_FL != 0 {
-                self.extent_runs(&ino.block, &mut runs, 0)?;
-            } else {
-                self.indirect_runs(&ino.block, ino.size.div_ceil(self.bs), &mut runs)?;
-            }
-            for (logical, phys, count) in runs {
-                let start = logical * self.bs;
-                if start >= ino.size {
-                    continue;
-                }
-                let len = (count * self.bs).min(ino.size - start) as usize;
-                self.dev.read_exact_at(
-                    phys * self.bs,
-                    &mut out[start as usize..start as usize + len],
-                )?;
-            }
-            out.into()
-        };
-        self.cache.lock().unwrap().insert(ino.ino, data.clone());
-        Ok(data)
+            self.indirect_runs(&ino.block, ino.size.div_ceil(self.bs), &mut runs)?;
+        }
+        runs.sort_unstable();
+        let runs: Arc<[Run]> = runs.into();
+        let mut kept = self.maps.lock().unwrap();
+        if kept.values().map(|r| r.len()).sum::<usize>() + runs.len() > RUNS_KEPT {
+            kept.clear();
+        }
+        kept.insert(ino.ino, runs.clone());
+        Ok(runs)
     }
 
     /// Collects (logical block, physical block, block count) from an extent tree node.

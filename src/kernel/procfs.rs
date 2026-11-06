@@ -11,7 +11,7 @@ use super::sysctl::{self, Sysctl};
 use super::{Kernel, Process};
 use crate::errno::*;
 use crate::paging::{PROT_EXEC, PROT_READ, PROT_WRITE};
-use crate::phys::{PAGE, PHYS_MAX};
+use crate::phys::PAGE;
 use crate::vfs::{Dirent, FileSystem, S_IFDIR, S_IFLNK, S_IFREG, Stat};
 use std::io;
 use std::sync::atomic::Ordering;
@@ -315,12 +315,16 @@ impl ProcFs {
             // Rewritten to the caller during resolution; only seen by readdir/stat.
             K::Self_ | K::ThreadSelf => Ok(Content::Link(kernel.root_pid.load(Ordering::Relaxed).to_string())),
             K::Meminfo => {
-                let total = PHYS_MAX / 1024;
-                let used = kernel.phys.frames_in_use() * PAGE / 1024;
+                let kb = |frames: u64| frames * PAGE / 1024;
+                let total = crate::phys::ram() / 1024;
+                let used = kb(kernel.phys.frames_in_use());
+                let (cached, idle) = (kb(kernel.phys.cached_frames()), kb(kernel.phys.cached_idle_frames()));
+                let free = total.saturating_sub(used);
                 text(format!(
-                    "MemTotal:       {total:8} kB\nMemFree:        {:8} kB\nMemAvailable:   {:8} kB\nBuffers:               0 kB\nCached:                0 kB\nSwapCached:            0 kB\nSwapTotal:             0 kB\nSwapFree:              0 kB\nShmem:                 0 kB\n",
-                    total - used,
-                    total - used
+                    "MemTotal:       {total:8} kB\nMemFree:        {free:8} kB\nMemAvailable:   {:8} kB\nBuffers:               0 kB\nCached:         {cached:8} kB\nSwapCached:            0 kB\nActive(file):   {:8} kB\nInactive(file): {idle:8} kB\nSwapTotal:             0 kB\nSwapFree:              0 kB\nMapped:         {:8} kB\nShmem:                 0 kB\n",
+                    (free + idle).min(total),
+                    cached - idle,
+                    cached - idle,
                 ))
             }
             K::Cpuinfo => text(cpuinfo()),
@@ -494,7 +498,7 @@ impl ProcFs {
                 let p = self.proc(pid)?;
                 let rss = p.mm.lock().unwrap().as_ref().map_or(0, |m| m.usage().1);
                 let adj = p.knobs.lock().unwrap().oom_score_adj as i64;
-                text(format!("{}\n", ((rss as u128 * 1000 / PHYS_MAX as u128) as i64 + adj).clamp(0, 2000)))
+                text(format!("{}\n", ((rss as u128 * 1000 / crate::phys::ram() as u128) as i64 + adj).clamp(0, 2000)))
             }
             K::PTimerslack => text(format!("{}\n", thread_of(&*self.proc(pid)?, extra as i32).ok_or_else(|| err(ESRCH))?.attrs.lock().unwrap().timer_slack())),
             K::PNs => {

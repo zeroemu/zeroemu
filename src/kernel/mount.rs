@@ -103,7 +103,7 @@ fn is_security_option(key: &str) -> bool {
 fn memparse(v: &str) -> Result<u64, i64> {
     if let Some(p) = v.strip_suffix('%') {
         let p: u64 = p.parse().map_err(|_| EINVAL)?;
-        return (crate::phys::PHYS_MAX / 100).checked_mul(p).ok_or(EINVAL);
+        return (crate::phys::ram() / 100).checked_mul(p).ok_or(EINVAL);
     }
     let (num, shift) = match v.as_bytes().last() {
         Some(b'k' | b'K') => (&v[..v.len() - 1], 10),
@@ -641,8 +641,8 @@ mod tests {
         assert_eq!(parse_options("mode=0755,uid=0,ro"), vec![("mode", Some("0755")), ("uid", Some("0")), ("ro", None)]);
         assert_eq!(memparse("16k"), Ok(16384));
         assert_eq!(memparse("2M"), Ok(2 << 20));
-        assert_eq!(memparse("50%"), Ok(crate::phys::PHYS_MAX / 100 * 50));
-        assert_eq!(memparse("100000000000%"), Err(EINVAL));
+        assert_eq!(memparse("50%"), Ok(crate::phys::ram() / 100 * 50));
+        assert_eq!(memparse("1000000000000%"), Err(EINVAL));
         assert_eq!(memparse("x"), Err(EINVAL));
         assert_eq!(octal(Some("0755")), Ok(0o755));
         assert_eq!(mangle("a b\\c"), "a\\040b\\134c");

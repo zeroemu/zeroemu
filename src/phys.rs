@@ -5,7 +5,7 @@
 use crate::errno::ENOMEM;
 use crate::hv::Hypervisor;
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 pub const PAGE: u64 = 4096;
@@ -17,6 +17,22 @@ pub const IPA_BITS: u32 = 36;
 /// Hypervisor.framework maps only 16 KiB-aligned host, GPA and size.
 pub const DEV_ALIGN: u64 = 16 << 10;
 const CHUNK: u64 = 64 << 20;
+/// In a frame's count: the page cache holds it. Its own hold isn't counted, so
+/// a count of 0 with this set is a cached page that nothing has mapped.
+const CACHED: u32 = 1 << 31;
+
+/// What the guest is told it has, in bytes. An AVD says 4096 MB (hw.ramSize).
+static RAM: AtomicU64 = AtomicU64::new(4096 << 20);
+
+/// The memory the guest believes in: /proc/meminfo, sysinfo, how Android sizes
+/// its caches and when it closes apps. Frames can go past this; see `PHYS_MAX`.
+pub fn ram() -> u64 {
+    RAM.load(Ordering::Relaxed)
+}
+
+pub fn set_ram(bytes: u64) {
+    RAM.store(bytes, Ordering::Relaxed);
+}
 
 pub struct PhysMem {
     base: NonNull<u8>,
@@ -28,6 +44,9 @@ pub struct PhysMem {
     /// after fork). Zeroed lazily by the OS; a frame only ever pays for this
     /// when its page of counters is touched.
     extra_refs: Box<[AtomicU32]>,
+    /// Frames in the page cache, and those of them nothing has mapped.
+    cached: AtomicU64,
+    cached_idle: AtomicU64,
 }
 
 struct Alloc {
@@ -66,6 +85,8 @@ impl PhysMem {
             alloc: Mutex::new(Alloc { mapped: 0, bump: PAGE, free: Vec::new() }),
             ext: Mutex::new(Ext { bump: PHYS_MAX, free: Vec::new(), live: Vec::new() }),
             extra_refs: zeroed_counters((PHYS_MAX / PAGE) as usize),
+            cached: AtomicU64::new(0),
+            cached_idle: AtomicU64::new(0),
         })
     }
 
@@ -138,20 +159,56 @@ impl PhysMem {
     pub fn free(&self, gpa: u64) {
         debug_assert!(gpa != 0 && gpa.is_multiple_of(PAGE));
         let others = &self.extra_refs[(gpa / PAGE) as usize];
-        if others.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1)).is_ok() {
+        if let Ok(before) = others.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| (n & !CACHED).checked_sub(1).map(|left| left | (n & CACHED))) {
+            if before == CACHED | 1 {
+                self.cached_idle.fetch_add(1, Ordering::Relaxed);
+            }
             return;
         }
         self.alloc.lock().unwrap().free.push(gpa);
     }
 
-    /// One more owner of a frame (fork's copy-on-write).
+    /// One more owner of a frame (fork's copy-on-write, a cached page mapped).
     pub fn share(&self, gpa: u64) {
-        self.extra_refs[(gpa / PAGE) as usize].fetch_add(1, Ordering::AcqRel);
+        if self.extra_refs[(gpa / PAGE) as usize].fetch_add(1, Ordering::AcqRel) == CACHED {
+            self.cached_idle.fetch_sub(1, Ordering::Relaxed);
+        }
     }
 
     /// Whether the caller is the frame's only owner.
     pub fn is_sole_owner(&self, gpa: u64) -> bool {
-        self.extra_refs[(gpa / PAGE) as usize].load(Ordering::Acquire) == 0
+        self.extra_refs[(gpa / PAGE) as usize].load(Ordering::Acquire) & !CACHED == 0
+    }
+
+    /// A frame the caller alone owns now belongs to the page cache.
+    pub fn mark_cached(&self, gpa: u64) {
+        self.extra_refs[(gpa / PAGE) as usize].fetch_or(CACHED, Ordering::AcqRel);
+        self.cached.fetch_add(1, Ordering::Relaxed);
+        self.cached_idle.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The page cache lets go of a frame, which lives on if something has it mapped.
+    pub fn release_cached(&self, gpa: u64) {
+        let before = self.extra_refs[(gpa / PAGE) as usize].fetch_and(!CACHED, Ordering::AcqRel);
+        self.cached.fetch_sub(1, Ordering::Relaxed);
+        if before == CACHED {
+            self.cached_idle.fetch_sub(1, Ordering::Relaxed);
+        }
+        self.free(gpa);
+    }
+
+    pub fn is_cached(&self, gpa: u64) -> bool {
+        self.extra_refs[(gpa / PAGE) as usize].load(Ordering::Acquire) & CACHED != 0
+    }
+
+    /// Frames in the page cache.
+    pub fn cached_frames(&self) -> u64 {
+        self.cached.load(Ordering::Relaxed)
+    }
+
+    /// Frames in the page cache that nothing has mapped: free for the taking.
+    pub fn cached_idle_frames(&self) -> u64 {
+        self.cached_idle.load(Ordering::Relaxed)
     }
 
     /// Host address of guest-physical `gpa` (a RAM frame, or a device mapping).
@@ -178,6 +235,11 @@ impl PhysMem {
 
     pub fn write_u64(&self, gpa: u64, v: u64) {
         unsafe { (self.host(gpa) as *mut u64).write(v) }
+    }
+
+    /// Frames that have ever been handed out, which is what the host holds.
+    pub fn frames_ever_used(&self) -> u64 {
+        self.alloc.lock().unwrap().bump / PAGE - 1
     }
 
     /// Frames in use (for diagnostics).

@@ -9,6 +9,7 @@ use crate::elf;
 use crate::errno::*;
 use crate::hv::{CpuState, Vcpu};
 use crate::mm::AddressSpace;
+use crate::phys::PAGE;
 use crate::vfs::{S_IFMT, S_IFREG};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
@@ -254,7 +255,9 @@ impl Kernel {
             if vfs.stat(&node)?.mode & S_IFMT != S_IFREG {
                 return Err(EACCES);
             }
-            let data = vfs.read_all(&node)?;
+            let size = vfs.stat(&node)?.size;
+            let src = vfs.page_source(&node)?;
+            let data = src.read_bytes(0, size.min(PAGE) as usize)?;
             if data.starts_with(b"#!") {
                 let line = data[2..].split(|&b| b == b'\n').next().unwrap_or(&[]);
                 let line = String::from_utf8_lossy(line);
@@ -270,7 +273,7 @@ impl Kernel {
                 path = interp;
                 continue;
             }
-            let main = elf::load(mm, &data, &node.path, false).map_err(|e| {
+            let main = elf::load(mm, &src, size, &node.path, false).map_err(|e| {
                 eprintln!("[droidrt] exec: {e}");
                 ENOEXEC
             })?;
@@ -278,8 +281,8 @@ impl Kernel {
             let (entry, base) = match &main.interp {
                 Some(interp) => {
                     let inode = vfs.resolve("/", interp, true)?;
-                    let idata = vfs.read_all(&inode)?;
-                    let li = elf::load(mm, &idata, interp, true).map_err(|e| {
+                    let (isrc, isize) = (vfs.page_source(&inode)?, vfs.stat(&inode)?.size);
+                    let li = elf::load(mm, &isrc, isize, interp, true).map_err(|e| {
                         eprintln!("[droidrt] exec: {e}");
                         ENOEXEC
                     })?;

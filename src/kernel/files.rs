@@ -203,6 +203,8 @@ pub struct NodeFile {
     stat: Stat,
     pos: u64,
     data: Option<Arc<[u8]>>,
+    /// Where the bytes of a file on an image come from.
+    cached: Option<Arc<crate::pagecache::CachedFile>>,
     dents: Option<Vec<Dirent>>,
     /// A kernel file (sysctl, cgroup control file) opened for writing.
     writable: bool,
@@ -216,7 +218,7 @@ impl NodeFile {
             let seen = c.load(Ordering::Relaxed);
             (c, seen)
         });
-        Mutex::new(NodeFile { node, stat, pos: 0, data: None, dents: None, writable, event })
+        Mutex::new(NodeFile { node, stat, pos: 0, data: None, cached: None, dents: None, writable, event })
     }
 
     /// Whether epoll may watch it (Linux refuses regular files).
@@ -1488,18 +1490,30 @@ impl Kernel {
         Ok(nf.data.clone().unwrap())
     }
 
-    /// Contents of a regular file behind `fd` (for file-backed mmap).
-    pub(super) fn fd_file_data(&self, t: &Thread, fd: i64) -> Result<Arc<[u8]>, i64> {
+    /// The page cache's copy of the file, if it is on an image.
+    fn node_cached(&self, nf: &mut NodeFile) -> Result<Option<Arc<crate::pagecache::CachedFile>>, i64> {
+        if nf.cached.is_none() {
+            nf.cached = self.vfs()?.cached(&nf.node)?;
+        }
+        Ok(nf.cached.clone())
+    }
+
+    /// Where a private mapping of the regular file behind `fd` gets its pages.
+    pub(super) fn fd_page_source(&self, t: &Thread, fd: i64) -> Result<Arc<dyn crate::pagecache::PageSource>, i64> {
         let f = t.files().get(fd)?;
         if let Kind::Mem(m) = &f.kind {
-            return Ok(m.file.read_at(0, usize::MAX).into()); // MAP_PRIVATE: a snapshot
+            return Ok(m.file.obj.clone());
         }
         let Kind::Node(nf) = &f.kind else { return Err(ENODEV) };
         let mut nf = nf.lock().unwrap();
         if nf.stat.mode & S_IFMT == S_IFDIR {
             return Err(ENODEV);
         }
-        self.node_data(&mut nf)
+        if let Some(file) = self.node_cached(&mut nf)? {
+            return Ok(file);
+        }
+        let data = self.node_data(&mut nf)?;
+        Ok(Arc::new(crate::pagecache::Bytes::new(self.phys.clone(), data)))
     }
 
     /// An iovec array, its total length capped at IO_MAX.
@@ -1596,6 +1610,13 @@ impl Kernel {
             }
             Kind::Node(nf) => {
                 let mut nf = nf.lock().unwrap();
+                if let Some(file) = self.node_cached(&mut nf)? {
+                    let data = file.read(at.unwrap_or(nf.pos), count)?;
+                    if at.is_none() {
+                        nf.pos += data.len() as u64;
+                    }
+                    return Ok(data);
+                }
                 let data = self.node_data(&mut nf)?;
                 let pos = at.unwrap_or(nf.pos) as usize;
                 let n = data.len().saturating_sub(pos).min(count);
@@ -2207,8 +2228,11 @@ impl block::Caller for BlockCaller<'_> {
         match &f.kind {
             Kind::Node(nf) => {
                 let node = nf.lock().unwrap().node.clone();
-                let data = self.k.vfs()?.read_all(&node)?;
-                Ok((Arc::new(crate::image::MemDev(data)), node.path))
+                let vfs = self.k.vfs()?;
+                if let Some(file) = vfs.cached(&node)? {
+                    return Ok((file, node.path));
+                }
+                Ok((Arc::new(crate::image::MemDev(vfs.read_all(&node)?)), node.path))
             }
             Kind::Mem(m) => Ok((Arc::new(block::MemFileDev(m.file.clone())), m.name.clone())),
             Kind::Block(b) => Ok((self.k.blocks.device(b.devt).ok_or(ENXIO)?, file_name(&f))),

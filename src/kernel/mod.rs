@@ -161,6 +161,8 @@ pub struct Kernel {
     /// Host threads running guest threads.
     live_threads: AtomicUsize,
     persist: Option<Persist>,
+    /// Where signal handlers return to: one page, the same in every process.
+    sigpage: Arc<crate::mm::SharedObject>,
     /// The vCPUs guest threads share.
     vcpus: Arc<vcpus::Pool>,
     futex: futex::Futexes,
@@ -800,6 +802,9 @@ impl Kernel {
             v.mount("/", crate::tmpfs::Tmpfs::new(phys.clone(), 0o755));
             v
         });
+        v.set_page_cache(crate::pagecache::PageCache::new(phys.clone()));
+        let sigpage = crate::mm::SharedObject::new(phys.clone());
+        sigpage.write(0, &signal::trampoline_page()).map_err(|e| format!("signal page: errno {e}"))?;
         let (dev, data) = mount_tmpfs(&mut v, &phys);
         let mut persist = None;
         if boot {
@@ -905,6 +910,7 @@ impl Kernel {
             live_threads: AtomicUsize::new(0),
             vcpus: vcpus::Pool::new(max_vcpus),
             persist,
+            sigpage,
             futex: futex::Futexes::default(),
             root_pid: AtomicI32::new(0),
             props,
@@ -924,10 +930,15 @@ impl Kernel {
         (self.next_asid.fetch_add(1, Ordering::Relaxed) % 0xffff + 1) as u16
     }
 
+    /// A program held in host memory, as something to load (the freestanding guests).
+    pub fn bytes_source(&self, data: Arc<[u8]>) -> Arc<dyn crate::pagecache::PageSource> {
+        Arc::new(crate::pagecache::Bytes::new(self.phys.clone(), data))
+    }
+
     pub fn new_address_space(&self) -> Result<AddressSpace, i64> {
         let mut mm = AddressSpace::new(self.phys.clone(), &self.kwin, self.alloc_asid())?;
         // Where signal handlers return to (Linux puts this in the vDSO).
-        mm.map(Placement::Fixed(signal::SIGRETURN_TRAMPOLINE), PAGE, PROT_READ | PROT_EXEC, Backing::File { data: signal::trampoline_page(), offset: 0 })?;
+        mm.map(Placement::Fixed(signal::SIGRETURN_TRAMPOLINE), PAGE, PROT_READ | PROT_EXEC, Backing::File { src: self.sigpage.clone(), offset: 0 })?;
         mm.set_name(signal::SIGRETURN_TRAMPOLINE, PAGE, "[sigpage]");
         Ok(mm)
     }
@@ -963,7 +974,75 @@ impl Kernel {
     /// Starts the first process: `mm` already holds the program and its stack.
     /// Prints every guest thread: comm, the syscall it is in, backtrace.
     /// Only try_lock: a dump is for when something holds a lock forever.
+    /// DROIDRT_MEMSTAT=1: where memory has gone, as part of a thread dump.
+    fn memory_report(&self) {
+        use std::collections::{HashMap, HashSet};
+        const MB: u64 = 1 << 20;
+        let mb = |frames: usize| frames as u64 * crate::phys::PAGE / MB;
+        let Ok(procs) = self.procs.try_lock().map(|p| p.values().cloned().collect::<Vec<Arc<Process>>>()) else { return };
+        let (mut anon, mut cached, mut private, mut shared) = (HashSet::new(), HashSet::new(), HashSet::new(), HashSet::new());
+        let (mut anon_mapped, mut file_mapped, mut shared_mapped, mut tables) = (0usize, 0usize, 0usize, 0usize);
+        // Pages of each file: still the page cache's, and copied because they were written.
+        let mut files: HashMap<String, (HashSet<u64>, HashSet<u64>)> = HashMap::new();
+        let mut anon_by_name: HashMap<String, HashSet<u64>> = HashMap::new();
+        for p in &procs {
+            let Ok(g) = p.mm.try_lock() else { continue };
+            let Some(mm) = g.as_ref() else { continue };
+            tables += mm.each_resident(&mut |_, vma, _, frame| match &vma.backing {
+                crate::mm::Backing::Anon => {
+                    anon.insert(frame);
+                    anon_mapped += 1;
+                    anon_by_name.entry(vma.name.as_deref().unwrap_or("[anon]").split('@').next().unwrap_or("").to_string()).or_default().insert(frame);
+                }
+                crate::mm::Backing::File { .. } => {
+                    file_mapped += 1;
+                    let e = files.entry(vma.name.as_deref().unwrap_or("?").to_string()).or_default();
+                    if self.phys.is_cached(frame) {
+                        cached.insert(frame);
+                        e.0.insert(frame);
+                    } else {
+                        private.insert(frame);
+                        e.1.insert(frame);
+                    }
+                }
+                crate::mm::Backing::Shared { .. } => {
+                    shared.insert(frame);
+                    shared_mapped += 1;
+                }
+                _ => {}
+            });
+        }
+        let in_use = self.phys.frames_in_use() as usize;
+        let touched = self.phys.frames_ever_used() as usize;
+        let (in_cache, idle) = (self.phys.cached_frames() as usize, self.phys.cached_idle_frames() as usize);
+        eprintln!("[mem] guest frames: {} MB in use, {} MB freed and still held, of {} MB ever touched", mb(in_use), mb(touched - in_use), mb(touched));
+        eprintln!("[mem] page tables: {} MB in {} processes", mb(tables), procs.len());
+        eprintln!("[mem] private anonymous: {} MB ({} MB as mapped)", mb(anon.len()), mb(anon_mapped));
+        eprintln!("[mem] page cache: {} MB, of which {} MB nothing has mapped. {} MB as mapped", mb(in_cache), mb(idle), mb(file_mapped.saturating_sub(private.len())));
+        eprintln!("[mem] file pages copied because they were written: {} MB", mb(private.len()));
+        eprintln!("[mem] shared memory mapped (tmpfs, memfd, ashmem): {} MB ({} MB as mapped)", mb(shared.len()), mb(shared_mapped));
+        eprintln!("[mem] the rest, tmpfs files not mapped and buffers: {} MB", mb(in_use.saturating_sub(tables + anon.len() + in_cache + private.len() + shared.len())));
+        let mut by: Vec<_> = files.iter().collect();
+        by.sort_by_key(|(_, f)| std::cmp::Reverse(f.0.len() + f.1.len()));
+        for (name, f) in by.iter().take(14) {
+            eprintln!("[mem]   file {:5} MB shared, {:4} MB copied: {name}", mb(f.0.len()), mb(f.1.len()));
+        }
+        let mut by: Vec<_> = anon_by_name.iter().collect();
+        by.sort_by_key(|(_, f)| std::cmp::Reverse(f.len()));
+        for (name, f) in by.iter().take(10) {
+            eprintln!("[mem]   anonymous {:5} MB: {name}", mb(f.len()));
+        }
+        if let Some(cache) = self.vfs.as_deref().and_then(|v| v.page_cache()) {
+            for (name, pages) in cache.largest(14) {
+                eprintln!("[mem]   cached {:5} MB: {name}", mb(pages));
+            }
+        }
+    }
+
     fn dump_threads(&self) {
+        if crate::vfs::memstat_on() {
+            self.memory_report();
+        }
         let procs = (0..50).find_map(|_| match self.procs.try_lock() {
             Ok(p) => Some(p.values().cloned().collect::<Vec<Arc<Process>>>()),
             Err(_) => {

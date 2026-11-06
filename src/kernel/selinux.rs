@@ -481,7 +481,7 @@ impl Selinux {
                 "cache_threshold" => text("512"),
                 "hash_stats" => text("entries: 0\nbuckets used: 0/512\nlongest chain: 0\n"),
                 "cache_stats" => text("lookups hits misses allocations reclaims frees\n0 0 0 0 0 0\n"),
-                "status" => Ok(self.status.read_at(0, 20)),
+                "status" => self.status.read_at(0, 20),
                 n if TRANSACTIONS.contains(&n) => Ok(Vec::new()),
                 _ => Err(EINVAL), // write-only
             };

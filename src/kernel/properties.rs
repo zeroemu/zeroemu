@@ -45,7 +45,7 @@ pub struct Properties {
 impl Properties {
     pub fn new(phys: Arc<PhysMem>) -> Arc<Properties> {
         let file = MemFile::new(phys);
-        file.truncate(AREA_SIZE);
+        file.truncate(AREA_SIZE).expect("property area");
         let p = Properties { file, index: Mutex::new(HashMap::new()) };
         // Root node, then a PROP_VALUE_MAX "dirty backup area".
         p.w32(0, BT + align4(PROP_VALUE_MAX as u32)); // bytes_used_

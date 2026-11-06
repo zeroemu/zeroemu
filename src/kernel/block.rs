@@ -11,6 +11,7 @@
 
 use crate::errno::*;
 use crate::image::{Dev, ReadAt};
+use crate::image::ExtentDev;
 use crate::tmpfs::MemFile;
 use crate::vfs::{FileSystem, S_IFDIR, S_IFMT, S_IFREG};
 use std::collections::BTreeMap;
@@ -67,7 +68,7 @@ pub struct MemFileDev(pub Arc<MemFile>);
 
 impl ReadAt for MemFileDev {
     fn read_exact_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
-        let data = self.0.read_at(offset, buf.len());
+        let data = self.0.read_at(offset, buf.len()).map_err(|e| io::Error::other(crate::errno::Errno(e)))?;
         if data.len() != buf.len() {
             return Err(io::ErrorKind::UnexpectedEof.into());
         }
@@ -137,6 +138,16 @@ impl ReadAt for LoopDev {
     fn len(&self) -> u64 {
         self.0.st.lock().unwrap().as_ref().map_or(0, Bound::size)
     }
+    fn pinned(&self) -> Option<Dev> {
+        let st = self.0.st.lock().unwrap();
+        let b = st.as_ref()?;
+        Some(ExtentDev::slice(pin(&b.dev), b.offset, b.size()))
+    }
+}
+
+/// `dev` as it reads now, whatever later happens to any loop device under it.
+pub(super) fn pin(dev: &Dev) -> Dev {
+    dev.pinned().unwrap_or_else(|| dev.clone())
 }
 
 fn cstr_field(b: &[u8]) -> String {
@@ -230,35 +241,71 @@ struct DmDevice {
 
 struct DmDev(Arc<DmDevice>);
 
+/// A device-mapper device's table as it was at one moment, its devices pinned.
+struct PinnedDm(Vec<Target>);
+
+impl ReadAt for PinnedDm {
+    fn read_exact_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
+        read_table(&self.0, offset, buf)
+    }
+    fn len(&self) -> u64 {
+        self.0.last().map_or(0, |t| (t.start + t.len) * SECTOR)
+    }
+}
+
 impl ReadAt for DmDev {
+    fn pinned(&self) -> Option<Dev> {
+        let table = self.0.st.lock().unwrap().active.clone()?;
+        let targets = table
+            .iter()
+            .map(|t| Target {
+                start: t.start,
+                len: t.len,
+                ty: t.ty.clone(),
+                params: t.params.clone(),
+                map: match &t.map {
+                    Map::Linear { dev, devt, offset } => Map::Linear { dev: pin(dev), devt: *devt, offset: *offset },
+                    Map::Zero => Map::Zero,
+                    Map::Error => Map::Error,
+                },
+            })
+            .collect();
+        Some(Arc::new(PinnedDm(targets)))
+    }
+
     fn read_exact_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
         let Some(table) = self.0.st.lock().unwrap().active.clone() else {
             return Err(io::ErrorKind::UnexpectedEof.into());
         };
-        let size = table.last().map_or(0, |t| (t.start + t.len) * SECTOR);
-        if offset + buf.len() as u64 > size {
-            return Err(io::ErrorKind::UnexpectedEof.into());
-        }
-        let mut done = 0;
-        while done < buf.len() {
-            let pos = offset + done as u64;
-            let i = table.partition_point(|t| (t.start + t.len) * SECTOR <= pos);
-            let t = &table[i];
-            let rel = pos - t.start * SECTOR;
-            let n = (((t.start + t.len) * SECTOR - pos) as usize).min(buf.len() - done);
-            let dst = &mut buf[done..done + n];
-            match &t.map {
-                Map::Linear { dev, offset, .. } => dev.read_exact_at(offset + rel, dst)?,
-                Map::Zero => dst.fill(0),
-                Map::Error => return Err(io::Error::other("dm-error target")),
-            }
-            done += n;
-        }
-        Ok(())
+        read_table(&table, offset, buf)
     }
+
     fn len(&self) -> u64 {
         self.0.st.lock().unwrap().active.as_ref().and_then(|t| t.last()).map_or(0, |t| (t.start + t.len) * SECTOR)
     }
+}
+
+fn read_table(table: &[Target], offset: u64, buf: &mut [u8]) -> io::Result<()> {
+    let size = table.last().map_or(0, |t| (t.start + t.len) * SECTOR);
+    if offset + buf.len() as u64 > size {
+        return Err(io::ErrorKind::UnexpectedEof.into());
+    }
+    let mut done = 0;
+    while done < buf.len() {
+        let pos = offset + done as u64;
+        let i = table.partition_point(|t| (t.start + t.len) * SECTOR <= pos);
+        let t = &table[i];
+        let rel = pos - t.start * SECTOR;
+        let n = (((t.start + t.len) * SECTOR - pos) as usize).min(buf.len() - done);
+        let dst = &mut buf[done..done + n];
+        match &t.map {
+            Map::Linear { dev, offset, .. } => dev.read_exact_at(offset + rel, dst)?,
+            Map::Zero => dst.fill(0),
+            Map::Error => return Err(io::Error::other("dm-error target")),
+        }
+        done += n;
+    }
+    Ok(())
 }
 
 // ---- the registry ----
@@ -317,7 +364,7 @@ pub(super) fn put_bytes(fs: &dyn FileSystem, path: &str, content: &[u8]) -> Opti
         },
     };
     if let Some(f) = fs.mem_file(ino) {
-        f.truncate(0);
+        let _ = f.truncate(0);
         let _ = f.write_at(0, content);
     }
     Some(ino)

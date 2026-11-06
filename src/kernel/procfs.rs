@@ -26,6 +26,8 @@ enum K {
     /// /proc/net, and in it the interfaces' counters, which `ifconfig` starts from.
     Net,
     NetDev,
+    Vmstat,
+    Zoneinfo,
     Self_,
     ThreadSelf,
     Meminfo,
@@ -81,14 +83,14 @@ enum K {
     AttrSockcreate,
 }
 
-const ALL: [K; 50] = [
+const ALL: [K; 52] = [
     K::Root, K::Self_, K::ThreadSelf, K::Meminfo, K::Cpuinfo, K::Stat, K::Uptime, K::Loadavg, K::Version, K::Filesystems,
     K::Cmdline, K::Mounts, K::Sysctl, K::Pid, K::PCmdline, K::PComm, K::PExe, K::PCwd, K::PFd, K::PFdLink,
     K::PMaps, K::PStatus, K::PStat, K::PStatm, K::PTask, K::PAttr, K::PMounts, K::POom, K::PEnviron,
     K::Task, K::PMountinfo, K::POomAdj, K::POomScore, K::PTimerslack, K::PNs, K::PNsLink, K::NsFile,
     K::Cgroups, K::PCgroup, K::Pressure, K::PressureFile,
     K::AttrCurrent, K::AttrPrev, K::AttrExec, K::AttrFscreate, K::AttrKeycreate, K::AttrSockcreate,
-    K::ConfigGz, K::Net, K::NetDev,
+    K::ConfigGz, K::Net, K::NetDev, K::Vmstat, K::Zoneinfo,
 ];
 const ATTR_K: [K; 6] = [K::AttrCurrent, K::AttrPrev, K::AttrExec, K::AttrFscreate, K::AttrKeycreate, K::AttrSockcreate];
 
@@ -165,6 +167,25 @@ fn psi_trigger(data: &[u8]) -> Result<usize, i64> {
     match (kind, stall, window) {
         (Some("some" | "full"), Some(s), Some(win)) if (500_000..=10_000_000).contains(&win) && s > 0 && s <= win => Ok(data.len()),
         _ => Err(EINVAL),
+    }
+}
+
+/// Memory as /proc reports it, in pages.
+struct MemCounts {
+    ram: u64,
+    free: u64,
+    cached: u64,
+    /// Of `cached`, what nothing has mapped.
+    idle: u64,
+    anon: u64,
+}
+
+impl MemCounts {
+    fn of(kernel: &Kernel) -> MemCounts {
+        let used = kernel.phys.frames_in_use();
+        let (cached, idle) = (kernel.phys.cached_frames(), kernel.phys.cached_idle_frames());
+        let ram = crate::phys::ram() / PAGE;
+        MemCounts { ram, free: ram.saturating_sub(used), cached, idle: idle.min(cached), anon: used.saturating_sub(cached) }
     }
 }
 
@@ -301,6 +322,8 @@ impl ProcFs {
                     ("cgroups", K::Cgroups),
                     ("config.gz", K::ConfigGz),
                     ("net", K::Net),
+                    ("vmstat", K::Vmstat),
+                    ("zoneinfo", K::Zoneinfo),
                 ]
                 .iter()
                 .map(|(n, k)| (n.to_string(), mk(*k, 0, 0)))
@@ -315,16 +338,47 @@ impl ProcFs {
             // Rewritten to the caller during resolution; only seen by readdir/stat.
             K::Self_ | K::ThreadSelf => Ok(Content::Link(kernel.root_pid.load(Ordering::Relaxed).to_string())),
             K::Meminfo => {
-                let kb = |frames: u64| frames * PAGE / 1024;
-                let total = crate::phys::ram() / 1024;
-                let used = kb(kernel.phys.frames_in_use());
-                let (cached, idle) = (kb(kernel.phys.cached_frames()), kb(kernel.phys.cached_idle_frames()));
-                let free = total.saturating_sub(used);
+                let m = MemCounts::of(&kernel);
+                let kb = |pages: u64| pages * PAGE / 1024;
+                let (active, anon) = (kb(m.cached - m.idle), kb(m.anon));
                 text(format!(
-                    "MemTotal:       {total:8} kB\nMemFree:        {free:8} kB\nMemAvailable:   {:8} kB\nBuffers:               0 kB\nCached:         {cached:8} kB\nSwapCached:            0 kB\nActive(file):   {:8} kB\nInactive(file): {idle:8} kB\nSwapTotal:             0 kB\nSwapFree:              0 kB\nMapped:         {:8} kB\nShmem:                 0 kB\n",
-                    (free + idle).min(total),
-                    cached - idle,
-                    cached - idle,
+                    "MemTotal:       {:8} kB\nMemFree:        {:8} kB\nMemAvailable:   {:8} kB\nBuffers:               0 kB\nCached:         {:8} kB\nSwapCached:            0 kB\nActive:         {:8} kB\nInactive:       {:8} kB\nActive(anon):   {anon:8} kB\nInactive(anon):        0 kB\nActive(file):   {active:8} kB\nInactive(file): {:8} kB\nUnevictable:           0 kB\nSwapTotal:             0 kB\nSwapFree:              0 kB\nAnonPages:      {anon:8} kB\nMapped:         {active:8} kB\nShmem:                 0 kB\nSlab:                  0 kB\nSReclaimable:          0 kB\nSUnreclaim:            0 kB\nKernelStack:           0 kB\nPageTables:            0 kB\n",
+                    kb(m.ram),
+                    kb(m.free),
+                    kb(m.free + m.idle).min(kb(m.ram)),
+                    kb(m.cached),
+                    active + anon,
+                    kb(m.idle),
+                    kb(m.idle),
+                ))
+            }
+            // lmkd looks only when these move: what they count is reclaim work, which
+            // is all it needs to know, and it decides by comparing MemFree with zoneinfo.
+            K::Vmstat => {
+                let m = MemCounts::of(&kernel);
+                let scanned = kernel.pressure.scanned.load(Ordering::Relaxed);
+                let short = kernel.pressure.short.load(Ordering::Relaxed);
+                text(format!(
+                    "nr_free_pages {}\nnr_inactive_anon 0\nnr_active_anon {}\nnr_inactive_file {}\nnr_active_file {}\nworkingset_refault_file {short}\npgscan_kswapd {scanned}\npgscan_direct 0\npgscan_direct_throttle 0\npgrefill 0\n",
+                    m.free,
+                    m.anon,
+                    m.idle,
+                    m.cached - m.idle,
+                ))
+            }
+            K::Zoneinfo => {
+                let m = MemCounts::of(&kernel);
+                let (min, low, high) = super::pressure::watermarks(m.ram);
+                text(format!(
+                    "Node 0, zone   Normal\n  per-node stats\n      nr_inactive_anon 0\n      nr_active_anon {}\n      nr_inactive_file {}\n      nr_active_file {}\n  pages free     {}\n        boost    0\n        min      {min}\n        low      {low}\n        high     {high}\n        spanned  {}\n        present  {}\n        managed  {}\n        cma      0\n        protection: (0, 0, 0)\n      nr_free_pages {}\n      nr_free_cma  0\n  pagesets\n    cpu: 0\n              count: 0\n  node_unreclaimable:  0\n  start_pfn:           1\n",
+                    m.anon,
+                    m.idle,
+                    m.cached - m.idle,
+                    m.free,
+                    m.ram,
+                    m.ram,
+                    m.ram,
+                    m.free,
                 ))
             }
             K::Cpuinfo => text(cpuinfo()),
@@ -434,10 +488,17 @@ impl ProcFs {
                 let state = if p.status.lock().unwrap().is_some() { ('Z', "zombie") } else { ('R', "running") };
                 let shown = if extra != 0 { extra as i32 } else { pid };
                 let threads = p.threads.lock().unwrap().len().max(1);
-                let (virt, rss, stack) = p.mm.lock().unwrap().as_ref().map_or((0, 0, 0), |m| {
+                let (virt, rss, stack, has_mm) = p.mm.lock().unwrap().as_ref().map_or((0, 0, 0, false), |m| {
                     let (v, r) = m.usage();
-                    (v, r, m.start_stack)
+                    (v, r, m.start_stack, true)
                 });
+                // A process without memory (a zombie) has none of these. lmkd goes by
+                // that: it won't kill what lacks either VmRSS or VmSwap.
+                let vm = if has_mm {
+                    format!("VmPeak:\t{} kB\nVmSize:\t{} kB\nVmHWM:\t{} kB\nVmRSS:\t{} kB\nVmSwap:\t0 kB\n", virt / 1024, virt / 1024, rss / 1024, rss / 1024)
+                } else {
+                    String::new()
+                };
                 let ppid = p.ppid.load(Ordering::Relaxed);
                 let name = comm(&p, extra as i32);
                 let c = p.creds.lock().unwrap().clone();
@@ -450,15 +511,12 @@ impl ProcFs {
                     K::PStatus => {
                         let groups: Vec<String> = c.groups.iter().map(|g| g.to_string()).collect();
                         text(format!(
-                            "Name:\t{name}\nUmask:\t{:04o}\nState:\t{} ({})\nTgid:\t{pid}\nNgid:\t0\nPid:\t{shown}\nPPid:\t{ppid}\nTracerPid:\t0\nUid:\t{}\t{}\t{}\t{}\nGid:\t{}\t{}\t{}\t{}\nFDSize:\t64\nGroups:\t{}\nVmPeak:\t{} kB\nVmSize:\t{} kB\nVmRSS:\t{} kB\nThreads:\t{threads}\nSigQ:\t0/0\nSigPnd:\t0000000000000000\nShdPnd:\t0000000000000000\nCapInh:\t{:016x}\nCapPrm:\t{:016x}\nCapEff:\t{:016x}\nCapBnd:\t{:016x}\nCapAmb:\t{:016x}\nNoNewPrivs:\t{}\nSeccomp:\t{}\nSeccomp_filters:\t{}\nCpus_allowed_list:\t0-{}\n",
+                            "Name:\t{name}\nUmask:\t{:04o}\nState:\t{} ({})\nTgid:\t{pid}\nNgid:\t0\nPid:\t{shown}\nPPid:\t{ppid}\nTracerPid:\t0\nUid:\t{}\t{}\t{}\t{}\nGid:\t{}\t{}\t{}\t{}\nFDSize:\t64\nGroups:\t{}\n{vm}Threads:\t{threads}\nSigQ:\t0/0\nSigPnd:\t0000000000000000\nShdPnd:\t0000000000000000\nCapInh:\t{:016x}\nCapPrm:\t{:016x}\nCapEff:\t{:016x}\nCapBnd:\t{:016x}\nCapAmb:\t{:016x}\nNoNewPrivs:\t{}\nSeccomp:\t{}\nSeccomp_filters:\t{}\nCpus_allowed_list:\t0-{}\n",
                             p.umask.load(Ordering::Relaxed),
                             state.0,
                             state.1,
                             c.uid, c.euid, c.suid, c.fsuid, c.gid, c.egid, c.sgid, c.fsgid,
                             groups.join(" "),
-                            virt / 1024,
-                            virt / 1024,
-                            rss / 1024,
                             c.inh, c.prm, c.eff, c.bnd, c.amb,
                             ta.no_new_privs as u32, ta.seccomp, ta.filters,
                             cpus() - 1
@@ -649,10 +707,21 @@ impl FileSystem for ProcFs {
     fn changes(&self, ino: u64) -> Option<Arc<std::sync::atomic::AtomicU64>> {
         match decode(ino)? {
             (K::Mounts | K::PMounts | K::PMountinfo, _, _) => Some(self.kernel.upgrade()?.vfs.as_ref()?.events()),
-            // A PSI trigger: droidrt keeps no stall accounting, so it never fires.
+            // Polled without a trigger written, it has nothing to say.
             (K::PressureFile, _, _) => Some(self.psi_events.clone()),
             _ => None,
         }
+    }
+
+    /// A trigger on memory pressure fires when droidrt runs short of memory (`pressure`);
+    /// those on other resources never do, since it keeps no stall accounting.
+    fn trigger(&self, ino: u64, data: &[u8]) -> Option<Arc<std::sync::atomic::AtomicU64>> {
+        let (K::PressureFile, _, extra) = decode(ino)? else { return None };
+        if PSI.get(extra as usize) != Some(&"memory") {
+            return None;
+        }
+        let pressure = &self.kernel.upgrade()?.pressure;
+        Some(if data.starts_with(b"full") { pressure.full.clone() } else { pressure.some.clone() })
     }
 
     fn magic_link(&self, ino: u64) -> Option<u64> {

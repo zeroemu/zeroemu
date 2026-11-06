@@ -110,6 +110,11 @@ pub trait FileSystem: Send + Sync {
     fn write(&self, _ino: u64, _data: &[u8]) -> Result<usize, i64> {
         Err(EINVAL)
     }
+    /// A counter for what was just written to set up, if it asks for events (a PSI
+    /// trigger): the file written through then reports those instead of `changes`.
+    fn trigger(&self, _ino: u64, _data: &[u8]) -> Option<Arc<AtomicU64>> {
+        None
+    }
     /// A magic symlink (/proc/<pid>/ns/*): following it lands on this inode
     /// of the same filesystem rather than on its text.
     fn magic_link(&self, _ino: u64) -> Option<u64> {
@@ -1214,6 +1219,10 @@ impl Vfs {
 
     pub fn changes(&self, node: &Node) -> Option<Arc<AtomicU64>> {
         self.fs(node).changes(node.ino)
+    }
+
+    pub fn trigger(&self, node: &Node, data: &[u8]) -> Option<Arc<AtomicU64>> {
+        self.fs(node).trigger(node.ino, data)
     }
 
     /// Resolves everything but the last component: (directory, name).

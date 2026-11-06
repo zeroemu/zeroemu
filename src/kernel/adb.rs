@@ -131,7 +131,7 @@ fn refresh_key() {
     let key = host_key();
     let mut last = LAST_KEY.lock().unwrap();
     if *last != key {
-        file.truncate(0);
+        let _ = file.truncate(0);
         let _ = file.write_at(0, &key);
         *last = key;
     }

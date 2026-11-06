@@ -4,12 +4,13 @@
 
 use crate::errno::*;
 use crate::mm::SharedObject;
+use crate::pagecache::{PageCache, Store};
 use crate::phys::PhysMem;
 use crate::vfs::{Dirent, FileSystem, S_IFDIR, S_IFLNK, S_IFMT, S_IFREG, Stat, XATTR_CREATE, XATTR_REPLACE, XATTR_SELINUX};
 use std::collections::{BTreeMap, HashMap};
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const ROOT: u64 = 1;
@@ -43,6 +44,9 @@ fn pages(bytes: u64) -> u64 {
     bytes.div_ceil(4096)
 }
 
+/// Longest a file can be.
+const MAX_FILE: u64 = 1 << 40;
+
 /// A regular file's contents: shared pages plus a length.
 pub struct MemFile {
     pub obj: Arc<SharedObject>,
@@ -66,27 +70,37 @@ impl MemFile {
         Arc::new(MemFile { obj: SharedObject::new(phys), size: Mutex::new(0), quota: None, xattrs: Mutex::default() })
     }
 
-    fn with_quota(phys: Arc<PhysMem>, quota: Arc<Quota>) -> Arc<MemFile> {
-        Arc::new(MemFile { obj: SharedObject::new(phys), size: Mutex::new(0), quota: Some((quota, AtomicU64::new(0))), xattrs: Mutex::default() })
+    fn with_quota(phys: Arc<PhysMem>, quota: Arc<Quota>, pager: Option<Arc<PageCache>>) -> Arc<MemFile> {
+        Arc::new(MemFile { obj: SharedObject::with_pager(phys, pager), size: Mutex::new(0), quota: Some((quota, AtomicU64::new(0))), xattrs: Mutex::default() })
+    }
+
+    /// A file's length, with its pages to be read from where they were saved. It is
+    /// charged as writing them would have been, up to the furthest.
+    fn set_saved_size(&self, size: u64, charge: u64) {
+        *self.size.lock().unwrap() = size;
+        if let Some((q, charged)) = &self.quota {
+            q.used.fetch_add(charge, Ordering::Relaxed);
+            charged.store(charge, Ordering::Relaxed);
+        }
     }
 
     pub fn size(&self) -> u64 {
         *self.size.lock().unwrap()
     }
 
-    pub fn read_at(&self, off: u64, max: usize) -> Vec<u8> {
+    pub fn read_at(&self, off: u64, max: usize) -> Result<Vec<u8>, i64> {
         let size = self.size();
         let n = size.saturating_sub(off).min(max as u64) as usize;
         let mut buf = vec![0; n];
-        self.obj.read(off, &mut buf);
-        buf
+        self.obj.try_read(off, &mut buf)?;
+        Ok(buf)
     }
 
     /// Writes `data` at `off`. Under a size= limit only the pages that fit
     /// are written, as Linux's tmpfs does: a short count, or ENOSPC for none.
     pub fn write_at(&self, off: u64, data: &[u8]) -> Result<usize, i64> {
         let end = off.checked_add(data.len() as u64).ok_or(EFBIG)?;
-        if end > 1 << 40 {
+        if end > MAX_FILE {
             return Err(EFBIG);
         }
         let mut size = self.size.lock().unwrap();
@@ -109,10 +123,13 @@ impl MemFile {
         Ok(data.len())
     }
 
-    pub fn truncate(&self, len: u64) {
+    pub fn truncate(&self, len: u64) -> Result<(), i64> {
+        if len > MAX_FILE {
+            return Err(EFBIG);
+        }
         let mut size = self.size.lock().unwrap();
         if len < *size {
-            self.obj.zero_from(len);
+            self.obj.zero_from(len)?;
         }
         if let Some((q, charged)) = &self.quota {
             let had = charged.load(Ordering::Relaxed);
@@ -122,6 +139,7 @@ impl MemFile {
             }
         }
         *size = len;
+        Ok(())
     }
 }
 
@@ -211,6 +229,8 @@ pub struct Tmpfs {
     nodes: Mutex<HashMap<u64, Node>>,
     next: AtomicU64,
     quota: Arc<Quota>,
+    /// If set, files' pages can leave memory.
+    pager: OnceLock<Arc<PageCache>>,
 }
 
 fn now() -> u64 {
@@ -240,7 +260,16 @@ impl Tmpfs {
     pub fn with_type(phys: Arc<PhysMem>, mode: u32, type_name: &'static str) -> Arc<Tmpfs> {
         let mut nodes = HashMap::new();
         nodes.insert(ROOT, Node { mode: S_IFDIR | mode, uid: 0, gid: 0, nlink: 2, mtime: now(), kind: Kind::Dir { entries: BTreeMap::new(), parent: ROOT }, xattrs: Xattrs::default() });
-        Arc::new(Tmpfs { phys, type_name, nodes: Mutex::new(nodes), next: AtomicU64::new(ROOT + 1), quota: Arc::default() })
+        Arc::new(Tmpfs { phys, type_name, nodes: Mutex::new(nodes), next: AtomicU64::new(ROOT + 1), quota: Arc::default(), pager: OnceLock::new() })
+    }
+
+    /// Files made from now on can leave memory, as this cache makes room.
+    pub fn set_pager(&self, pager: Arc<PageCache>) {
+        let _ = self.pager.set(pager);
+    }
+
+    fn new_file(&self) -> Arc<MemFile> {
+        MemFile::with_quota(self.phys.clone(), self.quota.clone(), self.pager.get().cloned())
     }
 
     fn add(&self, dir: u64, name: &str, mode: u32, kind: Kind) -> Result<u64, i64> {
@@ -291,7 +320,7 @@ impl Tmpfs {
     pub fn write_file(&self, path: &str, mode: u32, content: &str) {
         let (dir, name) = path.rsplit_once('/').unwrap_or(("", path));
         let d = self.mkdir_p(dir, 0o755);
-        let ino = self.add(d, name, S_IFREG | mode, Kind::File(MemFile::with_quota(self.phys.clone(), self.quota.clone()))).expect("tmpfs write_file");
+        let ino = self.add(d, name, S_IFREG | mode, Kind::File(self.new_file())).expect("tmpfs write_file");
         if let Some(Kind::File(f)) = self.nodes.lock().unwrap().get(&ino).map(|n| &n.kind) {
             f.write_at(0, content.as_bytes()).expect("tmpfs write_file");
         }
@@ -357,7 +386,7 @@ impl FileSystem for Tmpfs {
     fn read_all(&self, ino: u64) -> io::Result<Arc<[u8]>> {
         let nodes = self.nodes.lock().unwrap();
         match &nodes.get(&ino).ok_or_else(|| errno(ENOENT))?.kind {
-            Kind::File(f) => Ok(f.read_at(0, usize::MAX).into()),
+            Kind::File(f) => f.read_at(0, usize::MAX).map(Into::into).map_err(errno),
             Kind::Symlink(t) => Ok(t.as_bytes().into()),
             Kind::Dir { .. } => Err(errno(EISDIR)),
             Kind::Special { .. } => Ok(Arc::from(&[][..])),
@@ -390,7 +419,7 @@ impl FileSystem for Tmpfs {
 
     fn create(&self, dir: u64, name: &str, mode: u32, rdev: u64) -> Result<u64, i64> {
         let kind = match mode & S_IFMT {
-            0 | S_IFREG => Kind::File(MemFile::with_quota(self.phys.clone(), self.quota.clone())),
+            0 | S_IFREG => Kind::File(self.new_file()),
             S_IFDIR => return Err(EINVAL),
             _ => Kind::Special { rdev },
         };
@@ -587,20 +616,32 @@ fn get_string(r: &mut impl io::Read) -> io::Result<String> {
 pub struct SavedTree {
     nodes: HashMap<u64, Node>,
     next: u64,
+    /// Files whose pages are to be found after the structure: (the file, each page's
+    /// offset in it and place among all the file's saved pages).
+    pending: Vec<(Arc<MemFile>, Vec<(u64, u64)>)>,
+}
+
+/// A file's pages to be written after the structure, in this order: (the file, the
+/// offset of each page). Their place in the data section is their place in this.
+pub type SavedPages = Vec<(Arc<MemFile>, Vec<u64>)>;
+
+/// Where a page of saved contents is, counting from the start of that section.
+fn saved_page_offset(ordinal: u64) -> u64 {
+    ordinal * 4096
 }
 
 impl Tmpfs {
-    /// Writes the tree; returns the bytes of file contents. Sockets stay behind: what
-    /// was listening on them is gone. Files keep their holes.
-    pub fn save(&self, w: &mut impl io::Write) -> io::Result<u64> {
-        const NO_MORE_PAGES: u64 = u64::MAX;
+    /// Writes the tree's structure, saying which pages each file has; those to write
+    /// afterwards are added to `pages`. Sockets stay behind: what was listening on them
+    /// is gone. Files keep their holes.
+    pub fn save(&self, w: &mut impl io::Write, pages: &mut SavedPages) -> io::Result<()> {
         enum Saved {
             Dir(u64, Vec<(String, u64)>),
             File(Arc<MemFile>),
             Symlink(String),
             Special(u64),
         }
-        // The structure at one moment, and then the contents with the lock free.
+        // The structure at one moment.
         let (saved, next) = {
             let nodes = self.nodes.lock().unwrap();
             let socket = |ino: &u64| nodes.get(ino).is_some_and(|n| n.mode & S_IFMT == crate::vfs::S_IFSOCK);
@@ -618,8 +659,6 @@ impl Tmpfs {
         };
         put_u64(w, next)?;
         put_u64(w, saved.len() as u64)?;
-        let mut contents = 0;
-        let mut page = [0u8; 4096];
         for (ino, mode, uid, gid, nlink, mtime, xattrs, kind) in saved {
             for v in [ino, mode as u64, uid as u64, gid as u64, nlink as u64, mtime, xattrs.0.len() as u64] {
                 put_u64(w, v)?;
@@ -642,15 +681,12 @@ impl Tmpfs {
                     put_u64(w, 1)?;
                     let size = f.size();
                     put_u64(w, size)?;
-                    for off in (0..size).step_by(page.len()) {
-                        if f.obj.has_frame(off) {
-                            f.obj.read(off, &mut page);
-                            put_u64(w, off)?;
-                            w.write_all(&page)?;
-                            contents += page.len() as u64;
-                        }
+                    let offsets = f.obj.pages_with_contents(size);
+                    put_u64(w, offsets.len() as u64)?;
+                    for &off in &offsets {
+                        put_u64(w, off)?;
                     }
-                    put_u64(w, NO_MORE_PAGES)?;
+                    pages.push((f, offsets));
                 }
                 Saved::Symlink(t) => {
                     put_u64(w, 2)?;
@@ -662,17 +698,69 @@ impl Tmpfs {
                 }
             }
         }
-        Ok(contents)
+        Ok(())
     }
 
-    /// Reads a tree written by `save`. Nothing changes until `install`.
-    pub fn read_saved(&self, r: &mut impl io::Read) -> io::Result<SavedTree> {
+    /// Reads a tree's structure written by `save`. Nothing changes until `install`.
+    /// `ordinal` counts the pages of all the trees of the file so far.
+    pub fn read_saved(&self, r: &mut impl io::Read, ordinal: &mut u64) -> io::Result<SavedTree> {
+        let mut pending = Vec::new();
+        let tree = self.read_tree(r, |tree, r, size| {
+            let f = tree.new_file();
+            let count = get_u64(r)?;
+            if size > MAX_FILE || count > pages(size) {
+                return Err(io::Error::other("a saved tree has too many pages for a file"));
+            }
+            let mut offsets = Vec::new();
+            let mut charge = 0;
+            for _ in 0..count {
+                let off = get_u64(r)?;
+                if off >= size || !off.is_multiple_of(4096) {
+                    return Err(io::Error::other("a saved tree has a page outside its file"));
+                }
+                offsets.push((off, *ordinal));
+                *ordinal += 1;
+                charge = charge.max(off / 4096 + 1);
+            }
+            f.set_saved_size(size, charge);
+            pending.push((f.clone(), offsets));
+            Ok(f)
+        })?;
+        Ok(SavedTree { pending, ..tree })
+    }
+
+    /// As `read_saved`, for a file an earlier droidrt wrote, with the pages in among
+    /// the structure. They all go through memory, once.
+    pub fn read_saved_v1(&self, r: &mut impl io::Read) -> io::Result<SavedTree> {
         const NO_MORE_PAGES: u64 = u64::MAX;
+        let mut page = [0u8; 4096];
+        self.read_tree(r, |tree, r, size| {
+            let f = tree.new_file();
+            loop {
+                let off = get_u64(r)?;
+                if off == NO_MORE_PAGES {
+                    break;
+                }
+                r.read_exact(&mut page)?;
+                if off >= size || !off.is_multiple_of(page.len() as u64) {
+                    return Err(io::Error::other("a saved tree has a page outside its file"));
+                }
+                let n = (size - off).min(page.len() as u64) as usize;
+                f.write_at(off, &page[..n]).map_err(|e| io::Error::other(format!("restoring a file: errno {e}")))?;
+            }
+            // Holes at the end have no pages to say how far the file goes.
+            if f.size() < size {
+                f.write_at(size - 1, &[0]).map_err(|e| io::Error::other(format!("restoring a file: errno {e}")))?;
+            }
+            Ok(f)
+        })
+    }
+
+    fn read_tree<R: io::Read>(&self, r: &mut R, mut read_file: impl FnMut(&Tmpfs, &mut R, u64) -> io::Result<Arc<MemFile>>) -> io::Result<SavedTree> {
         let bad = |what: &str| io::Error::other(format!("a saved tree has {what}"));
         let next = get_u64(r)?;
         let count = get_u64(r)?;
         let mut nodes = HashMap::new();
-        let mut page = [0u8; 4096];
         for _ in 0..count {
             let (ino, mode, uid, gid, nlink, mtime, attrs) = (get_u64(r)?, get_u64(r)?, get_u64(r)?, get_u64(r)?, get_u64(r)?, get_u64(r)?, get_u64(r)?);
             let mut xattrs = BTreeMap::new();
@@ -691,25 +779,8 @@ impl Tmpfs {
                     Kind::Dir { entries, parent }
                 }
                 1 => {
-                    let f = MemFile::with_quota(self.phys.clone(), self.quota.clone());
                     let size = get_u64(r)?;
-                    loop {
-                        let off = get_u64(r)?;
-                        if off == NO_MORE_PAGES {
-                            break;
-                        }
-                        r.read_exact(&mut page)?;
-                        if off >= size || !off.is_multiple_of(page.len() as u64) {
-                            return Err(bad("a page outside its file"));
-                        }
-                        let n = (size - off).min(page.len() as u64) as usize;
-                        f.write_at(off, &page[..n]).map_err(|e| io::Error::other(format!("restoring a file: errno {e}")))?;
-                    }
-                    // Holes at the end have no pages to say how far the file goes.
-                    if f.size() < size {
-                        f.write_at(size - 1, &[0]).map_err(|e| io::Error::other(format!("restoring a file: errno {e}")))?;
-                    }
-                    Kind::File(f)
+                    Kind::File(read_file(self, r, size)?)
                 }
                 2 => Kind::Symlink(get_string(r)?),
                 3 => Kind::Special { rdev: get_u64(r)? },
@@ -720,13 +791,55 @@ impl Tmpfs {
         if !matches!(nodes.get(&ROOT).map(|n| &n.kind), Some(Kind::Dir { .. })) {
             return Err(bad("no root"));
         }
-        Ok(SavedTree { nodes, next })
+        for n in nodes.values() {
+            if let Kind::Dir { entries, parent } = &n.kind
+                && !(nodes.contains_key(parent) && entries.values().all(|c| nodes.contains_key(c)))
+            {
+                return Err(bad("a directory naming a node it doesn't have"));
+            }
+        }
+        Ok(SavedTree { nodes, next, pending: Vec::new() })
+    }
+
+    /// Says where a saved tree's files' pages are, from `data_start` of the file; for a
+    /// tree without a pager, reads them all now, through `whole`. What can fail in loading
+    /// a tree happens here or before, while it's still on the side.
+    pub fn prepare(&self, tree: &mut SavedTree, data_start: u64, whole: &mut impl FnMut(u64, &mut [u8]) -> io::Result<()>) -> io::Result<()> {
+        let mut page = [0u8; 4096];
+        for (f, offsets) in std::mem::take(&mut tree.pending) {
+            for (off, ordinal) in offsets {
+                let at = data_start + saved_page_offset(ordinal);
+                if self.pager.get().is_some() {
+                    f.obj.adopt((off / 4096) as usize, Store::in_image(at));
+                } else {
+                    whole(at, &mut page)?;
+                    f.obj.write(off, &page).map_err(|e| io::Error::other(format!("restoring a file: errno {e}")))?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Replaces the tree. Only before anything has it open.
     pub fn install(&self, tree: SavedTree) {
         *self.nodes.lock().unwrap() = tree.nodes;
         self.next.store(tree.next, Ordering::Relaxed);
+    }
+
+    /// The bytes of a saved page, in order: what `SavedPages` said to write.
+    pub fn write_saved_pages(w: &mut impl io::Write, pages: &SavedPages) -> io::Result<u64> {
+        let mut contents = 0;
+        let mut page = [0u8; 4096];
+        for (f, offsets) in pages {
+            for &off in offsets {
+                // A page that can't be read must not go in as zeros: the save stops here,
+                // and the last good file stays.
+                f.obj.try_read(off, &mut page).map_err(|e| io::Error::other(format!("reading a page back: errno {e}")))?;
+                w.write_all(&page)?;
+                contents += page.len() as u64;
+            }
+        }
+        Ok(contents)
     }
 }
 
@@ -737,6 +850,220 @@ mod saved_tests {
 
     fn phys() -> Arc<PhysMem> {
         PhysMem::new(Arc::new(crate::hv::NoHv))
+    }
+
+    /// (the file, how much of it is structure, how much contents).
+    fn saved(a: &Tmpfs) -> (Vec<u8>, usize, u64) {
+        let (mut bytes, mut pages) = (Vec::new(), Vec::new());
+        a.save(&mut bytes, &mut pages).unwrap();
+        let structure = bytes.len();
+        bytes.resize(structure.next_multiple_of(4096), 0);
+        let contents = Tmpfs::write_saved_pages(&mut bytes, &pages).unwrap();
+        (bytes, structure, contents)
+    }
+
+    fn load(b: &Tmpfs, bytes: &[u8], structure: usize) {
+        let mut ordinal = 0;
+        let mut tree = b.read_saved(&mut &bytes[..structure], &mut ordinal).unwrap();
+        let mut whole = |at: u64, page: &mut [u8]| {
+            page.copy_from_slice(&bytes[at as usize..at as usize + 4096]);
+            Ok(())
+        };
+        b.prepare(&mut tree, structure.next_multiple_of(4096) as u64, &mut whole).unwrap();
+        b.install(tree);
+    }
+
+    #[test]
+    fn a_file_an_earlier_version_wrote_still_loads() {
+        let mut v1 = Vec::new();
+        let page = vec![7u8; 4096];
+        let mut put = |vs: &[u64]| vs.iter().for_each(|v| put_u64(&mut v1, *v).unwrap());
+        put(&[3, 2]); // next inode, nodes
+        put(&[ROOT, (S_IFDIR | 0o755) as u64, 0, 0, 2, 0, 0, 0, ROOT, 1]);
+        put_bytes(&mut v1, b"f").unwrap();
+        put_u64(&mut v1, 2).unwrap();
+        for v in [2, (S_IFREG | 0o644) as u64, 0, 0, 1, 0, 0, 1, 5000, 4096] {
+            put_u64(&mut v1, v).unwrap();
+        }
+        v1.extend_from_slice(&page);
+        put_u64(&mut v1, u64::MAX).unwrap();
+        let b = Tmpfs::new(phys(), 0o755);
+        let tree = b.read_saved_v1(&mut &v1[..]).unwrap();
+        b.install(tree);
+        let f = b.mem_file(b.lookup_ino(ROOT, "f").unwrap()).unwrap();
+        assert_eq!(f.size(), 5000);
+        assert_eq!(f.read_at(4096, 904).unwrap(), vec![7u8; 904]);
+        assert_eq!(f.read_at(0, 1).unwrap(), [0], "a hole");
+    }
+
+    /// As a device would: a file too big for memory, read and written and mapped.
+    #[test]
+    fn pages_leave_memory_and_come_back() {
+        let phys = phys();
+        let cache = crate::pagecache::PageCache::new(phys.clone());
+        cache.limit_idle(0);
+        let t = Tmpfs::new(phys.clone(), 0o755);
+        t.set_pager(cache.clone());
+        let f = t.mem_file(t.create(ROOT, "f", S_IFREG | 0o600, 0).unwrap()).unwrap();
+        let base = phys.frames_in_use();
+        let settle = || {
+            cache.reclaim(1 << 20);
+        };
+
+        let mut want: Vec<u8> = (0..64 * 4096).map(|i| (i % 251) as u8).collect();
+        f.write_at(0, &want).unwrap();
+        settle();
+        assert_eq!(phys.frames_in_use(), base, "all out on the host's disk");
+        assert_eq!(f.read_at(0, want.len()).unwrap(), want);
+        assert_eq!(phys.frames_in_use(), base, "reading doesn't bring it in");
+
+        // A write to part of a page keeps the rest of it.
+        f.write_at(3 * 4096 + 5, b"hello").unwrap();
+        want[3 * 4096 + 5..3 * 4096 + 10].copy_from_slice(b"hello");
+        settle();
+        assert_eq!(f.read_at(0, want.len()).unwrap(), want);
+
+        // Mapped privately, a page stays till it is let go, and it is the file's.
+        let mapped = crate::pagecache::PageSource::page(&*f.obj, 2).unwrap().unwrap();
+        settle();
+        assert_eq!(unsafe { *phys.host(mapped).add(1) }, want[2 * 4096 + 1]);
+        assert!(!phys.is_sole_owner(mapped));
+        phys.free(mapped);
+        settle();
+        assert_eq!(phys.frames_in_use(), base);
+
+        // Mapped shared, what is written through the mapping is written to the file.
+        let shared = f.obj.map_frame(4).unwrap();
+        settle();
+        unsafe { phys.host(shared).add(9).write(0xee) };
+        want[4 * 4096 + 9] = 0xee;
+        phys.free(shared);
+        settle();
+        assert_eq!(phys.frames_in_use(), base);
+        assert_eq!(f.read_at(0, want.len()).unwrap(), want);
+
+        // Cut short, what is past the end reads as zeros when it grows back.
+        f.truncate(4096 + 10).unwrap();
+        f.write_at(3 * 4096, b"x").unwrap();
+        settle();
+        assert_eq!(f.read_at(4096, 10).unwrap(), want[4096..4096 + 10]);
+        assert_eq!(f.read_at(4096 + 10, 10).unwrap(), vec![0; 10]);
+        assert_eq!(f.read_at(2 * 4096, 1).unwrap(), [0]);
+        assert_eq!(f.read_at(3 * 4096, 1).unwrap(), *b"x");
+
+        // Scratch space gets used again.
+        let n = t.create(ROOT, "g", S_IFREG | 0o600, 0).unwrap();
+        t.mem_file(n).unwrap().write_at(0, &want).unwrap();
+        settle();
+        t.unlink(ROOT, "g", false).unwrap();
+        assert_eq!(cache.store().scratch_free() >= 64, true);
+    }
+
+    /// What can't be read is an error, not zeros that a save would then make permanent.
+    #[test]
+    fn a_page_that_cant_be_read_isnt_taken_for_zeros() {
+        let phys = phys();
+        let cache = crate::pagecache::PageCache::new(phys.clone());
+        let t = Tmpfs::new(phys, 0o755);
+        t.set_pager(cache);
+        let f = t.mem_file(t.create(ROOT, "f", S_IFREG | 0o600, 0).unwrap()).unwrap();
+        f.set_saved_size(4096, 1);
+        // Kept in an image, and there is none (or a disk that won't give it back).
+        f.obj.adopt(0, Store::in_image(4096));
+        assert_eq!(f.read_at(0, 1), Err(EIO));
+        let mut pages = Vec::new();
+        t.save(&mut Vec::new(), &mut pages).unwrap();
+        assert!(Tmpfs::write_saved_pages(&mut Vec::new(), &pages).is_err());
+        // Nor is a page cut short without being read.
+        assert_eq!(f.truncate(100), Err(EIO));
+        assert_eq!(f.size(), 4096, "as it was");
+    }
+
+    /// A journal, written and cut short again and again, while memory is plenty.
+    #[test]
+    fn a_page_that_keeps_coming_back_is_on_the_clock_once() {
+        let phys = phys();
+        let cache = crate::pagecache::PageCache::new(phys.clone());
+        let t = Tmpfs::new(phys, 0o755);
+        t.set_pager(cache.clone());
+        let f = t.mem_file(t.create(ROOT, "journal", S_IFREG | 0o600, 0).unwrap()).unwrap();
+        for _ in 0..1000 {
+            f.write_at(0, &[1; 8192]).unwrap();
+            f.truncate(0).unwrap();
+        }
+        assert!(cache.clock_len() <= 2, "{} entries", cache.clock_len());
+        // And files that come and go leave nothing behind for long.
+        for i in 0..4000 {
+            let name = format!("temp{}", i % 8);
+            let n = match t.lookup_ino(ROOT, &name) {
+                Some(n) => n,
+                None => t.create(ROOT, &name, S_IFREG | 0o600, 0).unwrap(),
+            };
+            t.mem_file(n).unwrap().write_at(0, &[1; 4096]).unwrap();
+            t.unlink(ROOT, &name, false).unwrap();
+        }
+        assert!(cache.clock_len() <= 4 * crate::pagecache::SWEEP_SLACK_FOR_TESTS, "{} entries", cache.clock_len());
+    }
+
+    /// Damage in a saved file means refusing it, not dying on it.
+    #[test]
+    fn absurd_numbers_in_a_saved_tree_are_refused() {
+        let b = Tmpfs::new(phys(), 0o755);
+        let mut bytes = Vec::new();
+        for v in [3, 1, ROOT, (S_IFDIR | 0o755) as u64, 0, 0, 2, 0, 0, 0, ROOT, 1] {
+            put_u64(&mut bytes, v).unwrap();
+        }
+        put_bytes(&mut bytes, b"gone").unwrap();
+        put_u64(&mut bytes, 77).unwrap();
+        assert!(b.read_saved(&mut &bytes[..], &mut 0).is_err(), "an entry for a node that isn't there");
+
+        let file = |size: u64, count: u64, offs: &[u64]| {
+            let mut bytes = Vec::new();
+            for v in [3, 1, 2, (S_IFREG | 0o600) as u64, 0, 0, 1, 0, 0, 1, size, count] {
+                put_u64(&mut bytes, v).unwrap();
+            }
+            offs.iter().for_each(|o| put_u64(&mut bytes, *o).unwrap());
+            bytes
+        };
+        for bytes in [file(u64::MAX, u64::MAX, &[]), file(1 << 62, 1 << 50, &[]), file(1 << 60, 1, &[1 << 59]), file(4096, 2, &[0, 4096])] {
+            assert!(b.read_saved(&mut &bytes[..], &mut 0).is_err());
+        }
+    }
+
+    #[test]
+    fn a_saved_tree_comes_back_without_coming_into_memory() {
+        let phys = phys();
+        let a = Tmpfs::new(phys.clone(), 0o771);
+        let f = a.mem_file(a.create(ROOT, "big", S_IFREG | 0o600, 0).unwrap()).unwrap();
+        let want: Vec<u8> = (0..32 * 4096 + 7).map(|i| (i % 253) as u8).collect();
+        f.write_at(0, &want).unwrap();
+        let (bytes, structure, _) = saved(&a);
+
+        let dir = std::env::temp_dir().join(format!("droidrt-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("saved");
+        std::fs::write(&path, &bytes).unwrap();
+        let cache = crate::pagecache::PageCache::new(phys.clone());
+        let b = Tmpfs::new(phys.clone(), 0o755);
+        b.set_pager(cache.clone());
+        let base = phys.frames_in_use();
+        let mut ordinal = 0;
+        let mut tree = b.read_saved(&mut &bytes[..structure], &mut ordinal).unwrap();
+        b.prepare(&mut tree, structure.next_multiple_of(4096) as u64, &mut |_, _| unreachable!("it has a pager")).unwrap();
+        cache.store().set_image(std::fs::File::open(&path).unwrap());
+        b.install(tree);
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(phys.frames_in_use(), base);
+
+        let g = b.mem_file(b.lookup_ino(ROOT, "big").unwrap()).unwrap();
+        assert_eq!(g.size(), want.len() as u64);
+        assert_eq!(g.read_at(0, want.len()).unwrap(), want);
+        assert_eq!(phys.frames_in_use(), base, "still not");
+
+        // And it saves again from there, without having been in memory.
+        let (again, _, contents) = saved(&b);
+        assert_eq!(contents, 33 * 4096);
+        assert_eq!(again[again.len() - 33 * 4096..][..want.len()], want[..]);
     }
 
     #[test]
@@ -752,17 +1079,15 @@ mod saved_tests {
         let f = a.mem_file(hole).unwrap();
         f.write_at(3 * 4096 + 10, b"end").unwrap();
         let tail = a.create(dir, "tail", S_IFREG | 0o600, 0).unwrap();
-        a.mem_file(tail).unwrap().truncate(9000);
+        a.mem_file(tail).unwrap().truncate(9000).unwrap();
         a.link(hole, 1, "again").unwrap();
         a.create(dir, "sock", S_IFSOCK | 0o600, 0).unwrap();
 
-        let mut bytes = Vec::new();
-        let contents = a.save(&mut bytes).unwrap();
+        let (bytes, structure, contents) = saved(&a);
         assert_eq!(contents, 4096 + 4096, "packages.xml and hole's one page, not its gap");
 
         let b = Tmpfs::new(phys, 0o755);
-        let tree = b.read_saved(&mut &bytes[..]).unwrap();
-        b.install(tree);
+        load(&b, &bytes, structure);
         let at = |path: &[&str]| path.iter().fold(ROOT, |d, n| b.lookup_ino(d, n).unwrap());
         let xml = at(&["system", "packages.xml"]);
         assert_eq!(&*b.read_all(xml).unwrap(), b"hello");
@@ -777,7 +1102,7 @@ mod saved_tests {
         let hole = at(&["user", "0", "hole"]);
         let f = b.mem_file(hole).unwrap();
         assert_eq!(f.size(), 3 * 4096 + 13);
-        assert_eq!(f.read_at(3 * 4096 + 10, 3), b"end");
+        assert_eq!(f.read_at(3 * 4096 + 10, 3).unwrap(), b"end");
         assert!(!f.obj.has_frame(0), "the gap stays a gap");
         assert_eq!(at(&["again"]), hole, "hard links stay one file");
         assert_eq!(b.stat(hole).unwrap().nlink, 2);
@@ -792,12 +1117,11 @@ mod saved_tests {
         let phys = phys();
         let a = Tmpfs::new(phys.clone(), 0o771);
         a.write_file("x/y", 0o640, "hello");
-        let mut bytes = Vec::new();
-        a.save(&mut bytes).unwrap();
+        let (bytes, structure, _) = saved(&a);
         let b = Tmpfs::new(phys, 0o755);
         b.write_file("mine", 0o600, "kept");
-        for cut in [0, 8, 20, bytes.len() / 2, bytes.len() - 1] {
-            assert!(b.read_saved(&mut &bytes[..cut]).is_err(), "cut at {cut}");
+        for cut in [0, 8, 20, structure / 2, structure - 1] {
+            assert!(b.read_saved(&mut &bytes[..cut], &mut 0).is_err(), "cut at {cut}");
         }
         assert!(b.lookup_ino(ROOT, "mine").is_some());
     }

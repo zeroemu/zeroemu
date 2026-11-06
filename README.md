@@ -35,7 +35,7 @@ arm64 Android on Apple Silicon and Windows on ARM, x86_64 Android on x86_64 PCs.
 | M2: demand paging, threads, futex, `fork`/`execve`/`wait4`, pipes, signals | done on macOS; x86_64 written (signal frames, TLB shootdown), untested |
 | M3: binder, `servicemanager`, property service, `logd`, `init` | done (macOS) |
 | M4: SurfaceFlinger, with Android's graphics stack unmodified on a virtio-gpu device backed by the Android Emulator's gfxstream renderer | done (macOS) |
-| M5: zygote, ART, `system_server`, launcher, apps | done (macOS): Android 16's Pixel launcher in the window, and boot complete about 20 s after start on a first boot and about 12 s after that |
+| M5: zygote, ART, `system_server`, launcher, apps | done (macOS): Android 16's Pixel launcher in the window, and boot complete about 17 s after start on a first boot and about 12 s after that |
 | M6: input from the window | done (macOS): mouse as touch, scroll as a finger drag, keyboard; Chrome and Play Store open and draw from a tap |
 | Network | done (macOS): Android validates the network, Chrome loads sites over HTTP, HTTPS and QUIC, and `adb forward` and `reverse` work. See below for what a network with no packets can't do |
 | Smoothness | in progress: see below |
@@ -69,8 +69,13 @@ Known gaps:
   no CNAMEs or HTTPS records, and every failure is SERVFAIL.
 - Android thinks eth1 is unmetered, so Google's services download what they like once
   it's up, into a `/data` that's saved whole.
-- `/data` is only saved at a clean exit, and held in memory while running. A kill or
-  a crash loses what happened since the last boot's save.
+- `/data` is only saved at a clean exit. A kill or a crash loses what happened since the
+  last boot's save.
+- A mapping of a file doesn't raise SIGBUS past the file's end: it reads zeros. A read
+  of a hole through a private mapping stays zeros if the file is written there later.
+- `mmap` and `mprotect` don't check what a file was opened for, so a read-only descriptor
+  can be mapped writable. `O_PATH` descriptors can be read, `O_NOFOLLOW` opens a symlink
+  rather than refusing it, and `/dev/zero` can't be mapped.
 - userfaultfd has only what ART's compacting collector uses: SIGBUS mode, on private
   anonymous memory.
 - Display frames are read back from the renderer into host memory, which limits
@@ -126,7 +131,9 @@ sets the lowest priority shown (default `I`; `S` silences them).
 and `/metadata` between boots, in one file per system image in the user's application
 data, saved when the window closes, on SIGINT or SIGTERM, or when Android shuts down:
 `--data <file>` puts it elsewhere, `--ephemeral` keeps nothing, and `--wipe-data` starts
-over. It needs the Android
+over. A second droidrt on the same file keeps nothing, and one that can't read the file
+moves it aside as `<file>.bad` rather than saving over it. `--ram <MB>` says how much memory
+the guest believes it has (4096 by default, as AVDs do). It needs the Android
 Emulator installed: droidrt loads its GPU renderer, `libgfxstream_backend`,
 from the SDK (or `DROIDRT_GFXSTREAM=<path>`), with the SDK's ANGLE on Metal
 underneath (`ANGLE_DEFAULT_PLATFORM` overrides). For development, `--push
@@ -174,6 +181,9 @@ the display's frame rate and black frames every five seconds, and
 prints them when its process is killed by a signal.
 `DROIDRT_SYSCOUNT=1` adds to each thread dump what each thread has called since the
 last, which finds a thread in a loop: send `SIGUSR1` twice, a few seconds apart.
+`DROIDRT_MEMSTAT=1` adds to each thread dump where memory has gone, by kind and by file.
+`DROIDRT_PROPS="name=value ..."` adds Android properties at boot (`ro.lmk.debug=true`
+makes `lmkd` say what it decides).
 `DROIDRT_DRM_TRACE=1` logs GPU ioctls, transfers and fences;
 `DROIDRT_GPU_LOG=<E|W|I|D>` shows the renderer's own log; `DROIDRT_SAVE_FRAMES=<dir>`
 and `DROIDRT_DUMP_RES=<dir>` save displayed frames and GPU buffers as raw pixels.
@@ -192,6 +202,37 @@ On Windows, enable the "Windows Hypervisor Platform" optional feature.
 - `mm` owns all page tables. Backends contribute only kernel-window pages
   (trap stubs at `paging::KERNEL_WINDOW`, mapped privileged-only into every
   address space) and enter the guest on the page-table root they are given.
+
+## Memory
+
+Measured on an M1 Pro with the default 4 GB, as Activity Monitor shows it:
+
+| | Activity Monitor |
+|---|---|
+| Five minutes after a first boot, nothing opened | 3.3 GB |
+| 16 apps opened one after another | 4.7 GB |
+| Those closed again | 4.1 GB |
+| Five minutes after a first boot, before this was looked at | about 14 GB |
+
+- Files on the system image live in a page cache: read and decompressed a page at a time when
+  wanted, one copy each, in guest memory, shared by whatever maps them until it writes.
+  Pages nothing has mapped stay up to 256 MB and then go, oldest first. ELF segments map
+  from the file.
+- Files on `/data` take their turn with those. Their pages can leave memory for the data
+  file they were last saved in, unchanged, or a scratch file that goes when droidrt does.
+- The guest is told it has 4 GB. Past that, what the page cache holds goes first, and then
+  `/proc/pressure/memory` wakes Android's own `lmkd`, which closes the least important apps
+  as on a phone. Frames can go past what the guest is told, up to the 32 GB ceiling, if it
+  takes `lmkd` a moment; nothing else stops them.
+- Frames are kept together by process in 64 KB blocks, each its own memory object, and whole
+  blocks go back to the host beyond 64 MB free. A block with any frame in use can't, so
+  closing apps gives back less than they took; the rest gets reused first.
+
+Measure with `top -l 1 -pid <pid> -stats mem` or `footprint <pid>`, which agree. `ps`'s RSS
+leaves out what macOS has compressed, and can be a tenth of the truth. They agree because
+blocks are *purgeable* memory objects, never marked volatile: macOS charges ordinary memory
+once for the host's mapping of a page and again for the VM's, and Activity Monitor would show
+guest memory twice. This is accounting: the page exists once either way.
 
 ## Performance notes
 

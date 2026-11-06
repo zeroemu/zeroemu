@@ -130,7 +130,9 @@ impl Ashmem {
         let size = st.size;
         let file = st.file.get_or_insert_with(|| {
             let f = MemFile::new(phys.clone());
-            f.truncate(size);
+            // It holds its pages in memory, so nothing about this can fail, short of
+            // a size no ashmem region can have, and those were refused when it was set.
+            let _ = f.truncate(size);
             f
         });
         Ok(if shared {

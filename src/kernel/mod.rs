@@ -29,6 +29,7 @@ mod locks;
 mod logd;
 mod net;
 mod power;
+mod pressure;
 mod memory;
 mod misc;
 mod mount;
@@ -161,6 +162,7 @@ pub struct Kernel {
     /// Host threads running guest threads.
     live_threads: AtomicUsize,
     persist: Option<Persist>,
+    pub(crate) pressure: pressure::Pressure,
     /// Where signal handlers return to: one page, the same in every process.
     sigpage: Arc<crate::mm::SharedObject>,
     /// The vCPUs guest threads share.
@@ -229,25 +231,87 @@ pub struct DataImage {
 struct Persist {
     path: std::path::PathBuf,
     trees: Vec<(&'static str, Arc<crate::tmpfs::Tmpfs>)>,
+    /// Held for as long as this process may write the file.
+    lock: Option<std::fs::File>,
 }
 
 impl Persist {
-    const MAGIC: &'static [u8] = b"droidrt data 1\n";
+    /// The trees' structure, padded to a page, then the pages of their files.
+    const MAGIC: &'static [u8] = b"droidrt data 2\n";
+    /// Pages in among the structure, as earlier droidrts wrote.
+    const MAGIC_V1: &'static [u8] = b"droidrt data 1\n";
 
-    fn load(&self) -> std::io::Result<u64> {
-        use std::io::Read;
+    /// `<file><suffix>`: added to the name, so never the name itself, whatever it is.
+    fn beside(&self, suffix: &str) -> std::path::PathBuf {
+        let mut s = self.path.clone().into_os_string();
+        s.push(suffix);
+        s.into()
+    }
+
+    /// Takes the file for this process, or says that another has it. Whatever a previous
+    /// one left half written goes now: only a holder of the lock can be writing one.
+    fn lock(&mut self) -> std::io::Result<bool> {
+        if let Some(dir) = self.path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let lock = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(self.beside(".lock"))?;
+        match lock.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => return Ok(false),
+            Err(std::fs::TryLockError::Error(e)) => return Err(e),
+        }
+        self.lock = Some(lock);
+        if let (Some(dir), Some(name)) = (self.path.parent(), self.path.file_name().and_then(|n| n.to_str())) {
+            let prefix = format!("{name}.");
+            for entry in std::fs::read_dir(dir)?.flatten() {
+                let file = entry.file_name();
+                if file.to_str().is_some_and(|f| f.starts_with(&prefix) && f.ends_with(".new")) {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    /// Nothing changes unless all of it works.
+    fn load(&self, cache: &crate::pagecache::PageCache) -> std::io::Result<u64> {
+        use std::io::{Read, Seek};
         let file = std::fs::File::open(&self.path)?;
         let size = file.metadata()?.len();
-        let mut r = std::io::BufReader::with_capacity(1 << 20, file);
+        let mut r = std::io::BufReader::with_capacity(1 << 20, &file);
         let mut magic = vec![0; Self::MAGIC.len()];
         r.read_exact(&mut magic)?;
+        if magic == Self::MAGIC_V1 {
+            let mut read = Vec::new();
+            for (_, tree) in &self.trees {
+                read.push(tree.read_saved_v1(&mut r)?);
+            }
+            for ((_, tree), saved) in self.trees.iter().zip(read) {
+                tree.install(saved);
+            }
+            return Ok(size);
+        }
         if magic != Self::MAGIC {
             return Err(std::io::Error::other("not a droidrt data file"));
         }
-        let mut read = Vec::new();
+        let (mut read, mut ordinal) = (Vec::new(), 0);
         for (_, tree) in &self.trees {
-            read.push(tree.read_saved(&mut r)?);
+            read.push(tree.read_saved(&mut r, &mut ordinal)?);
         }
+        let data_start = r.stream_position()?.next_multiple_of(PAGE);
+        if data_start.saturating_add(ordinal.saturating_mul(PAGE)) > size {
+            return Err(std::io::Error::other("the file is cut short"));
+        }
+        drop(r);
+        let mut whole = |at: u64, page: &mut [u8]| {
+            let mut f = &file;
+            f.seek(std::io::SeekFrom::Start(at))?;
+            f.read_exact(page)
+        };
+        for ((_, tree), saved) in self.trees.iter().zip(read.iter_mut()) {
+            tree.prepare(saved, data_start, &mut whole)?;
+        }
+        cache.store().set_image(file);
         for ((_, tree), saved) in self.trees.iter().zip(read) {
             tree.install(saved);
         }
@@ -255,21 +319,27 @@ impl Persist {
     }
 
     fn save(&self) -> std::io::Result<u64> {
-        use std::io::Write;
-        if let Some(dir) = self.path.parent() {
-            std::fs::create_dir_all(dir)?;
+        use std::io::{Seek, Write};
+        let new = self.beside(&format!(".{}.new", std::process::id()));
+        let saved = (|| {
+            let file = std::fs::File::create(&new)?;
+            let mut w = std::io::BufWriter::with_capacity(1 << 20, file);
+            w.write_all(Self::MAGIC)?;
+            let mut pages = Vec::new();
+            for (_, tree) in &self.trees {
+                tree.save(&mut w, &mut pages)?;
+            }
+            let at = w.stream_position()?;
+            w.write_all(&vec![0; (at.next_multiple_of(PAGE) - at) as usize])?;
+            let contents = crate::tmpfs::Tmpfs::write_saved_pages(&mut w, &pages)?;
+            w.into_inner().map_err(|e| e.into_error())?.sync_all()?;
+            std::fs::rename(&new, &self.path)?;
+            Ok(contents)
+        })();
+        if saved.is_err() {
+            let _ = std::fs::remove_file(&new);
         }
-        let new = self.path.with_extension("new");
-        let file = std::fs::File::create(&new)?;
-        let mut w = std::io::BufWriter::with_capacity(1 << 20, file);
-        w.write_all(Self::MAGIC)?;
-        let mut contents = 0;
-        for (_, tree) in &self.trees {
-            contents += tree.save(&mut w)?;
-        }
-        w.into_inner().map_err(|e| e.into_error())?.sync_all()?;
-        std::fs::rename(&new, &self.path)?;
-        Ok(contents)
+        saved
     }
 }
 
@@ -289,7 +359,7 @@ fn apply_extras(v: &Vfs, dev: &crate::tmpfs::Tmpfs, extras: &BootExtras) -> Resu
             Err(_) => v.create(&dir, name, crate::vfs::S_IFREG | 0o755, 0).map_err(fail)?,
         };
         let file = v.mem_file(&node).ok_or(format!("--push {path}: not on a writable filesystem"))?;
-        file.truncate(0);
+        file.truncate(0).map_err(fail)?;
         file.write_at(0, data).map(|_| ()).map_err(fail)
     };
     for (path, data) in &extras.push {
@@ -360,6 +430,11 @@ fn add_boot_props(v: &mut Vfs, phys: &Arc<PhysMem>) {
                 let mut text = String::from_utf8_lossy(&content).into_owned();
                 if rel == "build.prop" {
                     text.push_str(BOOT_PROPS);
+                    // For debugging: DROIDRT_PROPS="ro.lmk.debug=true other=1".
+                    for prop in std::env::var("DROIDRT_PROPS").unwrap_or_default().split_whitespace() {
+                        text.push_str(prop);
+                        text.push('\n');
+                    }
                 }
                 to.write_file(&rel, st.mode & 0o7777, &text);
             }
@@ -395,6 +470,9 @@ fn mount_tmpfs(vfs: &mut Vfs, phys: &Arc<PhysMem>) -> (Arc<crate::tmpfs::Tmpfs>,
     pts.create(1, "ptmx", 0o020000, 0x502).expect("devpts");
     vfs.mount("/dev/pts", pts);
     let data = Tmpfs::new(phys.clone(), 0o771);
+    if let Some(cache) = vfs.page_cache() {
+        data.set_pager(cache.clone());
+    }
     data.mkdir_p("local/tmp", 0o771);
     data.mkdir_p("system", 0o775);
     vfs.mount("/data", data.clone());
@@ -848,16 +926,38 @@ impl Kernel {
             let metadata = crate::tmpfs::Tmpfs::new(phys.clone(), 0o755);
             first_stage_mounts(&v, &metadata, &dev, &names);
             if let Some(image) = &extras.data {
-                let p = Persist { path: image.path.clone(), trees: vec![("data", data.clone()), ("metadata", metadata)] };
-                if !image.wipe {
+                let mut p = Persist { path: image.path.clone(), trees: vec![("data", data.clone()), ("metadata", metadata)], lock: None };
+                let mut keep = match p.lock() {
+                    Ok(true) => true,
+                    // Two can't share a device: the second gets one that lasts as long as it does.
+                    Ok(false) => {
+                        eprintln!("droidrt: {}: in use by another droidrt; this one's /data won't be kept", p.path.display());
+                        false
+                    }
+                    Err(e) => {
+                        eprintln!("droidrt: {}: {e}; /data won't be kept", p.path.display());
+                        false
+                    }
+                };
+                if keep && !image.wipe {
                     let started = Instant::now();
-                    match p.load() {
+                    match p.load(v.page_cache().expect("set above")) {
                         Ok(size) => eprintln!("droidrt: {}: read {} MB in {:.1} s", p.path.display(), size >> 20, started.elapsed().as_secs_f64()),
                         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                        Err(e) => eprintln!("droidrt: {}: {e}; starting with an empty /data", p.path.display()),
+                        // Never saved over: it may only need a newer droidrt, or a look.
+                        Err(e) => {
+                            let aside = p.beside(".bad");
+                            let moved = std::fs::rename(&p.path, &aside);
+                            eprintln!("droidrt: {}: {e}; starting with an empty /data{}", p.path.display(), if moved.is_ok() { format!(", and keeping the file as {}", aside.display()) } else { String::new() });
+                            if moved.is_err() {
+                                keep = false;
+                            }
+                        }
                     }
                 }
-                persist = Some(p);
+                if keep {
+                    persist = Some(p);
+                }
             }
             if extras.network {
                 seed_network_config(&data);
@@ -910,6 +1010,7 @@ impl Kernel {
             live_threads: AtomicUsize::new(0),
             vcpus: vcpus::Pool::new(max_vcpus),
             persist,
+            pressure: pressure::Pressure::default(),
             sigpage,
             futex: futex::Futexes::default(),
             root_pid: AtomicI32::new(0),
@@ -1013,9 +1114,9 @@ impl Kernel {
             });
         }
         let in_use = self.phys.frames_in_use() as usize;
-        let touched = self.phys.frames_ever_used() as usize;
+        let held = self.phys.frames_held() as usize;
         let (in_cache, idle) = (self.phys.cached_frames() as usize, self.phys.cached_idle_frames() as usize);
-        eprintln!("[mem] guest frames: {} MB in use, {} MB freed and still held, of {} MB ever touched", mb(in_use), mb(touched - in_use), mb(touched));
+        eprintln!("[mem] guest frames: {} MB in use, {} MB freed and still held", mb(in_use), mb(held.saturating_sub(in_use)));
         eprintln!("[mem] page tables: {} MB in {} processes", mb(tables), procs.len());
         eprintln!("[mem] private anonymous: {} MB ({} MB as mapped)", mb(anon.len()), mb(anon_mapped));
         eprintln!("[mem] page cache: {} MB, of which {} MB nothing has mapped. {} MB as mapped", mb(in_cache), mb(idle), mb(file_mapped.saturating_sub(private.len())));
@@ -1129,6 +1230,7 @@ impl Kernel {
                 k.dump_threads();
             });
         }
+        pressure::start(self);
         if self.persist.is_some() {
             let k = self.clone();
             crate::gpu::on_window_closed(Box::new(move || k.request_exit(0)));
@@ -1274,8 +1376,9 @@ impl Kernel {
             }
             let exit = vcpu.run();
             // The flush requested last time ran on entry; now frames are safe to
-            // reuse. (Interrupted: the vCPU may not have reached the flush yet.)
-            if !matches!(exit, Exit::Interrupted)
+            // reuse. (Interrupted: the vCPU may not have reached the flush yet. And a
+            // fault at nowhere: it says that no vCPU could be had, so it never ran.)
+            if !matches!(exit, Exit::Interrupted | Exit::Fault { pc: 0, addr: 0, .. })
                 && let Some(generation) = flushing.take()
             {
                 let mut mm = t.proc.mm();

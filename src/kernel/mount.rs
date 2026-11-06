@@ -587,7 +587,7 @@ impl Kernel {
         if dev.len() == 0 {
             return Err(ENXIO); // an unbound loop device
         }
-        let fs = open_fs_as(dev, ty).map_err(|_| EINVAL)?; // not that filesystem
+        let fs = open_fs_as(super::block::pin(&dev), ty).map_err(|_| EINVAL)?; // not that filesystem
         let options = if ty == "erofs" { "user_xattr,acl,cache_strategy=readaround" } else { "" };
         Ok(vfs.new_super(fs, src, Some(st.rdev), sb_flags | MS_RDONLY, options))
     }

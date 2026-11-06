@@ -24,6 +24,14 @@ pub trait ReadAt: Send + Sync {
     fn read_exact_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<()>;
     fn len(&self) -> u64;
 
+    /// If what it reads can change (a loop device can be cleared and bound to
+    /// something else), a device that goes on reading what it reads now. A filesystem
+    /// holds that from when it is mounted: its pages get read again long after, by
+    /// whoever still has them mapped, whatever has become of the device.
+    fn pinned(&self) -> Option<Dev> {
+        None
+    }
+
     fn read_vec(&self, offset: u64, len: usize) -> io::Result<Vec<u8>> {
         let mut v = vec![0; len];
         if len > 0 {

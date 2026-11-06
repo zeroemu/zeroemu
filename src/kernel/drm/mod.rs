@@ -301,6 +301,8 @@ impl DmaBuf {
 
 struct Fb {
     res: Arc<Resource>,
+    /// The open file it was made through: closing that takes it away too.
+    owner: usize,
     #[allow(dead_code)]
     width: u32,
     #[allow(dead_code)]
@@ -332,7 +334,8 @@ struct Inner {
     next_res: u32,
     next_ctx: u32,
     next_fence: u64,
-    resources: HashMap<u32, Arc<Resource>>,
+    /// Those alive, for a debugging dump. Handles and dma-bufs keep them so.
+    resources: HashMap<u32, Weak<Resource>>,
     fences: HashMap<u64, FenceRec>,
     ctxs: HashMap<u32, Watch>,
     kms: Kms,
@@ -433,8 +436,13 @@ impl Device {
         g.next_fence
     }
 
-    fn track_res(&self, res: Arc<Resource>) {
-        self.inner.lock().unwrap().resources.insert(res.id, res);
+    fn track_res(&self, res: &Arc<Resource>) {
+        let mut g = self.inner.lock().unwrap();
+        // Now and then, so that the map stays the size of what is alive.
+        if g.resources.len().is_power_of_two() {
+            g.resources.retain(|_, r| r.strong_count() > 0);
+        }
+        g.resources.insert(res.id, Arc::downgrade(res));
     }
 }
 
@@ -479,8 +487,22 @@ pub struct Open {
 impl Drop for Open {
     fn drop(&mut self) {
         let ctx = self.st.lock().unwrap().ctx;
+        let me = self as *const Open as usize;
+        let mut k = self.dev.inner.lock().unwrap();
         if ctx != 0 {
-            self.dev.inner.lock().unwrap().ctxs.remove(&ctx);
+            k.ctxs.remove(&ctx);
+        }
+        // As Linux does when a file goes: a composer that dies leaves no framebuffers.
+        let mine: Vec<u32> = k.kms.fbs.iter().filter(|(_, f)| f.owner == me).map(|(id, _)| *id).collect();
+        let gone: Vec<Fb> = mine.iter().filter_map(|id| k.kms.fbs.remove(id)).collect();
+        if mine.contains(&k.kms.fb) {
+            k.kms.fb = 0;
+        }
+        // Not under this lock: the last hold on a resource waits for the renderer,
+        // whose fence callbacks take it.
+        drop(k);
+        drop(gone);
+        if ctx != 0 {
             self.dev.gpu.context_destroy(ctx);
         }
     }
@@ -934,7 +956,7 @@ fn virt_res_create(o: &Open, arg: u64, io: &mut dyn Io) -> Result<i64, i64> {
         o.dev.gpu.ctx_attach_resource(ctx, id);
     }
     let res = new_res(&o.dev, id, size, stride, 0, Some(guest));
-    o.dev.track_res(res.clone());
+    o.dev.track_res(&res);
     let (handle, _) = o.gems.lock().unwrap().insert(res);
     wu32(&mut b, 40, handle);
     wu32(&mut b, 44, id);
@@ -979,7 +1001,7 @@ fn virt_create_blob(o: &Open, arg: u64, io: &mut dyn Io) -> Result<i64, i64> {
         return Err(e);
     }
     let res = new_res(&o.dev, id, size, 0, mem, guest);
-    o.dev.track_res(res.clone());
+    o.dev.track_res(&res);
     if ctx != 0 {
         o.dev.gpu.ctx_attach_resource(ctx, id);
     }
@@ -1377,7 +1399,7 @@ fn mode_addfb2(o: &Open, arg: u64, io: &mut dyn Io) -> Result<i64, i64> {
     let mut k = o.dev.inner.lock().unwrap();
     k.kms.next_fb += 1;
     let id = k.kms.next_fb;
-    k.kms.fbs.insert(id, Fb { res: gem.res.clone(), width: ru32(&b, 4), height: ru32(&b, 8) });
+    k.kms.fbs.insert(id, Fb { res: gem.res.clone(), owner: o as *const Open as usize, width: ru32(&b, 4), height: ru32(&b, 8) });
     drop(k);
     wu32(&mut b, 0, id);
     store(io, arg, &b)?;
@@ -1389,12 +1411,14 @@ fn mode_rmfb(o: &Open, arg: u64, io: &mut dyn Io) -> Result<i64, i64> {
     let b = io.read_mem(arg, 4)?;
     let id = ru32(&b, 0);
     let mut k = o.dev.inner.lock().unwrap();
-    if k.kms.fbs.remove(&id).is_none() {
-        return Err(ENOENT);
-    }
+    let Some(gone) = k.kms.fbs.remove(&id) else { return Err(ENOENT) };
     if k.kms.fb == id {
         k.kms.fb = 0;
     }
+    // Not under this lock: the last hold on a resource waits for the renderer,
+    // whose fence callbacks take it.
+    drop(k);
+    drop(gone);
     Ok(0)
 }
 
@@ -1483,7 +1507,7 @@ fn mode_create_dumb(o: &Open, arg: u64, io: &mut dyn Io) -> Result<i64, i64> {
     };
     o.dev.gpu.resource_create(&args, iov)?;
     let res = new_res(&o.dev, id, size, stride, 0, Some(guest));
-    o.dev.track_res(res.clone());
+    o.dev.track_res(&res);
     let (handle, _) = o.gems.lock().unwrap().insert(res);
     wu32(&mut b, 16, handle);
     wu32(&mut b, 20, stride);
@@ -1549,7 +1573,8 @@ fn mode_atomic(o: &Open, arg: u64, io: &mut dyn Io) -> Result<i64, i64> {
         if let Some(id) = fb {
             present(o, id, ru64(&b, 48), flags & PAGE_FLIP_EVENT != 0)?;
         } else if flags & PAGE_FLIP_EVENT != 0 {
-            present(o, o.dev.inner.lock().unwrap().kms.fb, ru64(&b, 48), true)?;
+            let shown = o.dev.inner.lock().unwrap().kms.fb;
+            present(o, shown, ru64(&b, 48), true)?;
         }
         if out_ptr != 0 {
             let fd = make_fence(&o.dev, 0, 0, io, true)?;
@@ -1705,7 +1730,7 @@ fn put_file(fs: &dyn FileSystem, path: &str, content: &str) {
         },
     };
     if let Some(f) = fs.mem_file(ino) {
-        f.truncate(0);
+        let _ = f.truncate(0);
         let _ = f.write_at(0, content.as_bytes());
     }
 }

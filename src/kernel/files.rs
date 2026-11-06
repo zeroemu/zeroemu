@@ -191,6 +191,8 @@ impl File {
 pub struct MemOpen {
     /// None for memfds, which have no name in the namespace.
     node: Option<Node>,
+    /// As it was when opened: all that's left to say once its last name is gone.
+    opened: Stat,
     name: String,
     pub file: Arc<MemFile>,
     pos: Mutex<u64>,
@@ -210,6 +212,8 @@ pub struct NodeFile {
     writable: bool,
     /// For files that report changes (/proc/mounts): the counter and the value last seen.
     event: Option<(Arc<std::sync::atomic::AtomicU64>, u64)>,
+    /// Poll bits for a change: a PSI trigger's differ from a mount table's.
+    event_bits: u16,
 }
 
 impl NodeFile {
@@ -218,7 +222,7 @@ impl NodeFile {
             let seen = c.load(Ordering::Relaxed);
             (c, seen)
         });
-        Mutex::new(NodeFile { node, stat, pos: 0, data: None, cached: None, dents: None, writable, event })
+        Mutex::new(NodeFile { node, stat, pos: 0, data: None, cached: None, dents: None, writable, event, event_bits: POLLERR | POLLPRI })
     }
 
     /// Whether epoll may watch it (Linux refuses regular files).
@@ -494,18 +498,22 @@ pub(super) fn poll_ready(f: &File, t: &Thread, depth: u32) -> u16 {
         Kind::Stdin => POLLIN,
         Kind::Stdout | Kind::Stderr => POLLOUT,
         // /proc/mounts: POLLERR | POLLPRI once per change of the mount table.
-        Kind::Node(nf) => match &mut nf.lock().unwrap().event {
-            Some((counter, seen)) => {
-                let now = counter.load(Ordering::Relaxed);
-                if now == *seen {
-                    POLLIN
-                } else {
-                    *seen = now;
-                    POLLIN | POLLERR | POLLPRI
+        Kind::Node(nf) => {
+            let mut nf = nf.lock().unwrap();
+            let bits = nf.event_bits;
+            match &mut nf.event {
+                Some((counter, seen)) => {
+                    let now = counter.load(Ordering::Relaxed);
+                    if now == *seen {
+                        POLLIN
+                    } else {
+                        *seen = now;
+                        POLLIN | bits
+                    }
                 }
+                None => POLLIN | POLLOUT,
             }
-            None => POLLIN | POLLOUT,
-        },
+        }
         Kind::Null | Kind::Zero | Kind::Random | Kind::Mem(_) | Kind::Block(_) | Kind::LoopControl | Kind::DmControl | Kind::Special(_) | Kind::DmaBuf(_) | Kind::Ashmem(_) => POLLIN | POLLOUT,
         Kind::Drm(d) => d.poll_bits(),
         Kind::Sync(s) => s.poll(),
@@ -1233,11 +1241,12 @@ impl Kernel {
             S_IFREG if vfs.writable(&node) => {
                 let file = vfs.mem_file(&node).ok_or(EIO)?;
                 if flags & O_TRUNC != 0 && access != 0 {
-                    file.truncate(0);
+                    file.truncate(0)?;
                 }
                 Kind::Mem(MemOpen {
                     name: node.path.clone(),
                     node: Some(node),
+                    opened: stat,
                     file,
                     pos: Mutex::new(0),
                     readable: access != O_WRONLY,
@@ -1245,6 +1254,16 @@ impl Kernel {
                 })
             }
             _ if access != 0 => return Err(EROFS),
+            // Through a read-only mount it's still the same live file.
+            S_IFREG if vfs.mem_file(&node).is_some() => Kind::Mem(MemOpen {
+                name: node.path.clone(),
+                file: vfs.mem_file(&node).ok_or(EIO)?,
+                node: Some(node),
+                opened: stat,
+                pos: Mutex::new(0),
+                readable: true,
+                writable: false,
+            }),
             _ => Kind::Node(NodeFile::open(vfs, node, stat, false)),
         };
         let file = File::new(kind, status);
@@ -1378,7 +1397,10 @@ impl Kernel {
                 if vfs.readonly(&node) {
                     return Err(EROFS);
                 }
-                vfs.mem_file(&node).ok_or(EISDIR)?.truncate(a[1]);
+                if (a[1] as i64) < 0 {
+                    return Err(EINVAL);
+                }
+                vfs.mem_file(&node).ok_or(EISDIR)?.truncate(a[1])?;
                 inotify::notify(&node.path, inotify::IN_MODIFY, 0);
                 Ok(0)
             }
@@ -1394,9 +1416,14 @@ impl Kernel {
                     return Err(EROFS);
                 }
                 if no == ftruncate {
-                    m.file.truncate(a[1]);
-                } else if a[2] + a[3] > m.file.size() && a[1] & 1 == 0 {
-                    m.file.truncate(a[2] + a[3]); // FALLOC_FL_KEEP_SIZE (1) unset: extend
+                    if (a[1] as i64) < 0 {
+                        return Err(EINVAL);
+                    }
+                    m.file.truncate(a[1])?;
+                } else if (a[2] as i64) < 0 || (a[3] as i64) <= 0 {
+                    return Err(EINVAL);
+                } else if a[2].saturating_add(a[3]) > m.file.size() && a[1] & 1 == 0 {
+                    m.file.truncate(a[2].saturating_add(a[3]))?; // FALLOC_FL_KEEP_SIZE (1) unset: extend
                 }
                 if let Some(n) = &m.node {
                     inotify::notify(&n.path, inotify::IN_MODIFY, 0);
@@ -1458,7 +1485,7 @@ impl Kernel {
                 const MFD_CLOEXEC: u64 = 1;
                 let name = t.proc.mm().read_cstr(a[0])?;
                 let file = MemFile::new(self.phys.clone());
-                let m = MemOpen { node: None, name: format!("/memfd:{name} (deleted)"), file, pos: Mutex::new(0), readable: true, writable: true };
+                let m = MemOpen { node: None, opened: Stat::default(), name: format!("/memfd:{name} (deleted)"), file, pos: Mutex::new(0), readable: true, writable: true };
                 t.files().alloc(File::new(Kind::Mem(m), 0), a[1] & MFD_CLOEXEC != 0, 0)
             }
             _ => Err(ENOSYS),
@@ -1575,7 +1602,7 @@ impl Kernel {
                 }
                 let mut pos = m.pos.lock().unwrap();
                 let off = at.unwrap_or(*pos);
-                let data = m.file.read_at(off, count);
+                let data = m.file.read_at(off, count)?;
                 if at.is_none() {
                     *pos += data.len() as u64;
                 }
@@ -1616,6 +1643,11 @@ impl Kernel {
                         nf.pos += data.len() as u64;
                     }
                     return Ok(data);
+                }
+                // A generated file (size 0) read from its start is made afresh, by pread as
+                // much as after a rewind: lmkd keeps /proc/meminfo open and rereads it so.
+                if at == Some(0) && nf.stat.size == 0 {
+                    nf.data = None;
                 }
                 let data = self.node_data(&mut nf)?;
                 let pos = at.unwrap_or(nf.pos) as usize;
@@ -1738,7 +1770,14 @@ impl Kernel {
                     return Err(EBADF); // opened read-only
                 }
                 nf.data = None;
-                self.vfs()?.write(&nf.node, &data)?
+                let vfs = self.vfs()?;
+                let n = vfs.write(&nf.node, &data)?;
+                if let Some(counter) = vfs.trigger(&nf.node, &data) {
+                    let seen = counter.load(Ordering::Relaxed);
+                    nf.event = Some((counter, seen));
+                    nf.event_bits = POLLPRI;
+                }
+                n
             }
             Kind::Special(s) if s.writable => s.file.write(t, &data)?,
             _ => return Err(EBADF),
@@ -1771,7 +1810,11 @@ impl Kernel {
             Kind::Node(nf) => nf.lock().unwrap().stat.clone(),
             Kind::Special(s) => self.vfs()?.stat(&s.node)?,
             Kind::Mem(m) => match &m.node {
-                Some(n) => self.vfs()?.stat(n)?,
+                Some(n) => match self.vfs()?.stat(n) {
+                    // Its last name is gone, and it lives on for those who have it open.
+                    Err(ENOENT) => Stat { nlink: 0, size: m.file.size(), ..m.opened.clone() },
+                    other => other?,
+                },
                 None => Stat { mode: S_IFREG | 0o600, nlink: 1, size: m.file.size(), ..Default::default() },
             },
         })

@@ -1,16 +1,21 @@
 //! The page cache: one copy of each page of each file on a read-only image, in
 //! guest frames, read and decompressed when first wanted. Everything that maps a
-//! page shares its frame until it writes, and a read(2) copies from it. Pages
-//! nothing has mapped are kept while there is room, then dropped oldest first.
+//! page shares its frame until it writes, and a read(2) copies from it.
+//!
+//! Pages nothing has mapped are kept while there is room, then dropped oldest
+//! first. Files on /data take their turn with these: their pages leave memory for
+//! the host's disk (`Store`), as a file on a real device would be on flash.
 
 use crate::errno::*;
 use crate::image::ReadAt;
+use crate::mm::SharedObject;
 use crate::phys::{PAGE, PhysMem};
 use crate::vfs::{FileSystem, io_errno};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::fs::File;
 use std::io;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, Weak};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 
 /// Where a private mapping's pages come from.
 pub trait PageSource: Send + Sync {
@@ -62,8 +67,202 @@ const IDLE_LIMIT: u64 = (256 << 20) / PAGE;
 /// How far one trip looks for pages to drop. Pages mapped by something are passed
 /// over, and a trip must not take long when most of them are.
 const SCAN_BUDGET: usize = 512;
+/// How far the clock can run ahead of the pages it has before it gets swept.
+const SWEEP_SLACK: u64 = 1024;
+#[cfg(test)]
+pub const SWEEP_SLACK_FOR_TESTS: usize = SWEEP_SLACK as usize;
 /// In a page's entry: looked up since the clock last came by.
 const REFERENCED: u64 = 1;
+
+/// What the clock comes round to.
+enum Page {
+    File(Arc<CachedFile>, u32),
+    /// A page of a file on /data, which is free to be deleted meanwhile.
+    Object(Weak<SharedObject>, u32),
+}
+
+impl Page {
+    /// Tries to drop it: returns whether it should get another turn.
+    fn try_evict(&self) -> bool {
+        match self {
+            Page::File(file, idx) => file.try_evict(*idx),
+            Page::Object(obj, idx) => obj.upgrade().is_some_and(|o| o.try_evict(*idx)),
+        }
+    }
+
+    /// Whether it is still there to come back to.
+    fn alive(&self) -> bool {
+        match self {
+            Page::File(file, idx) => file.state.lock().unwrap().pages.contains_key(idx),
+            Page::Object(obj, idx) => obj.upgrade().is_some_and(|o| o.still_in_memory(*idx)),
+        }
+    }
+}
+
+/// In a `kept` value: where a page of /data is when it isn't in memory. The rest of
+/// the value is the byte's offset in that file.
+const KEPT_IN_IMAGE: u64 = 1;
+const KEPT_IN_SCRATCH: u64 = 2;
+const KEPT_WHERE: u64 = KEPT_IN_IMAGE | KEPT_IN_SCRATCH;
+/// A `kept` is a page's offset and tag, plus the offset in the page when reading part
+/// of one, so tags sit in the top bits, clear of any offset.
+const KEPT_SHIFT: u32 = 62;
+
+/// Where the pages of /data go when they leave memory: the data image they were
+/// last saved in, unchanged, or else a scratch file that goes when droidrt does.
+#[derive(Default)]
+pub struct Store {
+    image: OnceLock<File>,
+    scratch: OnceLock<io::Result<File>>,
+    /// Offsets in the scratch file to use again.
+    free: Mutex<Vec<u64>>,
+    next: AtomicU64,
+    /// Said once: pages have nowhere to go.
+    complained: AtomicBool,
+    /// When a write last failed, in seconds from `started`, and 0 for never: there is
+    /// no use trying again for every page right away.
+    last_failure: AtomicU64,
+    started: OnceLock<std::time::Instant>,
+}
+
+/// How long to leave the host's disk alone after a write to it fails.
+const WRITE_BACKOFF_SECS: u64 = 5;
+
+impl Store {
+    /// Pages to be read from `image` as `in_image` says.
+    pub fn set_image(&self, image: File) {
+        let _ = self.image.set(image);
+    }
+
+    /// A `kept` value for the page at `offset` in the image.
+    pub fn in_image(offset: u64) -> u64 {
+        offset | KEPT_IN_IMAGE << KEPT_SHIFT
+    }
+
+    fn scratch(&self) -> io::Result<&File> {
+        self.scratch.get_or_init(open_scratch).as_ref().map_err(|e| io::Error::new(e.kind(), e.to_string()))
+    }
+
+    /// Reads from where `kept` says (with a place in the page added to it, if wanted).
+    pub fn read(&self, kept: u64, buf: &mut [u8]) -> Result<(), i64> {
+        let offset = kept & !(KEPT_WHERE << KEPT_SHIFT);
+        let file = match kept >> KEPT_SHIFT {
+            KEPT_IN_IMAGE => self.image.get().ok_or(EIO)?,
+            KEPT_IN_SCRATCH => self.scratch().map_err(|_| EIO)?,
+            _ => return Err(EIO),
+        };
+        read_exact_at(file, buf, offset).map_err(|e| {
+            eprintln!("[droidrt] reading a page of /data back: {e}");
+            EIO
+        })
+    }
+
+    /// Writes a page out, over its old place if it has one in the scratch file.
+    /// What to remember to read it back.
+    pub fn write(&self, kept: u64, page: &[u8]) -> Result<u64, i64> {
+        let now = self.started.get_or_init(std::time::Instant::now).elapsed().as_secs() + 1;
+        let failed_at = self.last_failure.load(Ordering::Relaxed);
+        if failed_at != 0 && now < failed_at + WRITE_BACKOFF_SECS {
+            return Err(EIO);
+        }
+        let file = self.scratch();
+        let has_place = kept >> KEPT_SHIFT == KEPT_IN_SCRATCH;
+        let wrote = file.and_then(|file| {
+            let offset = if has_place {
+                kept & !(KEPT_WHERE << KEPT_SHIFT)
+            } else if let Some(offset) = self.free.lock().unwrap().pop() {
+                offset
+            } else {
+                self.next.fetch_add(PAGE, Ordering::Relaxed)
+            };
+            match write_all_at(file, page, offset) {
+                Ok(()) => Ok(offset | KEPT_IN_SCRATCH << KEPT_SHIFT),
+                Err(e) => {
+                    // The place stays usable: it's the page's own, or goes back.
+                    if !has_place {
+                        self.free.lock().unwrap().push(offset);
+                    }
+                    Err(e)
+                }
+            }
+        });
+        wrote.map_err(|e| {
+            self.last_failure.store(now, Ordering::Relaxed);
+            if !self.complained.swap(true, Ordering::Relaxed) {
+                eprintln!("[droidrt] pages of /data stay in memory: {e}");
+            }
+            EIO
+        })
+    }
+
+    /// A page that won't be read back again.
+    pub fn forget(&self, kept: u64) {
+        if kept >> KEPT_SHIFT == KEPT_IN_SCRATCH {
+            self.free.lock().unwrap().push(kept & !(KEPT_WHERE << KEPT_SHIFT));
+        }
+    }
+
+    #[cfg(test)]
+    pub fn scratch_free(&self) -> usize {
+        self.free.lock().unwrap().len()
+    }
+}
+
+/// A name for a scratch file not used yet.
+fn scratch_path() -> std::path::PathBuf {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    std::env::temp_dir().join(format!("droidrt-{}-{}.scratch", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)))
+}
+
+/// A file only this process has: it goes when the process does, however that happens.
+#[cfg(unix)]
+fn open_scratch() -> io::Result<File> {
+    let path = scratch_path();
+    let file = std::fs::OpenOptions::new().read(true).write(true).create_new(true).open(&path)?;
+    std::fs::remove_file(&path)?;
+    Ok(file)
+}
+
+#[cfg(windows)]
+fn open_scratch() -> io::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_FLAG_DELETE_ON_CLOSE: u32 = 0x0400_0000;
+    std::fs::OpenOptions::new().read(true).write(true).create_new(true).custom_flags(FILE_FLAG_DELETE_ON_CLOSE).open(scratch_path())
+}
+
+#[cfg(unix)]
+fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<()> {
+    std::os::unix::fs::FileExt::read_exact_at(file, buf, offset)
+}
+
+#[cfg(unix)]
+fn write_all_at(file: &File, buf: &[u8], offset: u64) -> io::Result<()> {
+    std::os::unix::fs::FileExt::write_all_at(file, buf, offset)
+}
+
+#[cfg(windows)]
+fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<()> {
+    let mut done = 0;
+    while done < buf.len() {
+        match std::os::windows::fs::FileExt::seek_read(file, &mut buf[done..], offset + done as u64)? {
+            0 => return Err(io::ErrorKind::UnexpectedEof.into()),
+            n => done += n,
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn write_all_at(file: &File, buf: &[u8], offset: u64) -> io::Result<()> {
+    let mut done = 0;
+    while done < buf.len() {
+        match std::os::windows::fs::FileExt::seek_write(file, &buf[done..], offset + done as u64)? {
+            0 => return Err(io::ErrorKind::WriteZero.into()),
+            n => done += n,
+        }
+    }
+    Ok(())
+}
 
 pub struct PageCache {
     pub phys: Arc<PhysMem>,
@@ -71,9 +270,10 @@ pub struct PageCache {
     /// and open files do too; after that it goes, and lets go of its filesystem.
     files: Mutex<HashMap<(usize, u64), Weak<CachedFile>>>,
     /// Every page cached, in the order the clock will reach it.
-    clock: Mutex<VecDeque<(Arc<CachedFile>, u32)>>,
+    clock: Mutex<VecDeque<Page>>,
     /// How many pages nothing has mapped may stay.
     idle_limit: AtomicU64,
+    store: Store,
 }
 
 pub struct CachedFile {
@@ -98,7 +298,7 @@ struct FileState {
 
 impl PageCache {
     pub fn new(phys: Arc<PhysMem>) -> Arc<PageCache> {
-        Arc::new(PageCache { phys, files: Mutex::default(), clock: Mutex::default(), idle_limit: AtomicU64::new(IDLE_LIMIT) })
+        Arc::new(PageCache { phys, files: Mutex::default(), clock: Mutex::default(), idle_limit: AtomicU64::new(IDLE_LIMIT), store: Store::default() })
     }
 
     /// The one cached copy of a file.
@@ -113,28 +313,79 @@ impl PageCache {
         file
     }
 
+    pub fn store(&self) -> &Store {
+        &self.store
+    }
+
+    #[cfg(test)]
+    pub fn limit_idle(&self, pages: u64) {
+        self.idle_limit.store(pages, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub fn clock_len(&self) -> usize {
+        self.clock.lock().unwrap().len()
+    }
+
+    /// A page of a file on /data has come into memory.
+    pub fn watch_object(&self, obj: Weak<SharedObject>, idx: u32) {
+        self.clock.lock().unwrap().push_back(Page::Object(obj, idx));
+    }
+
+    /// One step of the clock: whether a page went, or None if it has nothing on it.
+    fn tick(&self) -> Option<bool> {
+        let page = self.clock.lock().unwrap().pop_front()?;
+        // No lock held here: dropping pages takes their owners' locks, and may write.
+        let again = page.try_evict();
+        if again {
+            self.clock.lock().unwrap().push_back(page);
+        }
+        Some(!again)
+    }
+
+    /// Clears the clock of pages long gone (a deleted file's, say), which go without
+    /// telling it. It may not go round for a long time otherwise, while memory is plenty.
+    fn sweep(&self) {
+        let mut clock = self.clock.lock().unwrap();
+        if clock.len() as u64 <= self.phys.cached_frames() * 2 + SWEEP_SLACK {
+            return;
+        }
+        let batch: Vec<Page> = (0..SCAN_BUDGET.min(clock.len())).filter_map(|_| clock.pop_front()).collect();
+        drop(clock);
+        let alive: Vec<Page> = batch.into_iter().filter(Page::alive).collect();
+        self.clock.lock().unwrap().extend(alive);
+    }
+
     /// Drops pages nothing has mapped until few enough remain. A page looked up since
     /// the clock last came by, and one mapped now, get another turn.
-    fn balance(&self) {
+    pub fn balance(&self) {
+        self.sweep();
         for _ in 0..SCAN_BUDGET {
             if self.phys.cached_idle_frames() <= self.idle_limit.load(Ordering::Relaxed) {
                 return;
             }
-            let Some((file, idx)) = self.clock.lock().unwrap().pop_front() else { return };
-            let mut st = file.state.lock().unwrap();
-            let Some(&entry) = st.pages.get(&idx) else { continue };
-            let frame = entry & !REFERENCED;
-            if entry & REFERENCED != 0 || !self.phys.is_sole_owner(frame) {
-                // Under this lock nothing new can map it; what maps it now will
-                // let go in its own time, and the clock will be back.
-                st.pages.insert(idx, frame);
-                drop(st);
-                self.clock.lock().unwrap().push_back((file, idx));
-                continue;
+            if self.tick().is_none() {
+                return;
             }
-            st.pages.remove(&idx);
-            self.phys.release_cached(frame);
         }
+    }
+
+    /// Memory is short: lets `pages` pages go if it can, however recently they were
+    /// used, and returns how many went.
+    pub fn reclaim(&self, pages: u64) -> u64 {
+        let mut gone = 0;
+        // Twice round takes what a first time round only took the flag from.
+        let mut steps = self.clock.lock().unwrap().len() * 2;
+        while gone < pages && steps > 0 && self.phys.cached_idle_frames() > 0 {
+            steps -= 1;
+            let frames = self.phys.frames_in_use();
+            match self.tick() {
+                Some(true) if self.phys.frames_in_use() < frames => gone += 1,
+                Some(_) => {}
+                None => break,
+            }
+        }
+        gone
     }
 
     /// The files holding the most pages, for a report.
@@ -148,6 +399,22 @@ impl PageCache {
 }
 
 impl CachedFile {
+    /// The clock has come to page `idx`: returns whether it should come back.
+    fn try_evict(&self, idx: u32) -> bool {
+        let mut st = self.state.lock().unwrap();
+        let Some(&entry) = st.pages.get(&idx) else { return false };
+        let frame = entry & !REFERENCED;
+        // Under this lock nothing new can map it; what maps it now will let go in
+        // its own time, and the clock will be back.
+        if entry & REFERENCED != 0 || !self.cache.phys.is_sole_owner(frame) {
+            st.pages.insert(idx, frame);
+            return true;
+        }
+        st.pages.remove(&idx);
+        self.cache.phys.release_cached(frame);
+        false
+    }
+
     fn fill(&self, window: u64) -> Result<(), i64> {
         let phys = &self.cache.phys;
         let first = window * WINDOW_PAGES;
@@ -169,7 +436,7 @@ impl CachedFile {
             let frame = match phys.alloc() {
                 Ok(f) => f,
                 Err(e) => {
-                    frames.into_iter().for_each(|(_, f)| phys.free(f));
+                    frames.into_iter().for_each(|(_, f)| phys.release_cached(f));
                     return Err(e);
                 }
             };
@@ -182,7 +449,7 @@ impl CachedFile {
         // Till it is on the clock, nothing can drop a page.
         if let Some(me) = self.me.upgrade() {
             let mut clock = self.cache.clock.lock().unwrap();
-            clock.extend(frames.iter().map(|&(idx, _)| (me.clone(), idx)));
+            clock.extend(frames.iter().map(|&(idx, _)| Page::File(me.clone(), idx)));
         }
         Ok(())
     }
@@ -363,7 +630,7 @@ mod tests {
     #[test]
     fn idle_pages_go_and_mapped_ones_stay() {
         let (phys, cache, fake, file) = fixture(PAGE * WINDOW_PAGES * 8);
-        cache.idle_limit.store(WINDOW_PAGES, Ordering::Relaxed);
+        cache.limit_idle(WINDOW_PAGES);
         let mapped = file.page(0).unwrap().unwrap();
         let before = phys.frames_in_use();
         for w in 1..8 {
@@ -392,7 +659,7 @@ mod tests {
         let f = file.page(0).unwrap().unwrap();
         phys.free(f);
         assert_eq!(phys.frames_in_use(), base + WINDOW_PAGES);
-        cache.idle_limit.store(0, Ordering::Relaxed);
+        cache.limit_idle(0);
         for _ in 0..4 {
             cache.balance();
         }

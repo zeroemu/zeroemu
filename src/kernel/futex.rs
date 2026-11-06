@@ -83,7 +83,7 @@ impl Kernel {
     /// by the physical frame so any process mapping it can wake them.
     pub(super) fn futex_key(&self, t: &Thread, addr: u64, private: bool) -> (i32, u64) {
         let addr = crate::arch::untag(addr);
-        if !private && let Some(gpa) = t.proc.mm.lock().unwrap().as_ref().and_then(|m| m.shared_frame(addr)) {
+        if !private && let Some(gpa) = t.proc.mm.lock().unwrap().as_mut().and_then(|m| m.shared_frame(addr)) {
             return (SHARED, gpa);
         }
         (t.proc.pid, addr)

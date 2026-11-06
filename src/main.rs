@@ -101,7 +101,7 @@ fn run() -> Result<i32, String> {
             "--no-adb" => no_adb = true,
             "--no-net" => no_net = true,
             // As hw.ramSize says in an AVD: what the guest believes it has.
-            "--ram" => phys::set_ram(args.next().ok_or(USAGE)?.parse::<u64>().ok().filter(|mb| (512..=phys::PHYS_MAX >> 20).contains(mb)).ok_or(USAGE)? << 20),
+            "--ram" => phys::set_ram(args.next().ok_or(USAGE)?.parse::<u64>().ok().filter(|mb| (1024..=phys::PHYS_MAX >> 20).contains(mb)).ok_or(USAGE)? << 20),
             "--display" => display = true,
             "--headless" => headless = true,
             "--gpu-selftest" => gpu_selftest = true,

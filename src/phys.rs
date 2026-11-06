@@ -79,6 +79,9 @@ pub struct PhysMem {
     /// Frames in the page cache, and those of them nothing has mapped.
     cached: AtomicU64,
     cached_idle: AtomicU64,
+    /// Address space ids in use, and where to look for the next: two live address
+    /// spaces with one id would hit each other's translations.
+    asids: Mutex<(Box<[u64]>, u32)>,
 }
 
 struct Alloc {
@@ -223,6 +226,7 @@ impl PhysMem {
             extra_refs: zeroed_counters((PHYS_MAX / PAGE) as usize),
             cached: AtomicU64::new(0),
             cached_idle: AtomicU64::new(0),
+            asids: Mutex::new((vec![0u64; 1 << 10].into_boxed_slice(), 1)),
         })
     }
 
@@ -264,6 +268,29 @@ impl PhysMem {
             eprintln!("[droidrt] device memory unmap: {e}");
         }
         ext.free.push((range.gpa, range.size));
+    }
+
+    /// An address space id nothing has, taken in turn: one that went is used again last.
+    /// Whoever gets it starts on a vCPU that flushes first (a new one, or one switching
+    /// roots at exec), so nothing is left of what it meant before.
+    pub fn alloc_asid(&self) -> Result<u16, i64> {
+        let mut g = self.asids.lock().unwrap();
+        let (used, next) = &mut *g;
+        for i in 0..=u16::MAX as u32 {
+            // 0 is for no address space.
+            let id = ((*next + i - 1) % u16::MAX as u32) + 1;
+            let (word, bit) = ((id / 64) as usize, id % 64);
+            if used[word] & 1 << bit == 0 {
+                used[word] |= 1 << bit;
+                *next = id % u16::MAX as u32 + 1;
+                return Ok(id as u16);
+            }
+        }
+        Err(ENOMEM)
+    }
+
+    pub fn free_asid(&self, id: u16) {
+        self.asids.lock().unwrap().0[id as usize / 64] &= !(1 << (id % 64));
     }
 
     /// A zeroed frame, for something with no particular owner.
@@ -674,6 +701,26 @@ mod tests {
         // With none, it does get used, before anything new.
         let i = phys.alloc_for(10).unwrap();
         assert_eq!(block_of(i), a);
+    }
+
+    #[test]
+    fn no_two_live_address_spaces_share_an_id() {
+        let phys = phys();
+        let first = phys.alloc_asid().unwrap();
+        assert_ne!(first, 0);
+        // Round many more times than there are ids, while this one stays.
+        let mut last = 0;
+        for _ in 0..200_000 {
+            let id = phys.alloc_asid().unwrap();
+            assert_ne!(id, 0);
+            assert_ne!(id, first);
+            assert_ne!(id, last, "one that went comes back last");
+            phys.free_asid(id);
+            last = id;
+        }
+        let all: Vec<u16> = (0..u16::MAX - 1).map(|_| phys.alloc_asid().unwrap()).collect();
+        assert_eq!(phys.alloc_asid(), Err(ENOMEM));
+        assert_eq!(all.iter().collect::<std::collections::HashSet<_>>().len(), all.len());
     }
 
     /// A process's frames sit together, so that when it goes they all empty.

@@ -614,6 +614,9 @@ pub struct Vfs {
     events: Arc<AtomicU64>,
     /// Holds the read-only images' pages, once there is guest memory to hold them in.
     cache: OnceLock<Arc<crate::pagecache::PageCache>>,
+    /// How many processes are in each namespace that goes when they do. Every app
+    /// starts with one of its own, holding a copy of the whole mount table.
+    ns_users: Mutex<HashMap<u32, u32>>,
 }
 
 pub(crate) fn io_errno(e: io::Error) -> i64 {
@@ -713,10 +716,33 @@ impl Vfs {
         }
     }
 
+    /// A process joins a namespace.
+    pub fn ns_enter(&self, ns: u32) {
+        if let Some(n) = self.ns_users.lock().unwrap().get_mut(&ns) {
+            *n += 1;
+        }
+    }
+
+    /// A process leaves a namespace, which goes with the last. Linux keeps one for as long
+    /// as a descriptor names it, too; those here only ever name init's, which stay.
+    pub fn ns_leave(&self, ns: u32) {
+        let mut users = self.ns_users.lock().unwrap();
+        let Some(n) = users.get_mut(&ns) else { return };
+        *n = n.saturating_sub(1);
+        if *n > 0 {
+            return;
+        }
+        users.remove(&ns);
+        drop(users);
+        let gone = self.spaces.write().unwrap().remove(&ns);
+        drop(gone); // with no lock held: what it held may be the last of a filesystem
+    }
+
     /// unshare(CLONE_NEWNS): a new namespace holding a copy of the current
     /// one's mounts. Copies of shared mounts are their peers, so mount events
-    /// keep propagating between the namespaces (init's /bootstrap-apex).
-    pub fn clone_ns(&self) -> u32 {
+    /// keep propagating between the namespaces (init's /bootstrap-apex). A `lasting`
+    /// one stays when nobody's in it: init keeps descriptors to go back to its own.
+    pub fn clone_ns(&self, lasting: bool) -> u32 {
         let _g = self.edit.lock().unwrap();
         let tab = self.table();
         let mut ids: HashMap<u32, u32> = HashMap::new();
@@ -743,6 +769,9 @@ impl Vfs {
             .collect();
         let ns = self.ns_ids.fetch_add(1, Ordering::Relaxed) + 1;
         self.spaces.write().unwrap().insert(ns, Arc::new(RwLock::new(Arc::new(Table::new(copies)))));
+        if !lasting {
+            self.ns_users.lock().unwrap().insert(ns, 0);
+        }
         ns
     }
 
@@ -1360,4 +1389,30 @@ impl Vfs {
 pub fn memstat_on() -> bool {
     static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var("DROIDRT_MEMSTAT").as_deref() == Ok("1"));
     *ON
+}
+
+#[cfg(test)]
+mod ns_tests {
+    use super::*;
+
+    #[test]
+    fn a_namespace_goes_with_its_last_process_unless_it_lasts() {
+        let vfs = Vfs::default();
+        vfs.mount("/", crate::tmpfs::Tmpfs::new(crate::phys::PhysMem::new(Arc::new(crate::hv::NoHv)), 0o755));
+        let ns = vfs.clone_ns(false);
+        vfs.ns_enter(ns);
+        vfs.ns_enter(ns);
+        vfs.ns_leave(ns);
+        assert!(vfs.has_ns(ns));
+        vfs.ns_leave(ns);
+        assert!(!vfs.has_ns(ns));
+        // Leaving again does nothing, and neither does anything to the first namespace.
+        vfs.ns_leave(ns);
+        vfs.ns_leave(INIT_NS);
+        assert!(vfs.has_ns(INIT_NS));
+        let kept = vfs.clone_ns(true);
+        vfs.ns_enter(kept);
+        vfs.ns_leave(kept);
+        assert!(vfs.has_ns(kept));
+    }
 }

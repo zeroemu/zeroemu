@@ -1422,6 +1422,8 @@ impl Kernel {
                     m.file.truncate(a[1])?;
                 } else if (a[2] as i64) < 0 || (a[3] as i64) <= 0 {
                     return Err(EINVAL);
+                } else if a[1] & !1 != 0 {
+                    return Err(EOPNOTSUPP); // punching holes and so on: say so, and they cope
                 } else if a[2].saturating_add(a[3]) > m.file.size() && a[1] & 1 == 0 {
                     m.file.truncate(a[2].saturating_add(a[3]))?; // FALLOC_FL_KEEP_SIZE (1) unset: extend
                 }

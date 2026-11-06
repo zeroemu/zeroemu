@@ -305,8 +305,10 @@ impl Kernel {
                     if !self.creds(t).capable(super::creds::CAP_SYS_ADMIN) {
                         return Err(EPERM);
                     }
-                    let ns = self.vfs.as_deref().ok_or(EINVAL)?.clone_ns();
-                    t.proc.mnt_ns.store(ns, Ordering::Relaxed);
+                    let vfs = self.vfs.as_deref().ok_or(EINVAL)?;
+                    let ns = vfs.clone_ns(t.proc.pid == 1);
+                    vfs.ns_enter(ns);
+                    vfs.ns_leave(t.proc.mnt_ns.swap(ns, Ordering::Relaxed));
                     crate::vfs::set_current_ns(ns);
                 }
                 Ok(0)
@@ -338,7 +340,8 @@ impl Kernel {
                     if !vfs.has_ns(ns) {
                         return Err(EINVAL);
                     }
-                    t.proc.mnt_ns.store(ns, Ordering::Relaxed);
+                    vfs.ns_enter(ns);
+                    vfs.ns_leave(t.proc.mnt_ns.swap(ns, Ordering::Relaxed));
                     crate::vfs::set_current_ns(ns);
                 }
                 Ok(0)

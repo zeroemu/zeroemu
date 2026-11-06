@@ -158,7 +158,6 @@ pub struct Kernel {
     next_id: AtomicI32,
     /// Serializes allocation; set once ids have wrapped around.
     id_wrapped: Mutex<bool>,
-    next_asid: AtomicU32,
     /// Host threads running guest threads.
     live_threads: AtomicUsize,
     persist: Option<Persist>,
@@ -251,9 +250,10 @@ impl Persist {
     /// Takes the file for this process, or says that another has it. Whatever a previous
     /// one left half written goes now: only a holder of the lock can be writing one.
     fn lock(&mut self) -> std::io::Result<bool> {
-        if let Some(dir) = self.path.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
+        // A bare file name's parent is "", which is the current directory, and which
+        // create_dir_all takes and read_dir doesn't.
+        let dir = self.path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(std::path::Path::new("."));
+        std::fs::create_dir_all(dir)?;
         let lock = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(self.beside(".lock"))?;
         match lock.try_lock() {
             Ok(()) => {}
@@ -261,11 +261,14 @@ impl Persist {
             Err(std::fs::TryLockError::Error(e)) => return Err(e),
         }
         self.lock = Some(lock);
-        if let (Some(dir), Some(name)) = (self.path.parent(), self.path.file_name().and_then(|n| n.to_str())) {
+        // Not being able to look is no reason not to keep /data.
+        if let (Ok(entries), Some(name)) = (std::fs::read_dir(dir), self.path.file_name().and_then(|n| n.to_str())) {
             let prefix = format!("{name}.");
-            for entry in std::fs::read_dir(dir)?.flatten() {
+            for entry in entries.flatten() {
+                // Only what `save` names <file>.<pid>.new: others may be anybody's.
                 let file = entry.file_name();
-                if file.to_str().is_some_and(|f| f.starts_with(&prefix) && f.ends_with(".new")) {
+                let pid = file.to_str().and_then(|f| f.strip_prefix(&prefix)).and_then(|f| f.strip_suffix(".new"));
+                if pid.is_some_and(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit())) {
                     let _ = std::fs::remove_file(entry.path());
                 }
             }
@@ -494,6 +497,14 @@ fn mount_tmpfs(vfs: &mut Vfs, phys: &Arc<PhysMem>) -> (Arc<crate::tmpfs::Tmpfs>,
     (dev_handle, data)
 }
 
+impl Drop for Process {
+    fn drop(&mut self) {
+        if let Some(v) = &self.vfs {
+            v.ns_leave(*self.mnt_ns.get_mut());
+        }
+    }
+}
+
 pub struct Process {
     pub pid: i32,
     pub ppid: AtomicI32,
@@ -524,6 +535,8 @@ pub struct Process {
     pub sec: selinux::ProcSec,
     /// Its mount namespace (vfs.rs).
     pub mnt_ns: AtomicU32,
+    /// Where that namespace is, to leave it when this process is gone.
+    vfs: Option<Arc<Vfs>>,
     /// umask(2): permission bits new files, directories and sockets lack.
     pub umask: AtomicU32,
 }
@@ -606,7 +619,8 @@ pub fn wakeup_stats(over: Duration) -> String {
     s
 }
 
-/// SIGINT and SIGTERM, when a device has something to save before it goes.
+/// SIGINT, SIGTERM and SIGHUP (the terminal going), when a device has something to
+/// save before it goes.
 #[cfg(unix)]
 fn exit_signals() -> libc::sigset_t {
     unsafe {
@@ -614,14 +628,20 @@ fn exit_signals() -> libc::sigset_t {
         libc::sigemptyset(&mut set);
         libc::sigaddset(&mut set, libc::SIGINT);
         libc::sigaddset(&mut set, libc::SIGTERM);
+        libc::sigaddset(&mut set, libc::SIGHUP);
         set
     }
 }
 
-/// Holds SIGINT and SIGTERM for `start`'s thread. As `reserve_dump_signal`.
+/// Whether those are held, which leaves it to a thread here to act on them.
+#[cfg(unix)]
+static EXIT_SIGNALS_HELD: AtomicBool = AtomicBool::new(false);
+
+/// Holds those signals for `start`'s thread. As `reserve_dump_signal`.
 pub fn reserve_exit_signals() {
     #[cfg(unix)]
     unsafe {
+        EXIT_SIGNALS_HELD.store(true, Ordering::Relaxed);
         libc::pthread_sigmask(libc::SIG_BLOCK, &exit_signals(), std::ptr::null_mut());
     }
 }
@@ -946,7 +966,8 @@ impl Kernel {
                         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                         // Never saved over: it may only need a newer droidrt, or a look.
                         Err(e) => {
-                            let aside = p.beside(".bad");
+                            // A name not in use, so as not to lose an earlier one that way.
+                            let aside = (0..1000).map(|i| p.beside(&if i == 0 { ".bad".to_string() } else { format!(".bad.{i}") })).find(|n| !n.exists()).unwrap_or_else(|| p.beside(".bad.last"));
                             let moved = std::fs::rename(&p.path, &aside);
                             eprintln!("droidrt: {}: {e}; starting with an empty /data{}", p.path.display(), if moved.is_ok() { format!(", and keeping the file as {}", aside.display()) } else { String::new() });
                             if moved.is_err() {
@@ -1006,7 +1027,6 @@ impl Kernel {
             procs: Mutex::new(HashMap::new()),
             next_id: AtomicI32::new(1),
             id_wrapped: Mutex::new(false),
-            next_asid: AtomicU32::new(1),
             live_threads: AtomicUsize::new(0),
             vcpus: vcpus::Pool::new(max_vcpus),
             persist,
@@ -1026,18 +1046,14 @@ impl Kernel {
         }))
     }
 
-    fn alloc_asid(&self) -> u16 {
-        // 16-bit ASIDs; on wrap-around, vCPUs flush when they switch roots.
-        (self.next_asid.fetch_add(1, Ordering::Relaxed) % 0xffff + 1) as u16
-    }
-
     /// A program held in host memory, as something to load (the freestanding guests).
     pub fn bytes_source(&self, data: Arc<[u8]>) -> Arc<dyn crate::pagecache::PageSource> {
         Arc::new(crate::pagecache::Bytes::new(self.phys.clone(), data))
     }
 
     pub fn new_address_space(&self) -> Result<AddressSpace, i64> {
-        let mut mm = AddressSpace::new(self.phys.clone(), &self.kwin, self.alloc_asid())?;
+        let asid = self.phys.alloc_asid()?;
+        let mut mm = AddressSpace::new(self.phys.clone(), &self.kwin, asid).inspect_err(|_| self.phys.free_asid(asid))?;
         // Where signal handlers return to (Linux puts this in the vDSO).
         mm.map(Placement::Fixed(signal::SIGRETURN_TRAMPOLINE), PAGE, PROT_READ | PROT_EXEC, Backing::File { src: self.sigpage.clone(), offset: 0 })?;
         mm.set_name(signal::SIGRETURN_TRAMPOLINE, PAGE, "[sigpage]");
@@ -1231,23 +1247,22 @@ impl Kernel {
             });
         }
         pressure::start(self);
-        if self.persist.is_some() {
+        // Whether there turns out to be anything to save or not.
+        let k = self.clone();
+        crate::gpu::on_window_closed(Box::new(move || k.request_exit(0)));
+        #[cfg(unix)]
+        if EXIT_SIGNALS_HELD.load(Ordering::Relaxed) {
             let k = self.clone();
-            crate::gpu::on_window_closed(Box::new(move || k.request_exit(0)));
-            #[cfg(unix)]
-            {
-                let k = self.clone();
-                let _ = std::thread::Builder::new().name("exit-signals".into()).spawn(move || {
-                    let mut sig = 0;
-                    if unsafe { libc::sigwait(&exit_signals(), &mut sig) } == 0 {
-                        k.request_exit(sig);
-                    }
-                    // Again while saving: this time they mean it.
-                    if unsafe { libc::sigwait(&exit_signals(), &mut sig) } == 0 {
-                        std::process::exit(128 + sig);
-                    }
-                });
-            }
+            let _ = std::thread::Builder::new().name("exit-signals".into()).spawn(move || {
+                let mut sig = 0;
+                if unsafe { libc::sigwait(&exit_signals(), &mut sig) } == 0 {
+                    k.request_exit(sig);
+                }
+                // Again while saving: this time they mean it.
+                if unsafe { libc::sigwait(&exit_signals(), &mut sig) } == 0 {
+                    std::process::exit(128 + sig);
+                }
+            });
         }
         #[cfg(unix)]
         {
@@ -1283,6 +1298,7 @@ impl Kernel {
             attrs: Mutex::new(control::ProcAttrs::first()),
             sec: self.selinux.initial_sec(),
             mnt_ns: AtomicU32::new(crate::vfs::INIT_NS),
+            vfs: self.vfs.clone(),
             umask: AtomicU32::new(0o022),
         });
         self.root_pid.store(pid, Ordering::Relaxed);
@@ -1374,6 +1390,16 @@ impl Kernel {
             if t.dying.load(Ordering::Acquire) {
                 break;
             }
+            // Last thing before going in: writing a signal frame just now may have copied
+            // a page that the guest would otherwise go on reading the old way.
+            {
+                let mut mm = t.proc.mm();
+                if mm.flushed_gen < mm.tlb_gen {
+                    stale.absorb(mm.take_stale());
+                    vcpu.flush_tlb();
+                    flushing = Some(mm.tlb_gen);
+                }
+            }
             let exit = vcpu.run();
             // The flush requested last time ran on entry; now frames are safe to
             // reuse. (Interrupted: the vCPU may not have reached the flush yet. And a
@@ -1428,12 +1454,6 @@ impl Kernel {
                     self.force_signal(t, signal::SIGILL, SigInfo::fault(signal::SIGILL, 1, pc), pc);
                 }
                 Exit::Interrupted => {}
-            }
-            let mut mm = t.proc.mm();
-            if mm.flushed_gen < mm.tlb_gen {
-                stale.absorb(mm.take_stale());
-                vcpu.flush_tlb();
-                flushing = Some(mm.tlb_gen);
             }
         }
         drop(vcpu); // destroyed on the thread that owns it

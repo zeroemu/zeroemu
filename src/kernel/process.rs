@@ -125,7 +125,7 @@ impl Kernel {
         }
         let mut mm = {
             let mut pm = parent.mm();
-            let mm = pm.fork(&self.kwin, self.alloc_asid())?;
+            let mm = pm.fork(&self.kwin, self.phys.alloc_asid()?)?;
             if threaded {
                 vcpu.flush_tlb_now();
             }
@@ -159,7 +159,14 @@ impl Kernel {
             creds: Mutex::new(parent.creds.lock().unwrap().clone()),
             attrs: Mutex::new(parent.attrs.lock().unwrap().fork(t.tid)),
             sec: parent.sec.clone(),
-            mnt_ns: AtomicU32::new(parent.mnt_ns.load(Ordering::Relaxed)),
+            mnt_ns: {
+                let ns = parent.mnt_ns.load(Ordering::Relaxed);
+                if let Some(v) = &self.vfs {
+                    v.ns_enter(ns);
+                }
+                AtomicU32::new(ns)
+            },
+            vfs: self.vfs.clone(),
             umask: AtomicU32::new(parent.umask.load(Ordering::Relaxed)),
         });
         let th = Thread::new(pid, child.clone(), t.mask.load(Ordering::Relaxed), None);

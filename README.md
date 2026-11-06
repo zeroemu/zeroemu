@@ -71,6 +71,7 @@ Known gaps:
   it's up, into a `/data` that's saved whole.
 - `/data` is only saved at a clean exit. A kill or a crash loses what happened since the
   last boot's save.
+- On Windows, nothing saves `/data` on Ctrl-C or when the console closes.
 - A mapping of a file doesn't raise SIGBUS past the file's end: it reads zeros. A read
   of a hole through a private mapping stays zeros if the file is written there later.
 - `mmap` and `mprotect` don't check what a file was opened for, so a read-only descriptor
@@ -129,7 +130,7 @@ sets the lowest priority shown (default `I`; `S` silences them).
 `--boot` runs Android's own `init` in a window (`--headless` for none,
 `DROIDRT_BACKGROUND=1` to open it without taking focus). A device keeps its `/data`
 and `/metadata` between boots, in one file per system image in the user's application
-data, saved when the window closes, on SIGINT or SIGTERM, or when Android shuts down:
+data, saved when the window closes, on SIGINT, SIGTERM or SIGHUP, or when Android shuts down:
 `--data <file>` puts it elsewhere, `--ephemeral` keeps nothing, and `--wipe-data` starts
 over. A second droidrt on the same file keeps nothing, and one that can't read the file
 moves it aside as `<file>.bad` rather than saving over it. `--ram <MB>` says how much memory
@@ -210,8 +211,8 @@ Measured on an M1 Pro with the default 4 GB, as Activity Monitor shows it:
 | | Activity Monitor |
 |---|---|
 | Five minutes after a first boot, nothing opened | 3.3 GB |
-| 16 apps opened one after another | 4.7 GB |
-| Those closed again | 4.1 GB |
+| 16 apps opened one after another | 5.6 GB |
+| Those closed again | 4.2 GB |
 | Five minutes after a first boot, before this was looked at | about 14 GB |
 
 - Files on the system image live in a page cache: read and decompressed a page at a time when

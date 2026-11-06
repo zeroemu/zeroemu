@@ -148,6 +148,9 @@ struct Inner {
     gated: Option<u64>,
     /// What the host was last told about this thread.
     told: Option<Urgency>,
+    /// A TLB flush asked for with no vCPU to ask: the next one does it. A new vCPU
+    /// flushing for itself isn't enough, since others hold translations too.
+    flush_wanted: bool,
 }
 
 /// One guest thread's vCPU, made and destroyed on its own host thread.
@@ -185,7 +188,7 @@ impl Slot {
             release_gate();
             return Err("dying".into());
         }
-        let v = match self.hv.create_vcpu(i.root, &i.state) {
+        let mut v = match self.hv.create_vcpu(i.root, &i.state) {
             Ok(v) => v,
             Err(e) => {
                 self.pool.release();
@@ -193,6 +196,9 @@ impl Slot {
                 return Err(e);
             }
         };
+        if std::mem::take(&mut i.flush_wanted) {
+            v.flush_tlb();
+        }
         let id = self.pool.add_holder(&self.thread);
         i.gated = gate.map(|g| g.add_holder(&self.thread));
         *self.thread.kick.lock().unwrap() = Some(v.kicker());
@@ -275,7 +281,7 @@ pub struct LazyVcpu(Rc<Slot>);
 
 impl LazyVcpu {
     pub fn new(hv: Arc<dyn Hypervisor>, pool: Arc<Pool>, thread: Arc<Thread>, root: PageTableRoot, state: CpuState) -> LazyVcpu {
-        let slot = Rc::new(Slot { hv, pool, thread, inner: RefCell::new(Inner { vcpu: None, state, root, held: None, gated: None, told: None }) });
+        let slot = Rc::new(Slot { hv, pool, thread, inner: RefCell::new(Inner { vcpu: None, state, root, held: None, gated: None, told: None, flush_wanted: false }) });
         CURRENT.with(|c| *c.borrow_mut() = Some(slot.clone()));
         LazyVcpu(slot)
     }
@@ -366,9 +372,10 @@ impl Vcpu for LazyVcpu {
     }
 
     fn flush_tlb(&mut self) {
-        // A new vCPU flushes on its first entry anyway.
-        if let Some(v) = &mut self.0.inner.borrow_mut().vcpu {
-            v.flush_tlb();
+        let mut i = self.0.inner.borrow_mut();
+        match &mut i.vcpu {
+            Some(v) => v.flush_tlb(),
+            None => i.flush_wanted = true,
         }
     }
 

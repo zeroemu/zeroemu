@@ -1360,7 +1360,7 @@ impl AddressSpace {
     /// must flush TLBs before releasing the lock: they may hold writable entries
     /// for what is now read-only, and a copy made meanwhile would lose their writes.
     pub fn fork(&mut self, kernel: &KernelWindow, asid: u16) -> Result<AddressSpace, i64> {
-        let mut child = AddressSpace::new(self.phys.clone(), kernel, asid)?;
+        let mut child = AddressSpace::new(self.phys.clone(), kernel, asid).inspect_err(|_| self.phys.free_asid(asid))?;
         // A userfaultfd is the parent's: the child's pages are its own to fault in.
         child.vmas = self.vmas.iter().filter(|(_, v)| v.on_fork != OnFork::Drop).map(|(&s, v)| (s, Vma { uffd: None, ..v.clone() })).collect();
         child.brk_start = self.brk_start;
@@ -1438,6 +1438,7 @@ impl Drop for AddressSpace {
         for f in self.tables.drain(..) {
             phys.free(f);
         }
+        phys.free_asid(self.root.asid);
     }
 }
 

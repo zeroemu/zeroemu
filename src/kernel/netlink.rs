@@ -154,12 +154,15 @@ impl Drop for Netlink {
             reg.ports.remove(&key);
         }
         reg.all.remove(&(self as *const Netlink as usize));
-        drop(reg);
-        EVENTS.bump();
     }
 }
 
 impl Netlink {
+    /// What its readers and pollers watch in EVENTS.
+    pub fn key(&self) -> usize {
+        self as *const Netlink as usize
+    }
+
     pub fn poll(&self) -> u16 {
         let st = self.st.lock().unwrap();
         (if st.rx.is_empty() && !st.overrun { 0 } else { POLLIN }) | POLLOUT
@@ -200,7 +203,7 @@ impl Netlink {
         st.rx_bytes += p.data.len();
         st.rx.push_back(p);
         drop(st);
-        EVENTS.bump();
+        EVENTS.bump_key(self.key());
         true
     }
 
@@ -210,12 +213,14 @@ impl Netlink {
         if !self.queue(p) {
             let mut st = self.st.lock().unwrap();
             st.overrun = st.opts & 1 << NETLINK_NO_ENOBUFS == 0;
+            drop(st);
+            EVENTS.bump_key(self.key()); // ENOBUFS is news too
         }
     }
 
     fn recv(&self, t: &Thread, flags: u64, nonblock: bool) -> Result<Packet, i64> {
         loop {
-            let seen = EVENTS.current();
+            let seen = EVENTS.watch_key(self.key());
             {
                 let mut st = self.st.lock().unwrap();
                 if std::mem::take(&mut st.overrun) {
@@ -228,7 +233,7 @@ impl Netlink {
                 } else if let Some(p) = st.rx.pop_front() {
                     st.rx_bytes -= p.data.len();
                     drop(st);
-                    EVENTS.bump();
+                    EVENTS.bump_key(self.key()); // room for a sender
                     return Ok(p);
                 }
             }
@@ -277,7 +282,7 @@ impl Netlink {
         }
         let p = Packet { group: 0, ..p };
         loop {
-            let seen = EVENTS.current();
+            let seen = EVENTS.watch_key(target.key());
             if target.queue(p.clone()) {
                 return Ok(len);
             }

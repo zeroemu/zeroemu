@@ -155,7 +155,12 @@ struct Evq {
 impl Evq {
     fn push(&self, ev: Vec<u8>) {
         self.q.lock().unwrap().push_back(ev);
-        EVENTS.bump_key(GPU_KEY);
+        EVENTS.bump_key(self.key());
+    }
+
+    /// What this file's event readers and pollers watch.
+    fn key(&self) -> usize {
+        self as *const Evq as usize
     }
 
     fn take(&self, max: usize) -> Result<Option<Vec<u8>>, i64> {
@@ -200,6 +205,8 @@ impl SyncPoint {
         if self.signaled.swap(true, Ordering::AcqRel) {
             return;
         }
+        // Pollers of a sync file watch its points; waits inside the kernel watch them all.
+        EVENTS.bump_key(self as *const SyncPoint as usize);
         EVENTS.bump_key(GPU_KEY);
     }
 
@@ -220,6 +227,11 @@ impl SyncFile {
 
     pub fn poll(&self) -> u16 {
         if self.ready() { 1 } else { 0 } // POLLIN once every point has signaled
+    }
+
+    /// What a poller of this watches: its points.
+    pub fn mask(&self) -> super::wait::Mask {
+        self.points.iter().fold(super::wait::Mask::plain(), |m, p| m | super::wait::key_mask(Arc::as_ptr(p) as usize))
     }
 }
 
@@ -528,6 +540,11 @@ impl Open {
         if self.card { card_rdev() } else { render_rdev() }
     }
 
+    /// What a poller or reader of this file's events watches.
+    pub fn key(&self) -> usize {
+        self.events.key()
+    }
+
     pub fn poll_bits(&self) -> u16 {
         // POLLIN when a fence or flip event is queued; the node is always writable.
         (if self.events.ready() { 1 } else { 0 }) | 4
@@ -535,7 +552,7 @@ impl Open {
 
     pub fn read_events(&self, t: &Thread, max: usize, nonblock: bool) -> Result<Vec<u8>, i64> {
         loop {
-            let seen = EVENTS.watch_key(GPU_KEY);
+            let seen = EVENTS.watch_key(self.events.key());
             if let Some(b) = self.events.take(max)? {
                 return Ok(b);
             }

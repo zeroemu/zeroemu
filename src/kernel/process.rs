@@ -12,7 +12,7 @@ use crate::mm::AddressSpace;
 use crate::phys::PAGE;
 use crate::vfs::{S_IFMT, S_IFREG};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 const CLONE_VM: u64 = 0x100;
@@ -43,7 +43,8 @@ enum Which {
 }
 
 /// (pid, wait status, real uid) of an exited child.
-type Exited = (i32, i32, u32);
+/// pid, wait status, uid, and the CPU time it and its reaped children used (ns).
+type Exited = (i32, i32, u32, u64);
 
 /// A wait status as SIGCHLD/waitid report it: (si_code, si_status).
 fn child_code(status: i32) -> (i32, i32) {
@@ -168,6 +169,9 @@ impl Kernel {
             },
             vfs: self.vfs.clone(),
             umask: AtomicU32::new(parent.umask.load(Ordering::Relaxed)),
+            cpu_gone: AtomicU64::new(0),
+            cpu_children: AtomicU64::new(0),
+            started_ns: super::monotonic_ns(),
         });
         let th = Thread::new(pid, child.clone(), t.mask.load(Ordering::Relaxed), None);
         th.sec.inherit(&t.sec);
@@ -321,9 +325,10 @@ impl Kernel {
             p => Which::Pid(p),
         };
         match self.wait_child(t, which, options | WEXITED) {
-            Ok(Some((pid, st, _))) => {
+            Ok(Some((pid, st, _, cpu))) => {
+                let used = super::misc::rusage(cpu, 0);
                 let mut mm = t.proc.mm();
-                if (status != 0 && mm.write_u32(status, st as u32).is_err()) || (rusage != 0 && mm.write(rusage, &[0; 144]).is_err()) {
+                if (status != 0 && mm.write_u32(status, st as u32).is_err()) || (rusage != 0 && mm.write(rusage, &used).is_err()) {
                     return -EFAULT;
                 }
                 pid as i64
@@ -355,14 +360,14 @@ impl Kernel {
         };
         // si_signo, si_errno, si_code, si_pid, si_uid, si_status; all zero if nothing exited.
         let mut info = [0u8; 28];
-        if let Some((pid, st, uid)) = found {
+        if let Some((pid, st, uid, cpu)) = found {
             let (code, value) = child_code(st);
             info[0..4].copy_from_slice(&(SIGCHLD as i32).to_le_bytes());
             info[8..12].copy_from_slice(&code.to_le_bytes());
             info[16..20].copy_from_slice(&pid.to_le_bytes());
             info[20..24].copy_from_slice(&uid.to_le_bytes());
             info[24..28].copy_from_slice(&value.to_le_bytes());
-            if rusage != 0 && t.proc.mm().write(rusage, &[0; 144]).is_err() {
+            if rusage != 0 && t.proc.mm().write(rusage, &super::misc::rusage(cpu, 0)).is_err() {
                 return -EFAULT;
             }
         }
@@ -393,11 +398,13 @@ impl Kernel {
             }
             for c in candidates.iter().filter(|_| options & WEXITED != 0) {
                 let Some(st) = *c.status.lock().unwrap() else { continue };
+                let cpu = c.cpu_ns() + c.cpu_children.load(Ordering::Relaxed);
                 if options & WNOWAIT == 0 {
                     children.retain(|&x| x != c.pid);
                     self.procs.lock().unwrap().remove(&c.pid);
+                    proc.cpu_children.fetch_add(cpu, Ordering::Relaxed);
                 }
-                return Ok(Some((c.pid, st, c.creds.lock().unwrap().uid)));
+                return Ok(Some((c.pid, st, c.creds.lock().unwrap().uid, cpu)));
             }
             if options & WNOHANG != 0 {
                 return Ok(None);

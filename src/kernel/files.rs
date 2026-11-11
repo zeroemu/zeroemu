@@ -458,8 +458,8 @@ const POLLNVAL: u16 = 0x20;
 
 /// What a thread waiting for this file to change should watch in EVENTS: what each
 /// kind bumps. Those with no key of their own only ever get a plain bump.
-pub(super) fn poll_mask(f: &File, t: &Thread, depth: u32) -> u64 {
-    use super::wait::{key_bit, plain_bit};
+pub(super) fn poll_mask(f: &File, t: &Thread, depth: u32) -> super::wait::Mask {
+    use super::wait::{Mask, key_mask as key_bit};
     match &f.kind {
         Kind::Event(e) => key_bit(e.key()),
         Kind::Timer(tf) => key_bit(tf.key()),
@@ -472,8 +472,12 @@ pub(super) fn poll_mask(f: &File, t: &Thread, depth: u32) -> u64 {
         Kind::Vsock(v) => v.mask(),
         Kind::Inet(s) => key_bit(s.key()),
         Kind::Inotify(i) => key_bit(Arc::as_ptr(i) as usize),
-        Kind::Drm(_) | Kind::DmaBuf(_) | Kind::Sync(_) => key_bit(super::drm::GPU_KEY),
-        _ => plain_bit(),
+        Kind::Netlink(n) => key_bit(n.key()),
+        Kind::Pty(p) => key_bit(p.key()),
+        Kind::Drm(d) => key_bit(d.key()),
+        Kind::Sync(s) => s.mask(),
+        Kind::DmaBuf(_) => key_bit(super::drm::GPU_KEY),
+        _ => Mask::plain(),
     }
 }
 
@@ -1996,13 +2000,13 @@ impl Kernel {
         };
         let wanted = |fd: usize, s: &Vec<u64>| !s.is_empty() && s[fd / 64] & 1 << (fd % 64) != 0;
         let old = self.swap_mask(t, sigmask)?;
-        let mut watching = 0;
+        let mut watching = super::wait::Mask::plain();
         let r = loop {
             // As the last pass found them. A descriptor closed and reopened since is
             // a surprise this finds out about from its timeout.
-            let seen = EVENTS.watch(watching);
+            let seen = EVENTS.watch(&watching);
             let mut out = [vec![0u64; words], vec![0u64; words], vec![0u64; words]];
-            let mut mask = 0;
+            let mut mask = super::wait::Mask::plain();
             let mut count = 0;
             let mut timer: Option<Instant> = None;
             {
@@ -2055,11 +2059,11 @@ impl Kernel {
     }
 
     fn ppoll_wait(&self, t: &Thread, fds: u64, mut raw: Vec<u8>, deadline: Option<Instant>) -> Result<i64, i64> {
-        let mut watching = 0;
+        let mut watching = super::wait::Mask::plain();
         loop {
-            let seen = EVENTS.watch(watching);
+            let seen = EVENTS.watch(&watching);
             let mut ready = 0;
-            let mut mask = 0;
+            let mut mask = super::wait::Mask::plain();
             let mut timer: Option<Instant> = None;
             {
                 for p in raw.chunks_exact_mut(8) {
@@ -2112,7 +2116,7 @@ impl Kernel {
         let old = self.swap_mask(t, sigmask)?;
         let mut fell_back = false;
         let r = loop {
-            let seen = EVENTS.watch(ep.mask(t, 0));
+            let seen = EVENTS.watch(&ep.mask(t, 0));
             let ready = ep.collect(t, max.min(1024) as usize, 0);
             if !ready.is_empty() {
                 if fell_back && late_wake_log() {

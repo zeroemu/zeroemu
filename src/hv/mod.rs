@@ -220,6 +220,122 @@ pub fn set_thread_urgency(u: Urgency) {
     let _ = u;
 }
 
+/// A host thread whose CPU time any thread can read. Each guest thread runs on a host
+/// thread of its own, so this is that guest thread's CPU time: its code in the VM and
+/// droidrt's work on its behalf.
+pub struct HostThread {
+    #[cfg(target_os = "macos")]
+    port: u32,
+    #[cfg(windows)]
+    handle: usize,
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn pthread_mach_thread_np(thread: libc::pthread_t) -> u32;
+    fn thread_info(thread: u32, flavor: i32, info: *mut i32, count: *mut u32) -> i32;
+}
+
+#[cfg(windows)]
+unsafe extern "system" {
+    fn GetCurrentThread() -> usize;
+    fn GetCurrentProcess() -> usize;
+    fn DuplicateHandle(src_process: usize, src: usize, dst_process: usize, dst: *mut usize, access: u32, inherit: i32, options: u32) -> i32;
+    fn CloseHandle(h: usize) -> i32;
+    fn GetThreadTimes(thread: usize, creation: *mut u64, exit: *mut u64, kernel: *mut u64, user: *mut u64) -> i32;
+    fn GetProcessTimes(process: usize, creation: *mut u64, exit: *mut u64, kernel: *mut u64, user: *mut u64) -> i32;
+}
+
+impl HostThread {
+    /// The calling thread. Valid for reading while that thread lives.
+    pub fn current() -> HostThread {
+        #[cfg(target_os = "macos")]
+        {
+            HostThread { port: unsafe { pthread_mach_thread_np(libc::pthread_self()) } }
+        }
+        #[cfg(windows)]
+        {
+            const DUPLICATE_SAME_ACCESS: u32 = 2;
+            let mut handle = 0;
+            unsafe { DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &mut handle, 0, 0, DUPLICATE_SAME_ACCESS) };
+            HostThread { handle }
+        }
+        #[cfg(not(any(target_os = "macos", windows)))]
+        {
+            HostThread {}
+        }
+    }
+
+    /// CPU time used so far, user and system together.
+    pub fn cpu_time(&self) -> std::time::Duration {
+        #[cfg(target_os = "macos")]
+        {
+            // struct thread_basic_info: user_time and system_time (seconds,
+            // microseconds), then six more integers.
+            const THREAD_BASIC_INFO: i32 = 3;
+            let mut info = [0i32; 10];
+            let mut count = info.len() as u32;
+            if unsafe { thread_info(self.port, THREAD_BASIC_INFO, info.as_mut_ptr(), &mut count) } != 0 {
+                return std::time::Duration::ZERO;
+            }
+            let us = (info[0] as u64 + info[2] as u64) * 1_000_000 + info[1] as u64 + info[3] as u64;
+            std::time::Duration::from_micros(us)
+        }
+        #[cfg(windows)]
+        {
+            let (mut c, mut e, mut k, mut u) = (0, 0, 0, 0);
+            if unsafe { GetThreadTimes(self.handle, &mut c, &mut e, &mut k, &mut u) } == 0 {
+                return std::time::Duration::ZERO;
+            }
+            std::time::Duration::from_nanos((k + u) * 100)
+        }
+        #[cfg(not(any(target_os = "macos", windows)))]
+        {
+            std::time::Duration::ZERO
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for HostThread {
+    fn drop(&mut self) {
+        if self.handle != 0 {
+            unsafe { CloseHandle(self.handle) };
+        }
+    }
+}
+
+/// The calling thread's CPU time.
+pub fn thread_cpu_time() -> std::time::Duration {
+    #[cfg(unix)]
+    {
+        let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) };
+        std::time::Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32)
+    }
+    #[cfg(windows)]
+    {
+        HostThread::current().cpu_time()
+    }
+}
+
+/// CPU time of droidrt as a whole: every guest thread and droidrt's own, gone ones too.
+pub fn process_cpu_time() -> std::time::Duration {
+    #[cfg(unix)]
+    {
+        let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+        unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) };
+        let tv = |t: libc::timeval| std::time::Duration::new(t.tv_sec as u64, t.tv_usec as u32 * 1000);
+        tv(ru.ru_utime) + tv(ru.ru_stime)
+    }
+    #[cfg(windows)]
+    {
+        let (mut c, mut e, mut k, mut u) = (0, 0, 0, 0);
+        unsafe { GetProcessTimes(GetCurrentProcess(), &mut c, &mut e, &mut k, &mut u) };
+        std::time::Duration::from_nanos((k + u) * 100)
+    }
+}
+
 pub trait Hypervisor: Send + Sync {
     /// Makes `size` bytes of host memory visible to the guest at `gpa`.
     fn map_ram(&self, host: *mut u8, gpa: u64, size: u64) -> Result<(), String>;

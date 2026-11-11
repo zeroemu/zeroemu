@@ -28,7 +28,13 @@ impl Kernel {
                 Ok(0)
             }
             clock_gettime => {
-                let (s, ns) = self.clock(a[0]);
+                let (s, ns) = match self.cpu_clock(t, a[0] as i32) {
+                    Some(d) => {
+                        let d = d?;
+                        (d.as_secs(), d.subsec_nanos() as u64)
+                    }
+                    None => self.clock(a[0]),
+                };
                 let mut b = [0u8; 16];
                 b[..8].copy_from_slice(&s.to_le_bytes());
                 b[8..].copy_from_slice(&ns.to_le_bytes());
@@ -61,6 +67,28 @@ impl Kernel {
                     (mm.read_u64(req)?, mm.read_u64(req + 8)?)
                 };
                 let d = super::wait::guest_timespec(s, ns)?;
+                if no == clock_nanosleep
+                    && let Some(now) = self.cpu_clock(t, clock as i32)
+                {
+                    // A CPU-time clock: a thread's can't be slept on (Linux says EINVAL);
+                    // a process's is slept on until it has used that much.
+                    let now = now?;
+                    if clock == 3 || (clock as i32) < 0 && clock as i32 & 4 != 0 {
+                        return Err(EINVAL);
+                    }
+                    let target = if abs { d } else { now + d };
+                    loop {
+                        let used = self.cpu_clock(t, clock as i32).unwrap_or(Ok(target))?;
+                        if used >= target {
+                            return Ok(0);
+                        }
+                        if t.interrupted() {
+                            return Err(EINTR);
+                        }
+                        super::vcpus::blocking();
+                        t.nap((target - used).min(IDLE));
+                    }
+                }
                 let deadline = if abs {
                     let (now_s, now_ns) = self.clock(clock);
                     super::wait::instant_after(d.saturating_sub(Duration::new(now_s, now_ns as u32)))
@@ -95,7 +123,19 @@ impl Kernel {
                 t.proc.mm().write(a[2], &mask[..len])?;
                 Ok(len as i64)
             }
-            getrusage => t.proc.mm().write(a[1], &[0u8; 144]).map(|_| 0),
+            getrusage => {
+                const RUSAGE_SELF: i32 = 0;
+                const RUSAGE_CHILDREN: i32 = -1;
+                const RUSAGE_THREAD: i32 = 1;
+                let ns = match a[0] as i32 {
+                    RUSAGE_SELF => t.proc.cpu_ns(),
+                    RUSAGE_CHILDREN => t.proc.cpu_children.load(std::sync::atomic::Ordering::Relaxed),
+                    RUSAGE_THREAD => t.cpu_ns(),
+                    _ => return Err(EINVAL),
+                };
+                let rss_kb = t.proc.mm.lock().unwrap().as_ref().map_or(0, |m| m.usage().1 / 1024);
+                t.proc.mm().write(a[1], &rusage(ns, rss_kb)).map(|_| 0)
+            }
             sysinfo => {
                 let mut b = [0u8; 112];
                 b[0..8].copy_from_slice(&self.boot.elapsed().as_secs().to_le_bytes());
@@ -156,6 +196,42 @@ impl Kernel {
         }
     }
 
+    /// The CPU-time clocks: CLOCK_PROCESS_CPUTIME_ID, CLOCK_THREAD_CPUTIME_ID, and the
+    /// ids clock_getcpuclockid and pthread_getcpuclockid make, which are a pid or tid
+    /// negated and shifted, with a thread bit and a kind (Linux's CPUCLOCK_*). None:
+    /// not one of these.
+    pub(super) fn cpu_clock(&self, t: &Thread, id: i32) -> Option<Result<Duration, i64>> {
+        let ns = |n: u64| Some(Ok(Duration::from_nanos(n)));
+        match id {
+            2 => ns(t.proc.cpu_ns()),
+            3 => ns(t.cpu_ns()),
+            id if id < 0 => {
+                if id & 3 == 3 {
+                    return Some(Err(EINVAL));
+                }
+                // 0 is the caller. A thread's clock only for the caller's own threads, as on
+                // Linux; a process's by its pid, or the caller's by any of its tids.
+                let who = !(id >> 3);
+                let found = if id & 4 != 0 {
+                    if who == 0 {
+                        Some(t.cpu_ns())
+                    } else {
+                        t.proc.threads.lock().unwrap().iter().find(|th| th.tid == who).map(|th| th.cpu_ns())
+                    }
+                } else if who == 0 || t.proc.threads.lock().unwrap().iter().any(|th| th.tid == who) {
+                    Some(t.proc.cpu_ns())
+                } else {
+                    self.live_process(who).filter(|p| p.pid == who).map(|p| p.cpu_ns())
+                };
+                match found {
+                    Some(n) => ns(n),
+                    None => Some(Err(EINVAL)),
+                }
+            }
+            _ => None,
+        }
+    }
+
     fn clock(&self, id: u64) -> (u64, u64) {
         let d = match id {
             0 | 5 | 8 | 11 => SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default(), // REALTIME(_COARSE), REALTIME_ALARM
@@ -163,4 +239,14 @@ impl Kernel {
         };
         (d.as_secs(), d.subsec_nanos() as u64)
     }
+}
+
+/// struct rusage: ru_utime then ru_stime (timevals), then ru_maxrss in KB and the rest.
+/// All of the time counts as user time (see /proc/<pid>/stat).
+pub(super) fn rusage(cpu_ns: u64, maxrss_kb: u64) -> [u8; 144] {
+    let mut b = [0u8; 144];
+    b[0..8].copy_from_slice(&(cpu_ns / 1_000_000_000).to_le_bytes());
+    b[8..16].copy_from_slice(&(cpu_ns % 1_000_000_000 / 1000).to_le_bytes());
+    b[32..40].copy_from_slice(&maxrss_kb.to_le_bytes());
+    b
 }

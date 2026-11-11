@@ -540,6 +540,11 @@ pub struct Process {
     vfs: Option<Arc<Vfs>>,
     /// umask(2): permission bits new files, directories and sockets lack.
     pub umask: AtomicU32,
+    /// CPU time of its threads that are gone, and of the children it has reaped, in ns.
+    pub cpu_gone: AtomicU64,
+    pub cpu_children: AtomicU64,
+    /// When it was made: guest CLOCK_MONOTONIC, ns.
+    pub started_ns: u64,
 }
 
 pub struct Thread {
@@ -573,6 +578,10 @@ pub struct Thread {
     pub sec: selinux::ThreadSec,
     /// The syscall in progress, for thread dumps.
     in_syscall: Mutex<Option<SyscallSnap>>,
+    /// The host thread it runs on, once it does, for its CPU time.
+    host: std::sync::OnceLock<crate::hv::HostThread>,
+    /// Asked to give its vCPU back the next time it blocks (vcpus::reclaim_sleepers).
+    give_back: AtomicBool,
     /// A descriptor table of its own: cloned without CLONE_FILES. Bionic's
     /// crash handler makes such a thread and closes everything in it.
     own_files: Option<Arc<Mutex<FdTable>>>,
@@ -616,13 +625,28 @@ pub(crate) fn monotonic_ns() -> u64 {
 }
 
 pub fn wakeup_stats(over: Duration) -> String {
-    static LAST: Mutex<(u64, u64)> = Mutex::new((0, 0));
-    let (plain, keyed) = (wait::BUMPS_PLAIN.load(Ordering::Relaxed), wait::BUMPS_KEYED.load(Ordering::Relaxed));
+    static LAST: Mutex<(u64, u64, u64)> = Mutex::new((0, 0, 0));
+    let (plain, keyed, wakes) =
+        (wait::BUMPS_PLAIN.load(Ordering::Relaxed), wait::BUMPS_KEYED.load(Ordering::Relaxed), wait::WAKES.load(Ordering::Relaxed));
     let mut last = LAST.lock().unwrap();
     let secs = over.as_secs_f64().max(0.001);
-    let s = format!("bumps {:.0}/s plain, {:.0}/s keyed", (plain - last.0) as f64 / secs, (keyed - last.1) as f64 / secs);
-    *last = (plain, keyed);
-    s
+    let s = format!(
+        "bumps {:.0}/s plain, {:.0}/s keyed, waking {:.0} threads/s",
+        (plain - last.0) as f64 / secs,
+        (keyed - last.1) as f64 / secs,
+        (wakes - last.2) as f64 / secs
+    );
+    *last = (plain, keyed, wakes);
+    static MADE_LAST: AtomicU64 = AtomicU64::new(0);
+    let made = vcpus::MADE.load(Ordering::Relaxed);
+    let (used, max) = vcpus::MAIN.get().and_then(|p| p.upgrade()).map_or((0, 0), |p| p.usage());
+    let s = format!("{s}, {:.0} vCPUs made/s, {used} of {max} in use", (made - MADE_LAST.swap(made, Ordering::Relaxed)) as f64 / secs);
+    let top = wait::top_wakers(4);
+    if top.is_empty() {
+        return s;
+    }
+    let named: Vec<String> = top.iter().map(|(k, e, w)| format!("{k:#x} {:.0}/s woke {:.1}", *e as f64 / secs, *w as f64 / (*e).max(1) as f64)).collect();
+    format!("{s} (most: {})", named.join(", "))
 }
 
 /// SIGINT, SIGTERM and SIGHUP (the terminal going), when a device has something to
@@ -728,6 +752,12 @@ impl DerefMut for Mm<'_> {
 }
 
 impl Process {
+    /// CPU time of its threads, the live ones and those gone, in ns.
+    pub fn cpu_ns(&self) -> u64 {
+        let threads = self.threads.lock().unwrap();
+        self.cpu_gone.load(Ordering::Relaxed) + threads.iter().map(|t| t.cpu_ns()).sum::<u64>()
+    }
+
     pub fn mm(&self) -> Mm<'_> {
         let guard = self.mm.lock().unwrap();
         self.mm_taker.store(guest_tid(), Ordering::Relaxed);
@@ -765,7 +795,24 @@ impl Thread {
             urgency: AtomicU8::new(Urgency::Normal as u8),
             sec: Default::default(),
             in_syscall: Mutex::new(None),
+            host: std::sync::OnceLock::new(),
+            give_back: AtomicBool::new(false),
         })
+    }
+
+    /// Whether it is in a syscall now (a thread dump's view of it).
+    pub fn in_syscall(&self) -> bool {
+        self.in_syscall.try_lock().is_ok_and(|s| s.is_some())
+    }
+
+    /// How long it has been in the syscall it is in, if it is in one.
+    pub(super) fn in_syscall_for(&self) -> Option<Duration> {
+        self.in_syscall.try_lock().ok().and_then(|s| s.as_ref().map(|s| s.since.elapsed()))
+    }
+
+    /// CPU time it has used, in ns.
+    pub fn cpu_ns(&self) -> u64 {
+        self.host.get().map_or(0, |h| h.cpu_time().as_nanos() as u64)
     }
 
     /// What the host should make of this thread (see sched::urgency).
@@ -1304,6 +1351,9 @@ impl Kernel {
             mnt_ns: AtomicU32::new(crate::vfs::INIT_NS),
             vfs: self.vfs.clone(),
             umask: AtomicU32::new(0o022),
+            cpu_gone: AtomicU64::new(0),
+            cpu_children: AtomicU64::new(0),
+            started_ns: monotonic_ns(),
         });
         self.root_pid.store(pid, Ordering::Relaxed);
         self.procs.lock().unwrap().insert(pid, proc.clone());
@@ -1376,7 +1426,9 @@ impl Kernel {
 
     fn thread_main(self: &Arc<Self>, t: &Arc<Thread>, state: CpuState) {
         GUEST_TID.with(|tid| tid.set(t.tid));
+        let _ = t.host.set(crate::hv::HostThread::current());
         t.event_slot.store(wait::EVENTS.slot_of_this_thread(), Ordering::Relaxed);
+        wait::set_slot_tid(t.tid);
         crate::vfs::set_current_ns(t.proc.mnt_ns.load(Ordering::Relaxed));
         let root = t.proc.mm().root;
         let mut vcpu: Box<dyn Vcpu> = Box::new(vcpus::LazyVcpu::new(self.hv.clone(), self.vcpus.clone(), t.clone(), root, state));
@@ -1673,6 +1725,9 @@ impl Kernel {
         }
         let last = {
             let mut threads = proc.threads.lock().unwrap();
+            // On its own host thread: its CPU time moves to the process's as it leaves
+            // the list, under the lock readers sum them under.
+            proc.cpu_gone.fetch_add(crate::hv::thread_cpu_time().as_nanos() as u64, Ordering::Relaxed);
             threads.retain(|x| x.tid != t.tid);
             threads.is_empty()
         };

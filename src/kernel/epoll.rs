@@ -40,7 +40,7 @@ impl Interest {
         if self.events & EPOLLET == 0 {
             return None;
         }
-        Some(super::wait::EVENTS.generation(poll_mask(f, t, depth)).wrapping_add(timers_fired(f, depth)))
+        Some(super::wait::EVENTS.generation(&poll_mask(f, t, depth)).wrapping_add(timers_fired(f, depth)))
     }
 }
 
@@ -140,8 +140,8 @@ impl Epoll {
 
     /// What a waiter on this watches: what its files say, and itself for changes
     /// to the list.
-    pub fn mask(&self, t: &Thread, depth: u32) -> u64 {
-        let own = super::wait::key_bit(self as *const Self as usize);
+    pub fn mask(&self, t: &Thread, depth: u32) -> super::wait::Mask {
+        let own = super::wait::key_mask(self as *const Self as usize);
         if depth > 4 {
             return own;
         }

@@ -110,7 +110,7 @@ impl Drop for End {
             drop(st);
         }
         self.pty.cv.notify_all();
-        EVENTS.bump();
+        EVENTS.bump_key(self.pty.key());
     }
 }
 
@@ -165,11 +165,22 @@ fn slave_of(pty: &Arc<Pty>) -> Result<End, i64> {
     st.slave_seen = true;
     drop(st);
     pty.cv.notify_all();
-    EVENTS.bump();
+    EVENTS.bump_key(pty.key());
     Ok(End { pty: pty.clone(), master: false, vfs: None })
 }
 
+impl Pty {
+    /// What both ends' readers and pollers watch in EVENTS.
+    pub fn key(&self) -> usize {
+        self as *const Pty as usize
+    }
+}
+
 impl End {
+    pub fn key(&self) -> usize {
+        self.pty.key()
+    }
+
     /// The slave of this master (TIOCGPTPEER).
     pub fn peer(&self) -> Result<End, i64> {
         if !self.master {
@@ -191,7 +202,7 @@ impl End {
                 let out: Vec<u8> = q.drain(..max.min(q.len())).collect();
                 drop(st);
                 self.pty.cv.notify_all();
-                EVENTS.bump();
+                EVENTS.bump_key(self.pty.key());
                 return Ok(out);
             }
             if max == 0 {
@@ -230,7 +241,7 @@ impl End {
             }
             if done > 0 {
                 self.pty.cv.notify_all();
-                EVENTS.bump();
+                EVENTS.bump_key(self.pty.key());
             }
             if done == data.len() {
                 return Ok(done);
@@ -300,6 +311,12 @@ impl End {
             TIOCSPTLCK if self.master => st.locked = mm.read_u32(arg)? != 0,
             TIOCGPTLCK if self.master => mm.write(arg, &(st.locked as u32).to_le_bytes())?,
             _ => return Err(ENOTTY),
+        }
+        // A flush makes room, for writers and pollers waiting for it.
+        if matches!(cmd, TCSETSF | TCFLSH) {
+            drop(st);
+            self.pty.cv.notify_all();
+            EVENTS.bump_key(self.pty.key());
         }
         Ok(0)
     }

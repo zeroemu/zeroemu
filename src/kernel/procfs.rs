@@ -383,10 +383,15 @@ impl ProcFs {
             }
             K::Cpuinfo => text(cpuinfo()),
             K::Stat => {
-                let n = cpus();
-                let mut s = String::from("cpu  0 0 0 0 0 0 0 0 0 0\n");
+                // Busy: what droidrt has used, all its threads together. Idle: the rest
+                // of the cores' time since boot. Spread evenly over the cores.
+                let n = cpus() as u64;
+                let up = kernel.boot.elapsed().as_nanos() as u64 / 10_000_000;
+                let busy = (crate::hv::process_cpu_time().as_nanos() as u64 / 10_000_000).min(up * n);
+                let idle = up * n - busy;
+                let mut s = format!("cpu  {busy} 0 0 {idle} 0 0 0 0 0 0\n");
                 for i in 0..n {
-                    s += &format!("cpu{i} 0 0 0 0 0 0 0 0 0 0\n");
+                    s += &format!("cpu{i} {} 0 0 {} 0 0 0 0 0 0\n", busy / n, idle / n);
                 }
                 let btime = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs()) - kernel.boot.elapsed().as_secs();
                 s += &format!("intr 0\nctxt 0\nbtime {btime}\nprocesses {}\nprocs_running 1\nprocs_blocked 0\n", kernel.next_id.load(Ordering::Relaxed));
@@ -394,7 +399,8 @@ impl ProcFs {
             }
             K::Uptime => {
                 let up = kernel.boot.elapsed().as_secs_f64();
-                text(format!("{up:.2} {:.2}\n", up * cpus() as f64))
+                let busy = crate::hv::process_cpu_time().as_secs_f64();
+                text(format!("{up:.2} {:.2}\n", (up * cpus() as f64 - busy).max(0.0)))
             }
             K::Loadavg => text(format!("0.00 0.00 0.00 1/{} {}\n", kernel.procs.lock().unwrap().len(), kernel.next_id.load(Ordering::Relaxed) - 1)),
             K::Version => text("Linux version 6.6.0-droidrt (droidrt) #1 SMP PREEMPT\n".into()),
@@ -485,7 +491,15 @@ impl ProcFs {
             }
             K::PStatus | K::PStat | K::PStatm => {
                 let p = self.proc_or_zombie(pid)?;
-                let state = if p.status.lock().unwrap().is_some() { ('Z', "zombie") } else { ('R', "running") };
+                // Sleeping while in a syscall: a thread blocked in one, for practical
+                // purposes. A process's is its main thread's, as on Linux.
+                let state = if p.status.lock().unwrap().is_some() {
+                    ('Z', "zombie")
+                } else if thread_of(&p, extra as i32).is_some_and(|t| t.in_syscall()) {
+                    ('S', "sleeping")
+                } else {
+                    ('R', "running")
+                };
                 let shown = if extra != 0 { extra as i32 } else { pid };
                 let threads = p.threads.lock().unwrap().len().max(1);
                 let (virt, rss, stack, has_mm) = p.mm.lock().unwrap().as_ref().map_or((0, 0, 0, false), |m| {
@@ -522,15 +536,25 @@ impl ProcFs {
                             cpus() - 1
                         ))
                     }
-                    K::PStat => text(format!(
-                        "{shown} ({name}) {} {ppid} {pgid} {sid} 0 -1 4194560 0 0 0 0 0 0 0 0 {} {} {threads} 0 0 {virt} {} 18446744073709551615 0 0 {stack} 0 0 0 0 0 0 0 0 0 0 17 0 {} {} 0 0 0 0 0 0 0 0 0 0 0\n",
-                        state.0,
-                        ta.sched.proc_priority(),
-                        ta.sched.nice,
-                        rss / PAGE,
-                        ta.sched.prio,
-                        ta.sched.policy
-                    )),
+                    K::PStat => {
+                        // utime, cutime and starttime in clock ticks (USER_HZ, 100). All of a
+                        // thread's time counts as user time: droidrt can't tell its own work
+                        // for a thread from the thread's.
+                        let cpu = if extra != 0 { thread_of(&p, extra as i32).map_or(0, |t| t.cpu_ns()) } else { p.cpu_ns() };
+                        let ticks = |ns: u64| ns / 10_000_000;
+                        text(format!(
+                            "{shown} ({name}) {} {ppid} {pgid} {sid} 0 -1 4194560 0 0 0 0 {} 0 {} 0 {} {} {threads} 0 {} {virt} {} 18446744073709551615 0 0 {stack} 0 0 0 0 0 0 0 0 0 17 0 {} {} 0 0 0 0 0 0 0 0 0 0 0\n",
+                            state.0,
+                            ticks(cpu),
+                            ticks(p.cpu_children.load(Ordering::Relaxed)),
+                            ta.sched.proc_priority(),
+                            ta.sched.nice,
+                            ticks(p.started_ns),
+                            rss / PAGE,
+                            ta.sched.prio,
+                            ta.sched.policy
+                        ))
+                    }
                     _ => text(format!("{} {} 0 0 0 0 0\n", virt / PAGE, rss / PAGE)),
                 }
             }
@@ -651,7 +675,17 @@ impl FileSystem for ProcFs {
             Some((K::NsFile, _, i)) => ns_inum(i),
             _ => ino,
         };
-        Ok(Stat { dev: 0, ino: st_ino, mode, nlink: 1, uid: 0, gid: 0, rdev: 0, size, mtime })
+        // A process's own directories belong to it, as ps and top find out whose it is
+        // from them. Its files stay root's: write permission on them is how Linux's
+        // rules for who may change them come out (oom_score_adj, timerslack_ns).
+        let (uid, gid) = match decode(ino) {
+            Some((K::Pid | K::Task, pid, _)) if pid > 0 => self.proc(pid).ok().map_or((0, 0), |p| {
+                let c = p.creds.lock().unwrap();
+                (c.euid, c.egid)
+            }),
+            _ => (0, 0),
+        };
+        Ok(Stat { dev: 0, ino: st_ino, mode, nlink: 1, uid, gid, rdev: 0, size, mtime })
     }
 
     fn write_ok(&self, ino: u64) -> bool {

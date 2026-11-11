@@ -19,7 +19,6 @@ use crate::arch::Sysno;
 use crate::errno::*;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, LazyLock, Mutex, Weak};
-use std::time::Duration;
 
 pub const AF_VSOCK: u64 = 40;
 const VMADDR_CID_HOST: u32 = 2;
@@ -111,7 +110,6 @@ struct Sensors {
     /// Bits of the sensors the guest turned on (sensor_list.cpp order).
     enabled: u32,
     delay_ms: u64,
-    streaming: bool,
 }
 
 /// What the host reports, in sensor_list.cpp bit order: accelerometer,
@@ -168,9 +166,10 @@ impl Vsock {
     }
 
     /// What a poller of this watches.
-    pub fn mask(self: &Arc<Self>) -> u64 {
-        use super::wait::key_bit;
-        key_bit(Arc::as_ptr(self) as usize) | self.io().map_or(0, |io| key_bit(io.key()))
+    pub fn mask(self: &Arc<Self>) -> super::wait::Mask {
+        use super::wait::key_mask;
+        let own = key_mask(Arc::as_ptr(self) as usize);
+        self.io().map_or(own, |io| own | key_mask(io.key()))
     }
 
     /// Host services' streams are always ready to take more, and a stream writes
@@ -254,7 +253,6 @@ impl Vsock {
             EVENTS.bump_key(Arc::as_ptr(self) as usize);
             return Ok(data.len());
         }
-        let mut start_stream = false;
         let mut at = 0;
         while st.inbuf.len() - at >= 4 {
             let len = std::str::from_utf8(&st.inbuf[at..at + 4]).ok().and_then(|h| usize::from_str_radix(h, 16).ok());
@@ -273,7 +271,7 @@ impl Vsock {
             at += 4 + len;
             let State { service, out, .. } = &mut *st;
             match service {
-                Some(Service::Sensors(s)) => start_stream |= sensors_message(s, out, &msg),
+                Some(Service::Sensors(s)) => sensors_message(s, out, &msg),
                 // A lone NUL ends the list of properties, and there are none to add.
                 Some(Service::BootProperties) => out.extend(b"0001\0"),
                 _ => {}
@@ -281,9 +279,6 @@ impl Vsock {
         }
         st.inbuf.drain(..at);
         drop(st);
-        if start_stream {
-            stream(Arc::downgrade(self));
-        }
         EVENTS.bump_key(Arc::as_ptr(self) as usize);
         Ok(data.len())
     }
@@ -508,56 +503,40 @@ impl Kernel {
     }
 }
 
-/// One message from the sensors HAL; true when streaming should start.
-fn sensors_message(s: &mut Sensors, out: &mut VecDeque<u8>, msg: &str) -> bool {
+/// One message from the sensors HAL. A sensor's reading goes back when the HAL turns it
+/// on, and only then: the readings never change, and the HAL makes a continuous sensor's
+/// events itself, at the rate Android asked for, from the last reading it got (its batch
+/// thread); an on-change sensor reports when its value changes. The emulator sends every
+/// sensor at the fastest rate anything asks for, and the HAL turns them all on, so that
+/// was ten messages every 10 ms, each waking the HAL, with nothing new in any of them.
+fn sensors_message(s: &mut Sensors, out: &mut VecDeque<u8>, msg: &str) {
     if msg == "list-sensors" {
         frame(out, &SENSORS.to_string());
-        return false;
+        return;
     }
     if let Some(ms) = msg.strip_prefix("set-delay:") {
+        let was = s.delay_ms;
         s.delay_ms = ms.parse().unwrap_or(200);
+        if s.delay_ms != was && std::env::var_os("DROIDRT_SENSOR_TRACE").is_some() {
+            eprintln!("droidrt: sensors asked for every {} ms", s.delay_ms);
+        }
     } else if let Some(rest) = msg.strip_prefix("set:") {
         const NAMES: [&str; 9] = ["acceleration", "gyroscope", "magnetic-field", "orientation", "temperature", "proximity", "light", "pressure", "humidity"];
         if let Some((name, on)) = rest.rsplit_once(':')
             && let Some(bit) = NAMES.iter().position(|n| *n == name)
         {
             if on == "1" {
-                s.enabled |= 1 << bit;
+                if s.enabled & 1 << bit == 0 {
+                    s.enabled |= 1 << bit;
+                    for r in readings(1 << bit) {
+                        frame(out, &r);
+                    }
+                    frame(out, &format!("sync:{}", super::monotonic_ns() / 1000));
+                }
             } else {
                 s.enabled &= !(1 << bit);
             }
         }
     }
     // time:<ns> needs nothing back.
-    if s.enabled != 0 && !s.streaming {
-        s.streaming = true;
-        return true;
-    }
-    false
-}
-
-/// Sends the enabled sensors' readings every set-delay, as the emulator's
-/// sensors thread does, until the connection goes away.
-fn stream(conn: Weak<Vsock>) {
-    let _ = std::thread::Builder::new().name("qemud-sensors".into()).spawn(move || {
-        let start = std::time::Instant::now();
-        loop {
-            let delay = {
-                let Some(c) = conn.upgrade() else { return };
-                let mut st = c.st.lock().unwrap();
-                let State { service, out, .. } = &mut *st;
-                let Some(Service::Sensors(s)) = service else { return };
-                // Keep the guest's queue short if nobody reads.
-                if out.len() < 4096 {
-                    for r in readings(s.enabled) {
-                        frame(out, &r);
-                    }
-                    frame(out, &format!("sync:{}", start.elapsed().as_micros()));
-                }
-                s.delay_ms.clamp(10, 1000)
-            };
-            EVENTS.bump_key(conn.as_ptr() as usize);
-            std::thread::sleep(Duration::from_millis(delay));
-        }
-    });
 }

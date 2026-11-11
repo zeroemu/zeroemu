@@ -11,7 +11,7 @@
 
 use super::signal::SigInfo;
 use super::specialfd::{deadline_for, put_timespec};
-use super::wait::{CENTURY, EVENTS};
+use super::wait::CENTURY;
 use super::{Kernel, Process, Thread};
 use crate::arch::Sysno;
 use crate::errno::*;
@@ -252,8 +252,8 @@ impl Kernel {
             }
             None => self.send_process_signal(&proc, timer.signo, info),
         }
-        // kick() only stops a running vCPU; this wakes a thread in a blocking call.
-        EVENTS.bump();
+        // Signal delivery kicks the thread it picks, waking it in a blocking call too,
+        // and announces the process for signalfd readers.
     }
 
     /// Sets a timer; returns its old (interval, value).

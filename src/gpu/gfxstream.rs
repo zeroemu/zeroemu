@@ -547,6 +547,7 @@ impl Gfxstream {
             }
             let up = !fb.is_null() && unsafe { setup(fb, win, p.x, p.y, p.w, p.h, p.w, p.h, p.dpr, 0.0, false, false) };
             g.direct.store(up, Ordering::Release);
+            window::set_drawing(up);
             if !up {
                 eprintln!("droidrt: the renderer can't draw into the window ({p:?}); reading frames back");
             }

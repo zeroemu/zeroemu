@@ -24,6 +24,15 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
+/// The kernel's pool, for wakeup_stats.
+pub static MAIN: std::sync::OnceLock<std::sync::Weak<Pool>> = std::sync::OnceLock::new();
+
+/// vCPUs made, for wakeup_stats: each costs the hypervisor a fresh one.
+pub static MADE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A holder asleep in the kernel this long gives its vCPU back when places run short.
+const ASLEEP: Duration = Duration::from_secs(1);
+
 /// How long a holder keeps its vCPU once others wait.
 const SLICE: Duration = Duration::from_millis(10);
 
@@ -60,7 +69,9 @@ impl Pool {
     pub fn new(max: usize) -> Arc<Pool> {
         let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
         let background = Pool::sized((cores / 2).max(2), None);
-        Pool::sized(max, Some(background))
+        let pool = Pool::sized(max, Some(background));
+        let _ = MAIN.set(Arc::downgrade(&pool));
+        pool
     }
 
     fn sized(max: usize, background: Option<Arc<Pool>>) -> Arc<Pool> {
@@ -81,9 +92,38 @@ impl Pool {
         self.frozen.store(true, Ordering::Release);
     }
 
+    /// (in use, the most there can be), for wakeup_stats.
+    pub fn usage(&self) -> (usize, usize) {
+        (self.used.load(Ordering::Relaxed), self.max)
+    }
+
     /// Few enough free vCPUs that blocked threads should give theirs back.
     fn short(&self) -> bool {
         self.waiting.load(Ordering::Relaxed) > 0 || self.used.load(Ordering::Relaxed) * 4 >= self.max * 3
+    }
+
+    /// Places run short: wakes holders that have slept in the kernel for a while, which
+    /// give theirs back as they go to sleep again. Otherwise those keep their places for
+    /// as long as they sleep, which can be for ever, and every thread that blocks for a
+    /// moment gives up its own, to make a new vCPU when it wakes: at idle that was 150 a
+    /// second, each a costly call to the hypervisor. At most ten times a second.
+    fn reclaim_sleepers(&self) {
+        static LAST: Mutex<Option<Instant>> = Mutex::new(None);
+        {
+            let mut last = LAST.lock().unwrap();
+            if last.is_some_and(|l| l.elapsed() < Duration::from_millis(100)) {
+                return;
+            }
+            *last = Some(Instant::now());
+        }
+        let sleepers: Vec<Arc<Thread>> = {
+            let st = self.st.lock().unwrap();
+            st.holders.values().filter(|(_, th)| th.in_syscall_for().is_some_and(|d| d >= ASLEEP)).map(|(_, th)| th.clone()).collect()
+        };
+        for th in sleepers {
+            th.give_back.store(true, Ordering::Relaxed);
+            th.kick();
+        }
     }
 
     /// Takes a place, waiting for one. False if there is no point any more: the thread
@@ -188,6 +228,7 @@ impl Slot {
             release_gate();
             return Err("dying".into());
         }
+        MADE.fetch_add(1, Ordering::Relaxed);
         let mut v = match self.hv.create_vcpu(i.root, &i.state) {
             Ok(v) => v,
             Err(e) => {
@@ -299,7 +340,12 @@ pub fn blocking() {
     CURRENT.with(|c| {
         if let Some(s) = c.borrow().as_ref() {
             let gated = s.inner.borrow().gated.is_some();
-            if s.pool.short() || (gated && s.pool.background.as_ref().is_some_and(|g| g.short())) {
+            let asked = s.thread.give_back.swap(false, Ordering::Relaxed);
+            let short = s.pool.short();
+            if short || asked || (gated && s.pool.background.as_ref().is_some_and(|g| g.short())) {
+                if short {
+                    s.pool.reclaim_sleepers();
+                }
                 s.park();
             }
         }

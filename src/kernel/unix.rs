@@ -469,9 +469,11 @@ impl Socket {
 
     /// What a poller of this watches: its own queue and state, and whether its peer has
     /// gone or made room.
-    pub fn mask(&self) -> u64 {
+    pub fn mask(&self) -> super::wait::Mask {
+        // A connected socket watches its peer's key too: what the peer reads makes room.
         let peer = self.st.lock().unwrap().peer.as_ref().and_then(Weak::upgrade);
-        super::wait::key_bit(self.key()) | peer.map_or(0, |p| super::wait::key_bit(p.key()))
+        let own = super::wait::key_mask(self.key());
+        peer.map_or(own, |p| own | super::wait::key_mask(p.key()))
     }
 
     pub fn poll(&self) -> u16 {
@@ -584,7 +586,7 @@ impl Socket {
         let (mut from, mut cred) = (Vec::new(), Cred::default());
         let until = deadline(self.st.lock().unwrap().opts.rcvtimeo);
         loop {
-            let seen = EVENTS.watch(self.mask());
+            let seen = EVENTS.watch(&self.mask());
             let (connected, shut_rd, gone) = {
                 let st = self.st.lock().unwrap();
                 if st.backlog.is_some() {

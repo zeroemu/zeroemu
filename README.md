@@ -186,6 +186,10 @@ prints them when its process is killed by a signal.
 `DROIDRT_SYSCOUNT=1` adds to each thread dump what each thread has called since the
 last, which finds a thread in a loop: send `SIGUSR1` twice, a few seconds apart.
 `DROIDRT_MEMSTAT=1` adds to each thread dump where memory has gone, by kind and by file.
+`DROIDRT_GPU_STATS=1`'s line also says how many sleeping threads events woke and how many
+vCPUs were made each second; `DROIDRT_WAKE_STATS=1` adds the keys that woke the most, and
+prints where a key that wakes over a hundred threads at once is announced from.
+`DROIDRT_SENSOR_TRACE=1` logs the rates the sensors HAL asks for.
 `DROIDRT_PROPS="name=value ..."` adds Android properties at boot (`ro.lmk.debug=true`
 makes `lmkd` say what it decides).
 `DROIDRT_TRACE=<file>` writes Android's own trace markers to a host file, each with the
@@ -263,6 +267,7 @@ count it, two runs each:
 |---|---|---|---|---|
 | Frames read back into host memory (before) | 7.6%, 7.0% | 19, 19 ms | 23, 22 ms | 28, 29 ms |
 | The renderer draws into the window | 5.0%, 5.1% | 12, 14 ms | 21, 21 ms | 25, 28 ms |
+| And threads stop waking each other for nothing (CPU, below) | 1.2%, 1.0% | 8, 8 ms | 11, 10 ms | 20, 19 ms |
 
 A freshly booted device, still busy setting itself up, gains more (one run each, opening
 the app list included): the median frame went from 29 ms to 18 ms and janky frames from
@@ -286,6 +291,40 @@ the app list included): the median frame went from 29 ms to 18 ms and janky fram
 
 What's left is mostly the first time something is drawn: a shader compiled, or icons
 uploaded, can cost 50 to 150 ms.
+
+CPU, as macOS counts droidrt's threads (Activity Monitor's figure), a settled device:
+
+| | Before | Now |
+|---|---|---|
+| Idle at the home screen | 51% of a core | 16% |
+| Flinging the app list | 270-320% | 95% |
+
+- Threads asleep in poll, epoll and the like are woken by keys their files hash onto.
+  There were 63 keys for well over a thousand sleeping threads, so every event woke
+  dozens of threads that had nothing to do, and that was most of the idle CPU. There
+  are now 4096. Netlink sockets, ptys, GPU fences and DRM events have keys of their own,
+  where each of their events used to wake everyone or every GPU waiter.
+- A vCPU belongs to its host thread, and the hypervisor allows 64. Threads that went to
+  sleep holding one kept it for as long as they slept, which kept the pool short, so
+  every thread that blocked for a moment gave its own up and made a new one when it
+  woke: 150 a second at idle. Now threads asleep in the kernel for a second give theirs
+  back when places run short.
+- The emulated sensors sent all nine sensors' readings every 10 ms, the fastest rate
+  anything had asked for, each reading waking the sensors HAL. The HAL makes Android's
+  events itself, at each sensor's rate, from the last reading it got, so droidrt now
+  sends a reading once, when the HAL turns the sensor on.
+- The window's event loop wakes every 50 ms rather than every 8 once the renderer draws
+  into the window itself.
+
+Android sees CPU time too now: `/proc/<pid>/stat` and `/proc/stat`, `getrusage`, and
+the CPU-time clocks (`CLOCK_THREAD_CPUTIME_ID` was the time since boot), so `top`,
+`dumpsys cpuinfo` and ART's own accounting work. All of a thread's time counts as user
+time: droidrt can't tell the time it spends on a thread's behalf from the thread's own.
+
+What idle CPU is left is mostly Android's: the composer calls SurfaceFlinger with a
+vsync 60 times a second whatever is on screen, as the emulator's images tell
+SurfaceFlinger not to trust present fences, and it keeps hardware vsync on for as long
+as it doesn't.
 
 Smoothness is expected to come from what disappears: there is no virtual GPU
 pipe, no second compositor, no guest kernel scheduler, and no virtual device

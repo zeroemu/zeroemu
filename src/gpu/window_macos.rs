@@ -315,6 +315,14 @@ pub type FrameSource = Box<dyn Fn() -> Option<(u32, u32, u32, Vec<u8>)> + Send +
 static RENDERER: std::sync::OnceLock<(Attach, FrameSource)> = std::sync::OnceLock::new();
 /// Where it was last put.
 static PLACED: Mutex<Option<Placement>> = Mutex::new(None);
+/// The renderer is drawing frames into the window, not leaving them to be read back.
+static DRAWING: AtomicBool = AtomicBool::new(false);
+
+/// Whether the renderer draws into the window (it may fail to, and frames are then
+/// read back and shown at the event loop's next turn).
+pub fn set_drawing(on: bool) {
+    DRAWING.store(on, Ordering::Relaxed);
+}
 
 /// The renderer draws frames into the window from now on, in a view `attach` puts
 /// where the frame belongs and puts again whenever that changes (UI thread).
@@ -801,7 +809,10 @@ fn pump_once(wait_s: f64) {
 
 pub fn pump_until(done: &std::sync::atomic::AtomicBool) {
     while !done.load(Ordering::Acquire) {
-        pump_once(0.008);
+        // Events end the wait at once. Frames read back are shown at the next turn, so
+        // that has to come soon; when the renderer draws them, only the window's own
+        // checks (a resize, a lost mouse release, the end of a scroll) need a turn.
+        pump_once(if DRAWING.load(Ordering::Relaxed) { 0.05 } else { 0.008 });
     }
 }
 

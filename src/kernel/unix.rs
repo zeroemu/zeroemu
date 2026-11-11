@@ -336,9 +336,16 @@ static ABSTRACT: Mutex<Abstract> = Mutex::new(BTreeMap::new());
 /// binding. EADDRINUSE if anything exists there (even a dangling symlink).
 fn bind_node(vfs: &Vfs, cwd: &str, path: &str, perm: u32, sock: &Arc<Socket>) -> Result<Node, i64> {
     let (dir, name) = vfs.resolve_parent(cwd, path).map_err(|e| if e == EBUSY { EADDRINUSE } else { e })?;
+    bind_at(vfs, &dir, &name, perm, sock, &|| Ok(()))
+}
+
+/// bind_node in `dir`, once the name is known to be free and `may_create` agrees.
+fn bind_at(vfs: &Vfs, dir: &Node, name: &str, perm: u32, sock: &Arc<Socket>, may_create: &dyn Fn() -> Result<(), i64>) -> Result<Node, i64> {
+    let (dir, name) = (dir.clone(), name.to_string());
     if vfs.resolve(&dir.path, &name, false).is_ok() {
         return Err(EADDRINUSE);
     }
+    may_create()?;
     let node = vfs.create(&dir, &name, S_IFSOCK | perm, 0).map_err(|e| if e == EEXIST { EADDRINUSE } else { e })?;
     let fs = vfs.fs_arc(&node);
     BOUND.lock().unwrap().insert(node_key(&fs, node.ino), (Arc::downgrade(&fs), Arc::downgrade(sock)));
@@ -883,7 +890,11 @@ impl Kernel {
                     let vfs = self.vfs.as_deref().ok_or(ENOENT)?;
                     let path = String::from_utf8_lossy(&name).into_owned();
                     let cwd = t.proc.cwd.lock().unwrap().clone();
-                    let node = bind_node(vfs, &cwd, &path, 0o777 & !t.proc.umask.load(Ordering::Relaxed), &sock)?;
+                    // As mknod would: searched to, made in a directory the caller may write, and the caller's.
+                    let (dir, leaf) = self.walk_parent(t, &cwd, &path).map_err(|e| if e == EBUSY { EADDRINUSE } else { e })?;
+                    let may_create = || if super::perm::enforcing() { self.may_create(t, &self.creds(t), &dir) } else { Ok(()) };
+                    let node = bind_at(vfs, &dir, &leaf, 0o777 & !t.proc.umask.load(Ordering::Relaxed), &sock, &may_create)?;
+                    self.init_owner(t, &dir, &node);
                     st.node = Some(node_key(&vfs.fs_arc(&node), node.ino));
                     st.log_tap = node.path == "/dev/socket/logdw";
                 }
@@ -1164,7 +1175,10 @@ impl Kernel {
         } else {
             let vfs = self.vfs.as_deref().ok_or(ENOENT)?;
             let node = self.resolve(t, AT_FDCWD, &String::from_utf8_lossy(name), true)?;
-            if vfs.stat(&node)?.mode & S_IFMT != S_IFSOCK {
+            let st = vfs.stat(&node)?;
+            // Write permission on the node, before what it is (unix_find_bsd).
+            self.permission(t, &self.creds(t), &node, &st, super::perm::MAY_WRITE)?;
+            if st.mode & S_IFMT != S_IFSOCK {
                 return Err(ECONNREFUSED);
             }
             let key = node_key(&vfs.fs_arc(&node), node.ino);

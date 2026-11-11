@@ -28,6 +28,7 @@ mod inotify;
 mod locks;
 mod logd;
 mod net;
+mod perm;
 mod power;
 mod pressure;
 mod memory;
@@ -457,8 +458,10 @@ fn mount_tmpfs(vfs: &mut Vfs, phys: &Arc<PhysMem>) -> (Arc<crate::tmpfs::Tmpfs>,
     use crate::vfs::FileSystem;
     let dev = Tmpfs::new(phys.clone(), 0o755);
     let dev_handle = dev.clone();
-    for (name, rdev) in [("null", 0x103), ("zero", 0x105), ("random", 0x108), ("urandom", 0x109), ("kmsg", 0x10b), ("ptmx", 0x502)] {
-        dev.create(1, name, 0o020666, rdev).expect("tmpfs /dev");
+    // Modes and owners as ueventd.rc has them (perm::device_node). /dev/kmsg has no
+    // line there, so it's ueventd's default: services that log to it get it from init.
+    for (name, rdev, mode) in [("null", 0x103, 0o666), ("zero", 0x105, 0o666), ("random", 0x108, 0o666), ("urandom", 0x109, 0o666), ("kmsg", 0x10b, 0o600), ("ptmx", 0x502, 0o666)] {
+        dev.create(1, name, 0o020000 | mode, rdev).expect("tmpfs /dev");
     }
     for (name, rdev) in binder::DEVICES {
         dev.create(1, name, 0o020666, rdev).expect("tmpfs /dev");
@@ -467,7 +470,7 @@ fn mount_tmpfs(vfs: &mut Vfs, phys: &Arc<PhysMem>) -> (Arc<crate::tmpfs::Tmpfs>,
     dev.mkdir_p("pts", 0o755);
     let input = dev.mkdir_p("input", 0o755);
     for (name, rdev) in evdev::nodes() {
-        dev.create(input, name, 0o020666, rdev).expect("tmpfs /dev");
+        perm::device_node(&*dev, input, name, 0o020660, rdev, (0, perm::AID_INPUT)).expect("tmpfs /dev");
     }
     vfs.mount("/dev", dev);
     let pts = Tmpfs::with_type(phys.clone(), 0o755, "devpts");
@@ -985,9 +988,10 @@ impl Kernel {
                     let _ = dev.create(root, &name, 0o020666, ashmem::rdev());
                 }
                 // The TUN device, at Android's path and Linux's.
-                let _ = dev.create(root, "tun", 0o020660, net::tun_rdev());
+                let vpn = (perm::AID_SYSTEM, perm::AID_VPN);
+                let _ = perm::device_node(&*dev, root, "tun", 0o020660, net::tun_rdev(), vpn);
                 if let Ok(d) = dev.mkdir(root, "net", 0o755) {
-                    let _ = dev.create(d, "tun", 0o020660, net::tun_rdev());
+                    let _ = perm::device_node(&*dev, d, "tun", 0o020660, net::tun_rdev(), vpn);
                 }
             }
         }

@@ -2,10 +2,12 @@
 
 use super::{Kernel, Thread};
 use crate::errno::*;
-use crate::mm::{Backing, Placement, SharedObject, OnFork};
+use crate::mm::{Backing, OnFork, PROT_ALL, Placement, SharedObject};
 use crate::phys::PAGE;
 
 const MAP_SHARED: u64 = 0x01;
+const PROT_WRITE: u32 = 2;
+const PROT_EXEC: u32 = 4;
 const MAP_FIXED: u64 = 0x10;
 const MAP_ANONYMOUS: u64 = 0x20;
 const MAP_FIXED_NOREPLACE: u64 = 0x10_0000;
@@ -54,6 +56,10 @@ impl Kernel {
                 Err(e) => return -e,
             };
             mm.set_name(a, len, "/dev/binderfs/binder");
+            // binder_mmap clears VM_MAYWRITE: the area never becomes writable.
+            if super::perm::enforcing() {
+                mm.limit_prot(a, len, PROT_ALL & !PROT_WRITE);
+            }
             // VM_DONTCOPY on Linux: a child has no business with these buffers.
             let _ = mm.set_on_fork(a, len, OnFork::Drop);
             drop(mm);
@@ -62,13 +68,47 @@ impl Kernel {
                 Err(e) => -e,
             };
         }
+        // do_mmap's checks on the descriptor: any mapping needs it open for reading, a
+        // shared writable one for writing too, and one of a read-only descriptor can't
+        // be made writable later. A noexec mount's files can't be mapped executable.
+        let mut max_prot = PROT_ALL;
+        if flags & MAP_ANONYMOUS == 0 && super::perm::enforcing() {
+            let (rw, noexec) = match self.fd_map_rights(t, fd) {
+                Ok(x) => x,
+                Err(e) => return -e,
+            };
+            let shared = flags & MAP_SHARED != 0;
+            if let Some((readable, writable)) = rw {
+                if shared && prot & PROT_WRITE != 0 && !writable {
+                    return -EACCES;
+                }
+                if !readable {
+                    return -EACCES;
+                }
+                if shared && !writable {
+                    max_prot &= !PROT_WRITE;
+                }
+            }
+            if noexec {
+                if prot & PROT_EXEC != 0 {
+                    return -EPERM;
+                }
+                max_prot &= !PROT_EXEC;
+            }
+        }
         if flags & MAP_ANONYMOUS == 0
             && let Ok(f) = t.files().get(fd)
         {
             let mapped = match &f.kind {
                 super::files::Kind::Drm(d) => Some(d.mmap(offset, len)),
                 super::files::Kind::DmaBuf(b) => Some(b.mmap(offset, len)),
-                super::files::Kind::Ashmem(a) => Some(a.mmap(&self.phys, offset, len, prot, flags & MAP_SHARED != 0)),
+                super::files::Kind::Ashmem(a) => {
+                    // ashmem_mmap clears the VM_MAY* bits its mask lacks, as at mmap.
+                    if super::perm::enforcing() {
+                        max_prot &= a.prot_mask();
+                    }
+                    Some(a.mmap(&self.phys, offset, len, prot, flags & MAP_SHARED != 0))
+                }
                 _ => None,
             };
             if let Some(mapped) = mapped {
@@ -81,6 +121,9 @@ impl Kernel {
                 return match mm.map(place, len, prot & !PROT_IGNORED, backing) {
                     Ok(a) => {
                         mm.set_name(a, len, &name);
+                        if max_prot != PROT_ALL {
+                            mm.limit_prot(a, len, max_prot);
+                        }
                         a as i64
                     }
                     Err(e) => -e,
@@ -107,6 +150,9 @@ impl Kernel {
             Ok(a) => {
                 if let Some(n) = name {
                     mm.set_name(a, len, &n);
+                }
+                if max_prot != PROT_ALL {
+                    mm.limit_prot(a, len, max_prot);
                 }
                 a as i64
             }

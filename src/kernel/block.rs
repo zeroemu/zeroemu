@@ -405,7 +405,8 @@ impl Blocks {
     pub fn new(dev: Arc<dyn FileSystem>, sys: Arc<dyn FileSystem>) -> Arc<Blocks> {
         let b = Arc::new(Blocks { devs: Mutex::default(), dev, sys });
         let root = b.dev.root().unwrap_or(1);
-        let _ = b.dev.create(root, "loop-control", S_IFCHR | 0o660, makedev(MISC_MAJOR, LOOP_CONTROL_MINOR));
+        // Neither is in ueventd.rc: ueventd's default, 0600 root root.
+        let _ = b.dev.create(root, "loop-control", S_IFCHR | 0o600, makedev(MISC_MAJOR, LOOP_CONTROL_MINOR));
         let _ = b.dev.create(root, "device-mapper", S_IFCHR | 0o600, makedev(MISC_MAJOR, DM_CONTROL_MINOR));
         mkdir_p(&*b.dev, "block/mapper/by-uuid");
         let mut devs = b.devs.lock().unwrap();
@@ -719,7 +720,7 @@ impl Blocks {
         devs.dms.push(d.clone());
         drop(devs);
         let block = mkdir_p(&*self.dev, "block");
-        let _ = self.dev.create(block, &format!("dm-{minor}"), S_IFBLK | 0o600, makedev(DM_MAJOR, minor));
+        let _ = super::perm::device_node(&*self.dev, block, &format!("dm-{minor}"), S_IFBLK | 0o640, makedev(DM_MAJOR, minor), (0, super::perm::AID_SYSTEM));
         self.dm_links(&d, true);
         self.dm_sysfs(&d);
     }
@@ -852,7 +853,7 @@ impl Blocks {
                 devs.dms.push(d.clone());
                 drop(devs);
                 let block = mkdir_p(&*self.dev, "block");
-                let _ = self.dev.create(block, &format!("dm-{minor}"), S_IFBLK | 0o600, makedev(DM_MAJOR, minor));
+                let _ = super::perm::device_node(&*self.dev, block, &format!("dm-{minor}"), S_IFBLK | 0o640, makedev(DM_MAJOR, minor), (0, super::perm::AID_SYSTEM));
                 self.dm_links(&d, true);
                 self.dm_sysfs(&d);
                 status_of = Some(d);

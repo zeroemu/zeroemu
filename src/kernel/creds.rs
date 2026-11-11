@@ -1,8 +1,8 @@
 //! Credentials and capabilities: real/effective/saved/fs ids, supplementary
 //! groups, the five capability sets and securebits, with Linux's rules for
 //! how id changes and execve transform them (kernel/sys.c, kernel/groups.c,
-//! kernel/capability.c, security/commoncap.c). Identity bookkeeping only:
-//! file access stays permissive. Kept per process rather than per thread
+//! kernel/capability.c, security/commoncap.c). File permission checks that
+//! use them are in perm.rs. Kept per process rather than per thread
 //! (bionic, unlike glibc, never relies on per-thread credentials).
 
 use super::{Kernel, Thread};

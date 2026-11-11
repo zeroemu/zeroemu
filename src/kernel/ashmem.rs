@@ -116,6 +116,11 @@ impl Ashmem {
 
     /// mmap: the region's pages, shared (or a private copy). The size must
     /// be set and cover the mapping, and `prot` stay within the mask.
+    /// ASHMEM_GET_PROT_MASK: what mappings made from now on may have.
+    pub fn prot_mask(&self) -> u32 {
+        self.st.lock().unwrap().prot_mask
+    }
+
     pub fn mmap(&self, phys: &Arc<PhysMem>, offset: u64, len: u64, prot: u32, shared: bool) -> Result<Backing, i64> {
         let mut st = self.st.lock().unwrap();
         if st.size == 0 {

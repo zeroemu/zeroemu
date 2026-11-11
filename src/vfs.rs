@@ -37,6 +37,9 @@ pub struct Stat {
     pub mtime: u64,
 }
 
+/// Asked about each directory a caller's path walk looks a name up in.
+pub type Search<'a> = &'a dyn Fn(&Node, &Stat) -> Result<(), i64>;
+
 pub struct Dirent {
     pub name: String,
     pub ino: u64,
@@ -1095,11 +1098,26 @@ impl Vfs {
         self.live(node).readonly()
     }
 
+    /// The MS_* flags of the mount `node` is on, its filesystem's included.
+    pub fn mount_flags(&self, node: &Node) -> u64 {
+        let m = self.live(node);
+        m.flags.load(Ordering::Relaxed) | m.sb.flags.load(Ordering::Relaxed)
+    }
+
     pub fn fs_arc(&self, node: &Node) -> Arc<dyn FileSystem> {
         node.mnt.sb.fs.clone()
     }
 
+    /// Path resolution for droidrt's own use, which no permission applies to.
     pub fn resolve(&self, cwd: &str, path: &str, follow_last: bool) -> Result<Node, i64> {
+        self.resolve_as(cwd, path, follow_last, None)
+    }
+
+    /// Path resolution for a caller: `search`, if given, is asked about each directory
+    /// a component is looked up in (Linux's may_lookup), and its error ends the walk.
+    /// Relative paths start at `cwd` as Linux starts at the working directory: the
+    /// directories above it aren't asked about, only `cwd` itself and what follows.
+    pub fn resolve_as(&self, cwd: &str, path: &str, follow_last: bool, search: Option<Search>) -> Result<Node, i64> {
         if path.is_empty() {
             return Err(ENOENT);
         }
@@ -1114,11 +1132,23 @@ impl Vfs {
             .filter(|c| !c.is_empty())
             .map(String::from)
             .collect();
+        // The working directory's own components: canonical, so the first ones popped.
+        let mut base = if path.starts_with('/') { 0 } else { cwd.split('/').filter(|c| !c.is_empty()).count() };
         let tab = self.table();
         let mut stack = vec![tab.root()?];
         let mut links = 0;
 
         while let Some(c) = todo.pop() {
+            let in_base = base > 0;
+            base = base.saturating_sub(1);
+            if let Some(check) = search.filter(|_| !in_base) {
+                let cur = stack.last().unwrap();
+                let st = self.stat(cur)?;
+                if st.mode & S_IFMT != S_IFDIR {
+                    return Err(ENOTDIR);
+                }
+                check(cur, &st)?;
+            }
             if c == "." {
                 continue;
             }
@@ -1256,6 +1286,12 @@ impl Vfs {
 
     /// Resolves everything but the last component: (directory, name).
     pub fn resolve_parent(&self, cwd: &str, path: &str) -> Result<(Node, String), i64> {
+        self.resolve_parent_as(cwd, path, None)
+    }
+
+    /// resolve_parent for a caller (see resolve_as). The directory is searched too:
+    /// Linux looks the last name up in it, whatever is then done with it.
+    pub fn resolve_parent_as(&self, cwd: &str, path: &str, search: Option<Search>) -> Result<(Node, String), i64> {
         let trimmed = path.trim_end_matches('/');
         let (dir, name) = match trimmed.rsplit_once('/') {
             Some(("", name)) => ("/", name),
@@ -1266,20 +1302,24 @@ impl Vfs {
         if name.is_empty() || name == "." || name == ".." {
             return Err(EINVAL);
         }
-        let dir_node = self.resolve(cwd, dir, true)?;
-        if self.stat(&dir_node)?.mode & S_IFMT != S_IFDIR {
+        let dir_node = self.resolve_as(cwd, dir, true, search)?;
+        let st = self.stat(&dir_node)?;
+        if st.mode & S_IFMT != S_IFDIR {
             return Err(ENOTDIR);
+        }
+        if let Some(check) = search {
+            check(&dir_node, &st)?;
         }
         Ok((dir_node, name.to_string()))
     }
 
-    fn is_mount_point(&self, dir: &Node, name: &str) -> bool {
+    pub fn is_mount_point(&self, dir: &Node, name: &str) -> bool {
         self.table().covering(&dir.mnt, &join(&dir.path, name)).is_some()
     }
 
     /// Linux's order for creating `name`: EEXIST if it is taken (a mount
     /// point counts), then EROFS.
-    fn creatable(&self, dir: &Node, name: &str) -> Result<(), i64> {
+    pub fn creatable(&self, dir: &Node, name: &str) -> Result<(), i64> {
         if self.is_mount_point(dir, name) || self.fs(dir).lookup(dir.ino, name).map_err(io_errno)?.is_some() {
             return Err(EEXIST);
         }

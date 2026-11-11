@@ -10,7 +10,7 @@ use crate::errno::*;
 use crate::hv::{CpuState, Vcpu};
 use crate::mm::AddressSpace;
 use crate::phys::PAGE;
-use crate::vfs::{S_IFMT, S_IFREG};
+use crate::vfs::{Node, S_IFMT, S_IFREG};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -208,7 +208,7 @@ impl Kernel {
         };
         let cmdline = super::cmdline_bytes(&argv);
         let comm_path = path.clone();
-        let (state, exe) = match self.load_program(&mut mm, &cwd, &path, argv, &envp) {
+        let (state, exe) = match self.load_program(Some(t), &mut mm, &cwd, &path, argv, &envp) {
             Ok(x) => x,
             Err(e) => return Ret::Value(-e),
         };
@@ -257,15 +257,29 @@ impl Kernel {
     }
 
     /// Loads `path` (an ELF or a `#!` script) into `mm` and builds its stack.
-    /// Returns the initial register state and the executable's path.
-    pub fn load_program(&self, mm: &mut AddressSpace, cwd: &str, path: &str, mut argv: Vec<String>, envp: &[String]) -> Result<(CpuState, String), i64> {
+    /// Returns the initial register state and the executable's path. `who`, the
+    /// thread calling execve, is held to its permissions; droidrt's own first
+    /// program isn't.
+    pub fn load_program(&self, who: Option<&Thread>, mm: &mut AddressSpace, cwd: &str, path: &str, mut argv: Vec<String>, envp: &[String]) -> Result<(CpuState, String), i64> {
         let vfs = self.vfs.as_deref().ok_or(ENOENT)?;
-        let mut path = path.to_string();
-        for _ in 0..4 {
-            let node = vfs.resolve(cwd, &path, true)?;
-            if vfs.stat(&node)?.mode & S_IFMT != S_IFREG {
+        // open_exec: the walk, a regular file, then noexec and the x bits.
+        let open_exec = |base: &str, path: &str| -> Result<Node, i64> {
+            let node = match who {
+                Some(t) => self.walk(t, base, path, true)?,
+                None => vfs.resolve(base, path, true)?,
+            };
+            let st = vfs.stat(&node)?;
+            if st.mode & S_IFMT != S_IFREG {
                 return Err(EACCES);
             }
+            if let Some(t) = who {
+                self.may_exec(t, &node, &st)?;
+            }
+            Ok(node)
+        };
+        let mut path = path.to_string();
+        for _ in 0..4 {
+            let node = open_exec(cwd, &path)?;
             let size = vfs.stat(&node)?.size;
             let src = vfs.page_source(&node)?;
             let data = src.read_bytes(0, size.min(PAGE) as usize)?;
@@ -291,7 +305,7 @@ impl Kernel {
             let mut interp_range = None;
             let (entry, base) = match &main.interp {
                 Some(interp) => {
-                    let inode = vfs.resolve("/", interp, true)?;
+                    let inode = open_exec("/", interp)?;
                     let (isrc, isize) = (vfs.page_source(&inode)?, vfs.stat(&inode)?.size);
                     let li = elf::load(mm, &isrc, isize, interp, true).map_err(|e| {
                         eprintln!("[droidrt] exec: {e}");

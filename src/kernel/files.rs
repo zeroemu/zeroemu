@@ -753,10 +753,10 @@ impl Kernel {
                 }
                 // Files and directories answer as Linux would. ART refuses to load a
                 // dex file its app could write, and only this tells it the app can't.
-                // Kernel files and device nodes keep their synthetic modes out of it:
-                // nothing has set those up for their real owners.
+                // Kernel files keep their synthetic modes out of it: nothing has set
+                // those up for their real owners (perm.rs says which those are).
                 let st = vfs.stat(&node)?;
-                let real = matches!(vfs.fs_type(&node), "tmpfs" | "ext4" | "erofs") && matches!(st.mode & S_IFMT, S_IFREG | S_IFDIR);
+                let real = super::perm::applies(vfs, &node) || matches!(vfs.fs_type(&node), "tmpfs" | "ext4" | "erofs") && matches!(st.mode & S_IFMT, S_IFREG | S_IFDIR);
                 if real && !self.creds(t).may_access(&st, a[2] as u32, flags & AT_EACCESS != 0) {
                     return Err(EACCES);
                 }
@@ -776,14 +776,19 @@ impl Kernel {
             chdir => {
                 let path = t.proc.mm().read_cstr(a[0])?;
                 let node = self.resolve(t, AT_FDCWD, &path, true)?;
-                if self.vfs()?.stat(&node)?.mode & S_IFMT != S_IFDIR {
+                let st = self.vfs()?.stat(&node)?;
+                if st.mode & S_IFMT != S_IFDIR {
                     return Err(ENOTDIR);
                 }
+                self.permission(t, &self.creds(t), &node, &st, super::perm::MAY_EXEC)?;
                 *t.proc.cwd.lock().unwrap() = node.path;
                 Ok(0)
             }
             fchdir => {
                 let dir = self.dir_path(t, int(a[0]))?;
+                if let Ok(node) = self.target(t, int(a[0]), 0, 0) {
+                    self.node_permission(t, &self.creds(t), &node, super::perm::MAY_EXEC)?;
+                }
                 *t.proc.cwd.lock().unwrap() = dir;
                 Ok(0)
             }
@@ -906,9 +911,16 @@ impl Kernel {
                         t.proc.mm().write_u32(a[2], v.unread().min(i32::MAX as usize) as u32)?;
                         return Ok(0);
                     }
-                    Kind::Block(b) => return self.blocks.ioctl(b.devt, cmd, a[2], &mut BlockCaller { k: self, t }),
+                    Kind::Block(b) => {
+                        self.block_ioctl_allowed(t, &f, cmd)?;
+                        return self.blocks.ioctl(b.devt, cmd, a[2], &mut BlockCaller { k: self, t });
+                    }
                     Kind::LoopControl => return self.blocks.loop_control(cmd, a[2]),
-                    Kind::DmControl => return self.blocks.dm_ioctl(cmd, a[2], &mut BlockCaller { k: self, t }),
+                    // dm-ioctl.c: "only root can play with this".
+                    Kind::DmControl => {
+                        self.need_cap(t, super::creds::CAP_SYS_ADMIN, "a device-mapper ioctl", EACCES)?;
+                        return self.blocks.dm_ioctl(cmd, a[2], &mut BlockCaller { k: self, t });
+                    }
                     Kind::Pty(p) if cmd == super::pty::TIOCGPTPEER => {
                         let file = File::new(Kind::Pty(p.peer()?), (a[2] & O_NONBLOCK as u64) as u32);
                         return t.files().alloc(file, a[2] & O_CLOEXEC != 0, 0);
@@ -1062,6 +1074,7 @@ impl Kernel {
                 let mask = a[2] as u32;
                 let path = t.proc.mm().read_cstr(a[1])?;
                 let node = self.resolve(t, AT_FDCWD, &path, super::inotify::follow(mask))?;
+                self.node_permission(t, &self.creds(t), &node, super::perm::MAY_READ)?;
                 let is_dir = self.vfs()?.stat(&node)?.mode & S_IFMT == S_IFDIR;
                 i.add_watch(&node.path, is_dir, mask)
             }
@@ -1188,7 +1201,25 @@ impl Kernel {
             }
         }
         let base = if path.starts_with('/') { "/".to_string() } else { self.dir_path(t, dirfd)? };
-        self.vfs()?.resolve(&base, path, follow)
+        self.walk(t, &base, path, follow)
+    }
+
+    /// A caller's path walk from `base`: search permission on each directory it looks in.
+    pub(super) fn walk(&self, t: &Thread, base: &str, path: &str, follow: bool) -> Result<Node, i64> {
+        let vfs = self.vfs()?;
+        match self.searcher(t) {
+            Some(s) => vfs.resolve_as(base, path, follow, Some(&s)),
+            None => vfs.resolve(base, path, follow),
+        }
+    }
+
+    /// A caller's walk to the directory a path's last name is in (see walk).
+    pub(super) fn walk_parent(&self, t: &Thread, base: &str, path: &str) -> Result<(Node, String), i64> {
+        let vfs = self.vfs()?;
+        match self.searcher(t) {
+            Some(s) => vfs.resolve_parent_as(base, path, Some(&s)),
+            None => vfs.resolve_parent(base, path),
+        }
     }
 
     fn openat(&self, t: &Arc<Thread>, dirfd: i64, path: u64, flags: u64, mode: u64) -> Result<i64, i64> {
@@ -1203,16 +1234,21 @@ impl Kernel {
         let creating = flags & O_CREAT != 0;
         let exclusive = creating && flags & O_EXCL != 0;
         let mut lost_races = 0;
+        let mut created = false;
         let node = loop {
             match self.resolve(t, dirfd, &path, flags & of.nofollow == 0) {
                 Ok(_) if exclusive => return Err(EEXIST),
                 Ok(n) => break n,
                 Err(ENOENT) if creating => {
                     let (dir, name) = self.parent(t, dirfd, &path)?;
+                    if super::perm::enforcing() {
+                        self.may_create(t, &self.creds(t), &dir)?;
+                    }
                     match self.vfs()?.create(&dir, &name, S_IFREG | (mode as u32 & 0o7777 & !t.proc.umask.load(Ordering::Relaxed)), 0) {
                         Ok(node) => {
                             self.init_owner(t, &dir, &node);
                             inotify::notify(&inotify::join(&dir.path, &name), inotify::IN_CREATE, 0);
+                            created = true;
                             break node;
                         }
                         // Another thread made it since the lookup: without O_EXCL,
@@ -1227,6 +1263,12 @@ impl Kernel {
         };
         let vfs = self.vfs()?;
         let stat = vfs.stat(&node)?;
+        // A file open() made is the caller's to use however it asked; a path-only
+        // descriptor opens nothing. Links and directories opened for writing fail below first.
+        let refused_anyway = stat.mode & S_IFMT == S_IFLNK || (stat.mode & S_IFMT == S_IFDIR && access != 0);
+        if !created && flags & O_PATH == 0 && !refused_anyway {
+            self.may_open(t, &node, &stat, access, flags & O_TRUNC != 0)?;
+        }
         let kind = match stat.mode & S_IFMT {
             // A path-only descriptor: nothing behind it is opened.
             _ if flags & O_PATH != 0 => Kind::Node(NodeFile::open(vfs, node, stat, false)),
@@ -1298,12 +1340,12 @@ impl Kernel {
     /// (directory, final name) of a path relative to `dirfd`.
     fn parent(&self, t: &Thread, dirfd: i64, path: &str) -> Result<(Node, String), i64> {
         let base = if path.starts_with('/') { "/".to_string() } else { self.dir_path(t, dirfd)? };
-        self.vfs()?.resolve_parent(&base, path)
+        self.walk_parent(t, &base, path)
     }
 
     /// A new node belongs to its creator; a set-gid directory passes on its group,
     /// and to subdirectories the bit itself (inode_init_owner).
-    fn init_owner(&self, t: &Thread, dir: &Node, node: &Node) {
+    pub(super) fn init_owner(&self, t: &Thread, dir: &Node, node: &Node) {
         const S_ISGID: u32 = 0o2000;
         let Ok(vfs) = self.vfs() else { return };
         let (Ok(parent), Ok(new)) = (vfs.stat(dir), vfs.stat(node)) else { return };
@@ -1341,14 +1383,61 @@ impl Kernel {
         }
     }
 
+    /// chmod of `node`, with perm.rs's rules.
+    fn chmod(&self, t: &Thread, node: &Node, mode: u32) -> Result<(), i64> {
+        let vfs = self.vfs()?;
+        if vfs.readonly(node) {
+            return Err(EROFS);
+        }
+        let mode = if super::perm::enforcing() { self.chmod_mode(t, node, mode)? } else { mode };
+        vfs.set_attr(node, Some(mode), None, None)
+    }
+
+    /// chown of `node`, with perm.rs's rules: a non-directory loses set-uid and maybe set-gid.
+    fn chown(&self, t: &Thread, node: &Node, uid: u32, gid: u32) -> Result<(), i64> {
+        let vfs = self.vfs()?;
+        if vfs.readonly(node) {
+            return Err(EROFS);
+        }
+        let mode = self.chown_check(t, node, uid, gid)?;
+        vfs.set_attr(node, mode, Some((uid, gid)), None)
+    }
+
+    /// may_linkat with fs.protected_hardlinks: a hard link to someone else's file
+    /// needs CAP_FOWNER, or a plain file the caller could read and write.
+    fn may_link(&self, t: &Thread, c: &super::creds::Creds, old: &Node) -> Result<(), i64> {
+        let vfs = self.vfs()?;
+        if self.sysctl.get("fs/protected_hardlinks").trim() != "1" || !super::perm::applies(vfs, old) {
+            return Ok(());
+        }
+        let st = vfs.stat(old)?;
+        if c.owns(&st) {
+            return Ok(());
+        }
+        let setid = st.mode & super::perm::S_ISUID != 0 || st.mode & (super::perm::S_ISGID | 0o010) == super::perm::S_ISGID | 0o010;
+        let safe = st.mode & S_IFMT == S_IFREG && !setid && c.may_access(&st, super::perm::MAY_READ | super::perm::MAY_WRITE, true);
+        if safe {
+            return Ok(());
+        }
+        Err(self.denied(t, c, &old.path, &st, "a hard link to another's file", EPERM))
+    }
+
     /// Namespace-changing and attribute syscalls over the writable mounts.
     fn change_syscall(&self, no: Sysno, t: &Arc<Thread>, a: [u64; 6]) -> Result<i64, i64> {
         use Sysno::*;
         let vfs = self.vfs()?;
+        let enforcing = super::perm::enforcing();
         match no {
             mknodat | mkdirat => {
                 let path = t.proc.mm().read_cstr(a[1])?;
                 let (dir, name) = self.parent(t, int(a[0]), &path)?;
+                if enforcing {
+                    vfs.creatable(&dir, &name)?;
+                    self.may_create(t, &self.creds(t), &dir)?;
+                    if no == mknodat {
+                        self.may_mknod(t, a[2] as u32)?;
+                    }
+                }
                 let mask = t.proc.umask.load(Ordering::Relaxed);
                 let node = if no == mkdirat {
                     vfs.mkdir(&dir, &name, a[2] as u32 & !mask)?;
@@ -1365,6 +1454,12 @@ impl Kernel {
                 let path = t.proc.mm().read_cstr(a[1])?;
                 let (dir, name) = self.parent(t, int(a[0]), &path)?;
                 let victim = vfs.resolve(&dir.path, &name, false);
+                if let Ok(v) = &victim
+                    && enforcing
+                    && !vfs.readonly(&dir)
+                {
+                    self.may_delete(t, &self.creds(t), &dir, v)?;
+                }
                 vfs.unlink(&dir, &name, a[2] & AT_REMOVEDIR != 0)?;
                 if let Ok(v) = victim {
                     unix::unlinked(vfs, &v);
@@ -1377,6 +1472,10 @@ impl Kernel {
                 let target = t.proc.mm().read_cstr(a[0])?;
                 let path = t.proc.mm().read_cstr(a[2])?;
                 let (dir, name) = self.parent(t, int(a[1]), &path)?;
+                if enforcing {
+                    vfs.creatable(&dir, &name)?;
+                    self.may_create(t, &self.creds(t), &dir)?;
+                }
                 vfs.symlink(&dir, &name, &target)?;
                 self.init_owner(t, &dir, &vfs.resolve(&dir.path, &name, false)?);
                 inotify::notify(&inotify::join(&dir.path, &name), inotify::IN_CREATE, 0);
@@ -1386,6 +1485,13 @@ impl Kernel {
                 let old = self.target(t, int(a[0]), a[1], a[4] ^ AT_SYMLINK_NOFOLLOW)?; // no-follow by default
                 let path = t.proc.mm().read_cstr(a[3])?;
                 let (dir, name) = self.parent(t, int(a[2]), &path)?;
+                if enforcing {
+                    vfs.creatable(&dir, &name)?;
+                    // do_linkat asks may_linkat before vfs_link's may_create.
+                    let c = self.creds(t);
+                    self.may_link(t, &c, &old)?;
+                    self.may_create(t, &c, &dir)?;
+                }
                 vfs.link(&old, &dir, &name)?;
                 inotify::notify(&inotify::join(&dir.path, &name), inotify::IN_CREATE, 0);
                 Ok(0)
@@ -1403,6 +1509,25 @@ impl Kernel {
                 let (odir, oname) = self.parent(t, int(a[0]), &op)?;
                 let (ndir, nname) = self.parent(t, int(a[2]), &np)?;
                 let victim = vfs.resolve(&ndir.path, &nname, false);
+                let moving = if enforcing && odir.mount().id == ndir.mount().id && !vfs.readonly(&odir) {
+                    Some(vfs.resolve(&odir.path, &oname, false)?)
+                } else {
+                    None
+                };
+                // vfs_rename: a name onto another for the same inode succeeds before any check.
+                let same = matches!((&moving, &victim), (Some(m), Ok(v)) if m.ino == v.ino);
+                if let Some(moving) = moving.filter(|_| !same) {
+                    let c = self.creds(t);
+                    self.may_delete(t, &c, &odir, &moving)?;
+                    match &victim {
+                        Ok(v) => self.may_delete(t, &c, &ndir, v)?,
+                        Err(_) => self.may_create(t, &c, &ndir)?,
+                    }
+                    // A directory moving to another parent has its ".." rewritten.
+                    if odir.path != ndir.path && vfs.stat(&moving)?.mode & S_IFMT == S_IFDIR {
+                        self.node_permission(t, &c, &moving, super::perm::MAY_WRITE)?;
+                    }
+                }
                 vfs.rename(&odir, &oname, &ndir, &nname, flags & RENAME_NOREPLACE != 0)?;
                 if let Ok(v) = victim {
                     unix::unlinked(vfs, &v);
@@ -1424,6 +1549,11 @@ impl Kernel {
                 if (a[1] as i64) < 0 {
                     return Err(EINVAL);
                 }
+                let st = vfs.stat(&node)?;
+                if st.mode & S_IFMT == S_IFDIR {
+                    return Err(EISDIR);
+                }
+                self.permission(t, &self.creds(t), &node, &st, super::perm::MAY_WRITE)?;
                 vfs.mem_file(&node).ok_or(EISDIR)?.truncate(a[1])?;
                 inotify::notify(&node.path, inotify::IN_MODIFY, 0);
                 Ok(0)
@@ -1465,22 +1595,22 @@ impl Kernel {
                 }
                 let node = self.target(t, int(a[0]), 0, 0)?;
                 if no == fchmod {
-                    vfs.set_attr(&node, Some(a[1] as u32), None, None)?;
+                    self.chmod(t, &node, a[1] as u32)?;
                 } else {
-                    vfs.set_attr(&node, None, Some((a[1] as u32, a[2] as u32)), None)?;
+                    self.chown(t, &node, a[1] as u32, a[2] as u32)?;
                 }
                 inotify::notify(&node.path, inotify::IN_ATTRIB, 0);
                 Ok(0)
             }
             fchmodat => {
                 let node = self.target(t, int(a[0]), a[1], 0)?;
-                vfs.set_attr(&node, Some(a[2] as u32), None, None)?;
+                self.chmod(t, &node, a[2] as u32)?;
                 inotify::notify(&node.path, inotify::IN_ATTRIB, 0);
                 Ok(0)
             }
             fchownat => {
                 let node = self.target(t, int(a[0]), a[1], a[4])?;
-                vfs.set_attr(&node, None, Some((a[2] as u32, a[3] as u32)), None)?;
+                self.chown(t, &node, a[2] as u32, a[3] as u32)?;
                 inotify::notify(&node.path, inotify::IN_ATTRIB, 0);
                 Ok(0)
             }
@@ -1489,12 +1619,25 @@ impl Kernel {
                 const UTIME_OMIT: u64 = (1 << 30) - 2;
                 let node = self.target(t, int(a[0]), a[1], a[3])?;
                 let now = || std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+                let (atime_ns, mtime_ns) = if a[2] == 0 {
+                    (UTIME_NOW, UTIME_NOW)
+                } else {
+                    let mut mm = t.proc.mm();
+                    (mm.read_u64(a[2] + 8)?, mm.read_u64(a[2] + 24)?)
+                };
+                // Both now (or no times at all) asks for write permission; any time given
+                // asks for ownership; now with the other omitted asks nothing (vfs_utimes).
+                let explicit = [atime_ns, mtime_ns].iter().any(|&n| n != UTIME_NOW && n != UTIME_OMIT);
+                let touch = atime_ns == UTIME_NOW && mtime_ns == UTIME_NOW;
+                if (explicit || touch) && !vfs.readonly(&node) {
+                    self.may_set_times(t, &node, explicit)?;
+                }
                 // Only mtime is kept: times[1], unless it says UTIME_OMIT.
                 let mtime = if a[2] == 0 {
                     now()
                 } else {
                     let mut mm = t.proc.mm();
-                    match mm.read_u64(a[2] + 24)? {
+                    match mtime_ns {
                         UTIME_OMIT => return Ok(0),
                         UTIME_NOW => now(),
                         _ => mm.read_u64(a[2] + 16)?,
@@ -1518,10 +1661,52 @@ impl Kernel {
         }
     }
 
+    /// The block ioctls that change a device: blkdev_ioctl's want CAP_SYS_ADMIN
+    /// (EACCES); lo_ioctl's settings want the device open for writing or that (EPERM).
+    fn block_ioctl_allowed(&self, t: &Thread, f: &File, cmd: u64) -> Result<(), i64> {
+        const BLKROSET: u64 = 0x125d;
+        const BLKFLSBUF: u64 = 0x1261;
+        const BLKRASET: u64 = 0x1262;
+        const BLKBSZSET: u64 = 0x4008_1271;
+        const LOOP_SET_STATUS: u64 = 0x4C02;
+        const LOOP_SET_STATUS64: u64 = 0x4C04;
+        const LOOP_SET_CAPACITY: u64 = 0x4C07;
+        const LOOP_SET_DIRECT_IO: u64 = 0x4C08;
+        const LOOP_SET_BLOCK_SIZE: u64 = 0x4C09;
+        let admin = super::creds::CAP_SYS_ADMIN;
+        match cmd {
+            BLKROSET | BLKFLSBUF | BLKRASET | BLKBSZSET => self.need_cap(t, admin, "a block device ioctl", EACCES),
+            LOOP_SET_STATUS | LOOP_SET_STATUS64 | LOOP_SET_CAPACITY | LOOP_SET_DIRECT_IO | LOOP_SET_BLOCK_SIZE
+                if !matches!(f.opened_for.get(), Some(&O_WRONLY) | Some(&O_RDWR)) =>
+            {
+                self.need_cap(t, admin, "a loop setting on a read-only descriptor", EPERM)
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// The path of a mapped file, for /proc/<pid>/maps.
     pub(super) fn fd_name(&self, t: &Thread, fd: i64) -> Option<String> {
         let f = t.files().get(fd).ok()?;
         Some(file_name(&f))
+    }
+
+    /// For mmap: whether the descriptor is open for reading and for writing (None
+    /// for kinds open() didn't make, which carry no access mode), and whether its
+    /// file is on a noexec mount.
+    pub(super) fn fd_map_rights(&self, t: &Thread, fd: i64) -> Result<(Option<(bool, bool)>, bool), i64> {
+        let f = t.files().get(fd)?;
+        let rw = match &f.kind {
+            Kind::Mem(m) => Some((m.readable, m.writable)),
+            _ => f.opened_for.get().map(|&a| (a == 0 || a == O_RDWR, a == O_WRONLY || a == O_RDWR)),
+        };
+        let node = match &f.kind {
+            Kind::Node(nf) => Some(nf.lock().unwrap().node.clone()),
+            Kind::Mem(m) => m.node.clone(),
+            _ => None,
+        };
+        let noexec = node.is_some_and(|n| self.vfs().is_ok_and(|v| v.mount_flags(&n) & crate::vfs::MS_NOEXEC != 0));
+        Ok((rw, noexec))
     }
 
     /// For MAP_SHARED of a file: the shared pages behind a writable file.

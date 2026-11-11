@@ -428,10 +428,16 @@ pub enum OnFork {
     Wipe,
 }
 
+/// PROT_READ | PROT_WRITE | PROT_EXEC.
+pub const PROT_ALL: u32 = 7;
+
 #[derive(Clone)]
 pub struct Vma {
     pub end: u64,
     pub prot: u32,
+    /// What mprotect may grant (Linux's VM_MAYREAD/MAYWRITE/MAYEXEC, as PROT_* bits):
+    /// a shared mapping of a read-only descriptor never becomes writable.
+    pub max_prot: u32,
     pub backing: Backing,
     pub on_fork: OnFork,
     /// Shown in /proc/<pid>/maps (a file path, "[stack]", …).
@@ -655,8 +661,21 @@ impl AddressSpace {
                 if h != 0 && self.is_free(h, h.saturating_add(len)) { h } else { self.gap(len)? }
             }
         };
-        self.vmas.insert(start, Vma { end: start + len, prot, backing, on_fork: OnFork::Copy, name: None, uffd: None });
+        self.vmas.insert(start, Vma { end: start + len, prot, max_prot: PROT_ALL, backing, on_fork: OnFork::Copy, name: None, uffd: None });
         Ok(start)
+    }
+
+    /// Limits what mprotect may later grant the mappings in [start, start+len)
+    /// (mmap's VM_MAY* bits: a read-only descriptor's shared mapping, ashmem's
+    /// protection mask, noexec mounts, binder's area).
+    pub fn limit_prot(&mut self, start: u64, len: u64, max_prot: u32) {
+        let end = start.saturating_add(page_up(len));
+        self.split(start);
+        self.split(end);
+        for (_, v) in self.vmas.range_mut(start..end) {
+            v.max_prot = max_prot & PROT_ALL;
+        }
+        self.merge(start, end);
     }
 
     /// Labels the mappings in [start, start+len) for /proc/<pid>/maps.
@@ -679,6 +698,7 @@ impl AddressSpace {
             let contiguous = |o1: &u64, o2: &u64| o1 + (a.end - a_start) == *o2;
             a.end == b_start
                 && a.prot == b.prot
+                && a.max_prot == b.max_prot
                 && a.on_fork == b.on_fork
                 && a.name == b.name
                 && match (a.uffd(), b.uffd()) {
@@ -922,6 +942,11 @@ impl AddressSpace {
         if !self.covered(start, end) {
             return Err(ENOMEM);
         }
+        // Nor may it grant what the mapping can't have (EACCES), anywhere in the range.
+        let first = self.vmas.range(..start).next_back().filter(|(_, v)| v.end > start).map(|(&s, _)| s).unwrap_or(start);
+        if self.vmas.range(first..end).any(|(_, v)| prot & PROT_ALL & !v.max_prot != 0) {
+            return Err(EACCES);
+        }
         self.split(start);
         self.split(end);
         for (_, v) in self.vmas.range_mut(start..end) {
@@ -957,7 +982,7 @@ impl AddressSpace {
         if dont_unmap && (old_len != new_len || !matches!(vma.backing, Backing::Anon)) {
             return Err(EINVAL);
         }
-        let (prot, on_fork, mut backing, vma_name) = (vma.prot, vma.on_fork, vma.backing.clone(), vma.name.clone());
+        let (prot, max_prot, on_fork, mut backing, vma_name) = (vma.prot, vma.max_prot, vma.on_fork, vma.backing.clone(), vma.name.clone());
         if !dont_unmap && fixed.is_none() && new_len <= old_len {
             self.unmap(old + new_len, old_len - new_len)?;
             return Ok(old);
@@ -1006,7 +1031,7 @@ impl AddressSpace {
         if !dont_unmap {
             self.unmap(old, old_len)?;
         }
-        self.vmas.insert(dst, Vma { end: dst + new_len, prot, backing, on_fork, name: vma_name, uffd: None });
+        self.vmas.insert(dst, Vma { end: dst + new_len, prot, max_prot, backing, on_fork, name: vma_name, uffd: None });
         for (off, e) in moves {
             // These exist now, so this can't fail, and it can't use up anything.
             let slot = walk(&self.phys, owner, &mut self.tables, self.root.root, 0, dst + off, true)?.unwrap();

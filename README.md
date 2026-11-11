@@ -74,9 +74,17 @@ Known gaps:
 - On Windows, nothing saves `/data` on Ctrl-C or when the console closes.
 - A mapping of a file doesn't raise SIGBUS past the file's end: it reads zeros. A read
   of a hole through a private mapping stays zeros if the file is written there later.
-- `mmap` and `mprotect` don't check what a file was opened for, so a read-only descriptor
-  can be mapped writable. `O_PATH` descriptors can be read, `O_NOFOLLOW` opens a symlink
-  rather than refusing it, and `/dev/zero` can't be mapped.
+- `O_PATH` descriptors can be read and mapped, and `/dev/zero` can't be mapped.
+- File permissions are Linux's (see below) only where owners and modes are real: tmpfs,
+  binderfs and the images. `/proc`, `/sys`, the cgroup hierarchies, selinuxfs, devpts,
+  tracefs and bpffs have modes droidrt made up and owners nobody set, so any process may
+  read and write what they let root. fs.protected_symlinks isn't applied, and `access()`
+  walks the path with the effective ids rather than the real ones.
+- There is no shared storage: without `/dev/fuse` vold can't mount the emulated volume,
+  so `/sdcard` and `/storage/emulated` are the bare mount points vold and zygote leave
+  (0700 root, 0710 shell:everybody), and apps are refused there as on a device whose
+  volume failed to mount. Before permissions were enforced, apps wrote into those
+  directories, in memory that nothing kept.
 - userfaultfd has only what ART's compacting collector uses: SIGBUS mode, on private
   anonymous memory.
 - Guest GLES reaches the renderer over virtio-gpu's pipe, not its shared-memory ring:
@@ -91,6 +99,19 @@ Known gaps:
   `com.android.tzdata`); reading `apex_manifest.pb` lazily would fix it.
 - `/linkerconfig/ld.config.txt` is not generated, so the linker warns and uses
   its default search paths.
+
+File permissions follow Linux's rules (fs/namei.c, fs/attr.c, mm/mmap.c): search
+permission on every directory a path walks through, read and write by open's access mode
+(and write for `O_TRUNC`), write and search on the directory to create, remove, rename or
+link, the sticky bit, chmod and utimes by the owner, chown by `CAP_CHOWN` (and set-uid and
+set-gid dropped as Linux drops them), execute permission and `noexec` mounts for `execve`
+and executable mappings, write permission on a socket to connect to it, a descriptor open
+for reading to map it and for writing to map it shared and writable (which `mprotect`
+can't add later, nor past ashmem's protection mask), the xattr namespaces' rules, and
+`CAP_SYS_ADMIN` for device-mapper. Root with its capabilities passes as on Linux; an app's
+uid is held to them. droidrt's own device nodes have the modes and owners ueventd.rc
+gives them. `src/kernel/perm.rs` has the shared checks and says which filesystems they
+cover.
 
 M3 so far adds the IPC Android's system services stand on: `eventfd`,
 `epoll`, `timerfd`, `signalfd`, Unix sockets with `SCM_RIGHTS`, tmpfs
@@ -171,7 +192,11 @@ library+offset, and writes to `/dev/kmsg` (where `servicemanager` and `init`
 log) appear on stderr. `DROIDRT_DUMP=<secs>` prints, every that many seconds,
 each guest thread with the syscall it is in, for how long, and its backtrace;
 `kill -USR1` on droidrt prints one such dump at any time (without backtraces
-unless `DROIDRT_DUMP` is set). `DROIDRT_FD_TRACE=<name>` logs every descriptor
+unless `DROIDRT_DUMP` is set). `DROIDRT_DAC_LOG=1` logs every file permission refusal: the process, its ids and
+groups, the syscall, the path, and the mode and owner that refused it (or the rule:
+sticky directory, owner only, a missing capability). `DROIDRT_DAC=0` turns file
+permissions off altogether, as before droidrt had them, to tell whether one is behind a
+failure. `DROIDRT_FD_TRACE=<name>` logs every descriptor
 added to or removed from the tables of programs whose path contains it.
 `DROIDRT_INPUT_FIFO=<path>` takes lines from a host FIFO as if from the window,
 for tests that must not touch the host's mouse: `down X Y`, `move X Y`, `up X Y`,

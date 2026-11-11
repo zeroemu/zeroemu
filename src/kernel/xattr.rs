@@ -115,6 +115,7 @@ impl Kernel {
                     if !user_allowed(vfs, &n, &name)? {
                         return Err(EPERM);
                     }
+                    self.xattr_permission(t, vfs, &n, &name, true)?;
                 }
                 vfs.setxattr(&n, &name, &value, a[4] as u32).map(|_| 0)
             }
@@ -132,6 +133,7 @@ impl Kernel {
                 if !user_allowed(vfs, &n, &name)? {
                     return Err(ENODATA);
                 }
+                self.xattr_permission(t, vfs, &n, &name, false)?;
                 let mut v = match vfs.getxattr(&n, &name) {
                     Err(ENODATA) if name == XATTR_SELINUX && vfs.fs_type(&n) == "bpf" => bpf_label(&n.path).into_bytes(),
                     r => r?,
@@ -161,6 +163,7 @@ impl Kernel {
                     if !user_allowed(vfs, &n, &name)? {
                         return Err(EPERM);
                     }
+                    self.xattr_permission(t, vfs, &n, &name, true)?;
                 }
                 vfs.removexattr(&n, &name).map(|_| 0)
             }
@@ -170,6 +173,50 @@ impl Kernel {
             }
             _ => Err(EOPNOTSUPP),
         }
+    }
+
+    /// Who may read or change an attribute: fs/xattr.c's xattr_permission (trusted.*
+    /// is CAP_SYS_ADMIN's; user.* follows the file's mode, and in a sticky directory
+    /// its owner's), then for a change of security.* what the security modules ask:
+    /// the owner or CAP_FOWNER to relabel (selinux_inode_setxattr), CAP_SETFCAP
+    /// for file capabilities, CAP_SYS_ADMIN for the rest (cap_inode_setxattr). And
+    /// system.* (ACLs) takes the owner or CAP_FOWNER to change.
+    fn xattr_permission(&self, t: &Thread, vfs: &Vfs, n: &Node, name: &str, write: bool) -> Result<(), i64> {
+        use super::perm::{MAY_READ, MAY_WRITE, S_ISVTX, applies, enforcing};
+        const CAP_SETFCAP: u32 = 31;
+        if !enforcing() {
+            return Ok(());
+        }
+        let c = self.creds(t);
+        let st = vfs.stat(n)?;
+        let refuse = |what: &str| Err(self.denied(t, &c, &n.path, &st, what, EPERM));
+        if name.starts_with("trusted.") {
+            if c.capable(super::creds::CAP_SYS_ADMIN) {
+                return Ok(());
+            }
+            return if write { refuse("trusted.* without CAP_SYS_ADMIN") } else { Err(ENODATA) };
+        }
+        let real = applies(vfs, n);
+        if name.starts_with("user.") {
+            if real && write && st.mode & S_IFMT == S_IFDIR && st.mode & S_ISVTX != 0 && !c.owns(&st) {
+                return refuse("user.* on a sticky directory by a non-owner");
+            }
+            return self.permission(t, &c, n, &st, if write { MAY_WRITE } else { MAY_READ });
+        }
+        if !write {
+            return Ok(());
+        }
+        if name.starts_with("security.") {
+            if name == XATTR_SELINUX {
+                return if !real || c.owns(&st) { Ok(()) } else { refuse("relabel by a non-owner") };
+            }
+            let cap = if name == "security.capability" { CAP_SETFCAP } else { super::creds::CAP_SYS_ADMIN };
+            return if c.capable(cap) { Ok(()) } else { refuse("a security.* attribute without the capability") };
+        }
+        if name.starts_with("system.") && real && !c.owns(&st) {
+            return refuse("an ACL change by a non-owner");
+        }
+        Ok(())
     }
 
     /// An attribute name: 1..=255 bytes, else ERANGE (as strncpy_from_user

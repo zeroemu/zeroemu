@@ -215,7 +215,7 @@ fn boot_guest(
     let mut mm = kernel.new_address_space().map_err(|e| format!("address space: errno {e}"))?;
     let (state, exe) = if system.is_some() {
         kernel
-            .load_program(&mut mm, "/", &program, argv, &envp)
+            .load_program(None, &mut mm, "/", &program, argv, &envp)
             .map_err(|e| format!("{program}: cannot execute (errno {e})"))?
     } else {
         // No image: a freestanding host binary (the test guests).

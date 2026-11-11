@@ -400,8 +400,10 @@ impl Device {
     pub fn publish(&self, dev: &dyn FileSystem, sys: &dyn FileSystem) {
         let root = dev.root().unwrap_or(1);
         let dri = mkdir_p(dev, "dri");
-        let _ = dev.create(dri, "card0", 0o020666, card_rdev());
-        let _ = dev.create(dri, "renderD128", 0o020666, render_rdev());
+        // The vendor's ueventd.rc: card0 0660, renderD128 0666, both system:graphics.
+        let owner = (crate::kernel::perm::AID_SYSTEM, crate::kernel::perm::AID_GRAPHICS);
+        let _ = crate::kernel::perm::device_node(dev, dri, "card0", 0o020660, card_rdev(), owner);
+        let _ = crate::kernel::perm::device_node(dev, dri, "renderD128", 0o020666, render_rdev(), owner);
         let _ = root;
         put_file(sys, "class/drm/card0/dev", "226:0\n");
         put_file(sys, "class/drm/card0/uevent", "MAJOR=226\nMINOR=0\nDEVNAME=dri/card0\nDEVTYPE=drm_minor\n");

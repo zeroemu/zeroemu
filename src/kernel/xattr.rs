@@ -196,7 +196,7 @@ impl Kernel {
             Kind::Mem(m) => Target::Memfd(m.file.clone()),
             Kind::Socket(_) => Target::Socket,
             // Opened devices keep no node; their path names the same inode.
-            Kind::Null | Kind::Zero | Kind::Random | Kind::Kmsg | Kind::Binder(_) | Kind::Block(_) | Kind::LoopControl | Kind::DmControl => {
+            Kind::Null | Kind::Zero | Kind::Random | Kind::Kmsg | Kind::TraceMarker | Kind::Binder(_) | Kind::Block(_) | Kind::LoopControl | Kind::DmControl => {
                 let vfs = self.vfs.as_deref().ok_or(ENOENT)?;
                 vfs.resolve("/", &file_name(&f), true).map_or(Target::Anon, Target::Node)
             }

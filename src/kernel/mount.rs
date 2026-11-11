@@ -564,6 +564,13 @@ impl Kernel {
                 let o: Vec<String> = opts.iter().map(|(k, v)| v.map_or(k.to_string(), |v| format!("{k}={v}"))).collect();
                 (tmpfs(mode) as Arc<dyn FileSystem>, o.join(","))
             }
+            // tracefs: only trace_marker, which DROIDRT_TRACE keeps (trace.rs).
+            "tracefs" => {
+                let fs = tmpfs(0o755);
+                fs.create(1, "trace_marker", 0o020222, super::trace::MARKER_RDEV)?;
+                let o: Vec<String> = opts.iter().map(|(k, v)| v.map_or(k.to_string(), |v| format!("{k}={v}"))).collect();
+                (fs as Arc<dyn FileSystem>, o.join(","))
+            }
             // Stand-ins: empty directories of the right type (a fuse daemon is never asked anything).
             _ => {
                 let o: Vec<String> = opts.iter().filter(|(k, _)| !matches!(*k, "fd" | "rootmode" | "user_id" | "group_id")).map(|(k, v)| v.map_or(k.to_string(), |v| format!("{k}={v}"))).collect();

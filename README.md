@@ -38,7 +38,7 @@ arm64 Android on Apple Silicon and Windows on ARM, x86_64 Android on x86_64 PCs.
 | M5: zygote, ART, `system_server`, launcher, apps | done (macOS): Android 16's Pixel launcher in the window, and boot complete about 17 s after start on a first boot and about 12 s after that |
 | M6: input from the window | done (macOS): mouse as touch, scroll as a finger drag, keyboard; Chrome and Play Store open and draw from a tap |
 | Network | done (macOS): Android validates the network, Chrome loads sites over HTTP, HTTPS and QUIC, and `adb forward` and `reverse` work. See below for what a network with no packets can't do |
-| Smoothness | in progress: see below |
+| Smoothness | in progress: the renderer draws straight into the window, and one app's GL stream no longer waits on another's. See Performance notes |
 | Windows | no window and never run; compiles (`cargo check --target x86_64-pc-windows-msvc`) |
 
 M1 reads the image directly; nothing is extracted to disk. The chain is
@@ -79,8 +79,10 @@ Known gaps:
   rather than refusing it, and `/dev/zero` can't be mapped.
 - userfaultfd has only what ART's compacting collector uses: SIGBUS mode, on private
   anonymous memory.
-- Display frames are read back from the renderer into host memory, which limits
-  the frame rate.
+- Guest GLES reaches the renderer over virtio-gpu's pipe, not its shared-memory ring:
+  gfxstream's guest library picks the pipe for the emulator's own EGL. Each GL call that
+  waits for an answer is a round trip through droidrt (a few hundred a second while an
+  app scrolls).
 - SELinux is permissive: selinuxfs, process and socket contexts, and exec
   domain transitions follow the image's CIL policy (with file labels from
   the images' xattrs), but no access is ever denied.
@@ -128,7 +130,7 @@ Android log records (`liblog`, i.e. `ALOGI` and friends) print to stderr as
 sets the lowest priority shown (default `I`; `S` silences them).
 
 `--boot` runs Android's own `init` in a window (`--headless` for none,
-`DROIDRT_BACKGROUND=1` to open it without taking focus). A device keeps its `/data`
+`DROIDRT_BACKGROUND=1` to open it behind other windows without taking focus). A device keeps its `/data`
 and `/metadata` between boots, in one file per system image in the user's application
 data, saved when the window closes, on SIGINT, SIGTERM or SIGHUP, or when Android shuts down:
 `--data <file>` puts it elsewhere, `--ephemeral` keeps nothing, and `--wipe-data` starts
@@ -173,9 +175,10 @@ unless `DROIDRT_DUMP` is set). `DROIDRT_FD_TRACE=<name>` logs every descriptor
 added to or removed from the tables of programs whose path contains it.
 `DROIDRT_INPUT_FIFO=<path>` takes lines from a host FIFO as if from the window,
 for tests that must not touch the host's mouse: `down X Y`, `move X Y`, `up X Y`,
-`wheel X Y DX DY` (0 to 1 across the display), `key CODE 1|0` (Linux key codes), and
-`shot PATH`, which writes the frame on show as a BMP. `DROIDRT_GPU_STATS=1` prints
-the display's frame rate and black frames every five seconds, and
+`wheel X Y DX DY` (0 to 1 across the display), `key CODE 1|0` (Linux key codes),
+`resize W H` (the window's content, in points), and `shot PATH`, which writes the frame on
+show as a BMP. `DROIDRT_GPU_STATS=1` prints the display's frame rate every five seconds
+(and black frames, when frames are read back), and
 `DROIDRT_SCHED_TRACE=1` each change in a thread's host priority.
 `DROIDRT_NET_TRACE=1` logs each network socket call and where connections go.
 `DROIDRT_BINDER_RING=1` keeps each thread's last binder events, ioctls included, and
@@ -185,9 +188,17 @@ last, which finds a thread in a loop: send `SIGUSR1` twice, a few seconds apart.
 `DROIDRT_MEMSTAT=1` adds to each thread dump where memory has gone, by kind and by file.
 `DROIDRT_PROPS="name=value ..."` adds Android properties at boot (`ro.lmk.debug=true`
 makes `lmkd` say what it decides).
+`DROIDRT_TRACE=<file>` writes Android's own trace markers to a host file, each with the
+guest's monotonic time, pid and tid, with droidrt's GPU ioctls on the guest thread that made
+them; turn Android's tags on with `DROIDRT_PROPS=debug.atrace.tags.enableflags=0x86e`
+(graphics, input, view, window and activity managers, HALs). Tracing slows the guest
+little enough to measure frames with it.
 `DROIDRT_DRM_TRACE=1` logs GPU ioctls, transfers and fences;
-`DROIDRT_GPU_LOG=<E|W|I|D>` shows the renderer's own log; `DROIDRT_SAVE_FRAMES=<dir>`
-and `DROIDRT_DUMP_RES=<dir>` save displayed frames and GPU buffers as raw pixels.
+`DROIDRT_GPU_LOG=<E|W|I|D>` shows the renderer's own log; `DROIDRT_READBACK=1` reads each
+frame back for the window to draw, as droidrt did before the renderer drew into the window
+itself, and `DROIDRT_GPU_SERIAL=1` sends every GPU call through one thread again;
+`DROIDRT_SAVE_FRAMES=<dir>` (with `DROIDRT_READBACK=1`) and `DROIDRT_DUMP_RES=<dir>` save
+displayed frames and GPU buffers as raw pixels.
 
 On macOS, `cargo run` signs the binary with the `com.apple.security.hypervisor`
 entitlement (see `scripts/macos-runner.sh`); without it the VM cannot be created.
@@ -243,6 +254,38 @@ A syscall round trip (guest → host → guest) is ~1.0 µs on an M1 Pro (1M
 - a vDSO page so `clock_gettime` / `gettimeofday` never exit the VM;
 - fewer register accesses per exit;
 - implementing binder transactions and futex wakeups without extra round trips.
+
+Smoothness, measured on an M1 Pro: flinging the launcher's app list 48 times, with a settled
+`/data` and the window covered, as Android's own frame statistics (`dumpsys gfxinfo`)
+count it, two runs each:
+
+| | Janky frames | Median frame | 90th percentile | 99th percentile |
+|---|---|---|---|---|
+| Frames read back into host memory (before) | 7.6%, 7.0% | 19, 19 ms | 23, 22 ms | 28, 29 ms |
+| The renderer draws into the window | 5.0%, 5.1% | 12, 14 ms | 21, 21 ms | 25, 28 ms |
+
+A freshly booted device, still busy setting itself up, gains more (one run each, opening
+the app list included): the median frame went from 29 ms to 18 ms and janky frames from
+30% to 16%. What changed:
+
+- The renderer draws each frame into the window itself, as the Android Emulator does,
+  at the screen's real pixel density. Before, SurfaceFlinger waited 3 ms per frame while
+  droidrt read the frame back, then copied it twice more to show it.
+- GPU calls went through one droidrt thread, so a read on one app's GL pipe, which
+  waits for the renderer's answer, held up every other app and SurfaceFlinger's
+  composition. Pipe transfers now run on the thread that asked, one at a time per
+  context; only creating or freeing a GPU buffer or context waits for the ones under way,
+  as the renderer's maps of them have no lock of their own.
+- droidrt tells macOS its work is user-initiated, so App Nap doesn't throttle it while
+  its window is covered: a device keeps running in the background, as a phone's apps do
+  with the screen off, and under App Nap frames took about eight times as long. The Mac
+  can still sleep.
+- Fence, vblank and page-flip times were on the wall clock rather than the guest's
+  monotonic clock, so Android's frame statistics said every frame took five seconds,
+  and SurfaceFlinger's vsync model was fed times it couldn't use.
+
+What's left is mostly the first time something is drawn: a shader compiled, or icons
+uploaded, can cost 50 to 150 ms.
 
 Smoothness is expected to come from what disappears: there is no virtual GPU
 pipe, no second compositor, no guest kernel scheduler, and no virtual device

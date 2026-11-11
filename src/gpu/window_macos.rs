@@ -128,6 +128,12 @@ unsafe fn msg_next_event(app: *mut c_void, sel: *mut c_void, mask: u64, until: *
     unsafe { f(app, sel, mask, until, mode, dequeue) }
 }
 
+/// DROIDRT_BACKGROUND=1: open the window without taking the keyboard or coming
+/// forward, for tests run while someone uses the Mac.
+pub fn background() -> bool {
+    std::env::var_os("DROIDRT_BACKGROUND").is_some_and(|v| !v.is_empty() && v != "0")
+}
+
 pub fn open(fb_w: u32, fb_h: u32) -> Result<NativeWindow, String> {
     if unsafe { libc::pthread_main_np() } == 0 {
         return Err("gfxstream window must be created on the main thread".into());
@@ -166,9 +172,27 @@ pub fn open(fb_w: u32, fb_h: u32) -> Result<NativeWindow, String> {
         msg_id(window, sel("setTitle:"), title);
         msg_bool(window, sel("setReleasedWhenClosed:"), 0); // this stays pointed at it
         msg_void(window, sel("center"));
-        msg_id(window, sel("makeKeyAndOrderFront:"), std::ptr::null_mut());
-        msg_bool(app, sel("activateIgnoringOtherApps:"), 1);
+        if background() {
+            // Behind everything, and the app never asks to be active: the user's
+            // keyboard and mouse stay where they were.
+            msg_id(window, sel("orderBack:"), std::ptr::null_mut());
+        } else {
+            msg_id(window, sel("makeKeyAndOrderFront:"), std::ptr::null_mut());
+            msg_bool(app, sel("activateIgnoringOtherApps:"), 1);
+        }
         msg_void(app, sel("finishLaunching"));
+        // A device keeps running when its window is covered or minimized, as a phone's
+        // apps do with its screen off: no App Nap, which throttled a covered droidrt's
+        // threads and timers until frames took ten times as long. The Mac may still sleep.
+        const USER_INITIATED_ALLOWING_IDLE_SYSTEM_SLEEP: u64 = 0x00ef_ffff;
+        let info = msg0(cls("NSProcessInfo"), sel("processInfo"));
+        let reason = msg_cstr(cls("NSString"), sel("stringWithUTF8String:"), "droidrt runs an Android device");
+        let begin: unsafe extern "C" fn(*mut c_void, *mut c_void, u64, *mut c_void) -> *mut c_void =
+            std::mem::transmute(objc_msgSend as *const ());
+        let activity = begin(info, sel("beginActivityWithOptions:reason:"), USER_INITIATED_ALLOWING_IDLE_SYSTEM_SLEEP, reason);
+        if !activity.is_null() {
+            msg0(activity, sel("retain")); // held for the process's life
+        }
         // createSubWindow messages this pointer with frame / contentRectForFrameRect:
         // / contentView / makeKeyAndOrderFront:, which are NSWindow methods, then
         // inserts its own EmuGLView into the content view.
@@ -176,6 +200,7 @@ pub fn open(fb_w: u32, fb_h: u32) -> Result<NativeWindow, String> {
             return Err("NSWindow contentView is null".into());
         }
         let number = msg_i64_ret(window, sel("windowNumber"));
+        SHOWN_SIZE.store((fb_w as u64) << 32 | fb_h as u64, Ordering::Relaxed);
         WINDOW.store(window, Ordering::Release);
         if number > 0 {
             WINDOW_ID.store(number as u64, Ordering::Release);
@@ -202,6 +227,7 @@ unsafe extern "C" {
     fn CGDataProviderRelease(p: *mut c_void);
     fn CGImageCreate(w: usize, h: usize, bpc: usize, bpp: usize, bpr: usize, cs: *mut c_void, info: u32, provider: *mut c_void, decode: *const f64, interpolate: bool, intent: i32) -> *mut c_void;
     fn CGImageRelease(img: *mut c_void);
+    fn CGColorCreateGenericGray(gray: f64, alpha: f64) -> *mut c_void;
 }
 
 #[link(name = "CoreFoundation", kind = "framework")]
@@ -250,15 +276,127 @@ pub fn present(w: u32, h: u32, stride: u32, fourcc: u32, pixels: &[u8]) {
 /// The newest frame as top-down B,G,R,A rows, and its size.
 pub fn shown_frame() -> Option<(u32, u32, Vec<u8>)> {
     let slot = FRAME.lock().unwrap_or_else(|p| p.into_inner());
-    let f = slot.as_ref()?;
+    if let Some(f) = slot.as_ref() {
+        return Some((f.w, f.h, bgra(f.w, f.h, f.stride, f.fourcc, &f.data)));
+    }
+    drop(slot);
+    let (w, h, fourcc, data) = RENDERER.get()?.1()?;
+    Some((w, h, bgra(w, h, w * 4, fourcc, &data)))
+}
+
+fn bgra(w: u32, h: u32, stride: u32, fourcc: u32, data: &[u8]) -> Vec<u8> {
     const BGRA: [u32; 2] = [0x3432_5241, 0x3432_5258];
-    let mut out = Vec::with_capacity(f.w as usize * f.h as usize * 4);
-    for row in f.data.chunks_exact(f.stride as usize).take(f.h as usize) {
-        for p in row.chunks_exact(4).take(f.w as usize) {
-            out.extend_from_slice(&if BGRA.contains(&f.fourcc) { [p[0], p[1], p[2], 255] } else { [p[2], p[1], p[0], 255] });
+    let mut out = Vec::with_capacity(w as usize * h as usize * 4);
+    for row in data.chunks_exact(stride as usize).take(h as usize) {
+        for p in row.chunks_exact(4).take(w as usize) {
+            out.extend_from_slice(&if BGRA.contains(&fourcc) { [p[0], p[1], p[2], 255] } else { [p[2], p[1], p[0], 255] });
         }
     }
-    Some((f.w, f.h, out))
+    out
+}
+
+/// Where the renderer draws in the window: a rectangle of the content view in
+/// points, from its top left, at `dpr` pixels per point.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Placement {
+    pub x: i32,
+    pub y: i32,
+    pub w: i32,
+    pub h: i32,
+    pub dpr: f32,
+}
+
+/// Puts the renderer's view at a placement (UI thread).
+pub type Attach = Box<dyn Fn(*mut c_void, Placement) + Send + Sync>;
+/// The frame on show, read back: width, height, DRM fourcc, rows of width * 4 bytes.
+pub type FrameSource = Box<dyn Fn() -> Option<(u32, u32, u32, Vec<u8>)> + Send + Sync>;
+
+/// The renderer drawing into the window itself, when it does.
+static RENDERER: std::sync::OnceLock<(Attach, FrameSource)> = std::sync::OnceLock::new();
+/// Where it was last put.
+static PLACED: Mutex<Option<Placement>> = Mutex::new(None);
+
+/// The renderer draws frames into the window from now on, in a view `attach` puts
+/// where the frame belongs and puts again whenever that changes (UI thread).
+pub fn attach_renderer(attach: Attach, source: FrameSource) {
+    if RENDERER.set((attach, source)).is_ok() {
+        unsafe {
+            // Black around the frame when the window's shape isn't the display's.
+            let window = WINDOW.load(Ordering::Acquire);
+            if !window.is_null() {
+                let view = msg0(window, sel("contentView"));
+                msg_bool(view, sel("setWantsLayer:"), 1);
+                let layer = msg0(view, sel("layer"));
+                let black = CGColorCreateGenericGray(0.0, 1.0);
+                if !layer.is_null() && !black.is_null() {
+                    msg_id(layer, sel("setBackgroundColor:"), black);
+                }
+                if !black.is_null() {
+                    CFRelease(black);
+                }
+            }
+        }
+        relayout();
+    }
+}
+
+/// Resizes the window's content area, from any thread.
+pub fn resize(w: f64, h: f64) {
+    extern "C" fn on_main(context: *mut c_void) {
+        let size = unsafe { Box::from_raw(context as *mut NSSize) };
+        let window = WINDOW.load(Ordering::Acquire);
+        if !window.is_null() {
+            let f: unsafe extern "C" fn(*mut c_void, *mut c_void, NSSize) = unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+            unsafe { f(window, sel("setContentSize:"), *size) };
+            relayout();
+        }
+    }
+    let size = Box::new(NSSize { width: w.max(100.0), height: h.max(100.0) });
+    unsafe { dispatch_async_f(&raw const _dispatch_main_q, Box::into_raw(size) as *mut c_void, on_main) };
+}
+
+/// The frame's size, for fitting it to the window and placing the pointer on it.
+pub fn set_shown_size(w: u32, h: u32) {
+    SHOWN_SIZE.store((w as u64) << 32 | h as u64, Ordering::Relaxed);
+}
+
+/// Moves the renderer's view to where the frame now belongs, if that changed:
+/// the window was resized or went to a screen of another density (UI thread).
+fn relayout() {
+    let Some((attach, _)) = RENDERER.get() else { return };
+    let window = WINDOW.load(Ordering::Acquire);
+    if window.is_null() {
+        return;
+    }
+    let (bounds, dpr) = unsafe {
+        let view = msg0(window, sel("contentView"));
+        if view.is_null() {
+            return;
+        }
+        (msg_rect(view, sel("bounds")), msg_f64_ret(window, sel("backingScaleFactor")))
+    };
+    let r = shown_rect(bounds);
+    let (w, h) = (r.w.floor().max(1.0), r.h.floor().max(1.0));
+    let p = Placement {
+        x: ((bounds.size.width - w) / 2.0).round() as i32,
+        y: ((bounds.size.height - h) / 2.0).round() as i32,
+        w: w as i32,
+        h: h as i32,
+        dpr: dpr.max(1.0) as f32,
+    };
+    {
+        let mut placed = PLACED.lock().unwrap_or_else(|e| e.into_inner());
+        if *placed == Some(p) {
+            return;
+        }
+        *placed = Some(p);
+    }
+    attach(window, p);
+    // Creating the renderer's view (the first time, or after it failed) orders the
+    // window front and makes it key.
+    if background() {
+        unsafe { msg_id(window, sel("orderBack:"), std::ptr::null_mut()) };
+    }
 }
 
 /// Puts the newest frame into the window's layer (UI thread only).
@@ -318,33 +456,45 @@ struct UiJob {
 // The pointer is a gfxstream cookie handed back to the callback on the UI thread.
 unsafe impl Send for UiJob {}
 
-static UI_QUEUE: Mutex<Vec<UiJob>> = Mutex::new(Vec::new());
+#[link(name = "System")]
+unsafe extern "C" {
+    static _dispatch_main_q: c_void;
+    fn dispatch_async_f(queue: *const c_void, context: *mut c_void, work: extern "C" fn(*mut c_void));
+}
+
+/// Runs a job from the main dispatch queue, which the UI thread's run loop serves
+/// while it waits for events and while AppKit tracks a resize.
+extern "C" fn run_ui_job(context: *mut c_void) {
+    let job = unsafe { Box::from_raw(context as *mut UiJob) };
+    // While AppKit tracks a resize, the pump doesn't run but these do: the frame
+    // follows the window's edge as it moves.
+    relayout();
+    let span = crate::kernel::trace::span("ui: renderer job");
+    unsafe { (job.f)(job.data) };
+    drop(span);
+    let (lock, cv) = &*job.done;
+    *lock.lock().unwrap_or_else(|p| p.into_inner()) = true;
+    cv.notify_all();
+}
 
 /// gfxstream asks the host to run a present on the thread that owns the window.
-/// The library's default of this is a no-op, which drops the frame.
+/// The library's default of this is a no-op, which drops the frame. Jobs go to the
+/// main dispatch queue, so they run as soon as the UI thread is free, not at its
+/// next turn of pumping events.
 pub fn run_on_ui_thread(f: unsafe extern "C" fn(*mut c_void), data: *mut c_void, wait: bool) {
     if unsafe { libc::pthread_main_np() } != 0 {
         unsafe { f(data) };
         return;
     }
     let done = std::sync::Arc::new((Mutex::new(false), Condvar::new()));
-    UI_QUEUE.lock().unwrap_or_else(|p| p.into_inner()).push(UiJob { f, data, done: done.clone() });
+    let job = Box::new(UiJob { f, data, done: done.clone() });
+    unsafe { dispatch_async_f(&raw const _dispatch_main_q, Box::into_raw(job) as *mut c_void, run_ui_job) };
     if wait {
         let (lock, cv) = &*done;
         let mut flag = lock.lock().unwrap_or_else(|p| p.into_inner());
         while !*flag {
             flag = cv.wait(flag).unwrap_or_else(|p| p.into_inner());
         }
-    }
-}
-
-fn drain_ui() {
-    let jobs = std::mem::take(&mut *UI_QUEUE.lock().unwrap_or_else(|p| p.into_inner()));
-    for job in jobs {
-        unsafe { (job.f)(job.data) };
-        let (lock, cv) = &*job.done;
-        *lock.lock().unwrap_or_else(|p| p.into_inner()) = true;
-        cv.notify_all();
     }
 }
 
@@ -612,9 +762,23 @@ fn check_lost_input() {
     }
 }
 
+/// Whether any of the window is on screen, as AppKit last said (UI thread writes).
+static ON_SCREEN: AtomicBool = AtomicBool::new(true);
+
+/// Whether any of the window can be seen: not covered, minimized or on another Space.
+pub fn on_screen() -> bool {
+    ON_SCREEN.load(Ordering::Relaxed)
+}
+
 fn pump_once(wait_s: f64) {
-    drain_ui();
     show_frame();
+    relayout();
+    let window = WINDOW.load(Ordering::Acquire);
+    if !window.is_null() {
+        const NS_WINDOW_OCCLUSION_STATE_VISIBLE: i64 = 1 << 1;
+        let state = unsafe { msg_i64_ret(window, sel("occlusionState")) };
+        ON_SCREEN.store(state & NS_WINDOW_OCCLUSION_STATE_VISIBLE != 0, Ordering::Relaxed);
+    }
     crate::kernel::evdev::scroll_idle(Duration::from_millis(100));
     check_lost_input();
     let app = APP.load(Ordering::Acquire);
@@ -633,7 +797,6 @@ fn pump_once(wait_s: f64) {
             msg_void(app, sel("updateWindows"));
         }
     }
-    drain_ui();
 }
 
 pub fn pump_until(done: &std::sync::atomic::AtomicBool) {

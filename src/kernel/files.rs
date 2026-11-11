@@ -86,6 +86,8 @@ pub enum Kind {
     Random,
     /// The kernel log: writes go to the host's stderr.
     Kmsg,
+    /// tracefs's trace_marker: see trace.rs.
+    TraceMarker,
     Node(Mutex<NodeFile>),
     /// A writable regular file (tmpfs or memfd): live contents.
     Mem(MemOpen),
@@ -517,7 +519,7 @@ pub(super) fn poll_ready(f: &File, t: &Thread, depth: u32) -> u16 {
         Kind::Null | Kind::Zero | Kind::Random | Kind::Mem(_) | Kind::Block(_) | Kind::LoopControl | Kind::DmControl | Kind::Special(_) | Kind::DmaBuf(_) | Kind::Ashmem(_) => POLLIN | POLLOUT,
         Kind::Drm(d) => d.poll_bits(),
         Kind::Sync(s) => s.poll(),
-        Kind::Kmsg => POLLOUT,
+        Kind::Kmsg | Kind::TraceMarker => POLLOUT,
         Kind::Pipe(end) => {
             let st = end.pipe.st.lock().unwrap();
             if end.write {
@@ -1214,6 +1216,7 @@ impl Kernel {
                 0x105 => Kind::Zero,
                 0x108 | 0x109 => Kind::Random,
                 0x10b => Kind::Kmsg,
+                super::trace::MARKER_RDEV => Kind::TraceMarker,
                 super::pty::PTMX => Kind::Pty(super::pty::open_master(self.vfs.clone())?),
                 r if super::pty::is_slave(r) => Kind::Pty(super::pty::open_slave(r)?),
                 r if r == block::makedev(block::MISC_MAJOR, block::LOOP_CONTROL_MINOR) => Kind::LoopControl,
@@ -1576,6 +1579,7 @@ impl Kernel {
                 v
             }
             Kind::Null | Kind::Kmsg => Vec::new(),
+            Kind::TraceMarker => return Err(EINVAL),
             Kind::Zero => vec![0; count],
             Kind::Random => {
                 let mut v = vec![0; count];
@@ -1689,6 +1693,10 @@ impl Kernel {
             Kind::Stdout => std::io::stdout().write_all(&data).and_then(|_| std::io::stdout().flush()).map(|_| data.len()).map_err(|_| EIO)?,
             Kind::Stderr => std::io::stderr().write_all(&data).map(|_| data.len()).map_err(|_| EIO)?,
             Kind::Null | Kind::Zero | Kind::Random => data.len(),
+            Kind::TraceMarker => {
+                super::trace::marker(t.proc.pid, t.tid, &data);
+                data.len()
+            }
             Kind::Kmsg => {
                 // "<prio>tag: message" records, one per write.
                 let text = String::from_utf8_lossy(&data);
@@ -1796,6 +1804,7 @@ impl Kernel {
             Kind::Zero => chr(0x0105),
             Kind::Random => chr(0x0109),
             Kind::Kmsg => chr(0x010b),
+            Kind::TraceMarker => Stat { mode: 0o020222, nlink: 1, rdev: super::trace::MARKER_RDEV, ..Default::default() },
             Kind::Pipe(_) => Stat { mode: 0o010600, nlink: 1, ..Default::default() },
             Kind::Socket(_) | Kind::Netlink(_) | Kind::Inet(_) | Kind::Vsock(_) => Stat { mode: 0o140777, nlink: 1, ..Default::default() },
             Kind::Event(_) | Kind::Timer(_) | Kind::Signal(_) | Kind::Epoll(_) | Kind::Bpf(_) | Kind::Sync(_) | Kind::Inotify(_) | Kind::Uffd(_) => Stat { mode: 0o600, nlink: 1, ..Default::default() }, // anon_inode
@@ -2180,6 +2189,7 @@ pub(super) fn file_name(f: &File) -> String {
         Kind::Zero => "/dev/zero".into(),
         Kind::Random => "/dev/urandom".into(),
         Kind::Kmsg => "/dev/kmsg".into(),
+        Kind::TraceMarker => "/sys/kernel/tracing/trace_marker".into(),
         Kind::Pipe(p) => format!("pipe:[{}]", Arc::as_ptr(&p.pipe) as usize % 100_000),
         Kind::Socket(s) => format!("socket:[{}]", Arc::as_ptr(s) as usize % 100_000),
         Kind::Netlink(s) => format!("socket:[{}]", Arc::as_ptr(s) as usize % 100_000),
@@ -2236,6 +2246,9 @@ impl super::drm::Io for DrmIo<'_> {
             Kind::DmaBuf(d) => Ok(d.clone()),
             _ => Err(EINVAL),
         }
+    }
+    fn ids(&self) -> (i32, i32) {
+        (self.t.proc.pid, self.t.tid)
     }
     fn comm(&self) -> String {
         let c = self.t.attrs.lock().unwrap().comm.clone();

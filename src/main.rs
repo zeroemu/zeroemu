@@ -40,10 +40,13 @@ fn main() -> ExitCode {
     let default = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         default(info);
+        kernel::trace::flush_if_free();
         eprintln!("[droidrt] internal error in {}; stopping", std::thread::current().name().unwrap_or("?"));
         std::process::exit(101);
     }));
-    match run() {
+    let result = run();
+    kernel::trace::flush();
+    match result {
         Ok(code) => ExitCode::from(code as u8),
         Err(e) => {
             eprintln!("droidrt: {e}");

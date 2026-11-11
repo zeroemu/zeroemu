@@ -146,11 +146,13 @@ pub fn open(devt: u64) -> Option<Arc<Client>> {
 /// anything it thinks is more than ten seconds old.
 static BOOT: OnceLock<Instant> = OnceLock::new();
 
-pub fn set_boot(at: Instant) {
-    let _ = BOOT.set(at);
+/// CLOCK_MONOTONIC's zero, fixed by whoever asks first: the kernel's clock, input
+/// events and the GPU's fence and flip times all count from it.
+pub fn boot_instant() -> Instant {
+    *BOOT.get_or_init(Instant::now)
 }
 
-fn since_boot() -> Duration {
+pub(crate) fn since_boot() -> Duration {
     BOOT.get_or_init(Instant::now).elapsed()
 }
 
@@ -388,6 +390,11 @@ pub fn start_input_fifo() {
                     ["wheel", x, y, dx, dy] => {
                         if let (Ok(x), Ok(y), Ok(dx), Ok(dy)) = (x.parse(), y.parse(), dx.parse(), dy.parse()) {
                             scroll(Scroll::Wheel, x, y, dx, dy);
+                        }
+                    }
+                    ["resize", w, h] => {
+                        if let (Ok(w), Ok(h)) = (w.parse(), h.parse()) {
+                            crate::gpu::resize_window(w, h);
                         }
                     }
                     ["shot", path] => {

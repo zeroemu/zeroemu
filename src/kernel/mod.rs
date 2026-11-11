@@ -44,6 +44,7 @@ mod signal;
 mod specialfd;
 mod sysctl;
 mod timers;
+pub(crate) mod trace;
 mod unix;
 mod vcpus;
 mod vsock;
@@ -609,6 +610,11 @@ fn dump_signal() -> libc::sigset_t {
 }
 
 /// Wakeups since last asked, for DROIDRT_GPU_STATS.
+/// The guest's CLOCK_MONOTONIC now, in nanoseconds.
+pub(crate) fn monotonic_ns() -> u64 {
+    evdev::since_boot().as_nanos() as u64
+}
+
 pub fn wakeup_stats(over: Duration) -> String {
     static LAST: Mutex<(u64, u64)> = Mutex::new((0, 0));
     let (plain, keyed) = (wait::BUMPS_PLAIN.load(Ordering::Relaxed), wait::BUMPS_KEYED.load(Ordering::Relaxed));
@@ -1018,11 +1024,7 @@ impl Kernel {
             phys,
             kwin,
             strace,
-            boot: {
-                let now = Instant::now();
-                evdev::set_boot(now);
-                now
-            },
+            boot: evdev::boot_instant(),
             timers: timers::TimerQueue::new(me.clone()),
             procs: Mutex::new(HashMap::new()),
             next_id: AtomicI32::new(1),
@@ -1157,6 +1159,7 @@ impl Kernel {
     }
 
     fn dump_threads(&self) {
+        trace::flush();
         if crate::vfs::memstat_on() {
             self.memory_report();
         }
@@ -1260,6 +1263,7 @@ impl Kernel {
                 }
                 // Again while saving: this time they mean it.
                 if unsafe { libc::sigwait(&exit_signals(), &mut sig) } == 0 {
+                    trace::flush();
                     std::process::exit(128 + sig);
                 }
             });

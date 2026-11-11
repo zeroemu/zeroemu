@@ -30,6 +30,11 @@ pub fn shown_frame() -> Option<(u32, u32, Vec<u8>)> {
     None
 }
 
+/// TODO: the frame's size, once there is a window to fit it to.
+pub fn set_shown_size(w: u32, h: u32) {
+    let _ = (w, h);
+}
+
 pub fn window_id() -> Option<u64> {
     None
 }
@@ -42,4 +47,9 @@ pub fn pump_until(done: &AtomicBool) {
 
 pub fn pump_for(secs: f64) {
     std::thread::sleep(Duration::from_secs_f64(secs));
+}
+
+/// TODO: whether the window can be seen, once there is one.
+pub fn on_screen() -> bool {
+    true
 }

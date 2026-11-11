@@ -18,7 +18,6 @@ use crate::vfs::FileSystem;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 const DRM_MAJOR: u32 = 226;
 const FB_W: u32 = 1080;
@@ -83,6 +82,10 @@ pub trait Io {
     fn sync_of(&mut self, fd: i64) -> Result<SyncFile, i64>;
     fn dma_of(&mut self, fd: i64) -> Result<DmaBuf, i64>;
     fn comm(&self) -> String;
+    /// The calling thread's pid and tid, for DROIDRT_TRACE.
+    fn ids(&self) -> (i32, i32) {
+        (0, 0)
+    }
     fn wait_until(&mut self, pred: &mut dyn FnMut() -> bool) -> Result<(), i64>;
 }
 
@@ -120,8 +123,11 @@ fn ioc_type(cmd: u64) -> u32 {
     ((cmd >> 8) & 0xff) as u32
 }
 
+/// CLOCK_MONOTONIC, as DRM_CAP_TIMESTAMP_MONOTONIC promises: fence signal times,
+/// vblank and page-flip events. SurfaceFlinger models vsync from present fences'
+/// signal times, and HWUI times frames by them.
 fn now_ns() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64)
+    super::monotonic_ns()
 }
 
 fn modeinfo() -> [u8; 68] {
@@ -185,10 +191,15 @@ impl SyncPoint {
     }
 
     fn signal(&self) {
+        if self.signaled.load(Ordering::Acquire) {
+            return;
+        }
+        // The time first: whoever sees the point signaled (Acquire) sees when. A second
+        // signal racing this one keeps the first time.
+        let _ = self.ns.compare_exchange(0, now_ns().max(1), Ordering::Relaxed, Ordering::Relaxed);
         if self.signaled.swap(true, Ordering::AcqRel) {
             return;
         }
-        self.ns.store(now_ns(), Ordering::Relaxed);
         EVENTS.bump_key(GPU_KEY);
     }
 
@@ -563,7 +574,12 @@ fn trace() -> bool {
 }
 
 pub fn ioctl(o: &Open, cmd: u64, arg: u64, io: &mut dyn Io) -> Result<i64, i64> {
+    let span = super::trace::enabled().then(|| {
+        let (pid, tid) = io.ids();
+        super::trace::guest_span(pid, tid, &format!("drm {}", ioctl_name(cmd)))
+    });
     let r = dispatch(o, cmd, arg, io);
+    drop(span);
     let shown = match &r {
         Ok(v) => v.to_string(),
         Err(e) => format!("-{e}"),
@@ -1561,6 +1577,7 @@ fn mode_atomic(o: &Open, arg: u64, io: &mut dyn Io) -> Result<i64, i64> {
         cursor += n;
     }
     if in_fd >= 0 {
+        let _span = super::trace::span("drm commit: wait in-fence");
         let sync = io.sync_of(in_fd as i64)?;
         for p in sync.points {
             if !p.ready() {
@@ -1611,11 +1628,10 @@ fn wait_vblank(o: &Open, arg: u64, io: &mut dyn Io) -> Result<i64, i64> {
     };
     wu32(&mut b, 4, seq);
     let ns = now_ns();
-    wu32(&mut b, 12, (ns / 1_000_000_000) as u32); // reply starts after the request's 8 bytes? 
-    // The union is { request, reply }. reply: { type, sequence, tval_sec, tval_usec }.
-    wu32(&mut b, 8, (ns / 1_000_000_000) as u32);
-    if b.len() >= 16 {
-        wu32(&mut b, 12, ((ns / 1000) % 1_000_000) as u32);
+    // The union's reply: { u32 type, u32 sequence, long tval_sec, long tval_usec }.
+    if b.len() >= 24 {
+        wu64(&mut b, 8, ns / 1_000_000_000);
+        wu64(&mut b, 16, (ns / 1000) % 1_000_000);
     }
     store(io, arg, &b)?;
     Ok(0)

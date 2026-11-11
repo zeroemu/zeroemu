@@ -9,7 +9,7 @@ use super::window::{self, NativeWindow};
 use super::{Blob, Box3, Fence, GpuBackend, Iov, Resource3d, ResourceInfo, Transfer};
 use std::ffi::{CStr, CString, c_void};
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::time::{Duration, Instant};
 
@@ -151,7 +151,12 @@ type FnCreateBlob = unsafe extern "C" fn(u32, u32, *const CBlob, *const Iovec, u
 type FnMap = unsafe extern "C" fn(u32, *mut *mut c_void, *mut u64) -> i32;
 type FnUnmap = unsafe extern "C" fn(u32) -> i32;
 type FnMapInfo = unsafe extern "C" fn(u32, *mut u32) -> i32;
-type FnSetup = unsafe extern "C" fn(*mut c_void, i32, i32, i32, i32, i32, i32);
+/// FrameBuffer::getFB(): the renderer's display, or null before init.
+type FnGetFb = unsafe extern "C" fn() -> *mut c_void;
+/// FrameBuffer::setupSubWindow(this, window, x, y, w, h, fb_w, fb_h, dpr, rotation,
+/// delete_existing, hide): what gfxstream_backend_setup_window ends in, there with a
+/// pixel ratio fixed at 1. True when the subwindow is up.
+type FnSetupSubWindow = unsafe extern "C" fn(*mut c_void, *mut c_void, i32, i32, i32, i32, i32, i32, f32, f32, bool, bool) -> bool;
 type FnTeardown = unsafe extern "C" fn();
 
 struct Api {
@@ -176,7 +181,8 @@ struct Api {
     resource_map: FnMap,
     resource_unmap: FnUnmap,
     map_info: FnMapInfo,
-    setup_window: FnSetup,
+    /// FrameBuffer::getFB and setupSubWindow, C++ methods this build exports.
+    subwindow: Option<(FnGetFb, FnSetupSubWindow)>,
     teardown: FnTeardown,
 }
 
@@ -232,6 +238,17 @@ impl Worker {
     }
 }
 
+/// What droidrt knows of a pipe resource.
+#[derive(Clone, Copy, Default)]
+struct Pipe {
+    /// Its first write, the guest's connect, has been made.
+    connected: bool,
+    /// The context it was attached to last, whose pipe the renderer uses for it.
+    ctx: u32,
+    /// It has been attached to more than one context.
+    shared: bool,
+}
+
 struct FenceSlot {
     handler: Option<Arc<dyn Fn(Fence) + Send + Sync>>,
     pending: Vec<Fence>,
@@ -241,9 +258,29 @@ pub struct Gfxstream {
     api: Api,
     worker: Worker,
     live: Mutex<bool>,
-    fences: Mutex<FenceSlot>,
+    /// The renderer's user-data cookie: it holds a reference of its own, never given
+    /// back, as the renderer's threads can outlive this (see Drop).
+    fences: Arc<Mutex<FenceSlot>>,
     /// The last scanout read back for the window.
     frame: Mutex<Vec<u8>>,
+    /// The renderer draws scanouts into the window itself, rather than droidrt
+    /// reading them back to show.
+    direct: AtomicBool,
+    /// The resource last shown.
+    scanout: AtomicU32,
+    /// Resources that are a context's pipe to its render thread: the guest's GLES
+    /// stream (emulation EGL sends it over the pipe, not ASG). Their transfers touch
+    /// no GL state and a read waits for the render thread's reply, so they run on the
+    /// calling thread, not the worker every other context waits on.
+    pipes: Mutex<std::collections::HashMap<u32, Pipe>>,
+    /// One pipe transfer at a time per context: gfxstream's pipe state has no lock.
+    pipe_ctx: Mutex<std::collections::HashMap<u32, Arc<Mutex<()>>>>,
+    /// The renderer's resource and context maps have no lock of their own. Calls
+    /// that insert or erase entries hold this exclusively, on the worker; pipe
+    /// transfers, which only look entries up, share it.
+    maps: std::sync::RwLock<()>,
+    /// The renderer's subwindow is (or was) up: teardown must remove it first.
+    subwindow: AtomicBool,
     // Kept mapped for the process lifetime. dlclose races the renderer's threads.
     _lib: *mut c_void,
 }
@@ -343,8 +380,9 @@ extern "C" fn on_debug(_user: *mut c_void, dbg: *const CDebug) {
 }
 
 /// DROIDRT_GPU_STATS=1: every five seconds, how many frames went to the window and
-/// what reading them back cost. A frame's budget is 16 ms.
-fn flush_stats(took: Duration, frame: &[u8]) {
+/// what showing them cost the composer: reading each back, or handing it to the
+/// renderer to draw (`frame` is None). A frame's budget is 16 ms.
+fn flush_stats(took: Duration, frame: Option<&[u8]>) {
     struct Window {
         since: Instant,
         frames: u32,
@@ -361,7 +399,7 @@ fn flush_stats(took: Duration, frame: &[u8]) {
     let w = g.get_or_insert_with(|| Window { since: Instant::now(), frames: 0, black: 0, total: Duration::ZERO, worst: Duration::ZERO });
     w.frames += 1;
     // A sample is plenty, as a frame is either wholly black or it isn't. Alpha aside.
-    if frame.chunks_exact(4).step_by(1009).all(|p| p[..3] == [0, 0, 0] || p[1..] == [0, 0, 0]) {
+    if frame.is_some_and(|f| f.chunks_exact(4).step_by(1009).all(|p| p[..3] == [0, 0, 0] || p[1..] == [0, 0, 0])) {
         w.black += 1;
     }
     w.total += took;
@@ -369,11 +407,13 @@ fn flush_stats(took: Duration, frame: &[u8]) {
     let elapsed = w.since.elapsed();
     if elapsed >= Duration::from_secs(5) {
         eprintln!(
-            "droidrt: display {:.1} fps, {} black, readback avg {:.1} ms, worst {:.1} ms; {}",
+            "droidrt: display {:.1} fps, {} black, {} avg {:.1} ms, worst {:.1} ms, window {}; {}",
             w.frames as f64 / elapsed.as_secs_f64(),
             w.black,
+            if frame.is_some() { "readback" } else { "post" },
             w.total.as_secs_f64() * 1000.0 / w.frames as f64,
             w.worst.as_secs_f64() * 1000.0,
+            if window::on_screen() { "on screen" } else { "covered" },
             crate::kernel::wakeup_stats(elapsed)
         );
         *g = None;
@@ -384,11 +424,11 @@ extern "C" fn on_fence(user: *mut c_void, fence: *const CFence) {
     if user.is_null() || fence.is_null() {
         return;
     }
-    let g = unsafe { &*(user as *const Gfxstream) };
+    let fences = unsafe { &*(user as *const Mutex<FenceSlot>) };
     let f = unsafe { &*fence };
     let fence = Fence { flags: f.flags, fence_id: f.fence_id, ctx_id: f.ctx_id, ring_idx: f.ring_idx };
     let handler = {
-        let mut slot = g.fences.lock().unwrap_or_else(|p| p.into_inner());
+        let mut slot = fences.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(h) = slot.handler.clone() {
             h
         } else {
@@ -419,8 +459,14 @@ pub fn open(width: u32, height: u32) -> Result<Arc<dyn GpuBackend>, String> {
         api,
         worker: Worker::spawn(),
         live: Mutex::new(false),
-        fences: Mutex::new(FenceSlot { handler: None, pending: Vec::new() }),
+        fences: Arc::new(Mutex::new(FenceSlot { handler: None, pending: Vec::new() })),
         frame: Mutex::new(Vec::new()),
+        direct: AtomicBool::new(false),
+        scanout: AtomicU32::new(0),
+        pipes: Mutex::new(std::collections::HashMap::new()),
+        pipe_ctx: Mutex::new(std::collections::HashMap::new()),
+        maps: std::sync::RwLock::new(()),
+        subwindow: AtomicBool::new(false),
         _lib: lib,
     });
     gfx.start(width, height, &win)?;
@@ -451,7 +497,7 @@ impl Gfxstream {
         // The guest's gralloc is minigbm, as in the Android Emulator's
         // virtio-gpu mode; DROIDRT_GPU_FEATURES overrides ("Name:enabled,...").
         let features = std::ffi::CString::new(std::env::var("DROIDRT_GPU_FEATURES").unwrap_or_else(|_| "Minigbm:enabled".into())).unwrap_or_default();
-        let user = Arc::as_ptr(self) as usize as u64;
+        let user = Arc::into_raw(self.fences.clone()) as usize as u64;
         let mut params = [
             Param { key: PARAM_USER_DATA, value: user },
             Param { key: PARAM_RENDERER_FLAGS, value: RENDERER_FLAGS },
@@ -470,11 +516,50 @@ impl Gfxstream {
         *self.live.lock().unwrap_or_else(|p| p.into_inner()) = true;
         #[cfg(target_os = "macos")]
         install_window_ops(self._lib);
-        // No gfxstream subwindow: it renders at a device pixel ratio of 1 (its
-        // C entry point takes none), so Retina screens showed a magnified
-        // corner. flush() reads frames back and the window shows them instead.
-        let _ = (win, fb_w, fb_h, self.api.setup_window);
+        #[cfg(target_os = "macos")]
+        self.attach_window();
+        let _ = (win, fb_w, fb_h);
         Ok(())
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Gfxstream {
+    /// Has the renderer draw each scanout straight into the window, as the Android
+    /// Emulator does, instead of droidrt reading it back. gfxstream's own
+    /// setup_window entry point fixes the pixel ratio at 1, which showed a magnified
+    /// corner on Retina screens; the method it ends in takes the real ratio.
+    /// DROIDRT_READBACK=1 keeps the old way.
+    fn attach_window(self: &Arc<Self>) {
+        let Some((get_fb, setup)) = self.api.subwindow else { return };
+        if std::env::var_os("DROIDRT_READBACK").is_some() {
+            return;
+        }
+        let me = Arc::downgrade(self);
+        let attach = move |win: *mut c_void, p: window::Placement| {
+            // The UI thread. The rectangle is the view's from its top left, in points;
+            // the frame fills it, at p.dpr pixels per point. Not once the renderer is
+            // going away.
+            let Some(g) = me.upgrade() else { return };
+            let fb = unsafe { get_fb() };
+            if !fb.is_null() {
+                g.subwindow.store(true, Ordering::Release);
+            }
+            let up = !fb.is_null() && unsafe { setup(fb, win, p.x, p.y, p.w, p.h, p.w, p.h, p.dpr, 0.0, false, false) };
+            g.direct.store(up, Ordering::Release);
+            if !up {
+                eprintln!("droidrt: the renderer can't draw into the window ({p:?}); reading frames back");
+            }
+        };
+        let me = Arc::downgrade(self);
+        let source = move || {
+            let g = me.upgrade()?;
+            let handle = g.scanout.load(Ordering::Acquire);
+            let info = g.resource_info(handle)?;
+            let (w, h, px) = g.read_pixels(handle)?;
+            Some((w, h, info.drm_fourcc, px))
+        };
+        window::attach_renderer(Box::new(attach), Box::new(source));
     }
 }
 
@@ -486,8 +571,12 @@ impl Drop for Gfxstream {
             *g = false;
             was
         };
-        if live {
-            self.worker.run(|| unsafe { (self.api.teardown)() });
+        // Once it has drawn into the window, the renderer can't be torn down: its
+        // teardown destroys the post worker that posts queued on the UI thread still
+        // point at, and removes the subwindow off the UI thread. This only happens as
+        // droidrt exits, which frees everything anyway.
+        if live && !self.subwindow.load(Ordering::Acquire) {
+            self.exclusive(|| unsafe { (self.api.teardown)() });
         }
     }
 }
@@ -509,11 +598,12 @@ impl GpuBackend for Gfxstream {
 
     fn context_create(&self, ctx_id: u32, name: &str, context_init: u32) -> Result<(), i64> {
         let c = CString::new(name).map_err(|_| 22i64)?;
-        ck(self.worker.run(|| unsafe { (self.api.context_create)(ctx_id, c.as_bytes().len() as u32, c.as_ptr(), context_init) }))
+        ck(self.exclusive(|| unsafe { (self.api.context_create)(ctx_id, c.as_bytes().len() as u32, c.as_ptr(), context_init) }))
     }
 
     fn context_destroy(&self, ctx_id: u32) {
-        self.worker.run(|| unsafe { (self.api.context_destroy)(ctx_id) });
+        self.exclusive(|| unsafe { (self.api.context_destroy)(ctx_id) });
+        self.pipe_ctx.lock().unwrap_or_else(|p| p.into_inner()).remove(&ctx_id);
     }
 
     fn submit(&self, ctx_id: u32, cmds: &[u8], in_fences: &[u64]) -> Result<(), i64> {
@@ -548,44 +638,63 @@ impl GpuBackend for Gfxstream {
         };
         let buf = iov_buf(&iov);
         let ptr = if buf.is_empty() { std::ptr::null() } else { buf.as_ptr() };
-        ck(self.worker.run(|| unsafe { (self.api.resource_create)(&c, ptr, buf.len() as u32) }))
+        ck(self.exclusive(|| unsafe { (self.api.resource_create)(&c, ptr, buf.len() as u32) }))?;
+        // As the renderer tells them apart (GetResourceType).
+        const PIPE_BUFFER: u32 = 0;
+        const VIRGL_BIND_CUSTOM: u32 = 1 << 17;
+        if args.target == PIPE_BUFFER && args.bind == VIRGL_BIND_CUSTOM {
+            self.pipes.lock().unwrap_or_else(|p| p.into_inner()).insert(args.handle, Pipe::default());
+        }
+        Ok(())
     }
 
     fn resource_create_blob(&self, ctx_id: u32, handle: u32, blob: &Blob, iov: Iov) -> Result<(), i64> {
         let c = CBlob { blob_mem: blob.blob_mem, blob_flags: blob.blob_flags, blob_id: blob.blob_id, size: blob.size };
         let buf = iov_buf(&iov);
         let ptr = if buf.is_empty() { std::ptr::null() } else { buf.as_ptr() };
-        ck(self.worker.run(|| unsafe { (self.api.create_blob)(ctx_id, handle, &c, ptr, buf.len() as u32, std::ptr::null()) }))
+        ck(self.exclusive(|| unsafe { (self.api.create_blob)(ctx_id, handle, &c, ptr, buf.len() as u32, std::ptr::null()) }))
     }
 
     fn resource_unref(&self, handle: u32) {
-        self.worker.run(|| unsafe { (self.api.resource_unref)(handle) });
+        self.pipes.lock().unwrap_or_else(|p| p.into_inner()).remove(&handle);
+        self.exclusive(|| unsafe { (self.api.resource_unref)(handle) });
     }
 
     fn attach_iov(&self, handle: u32, iov: Iov) -> Result<(), i64> {
         let buf = iov_buf(&iov);
         let ptr = if buf.is_empty() { std::ptr::null() } else { buf.as_ptr() };
-        ck(self.worker.run(|| unsafe { (self.api.attach_iov)(handle as i32, ptr, buf.len() as i32) }))
+        ck(self.for_resource(handle, || unsafe { (self.api.attach_iov)(handle as i32, ptr, buf.len() as i32) }))
     }
 
     fn detach_iov(&self, handle: u32) {
-        self.worker.run(|| unsafe { (self.api.detach_iov)(handle as i32) });
+        self.for_resource(handle, || unsafe { (self.api.detach_iov)(handle as i32) });
     }
 
     fn ctx_attach_resource(&self, ctx_id: u32, handle: u32) {
-        self.worker.run(|| unsafe { (self.api.ctx_attach)(ctx_id as i32, handle as i32) });
+        self.for_resource(handle, || unsafe { (self.api.ctx_attach)(ctx_id as i32, handle as i32) });
+        // The renderer moves a pipe resource onto the pipe of the context it was
+        // attached to last.
+        if let Some(p) = self.pipes.lock().unwrap_or_else(|p| p.into_inner()).get_mut(&handle) {
+            p.shared |= p.ctx != 0 && p.ctx != ctx_id;
+            p.ctx = ctx_id;
+        }
     }
 
     fn ctx_detach_resource(&self, ctx_id: u32, handle: u32) {
-        self.worker.run(|| unsafe { (self.api.ctx_detach)(ctx_id as i32, handle as i32) });
+        self.for_resource(handle, || unsafe { (self.api.ctx_detach)(ctx_id as i32, handle as i32) });
+        if let Some(p) = self.pipes.lock().unwrap_or_else(|p| p.into_inner()).get_mut(&handle)
+            && p.ctx == ctx_id
+        {
+            p.ctx = 0;
+        }
     }
 
     fn transfer_write(&self, handle: u32, t: &Transfer) -> Result<(), i64> {
-        self.xfer(self.api.transfer_write, handle, t)
+        self.xfer(self.api.transfer_write, handle, t, true)
     }
 
     fn transfer_read(&self, handle: u32, t: &Transfer) -> Result<(), i64> {
-        self.xfer(self.api.transfer_read, handle, t)
+        self.xfer(self.api.transfer_read, handle, t, false)
     }
 
     fn resource_info(&self, handle: u32) -> Option<ResourceInfo> {
@@ -618,12 +727,12 @@ impl GpuBackend for Gfxstream {
     fn resource_map(&self, handle: u32) -> Result<(*mut u8, u64), i64> {
         let mut ptr = std::ptr::null_mut();
         let mut size = 0u64;
-        ck(self.worker.run(|| unsafe { (self.api.resource_map)(handle, &mut ptr, &mut size) }))?;
+        ck(self.for_resource(handle, || unsafe { (self.api.resource_map)(handle, &mut ptr, &mut size) }))?;
         Ok((ptr as *mut u8, size))
     }
 
     fn resource_unmap(&self, handle: u32) {
-        self.worker.run(|| unsafe { (self.api.resource_unmap)(handle) });
+        self.for_resource(handle, || unsafe { (self.api.resource_unmap)(handle) });
     }
 
     fn map_info(&self, handle: u32) -> Option<u32> {
@@ -632,9 +741,31 @@ impl GpuBackend for Gfxstream {
         if r == 0 { Some(info) } else { None }
     }
 
-    /// Shows a scanout: reads it back into host memory and hands it to the
-    /// window, which draws it on the UI thread without blocking the guest.
+    /// Shows a scanout: the renderer draws it into the window, or, when it can't,
+    /// it's read back into host memory for the window to draw on the UI thread.
     fn flush(&self, handle: u32) {
+        if self.direct.load(Ordering::Acquire) {
+            // The renderer posts it to the window from the UI thread, and finishes the
+            // flush's task on its global timeline when it has: the composer's present
+            // fence then signals when the frame is up.
+            self.scanout.store(handle, Ordering::Release);
+            let _span = crate::kernel::trace::span("gpu flush (post)");
+            let started = Instant::now();
+            let size = self.worker.run(|| unsafe {
+                let mut info = CInfo { handle: 0, virgl_format: 0, width: 0, height: 0, depth: 0, flags: 0, tex_id: 0, stride: 0, drm_fourcc: 0 };
+                let size = ((self.api.get_info)(handle as i32, &mut info) == 0).then_some((info.width, info.height));
+                (self.api.flush)(handle);
+                size
+            });
+            if let Some((w, h)) = size {
+                window::set_shown_size(w, h);
+            }
+            flush_stats(started.elapsed(), None);
+            return;
+        }
+        if self.pipes.lock().unwrap_or_else(|p| p.into_inner()).contains_key(&handle) {
+            return; // a pipe, not a picture
+        }
         let Some(info) = self.resource_info(handle) else { return };
         let (w, h) = (info.width, info.height);
         if w == 0 || h == 0 || w > 8192 || h > 8192 {
@@ -649,10 +780,13 @@ impl GpuBackend for Gfxstream {
         if self.worker.run(|| unsafe { (self.api.transfer_read)(handle, 0, 0, stride, 0, &b, 0, &iov, 1) }) == 0 {
             window::present(w, h, stride, info.drm_fourcc, &buf);
         }
-        flush_stats(started.elapsed(), &buf);
+        flush_stats(started.elapsed(), Some(&buf));
     }
 
     fn read_pixels(&self, handle: u32) -> Option<(u32, u32, Vec<u8>)> {
+        if self.pipes.lock().unwrap_or_else(|p| p.into_inner()).contains_key(&handle) {
+            return None;
+        }
         let info = self.resource_info(handle)?;
         let (w, h) = (info.width, info.height);
         if w == 0 || h == 0 || w > 8192 || h > 8192 {
@@ -677,10 +811,55 @@ impl GpuBackend for Gfxstream {
 }
 
 impl Gfxstream {
-    fn xfer(&self, f: FnXfer, handle: u32, t: &Transfer) -> Result<(), i64> {
+    fn xfer(&self, f: FnXfer, handle: u32, t: &Transfer, write: bool) -> Result<(), i64> {
         // Null iov: the renderer uses the iovec attached to the resource.
         let b = c_box(&t.bx);
-        ck(self.worker.run(|| unsafe { f(handle, t.ctx_id, t.level, t.stride, t.layer_stride, &b, t.offset, std::ptr::null(), 0) }))
+        let call = || unsafe { f(handle, t.ctx_id, t.level, t.stride, t.layer_stride, &b, t.offset, std::ptr::null(), 0) };
+        static SERIAL: OnceLock<bool> = OnceLock::new();
+        let serial = *SERIAL.get_or_init(|| std::env::var_os("DROIDRT_GPU_SERIAL").is_some());
+        let pipe = if serial { None } else { self.pipes.lock().unwrap_or_else(|p| p.into_inner()).get(&handle).copied() };
+        match pipe {
+            None => ck(self.worker.run(call)),
+            // Connected, and on the pipe of the one context it has been attached to: on the
+            // calling thread, one transfer at a time on that pipe.
+            Some(p) if p.connected && !p.shared && p.ctx != 0 && p.ctx == t.ctx_id => {
+                let one = self.pipe_ctx.lock().unwrap_or_else(|p| p.into_inner()).entry(p.ctx).or_default().clone();
+                let _one = one.lock().unwrap_or_else(|p| p.into_inner());
+                let _shared = self.maps.read().unwrap_or_else(|p| p.into_inner());
+                ck(call())
+            }
+            // The first write is the guest's connect, which makes the renderer create the
+            // pipe's render channel. And a pipe attached to more than one context, or used
+            // from another, may share its pipe with any of them. With nothing else running.
+            Some(p) => {
+                let r = ck(self.exclusive(call));
+                if !p.connected && write && r.is_ok()
+                    && let Some(p) = self.pipes.lock().unwrap_or_else(|p| p.into_inner()).get_mut(&handle)
+                {
+                    p.connected = true;
+                }
+                r
+            }
+        }
+    }
+
+    /// A call about one resource that changes no map: on the worker, and with no
+    /// pipe transfer running if the resource is a pipe.
+    fn for_resource<R>(&self, handle: u32, f: impl FnOnce() -> R) -> R {
+        if self.pipes.lock().unwrap_or_else(|p| p.into_inner()).contains_key(&handle) {
+            self.exclusive(f)
+        } else {
+            self.worker.run(f)
+        }
+    }
+
+    /// Runs a call that inserts or erases entries in the renderer's maps: on the
+    /// worker, with no pipe transfer looking at them.
+    fn exclusive<R>(&self, f: impl FnOnce() -> R) -> R {
+        self.worker.run(|| {
+            let _only = self.maps.write().unwrap_or_else(|p| p.into_inner());
+            f()
+        })
     }
 }
 
@@ -743,7 +922,9 @@ fn load_api(lib: *mut c_void) -> Result<Api, String> {
         resource_map: lookup(lib, "stream_renderer_resource_map")?,
         resource_unmap: lookup(lib, "stream_renderer_resource_unmap")?,
         map_info: lookup(lib, "stream_renderer_resource_map_info")?,
-        setup_window: lookup(lib, "gfxstream_backend_setup_window")?,
+        subwindow: lookup(lib, "_ZN9gfxstream4host11FrameBuffer5getFBEv")
+            .and_then(|get| Ok((get, lookup(lib, "_ZN9gfxstream4host11FrameBuffer14setupSubWindowEPviiiiiiffbb")?)))
+            .ok(),
         teardown: lookup(lib, "stream_renderer_teardown")?,
     })
 }

@@ -53,6 +53,15 @@ pub fn save_shown_frame(_path: &str) -> std::io::Result<()> {
     Err(std::io::Error::other("no window on this host"))
 }
 
+/// Resizes the window's content to `w` x `h` points, as a user dragging its edge
+/// would (for tests: DROIDRT_INPUT_FIFO's `resize`).
+pub fn resize_window(w: f64, h: f64) {
+    #[cfg(target_os = "macos")]
+    window::resize(w, h);
+    #[cfg(not(target_os = "macos"))]
+    let _ = (w, h);
+}
+
 /// `f` runs when the user closes the window. It is called on the UI thread.
 pub fn on_window_closed(f: Box<dyn Fn() + Send + Sync>) {
     #[cfg(target_os = "macos")]

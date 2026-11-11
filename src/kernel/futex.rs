@@ -1,5 +1,5 @@
-//! Futexes, keyed by (process, address). Every futex is treated as private:
-//! there is no memory shared between processes yet.
+//! Futexes, keyed by (process, address), or by guest-physical address for those in
+//! memory that processes share.
 //!
 //! Lock order: the waiter table, then the address space (to read the word).
 
@@ -36,6 +36,10 @@ struct Waiter {
     bitset: u32,
     /// A PI lock waiter's tid: unlock hands it the lock.
     tid: i32,
+    /// The queue it is on now: FUTEX_REQUEUE moves waiters, and one that gives up
+    /// (a timeout, a signal) must leave the queue it was moved to. Written under the
+    /// table's lock.
+    key: Mutex<(i32, u64)>,
 }
 
 /// (pid, address) -> threads waiting there, in arrival order.
@@ -67,8 +71,9 @@ impl Futexes {
         woken as i64
     }
 
-    fn remove(&self, key: (i32, u64), w: &Arc<Waiter>) {
+    fn remove(&self, w: &Arc<Waiter>) {
         let mut map = self.waiters.lock().unwrap();
+        let key = *w.key.lock().unwrap();
         if let Some(list) = map.get_mut(&key) {
             list.retain(|x| !Arc::ptr_eq(x, w));
             if list.is_empty() {
@@ -145,6 +150,9 @@ impl Kernel {
                 }
                 let move_n = (timeout as usize).min(list.len()); // val2 travels in the timeout slot
                 let moved: Vec<_> = list.drain(..move_n).collect();
+                for w in &moved {
+                    *w.key.lock().unwrap() = key2;
+                }
                 if !list.is_empty() {
                     map.insert(key, list);
                 }
@@ -198,7 +206,7 @@ impl Kernel {
         if owner != 0 && owner != me && self.task(owner as i32).is_none() {
             return -ESRCH;
         }
-        let w = Arc::new(Waiter { woken: Mutex::new(false), cv: Condvar::new(), bitset: u32::MAX, tid: t.tid });
+        let w = Arc::new(Waiter { woken: Mutex::new(false), cv: Condvar::new(), bitset: u32::MAX, tid: t.tid, key: Mutex::new(key) });
         {
             let mut map = self.futex.waiters.lock().unwrap();
             let queued = map.get(&key).is_some_and(|l| !l.is_empty());
@@ -243,7 +251,7 @@ impl Kernel {
             };
             if let Some(err) = give_up {
                 drop(woken);
-                self.futex.remove(key, &w);
+                self.futex.remove(&w);
                 return if *w.woken.lock().unwrap() { 0 } else { err };
             }
             let nap = deadline.map_or(IDLE, |d| d.saturating_duration_since(Instant::now()).min(IDLE));
@@ -288,7 +296,7 @@ impl Kernel {
     }
 
     fn futex_wait(&self, t: &Thread, key: (i32, u64), addr: u64, val: u32, deadline: Option<Instant>, bitset: u32) -> i64 {
-        let w = Arc::new(Waiter { woken: Mutex::new(false), cv: Condvar::new(), bitset, tid: 0 });
+        let w = Arc::new(Waiter { woken: Mutex::new(false), cv: Condvar::new(), bitset, tid: 0, key: Mutex::new(key) });
         {
             let mut map = self.futex.waiters.lock().unwrap();
             match t.proc.mm().read_u32(addr) {
@@ -305,12 +313,12 @@ impl Kernel {
             }
             if deadline.is_some_and(|d| Instant::now() >= d) {
                 drop(woken);
-                self.futex.remove(key, &w);
+                self.futex.remove(&w);
                 return if *w.woken.lock().unwrap() { 0 } else { -ETIMEDOUT };
             }
             if t.interrupted() {
                 drop(woken);
-                self.futex.remove(key, &w);
+                self.futex.remove(&w);
                 return if *w.woken.lock().unwrap() { 0 } else { -EINTR };
             }
             let nap = deadline.map_or(IDLE, |d| d.saturating_duration_since(Instant::now()).min(IDLE));

@@ -42,6 +42,7 @@ pub const SS_DISABLE: i32 = 2;
 const SIG_DFL: u64 = 0;
 const SIG_IGN: u64 = 1;
 const SA_NOCLDWAIT: u64 = 2;
+const SA_RESTORER: u64 = 0x0400_0000;
 const SA_ONSTACK: u64 = 0x0800_0000;
 const SA_RESTART: u64 = 0x1000_0000;
 const SA_NODEFER: u64 = 0x4000_0000;
@@ -664,7 +665,9 @@ impl Kernel {
         s.x[1] = frame;
         s.x[2] = frame + UC;
         s.x[29] = frame + FRAME_SIZE;
-        s.x[30] = if act.restorer != 0 {
+        // Only if it says so, as Linux: bionic passes the caller's sa_restorer through as
+        // it found it, and a caller that never set the field left whatever was there.
+        s.x[30] = if act.flags & SA_RESTORER != 0 && act.restorer != 0 {
             act.restorer
         } else {
             SIGRETURN_TRAMPOLINE

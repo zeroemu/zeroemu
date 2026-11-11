@@ -1502,6 +1502,13 @@ impl Kernel {
                         self.force_signal(t, signal::SIGSEGV, SigInfo::fault(signal::SIGSEGV, code, addr), pc);
                     }
                 }
+                Exit::Alignment { pc, addr } => {
+                    const BUS_ADRALN: i32 = 1;
+                    if !self.signal_caught(t, signal::SIGBUS) {
+                        self.crash_report(t, vcpu.as_ref(), "SIGBUS (misaligned)", pc, addr, false);
+                    }
+                    self.force_signal(t, signal::SIGBUS, SigInfo::fault(signal::SIGBUS, BUS_ADRALN, addr), pc);
+                }
                 Exit::Fault { pc, addr, detail } => {
                     eprintln!("[droidrt] tid {}: guest fault at pc={pc:#x} addr={addr:#x}: {detail}", t.tid);
                     if !self.signal_caught(t, signal::SIGILL) {

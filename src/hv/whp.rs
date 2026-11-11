@@ -562,10 +562,12 @@ mod imp {
     impl Kick for WhpKick {
         fn kick(&self) {
             let slot = &self.shared.slots[self.index as usize];
-            slot.kicked.store(true, Ordering::Release);
+            // SeqCst, as the TLB generation is: this stores then loads, run() stores
+            // in_guest then loads this, and with less each could miss the other.
+            slot.kicked.store(true, Ordering::SeqCst);
             // A cancel issued before `WHvRunVirtualProcessor` is lost. Retry
             // while the vCPU publishes that it is inside the call.
-            while slot.in_guest.load(Ordering::Acquire) && slot.kicked.load(Ordering::Acquire) {
+            while slot.in_guest.load(Ordering::SeqCst) && slot.kicked.load(Ordering::Acquire) {
                 let _ = unsafe { WHvCancelRunVirtualProcessor(self.shared.handle, self.index, 0) };
                 std::thread::yield_now();
             }
@@ -991,6 +993,10 @@ mod imp {
                     ),
                 );
             }
+            // #AC: alignment checking, which a program can turn on for itself.
+            if ex.ExceptionType == 17 {
+                return Exit::Alignment { pc: rip, addr: 0 };
+            }
             fault(
                 rip,
                 0,
@@ -1046,7 +1052,7 @@ mod imp {
                 slot.in_guest.store(true, Ordering::SeqCst);
                 let stale = self.shared.tlb_gen.load(Ordering::SeqCst)
                     != slot.seen.load(Ordering::Relaxed);
-                let kicked = slot.kicked.load(Ordering::Acquire);
+                let kicked = slot.kicked.load(Ordering::SeqCst);
                 if stale || kicked {
                     slot.in_guest.store(false, Ordering::Release);
                     continue;

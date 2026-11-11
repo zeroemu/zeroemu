@@ -450,6 +450,12 @@ impl Socket {
         self.st.lock().unwrap().peer.as_ref().and_then(Weak::upgrade)
     }
 
+    /// FIONREAD: the bytes a stream has waiting, or the size of the next datagram.
+    pub fn unread(&self) -> usize {
+        let q = self.rx.lock().unwrap();
+        if self.ty == SOCK_STREAM { q.msgs.iter().map(|m| m.data.len() - m.off).sum() } else { q.msgs.front().map_or(0, |m| m.data.len()) }
+    }
+
     fn connect_pair(a: &Arc<Socket>, b: &Arc<Socket>, a_cred: Cred, b_cred: Cred) {
         let mut sa = a.st.lock().unwrap();
         sa.connected = true;
@@ -573,8 +579,54 @@ impl Socket {
             return Ok(len);
         }
         let peer = self.peer().ok_or(if connected { EPIPE } else { ENOTCONN })?;
+        if self.ty == SOCK_STREAM && len > 0 {
+            return self.deliver_stream(t, peer, data, fds, name, nonblock);
+        }
         self.deliver(t, &peer, Msg { data, off: 0, fds, from: name, cred: Cred::of(t) }, nonblock)?;
         Ok(len)
+    }
+
+    /// Queues a stream's bytes for its peer: as many as there is room for, and the rest
+    /// as room appears, or a short count when it can't wait. poll says a stream is
+    /// writable whenever there is any room, so a write that only went whole would spin a
+    /// nonblocking writer for as long as the reader stayed a little behind.
+    fn deliver_stream(&self, t: &Thread, target: Arc<Socket>, data: Vec<u8>, mut fds: Vec<Arc<File>>, from: Vec<u8>, nonblock: bool) -> Result<usize, i64> {
+        let until = deadline(self.st.lock().unwrap().opts.sndtimeo);
+        let cred = Cred::of(t);
+        let mut done = 0;
+        let stop = |done: usize, e: i64| if done > 0 { Ok(done) } else { Err(e) };
+        loop {
+            let seen = EVENTS.watch_key(target.key());
+            let room = {
+                let mut q = target.rx.lock().unwrap();
+                let room = QUEUE_LIMIT.saturating_sub(q.bytes).min(data.len() - done);
+                if room > 0 {
+                    q.bytes += room;
+                    // Passed files ride on the first of it.
+                    q.msgs.push_back(Msg { data: data[done..done + room].to_vec(), off: 0, fds: std::mem::take(&mut fds), from: from.clone(), cred });
+                }
+                room
+            };
+            if room > 0 {
+                done += room;
+                target.serve();
+                EVENTS.bump_key(target.key());
+                if done == data.len() {
+                    return Ok(done);
+                }
+                continue; // the reader may have made room meanwhile
+            }
+            // Nothing else holds the other end: every descriptor for it is closed.
+            if Arc::strong_count(&target) == 1 {
+                return stop(done, EPIPE);
+            }
+            if nonblock {
+                return stop(done, EAGAIN);
+            }
+            if let Err(e) = wait_or_give_up(t, seen, until) {
+                return stop(done, e);
+            }
+        }
     }
 
     /// Receives up to `max` bytes: data, passed files, sender address, sender
@@ -1165,7 +1217,8 @@ impl Kernel {
             let mut mm = t.proc.mm();
             for i in 0..iovlen.min(1024) {
                 let (base, len) = (mm.read_u64(iov + i * 16)?, mm.read_u64(iov + i * 16 + 8)?);
-                data.extend(mm.read_vec(base, len.min(IO_MAX) as usize)?);
+                // IO_MAX in all, not for each: a thousand of them is a lot of memory.
+                data.extend(mm.read_vec(base, len.min(IO_MAX - data.len() as u64) as usize)?);
             }
         }
         let mut fds = Vec::new();

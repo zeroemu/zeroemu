@@ -891,6 +891,21 @@ impl Kernel {
                         t.proc.mm().write_u32(a[2], i.pending() as u32)?; // FIONREAD
                         return Ok(0);
                     }
+                    // FIONREAD (SIOCINQ on a socket): what a read would find now. Java's
+                    // available() asks this of whatever it is reading.
+                    Kind::Pipe(end) if cmd == 0x541b => {
+                        let n = if end.write { 0 } else { end.pipe.st.lock().unwrap().buf.len() };
+                        t.proc.mm().write_u32(a[2], n.min(i32::MAX as usize) as u32)?;
+                        return Ok(0);
+                    }
+                    Kind::Socket(s) if cmd == 0x541b => {
+                        t.proc.mm().write_u32(a[2], s.unread().min(i32::MAX as usize) as u32)?;
+                        return Ok(0);
+                    }
+                    Kind::Vsock(v) if cmd == 0x541b => {
+                        t.proc.mm().write_u32(a[2], v.unread().min(i32::MAX as usize) as u32)?;
+                        return Ok(0);
+                    }
                     Kind::Block(b) => return self.blocks.ioctl(b.devt, cmd, a[2], &mut BlockCaller { k: self, t }),
                     Kind::LoopControl => return self.blocks.loop_control(cmd, a[2]),
                     Kind::DmControl => return self.blocks.dm_ioctl(cmd, a[2], &mut BlockCaller { k: self, t }),
@@ -1215,6 +1230,8 @@ impl Kernel {
         let kind = match stat.mode & S_IFMT {
             // A path-only descriptor: nothing behind it is opened.
             _ if flags & O_PATH != 0 => Kind::Node(NodeFile::open(vfs, node, stat, false)),
+            // Only O_NOFOLLOW leaves a link here, and a link can't be opened.
+            S_IFLNK => return Err(ELOOP),
             S_IFCHR => match stat.rdev {
                 0x103 => Kind::Null,
                 0x105 => Kind::Zero,
@@ -1822,7 +1839,18 @@ impl Kernel {
             Kind::LoopControl => chr(block::makedev(block::MISC_MAJOR, block::LOOP_CONTROL_MINOR)),
             Kind::DmControl => chr(block::makedev(block::MISC_MAJOR, block::DM_CONTROL_MINOR)),
             Kind::Pty(p) => Stat { mode: if p.master { 0o020666 } else { 0o020620 }, rdev: p.rdev(), nlink: 1, ..Default::default() },
-            Kind::Node(nf) => nf.lock().unwrap().stat.clone(),
+            Kind::Node(nf) => {
+                let (node, opened) = {
+                    let nf = nf.lock().unwrap();
+                    (nf.node.clone(), nf.stat.clone())
+                };
+                // On a filesystem that changes, as it is now: a directory's times, mode
+                // and owner move after it is opened. An image's never do.
+                match self.vfs().ok().filter(|v| v.fs_arc(&node).writable()).map(|v| v.stat(&node)) {
+                    Some(Ok(st)) => st,
+                    _ => opened,
+                }
+            }
             Kind::Special(s) => self.vfs()?.stat(&s.node)?,
             Kind::Mem(m) => match &m.node {
                 Some(n) => match self.vfs()?.stat(n) {

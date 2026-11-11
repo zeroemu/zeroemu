@@ -33,6 +33,11 @@ const ESR_WNR: u64 = 1 << 6;
 /// which reports WnR = 1; Linux counts it as a read (is_write_abort), so
 /// cleaning the cache over read-only code works.
 const ESR_CM: u64 = 1 << 8;
+/// A data abort's fault status code: translation, access flag and permission faults
+/// (levels 0 to 3 of each) are what a page table can answer, and alignment isn't.
+const ESR_DFSC: u64 = 0x3f;
+const DFSC_PAGING: std::ops::RangeInclusive<u64> = 0b000100..=0b001111;
+const DFSC_ALIGNMENT: u64 = 0b100001;
 
 const CPSR_EL1H_MASKED: u64 = 0x3c5;
 const CPSR_MODE_MASK: u64 = 0xf;
@@ -260,7 +265,8 @@ impl Vcpu for HvfVcpu {
             let addr = || crate::arch::untag(self.sys(HV_SYS_REG_FAR_EL1));
             return match esr >> 26 {
                 EC_SVC64 => Exit::Syscall,
-                EC_DATA_ABORT_LOWER => Exit::PageFault { pc: elr, addr: addr(), write: esr & ESR_WNR != 0 && esr & ESR_CM == 0, exec: false },
+                EC_DATA_ABORT_LOWER if DFSC_PAGING.contains(&(esr & ESR_DFSC)) => Exit::PageFault { pc: elr, addr: addr(), write: esr & ESR_WNR != 0 && esr & ESR_CM == 0, exec: false },
+                EC_DATA_ABORT_LOWER if esr & ESR_DFSC == DFSC_ALIGNMENT => Exit::Alignment { pc: elr, addr: addr() },
                 EC_INSTR_ABORT_LOWER => Exit::PageFault { pc: elr, addr: addr(), write: false, exec: true },
                 ec => Exit::Fault { pc: elr, addr: addr(), detail: format!("ESR_EL1={esr:#x} (EC {ec:#x})") },
             };

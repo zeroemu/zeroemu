@@ -629,6 +629,10 @@ impl AddressSpace {
         if len == 0 {
             return Err(EINVAL);
         }
+        // More than there is: and sums with it further on would wrap.
+        if len > USER_TOP {
+            return Err(ENOMEM);
+        }
         let start = match place {
             Placement::Fixed(a) => {
                 if a % PAGE != 0 || a < MIN_ADDR || a.saturating_add(len) > USER_TOP {
@@ -943,7 +947,8 @@ impl AddressSpace {
             return Err(EINVAL);
         }
         let (vstart, vma) = self.find(old).ok_or(EFAULT)?;
-        if old + old_len > vma.end {
+        // Not `old + old_len`, which a huge length wraps past the check.
+        if old_len > vma.end - old {
             return Err(EFAULT);
         }
         if old_len == 0 && !matches!(vma.backing, Backing::Shared { .. } | Backing::Dev { .. }) {

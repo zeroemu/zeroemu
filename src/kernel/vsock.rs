@@ -165,6 +165,15 @@ impl Vsock {
         self.st.lock().unwrap().stream.clone()
     }
 
+    /// FIONREAD: bytes waiting to be read.
+    pub fn unread(&self) -> usize {
+        let st = self.st.lock().unwrap();
+        match &st.stream {
+            Some(io) => io.queued().0,
+            None => st.out.len(),
+        }
+    }
+
     /// What a poller of this watches.
     pub fn mask(self: &Arc<Self>) -> super::wait::Mask {
         use super::wait::key_mask;
@@ -363,7 +372,7 @@ impl Kernel {
     /// What a vsock can do besides the read and write every file can.
     pub(super) fn vsock_syscall(&self, no: Sysno, t: &Arc<Thread>, f: &Arc<File>, v: &Arc<Vsock>, a: [u64; 6]) -> Result<i64, i64> {
         use Sysno::*;
-        const IO_MAX: u64 = 1 << 31;
+        const IO_MAX: u64 = 16 << 20;
         const MSG_DONTWAIT: u64 = 0x40;
         const SOCK_NONBLOCK: u64 = 0o4000;
         const SOCK_CLOEXEC: u64 = 0o2000000;

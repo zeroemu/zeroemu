@@ -61,7 +61,7 @@ impl Kernel {
             }
             nanosleep | clock_nanosleep => {
                 const TIMER_ABSTIME: u64 = 1;
-                let (req, abs, clock) = if no == nanosleep { (a[0], false, 1) } else { (a[2], a[1] & TIMER_ABSTIME != 0, a[0]) };
+                let (req, abs, clock, rem) = if no == nanosleep { (a[0], false, 1, a[1]) } else { (a[2], a[1] & TIMER_ABSTIME != 0, a[0], a[3]) };
                 let (s, ns) = {
                     let mut mm = t.proc.mm();
                     (mm.read_u64(req)?, mm.read_u64(req + 8)?)
@@ -97,6 +97,15 @@ impl Kernel {
                 };
                 while Instant::now() < deadline {
                     if t.interrupted() {
+                        // What is left of a relative sleep, for the caller to sleep again:
+                        // `while (nanosleep(&ts, &ts) == -1 && errno == EINTR)` counts on it.
+                        if !abs && rem != 0 {
+                            let left = deadline.saturating_duration_since(Instant::now());
+                            let mut b = [0u8; 16];
+                            b[..8].copy_from_slice(&left.as_secs().to_le_bytes());
+                            b[8..].copy_from_slice(&(left.subsec_nanos() as u64).to_le_bytes());
+                            t.proc.mm().write(rem, &b)?;
+                        }
                         return Err(EINTR);
                     }
                     super::vcpus::blocking();

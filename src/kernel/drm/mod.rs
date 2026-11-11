@@ -681,7 +681,7 @@ fn dispatch(o: &Open, cmd: u64, arg: u64, io: &mut dyn Io) -> Result<i64, i64> {
         0x3a => wait_vblank(o, arg, io),
         0x3b => crtc_sequence(o, arg, io),
         0x41 => virt_map(o, arg, io),
-        0x42 => virt_exec(o, arg, io),
+        0x42 => virt_exec(o, cmd, arg, io),
         0x43 => virt_getparam(o, arg, io),
         0x44 => virt_res_create(o, arg, io),
         0x45 => virt_res_info(o, arg, io),
@@ -963,7 +963,9 @@ fn virt_res_create(o: &Open, arg: u64, io: &mut dyn Io) -> Result<i64, i64> {
     let depth = ru32(&b, 20).max(1);
     let array = ru32(&b, 24).max(1);
     let stride = width.saturating_mul(4);
-    let size = (stride as u64) * (height as u64) * (depth as u64) * (array as u64);
+    // Checked: a product that wrapped to something small would back the resource with
+    // less than the renderer is about to be told it has.
+    let size = (stride as u64).checked_mul(height as u64).and_then(|s| s.checked_mul(depth as u64)).and_then(|s| s.checked_mul(array as u64)).ok_or(EINVAL)?;
     if size == 0 || size > (1 << 32) {
         return Err(EINVAL);
     }
@@ -1098,12 +1100,14 @@ fn virt_wait(o: &Open, arg: u64, io: &mut dyn Io) -> Result<i64, i64> {
     Ok(0) // transfers complete before they return
 }
 
-fn virt_exec(o: &Open, arg: u64, io: &mut dyn Io) -> Result<i64, i64> {
+fn virt_exec(o: &Open, cmd: u64, arg: u64, io: &mut dyn Io) -> Result<i64, i64> {
     let ctx = o.st.lock().unwrap().ctx;
     if ctx == 0 {
         return Err(EINVAL);
     }
-    let mut b = load(io, arg, 0x42, 32)?;
+    // As long as the caller's struct is: ring_idx comes after the first 32 bytes, and
+    // an older one doesn't have it.
+    let mut b = load(io, arg, cmd, 32)?;
     let flags = ru32(&b, 0);
     let size = ru32(&b, 4) as usize;
     let cmd_ptr = ru64(&b, 8);

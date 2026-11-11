@@ -55,6 +55,9 @@ pub struct MemFile {
     quota: Option<(Arc<Quota>, AtomicU64)>,
     /// A memfd's extended attributes (it has no tmpfs node to hold them).
     pub xattrs: Mutex<Xattrs>,
+    /// When its contents last changed, in seconds: here and not on the node, since
+    /// those who write it hold the file and not its name.
+    mtime: AtomicU64,
 }
 
 impl Drop for MemFile {
@@ -67,11 +70,11 @@ impl Drop for MemFile {
 
 impl MemFile {
     pub fn new(phys: Arc<PhysMem>) -> Arc<MemFile> {
-        Arc::new(MemFile { obj: SharedObject::new(phys), size: Mutex::new(0), quota: None, xattrs: Mutex::default() })
+        Arc::new(MemFile { obj: SharedObject::new(phys), size: Mutex::new(0), quota: None, xattrs: Mutex::default(), mtime: AtomicU64::new(now()) })
     }
 
     fn with_quota(phys: Arc<PhysMem>, quota: Arc<Quota>, pager: Option<Arc<PageCache>>) -> Arc<MemFile> {
-        Arc::new(MemFile { obj: SharedObject::with_pager(phys, pager), size: Mutex::new(0), quota: Some((quota, AtomicU64::new(0))), xattrs: Mutex::default() })
+        Arc::new(MemFile { obj: SharedObject::with_pager(phys, pager), size: Mutex::new(0), quota: Some((quota, AtomicU64::new(0))), xattrs: Mutex::default(), mtime: AtomicU64::new(now()) })
     }
 
     /// A file's length, with its pages to be read from where they were saved. It is
@@ -86,6 +89,14 @@ impl MemFile {
 
     pub fn size(&self) -> u64 {
         *self.size.lock().unwrap()
+    }
+
+    pub fn mtime(&self) -> u64 {
+        self.mtime.load(Ordering::Relaxed)
+    }
+
+    pub fn set_mtime(&self, secs: u64) {
+        self.mtime.store(secs, Ordering::Relaxed);
     }
 
     pub fn read_at(&self, off: u64, max: usize) -> Result<Vec<u8>, i64> {
@@ -120,6 +131,7 @@ impl MemFile {
         }
         self.obj.write(off, data)?;
         *size = (*size).max(off + data.len() as u64);
+        self.set_mtime(now());
         Ok(data.len())
     }
 
@@ -139,6 +151,7 @@ impl MemFile {
             }
         }
         *size = len;
+        self.set_mtime(now());
         Ok(())
     }
 }
@@ -288,6 +301,7 @@ impl Tmpfs {
             None => return Err(ENOENT),
         }
         let parent = nodes.get_mut(&dir).unwrap();
+        parent.mtime = now();
         if is_dir {
             parent.nlink += 1;
         }
@@ -350,13 +364,13 @@ impl FileSystem for Tmpfs {
     fn stat(&self, ino: u64) -> io::Result<Stat> {
         let nodes = self.nodes.lock().unwrap();
         let n = nodes.get(&ino).ok_or_else(|| errno(ENOENT))?;
-        let (size, rdev) = match &n.kind {
-            Kind::File(f) => (f.size(), 0),
-            Kind::Symlink(t) => (t.len() as u64, 0),
-            Kind::Dir { entries, .. } => (entries.len() as u64 * 32, 0),
-            Kind::Special { rdev } => (0, *rdev),
+        let (size, rdev, mtime) = match &n.kind {
+            Kind::File(f) => (f.size(), 0, f.mtime()),
+            Kind::Symlink(t) => (t.len() as u64, 0, n.mtime),
+            Kind::Dir { entries, .. } => (entries.len() as u64 * 32, 0, n.mtime),
+            Kind::Special { rdev } => (0, *rdev, n.mtime),
         };
-        Ok(Stat { dev: 0, ino, mode: n.mode, nlink: n.nlink, uid: n.uid, gid: n.gid, rdev, size, mtime: n.mtime })
+        Ok(Stat { dev: 0, ino, mode: n.mode, nlink: n.nlink, uid: n.uid, gid: n.gid, rdev, size, mtime })
     }
 
     fn lookup(&self, dir: u64, name: &str) -> io::Result<Option<u64>> {
@@ -450,6 +464,7 @@ impl FileSystem for Tmpfs {
             }
             _ => return Err(ENOTDIR),
         }
+        nodes.get_mut(&dir).unwrap().mtime = now();
         nodes.get_mut(&ino).unwrap().nlink += 1;
         Ok(())
     }
@@ -467,8 +482,11 @@ impl FileSystem for Tmpfs {
             (_, true) => return Err(ENOTDIR),
             (_, false) => {}
         }
-        if let Some(Kind::Dir { entries, .. }) = nodes.get_mut(&dir).map(|n| &mut n.kind) {
-            entries.remove(name);
+        if let Some(d) = nodes.get_mut(&dir) {
+            d.mtime = now();
+            if let Kind::Dir { entries, .. } = &mut d.kind {
+                entries.remove(name);
+            }
         }
         if rmdir {
             nodes.get_mut(&dir).unwrap().nlink -= 1;
@@ -529,11 +547,18 @@ impl FileSystem for Tmpfs {
                 }
             }
         }
-        if let Some(Kind::Dir { entries, .. }) = nodes.get_mut(&odir).map(|n| &mut n.kind) {
-            entries.remove(oname);
+        let when = now();
+        if let Some(d) = nodes.get_mut(&odir) {
+            d.mtime = when;
+            if let Kind::Dir { entries, .. } = &mut d.kind {
+                entries.remove(oname);
+            }
         }
-        if let Some(Kind::Dir { entries, .. }) = nodes.get_mut(&ndir).map(|n| &mut n.kind) {
-            entries.insert(nname.to_string(), ino);
+        if let Some(d) = nodes.get_mut(&ndir) {
+            d.mtime = when;
+            if let Kind::Dir { entries, .. } = &mut d.kind {
+                entries.insert(nname.to_string(), ino);
+            }
         }
         if let Some(Kind::Dir { parent, .. }) = nodes.get_mut(&ino).map(|n| &mut n.kind) {
             *parent = ndir;
@@ -557,6 +582,9 @@ impl FileSystem for Tmpfs {
         }
         if let Some(t) = mtime {
             n.mtime = t;
+            if let Kind::File(f) = &n.kind {
+                f.set_mtime(t);
+            }
         }
         Ok(())
     }
@@ -653,7 +681,11 @@ impl Tmpfs {
                     Kind::Symlink(t) => Saved::Symlink(t.clone()),
                     Kind::Special { rdev } => Saved::Special(*rdev),
                 };
-                saved.push((ino, n.mode, n.uid, n.gid, n.nlink, n.mtime, n.xattrs.clone(), kind));
+                let mtime = match &n.kind {
+                    Kind::File(f) => f.mtime(),
+                    _ => n.mtime,
+                };
+                saved.push((ino, n.mode, n.uid, n.gid, n.nlink, mtime, n.xattrs.clone(), kind));
             }
             (saved, self.next.load(Ordering::Relaxed))
         };
@@ -780,7 +812,9 @@ impl Tmpfs {
                 }
                 1 => {
                     let size = get_u64(r)?;
-                    Kind::File(read_file(self, r, size)?)
+                    let f = read_file(self, r, size)?;
+                    f.set_mtime(mtime); // after its contents went in
+                    Kind::File(f)
                 }
                 2 => Kind::Symlink(get_string(r)?),
                 3 => Kind::Special { rdev: get_u64(r)? },

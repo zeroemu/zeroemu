@@ -29,6 +29,10 @@ pub enum Exit {
         write: bool,
         exec: bool,
     },
+    /// An access the page tables allow and the CPU still refused: a misaligned one
+    /// where alignment is required (an exclusive or atomic access). Resuming would
+    /// fault again, for ever.
+    Alignment { pc: u64, addr: u64 },
     /// Anything else the guest cannot continue from (undefined instruction…).
     Fault { pc: u64, addr: u64, detail: String },
     /// `Kick::kick` was called from another thread.

@@ -1106,9 +1106,11 @@ impl Kernel {
         if sg {
             for &o in &offsets {
                 let o = o as usize;
-                if o.saturating_add(40) <= data.len() && u32_at(&data, o) == TYPE_PTR {
+                if o.saturating_add(40) <= data.len() && u32_at(&data, o) == TYPE_PTR && !sgmap.contains_key(&(o as u64)) {
                     let (buf, len) = (u64_at(&data, o + 8), u64_at(&data, o + 16));
-                    if len > MAX_AREA {
+                    // All of them together, before any is read: no receive area holds
+                    // more, and each is this process's memory to hold meanwhile.
+                    if len > MAX_AREA || sg_size + align8(len) > MAX_AREA {
                         return Ok(too_big);
                     }
                     sgmap.insert(o as u64, mm.read_vec(buf, len as usize)?);
@@ -1238,13 +1240,22 @@ impl Kernel {
         let offsets = out.offsets.clone();
         let mut failed = false;
         let mut held: Vec<Held> = Vec::new();
-        for &o in &offsets {
+        // Where the next object may start: past the last one, as Linux requires. One
+        // translated in place can't then rewrite the fields of another that overlaps
+        // it, after the space for that one was counted.
+        let mut floor = 0usize;
+        for (index, &o) in offsets.iter().enumerate() {
             let o = o as usize;
             // Offsets come from the guest, and may be anything.
-            if o.saturating_add(8) > out.data.len() {
+            if o.saturating_add(8) > out.data.len() || o < floor || !o.is_multiple_of(4) {
                 failed = true;
                 break;
             }
+            floor = o + match u32_at(&out.data, o) {
+                TYPE_PTR => 40,
+                TYPE_FDA => 32,
+                _ => 24,
+            };
             match u32_at(&out.data, o) {
                 ty @ (TYPE_BINDER | TYPE_WEAK_BINDER) if o + 24 <= out.data.len() => {
                     let (flags, ptr, cookie) = (u32_at(&out.data, o + 4), u64_at(&out.data, o + 8), u64_at(&out.data, o + 16));
@@ -1291,16 +1302,22 @@ impl Kernel {
                         break;
                     }
                 },
-                TYPE_PTR if o + 40 <= out.data.len() => {
+                // Only one whose buffer came with it (BC_TRANSACTION_SG): room was made
+                // for those and for nothing else.
+                TYPE_PTR if o + 40 <= out.data.len() && out.sg.contains_key(&(o as u64)) => {
                     let flags = u32_at(&out.data, o + 4);
-                    let len = u64_at(&out.data, o + 16);
+                    let len = out.sg[&(o as u64)].len() as u64;
                     sg_addr.insert(o as u64, sg_cursor);
                     out.data[o + 8..o + 16].copy_from_slice(&sg_cursor.to_le_bytes());
                     if flags & BUFFER_FLAG_HAS_PARENT != 0 {
                         let (parent, parent_off) = (u64_at(&out.data, o + 24), u64_at(&out.data, o + 32));
-                        match offsets.get(parent as usize).and_then(|po| sg_addr.get(po)) {
-                            Some(&pa) => patches.push((pa + parent_off, sg_cursor)),
-                            None => {
+                        // The pointer to this buffer goes into its parent's: an earlier
+                        // buffer, and a place inside it (binder_fixup_parent). The sender
+                        // names both, and what's written lands in the receiver's memory.
+                        let parent = offsets.get(..index).and_then(|earlier| earlier.get(parent as usize)).and_then(|po| Some((*sg_addr.get(po)?, out.sg.get(po)?.len() as u64)));
+                        match parent {
+                            Some((pa, parent_len)) if parent_off.is_multiple_of(4) && parent_off.checked_add(8).is_some_and(|end| end <= parent_len) => patches.push((pa + parent_off, sg_cursor)),
+                            _ => {
                                 failed = true;
                                 break;
                             }
@@ -1355,11 +1372,16 @@ impl Kernel {
                 }
             }
         }
-        {
+        // Descriptors put in the receiver's table, to take out again if this fails.
+        let mut installed: Vec<i64> = Vec::new();
+        if !failed {
             let mut files = receiver.files.lock().unwrap();
             for (at, f) in fd_work {
                 match files.alloc(f, true, 0) {
-                    Ok(fd) => out.data[at..at + 4].copy_from_slice(&(fd as u32).to_le_bytes()),
+                    Ok(fd) => {
+                        out.data[at..at + 4].copy_from_slice(&(fd as u32).to_le_bytes());
+                        installed.push(fd);
+                    }
                     Err(_) => failed = true,
                 }
             }
@@ -1368,6 +1390,7 @@ impl Kernel {
                     Ok(fd) => {
                         out.sg.get_mut(&po).unwrap()[at..at + 4].copy_from_slice(&(fd as u32).to_le_bytes());
                         fda_fds.push(fd as i32);
+                        installed.push(fd);
                     }
                     Err(_) => failed = true,
                 }
@@ -1395,6 +1418,13 @@ impl Kernel {
             Ok(())
         })();
         if copied.is_err() || failed {
+            // The receiver never hears of them: they'd stay open in its table for good.
+            {
+                let mut files = receiver.files.lock().unwrap();
+                for fd in installed {
+                    files.close(fd);
+                }
+            }
             w.free(to, buffer);
             w.release_held(to, held);
             w.transaction_failed(me, t.tid, answering, to, to_thread);

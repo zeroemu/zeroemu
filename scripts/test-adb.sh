@@ -55,6 +55,52 @@ pulls() { A pull /data/local/tmp/big "$TMP/back" >/dev/null && [ "$(shasum -a 25
 check "100 MB pull comes back intact" pulls
 A shell rm /data/local/tmp/big
 
+# Shared storage: vold mounts the emulated volume on /dev/fuse, which droidrt serves
+# from /data/media, and MediaProvider makes the standard directories on it.
+until A shell ls /sdcard/Download >/dev/null 2>&1 || [ $n -gt 300 ]; do sleep 1; n=$((n + 1)); done
+mounted() { A shell sm list-volumes | grep -q "emulated;0 mounted"; }
+check "vold mounts the emulated volume" mounted
+standard() { out=$(A shell ls -la /sdcard/); for d in Android DCIM Download Music Pictures; do echo "$out" | grep -q " $d" || return 1; done; }
+check "ls -la /sdcard/ lists the standard directories" standard
+echoes() { [ "$(A shell 'echo hi > /sdcard/Download/t.txt && cat /sdcard/Download/t.txt' | tr -d '\r')" = hi ]; }
+check "write and read a file in /sdcard/Download" echoes
+round_trip() { # MB
+    head -c $(($1 << 20)) /dev/urandom > "$TMP/sd$1"
+    A push "$TMP/sd$1" /sdcard/Download/ >/dev/null && A pull /sdcard/Download/sd$1 "$TMP/sdback$1" >/dev/null && cmp -s "$TMP/sd$1" "$TMP/sdback$1"
+}
+check "1 MB push and pull through /sdcard" round_trip 1
+check "50 MB push and pull through /sdcard" round_trip 50
+A shell rm /sdcard/Download/sd1 /sdcard/Download/sd50 /sdcard/Download/t.txt
+
+# An app's external files directory: scripts/sdtest writes one file there on start, as
+# its own uid, through vold's setupAppDir. Built here when the SDK's build tools and a
+# JDK are installed.
+BT=$(ls -d "$SDK"/build-tools/* 2>/dev/null | tail -1)
+PLAT=$(ls -d "$SDK"/platforms/android-* 2>/dev/null | head -1)/android.jar
+build_sdtest() {
+    S=scripts/sdtest O=$TMP/sdtest
+    mkdir -p "$O/classes" "$O/dex" &&
+    javac --release 8 -nowarn -cp "$PLAT" -d "$O/classes" "$S/src/org/droidrt/sdtest/Main.java" 2>/dev/null &&
+    "$BT/d8" --min-api 30 --lib "$PLAT" --output "$O/dex" "$O"/classes/org/droidrt/sdtest/*.class &&
+    "$BT/aapt2" link -o "$O/base.apk" -I "$PLAT" --manifest "$S/AndroidManifest.xml" &&
+    (cd "$O/dex" && zip -q ../base.apk classes.dex) &&
+    "$BT/zipalign" -f 4 "$O/base.apk" "$O/aligned.apk" &&
+    keytool -genkeypair -keystore "$O/key" -storepass android -keypass android -alias k -keyalg RSA -keysize 2048 -validity 1 -dname CN=droidrt >/dev/null 2>&1 &&
+    "$BT/apksigner" sign --ks "$O/key" --ks-pass pass:android --out "$TMP/sdtest.apk" "$O/aligned.apk"
+}
+external_files() {
+    A install -r "$TMP/sdtest.apk" | grep -q Success && A shell am start -W -n org.droidrt.sdtest/.Main >/dev/null || return 1
+    uid=$(A shell pm list packages -U org.droidrt.sdtest | sed -n 's/.*uid://p' | tr -d '\r')
+    f=/sdcard/Android/data/org.droidrt.sdtest/files/hello.txt
+    m=0
+    until A shell ls -ln $f 2>/dev/null | grep -q " $uid "; do sleep 1; m=$((m + 1)); [ $m -gt 20 ] && return 1; done
+}
+if [ -n "$BT" ] && [ -f "$PLAT" ] && command -v javac >/dev/null && build_sdtest; then
+    check "an app writes its external files directory as its own uid" external_files
+else
+    echo "skip an app's external files directory: no build tools, platform or JDK"
+fi
+
 screenshot() { A exec-out screencap -p > "$TMP/shot.png" && [ "$(head -c 4 "$TMP/shot.png" | tail -c 3)" = PNG ]; }
 check "screencap" screenshot
 key() { A shell input keyevent 3; }

@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="org.droidrt.sdtest">
+    <uses-sdk android:minSdkVersion="30" android:targetSdkVersion="36" />
+    <application android:label="sdtest" android:debuggable="true">
+        <activity android:name=".Main" android:exported="true" />
+    </application>
+</manifest>

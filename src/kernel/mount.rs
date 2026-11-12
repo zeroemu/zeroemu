@@ -795,6 +795,54 @@ mod tests {
         assert!(!at("/apex/m/x").unwrap().is_mount_root());
     }
 
+    /// zygote binds /mnt/user/0 on an app's /storage from a slave of init's /mnt; vold
+    /// mounts the volume at /mnt/user/0/emulated later, and the app sees it there.
+    #[test]
+    fn a_bind_of_a_slave_receives_its_masters_mounts() {
+        let phys = crate::phys::PhysMem::new(Arc::new(NoHv));
+        let tmpfs = || Tmpfs::new(phys.clone(), 0o755);
+        let vfs = Vfs::default();
+        vfs.mount("/", tmpfs());
+        let root = vfs.resolve("/", "/", true).unwrap();
+        for d in ["mnt", "app", "storage"] {
+            vfs.mkdir(&root, d, 0o755).unwrap();
+        }
+        let at = |p: &str| vfs.resolve("/", p, true);
+        let sb = |fs: Arc<Tmpfs>| vfs.new_super(fs, "tmpfs", None, 0, "");
+        let mnt = tmpfs();
+        mnt.mkdir_p("user/0", 0o755);
+        vfs.mount_at(&at("/mnt").unwrap(), sb(mnt), 0).unwrap();
+        vfs.set_propagation(&at("/mnt").unwrap(), PropagationChange::Shared, false).unwrap();
+        // The app's copy of /mnt is a slave, and its /storage a bind from that copy.
+        vfs.bind(&at("/mnt").unwrap(), &at("/app").unwrap(), false).unwrap();
+        vfs.set_propagation(&at("/app").unwrap(), PropagationChange::Slave, false).unwrap();
+        vfs.bind(&at("/app/user/0").unwrap(), &at("/storage").unwrap(), false).unwrap();
+        let volume = tmpfs();
+        volume.mkdir_p("0/Download", 0o755);
+        vfs.mkdir(&at("/mnt/user/0").unwrap(), "emulated", 0o755).unwrap();
+        vfs.mount_at(&at("/mnt/user/0/emulated").unwrap(), sb(volume), 0).unwrap();
+        assert!(at("/storage/emulated/0/Download").is_ok());
+        // And nothing flows back from a slave.
+        vfs.mkdir(&at("/storage").unwrap(), "x", 0o755).unwrap();
+        vfs.mount_at(&at("/storage/x").unwrap(), sb(tmpfs()), 0).unwrap();
+        assert!(!at("/mnt/user/0/x").unwrap().is_mount_root());
+    }
+
+    /// A trailing slash follows a link and wants a directory.
+    #[test]
+    fn a_trailing_slash_follows_the_last_link() {
+        let phys = crate::phys::PhysMem::new(Arc::new(NoHv));
+        let vfs = Vfs::default();
+        vfs.mount("/", Tmpfs::new(phys.clone(), 0o755));
+        let root = vfs.resolve("/", "/", true).unwrap();
+        vfs.mkdir(&root, "d", 0o755).unwrap();
+        vfs.symlink(&root, "l", "/d").unwrap();
+        vfs.create(&root, "f", 0o644, 0).unwrap();
+        assert_eq!(vfs.resolve("/", "/l", false).unwrap().path, "/l");
+        assert_eq!(vfs.resolve("/", "/l/", false).unwrap().path, "/d");
+        assert_eq!(vfs.resolve("/", "/f/", false).err(), Some(ENOTDIR));
+    }
+
     #[test]
     fn statfs_flags() {
         let b = statfs_bytes("tmpfs", MS_RDONLY | MS_NOSUID | MS_RELATIME);

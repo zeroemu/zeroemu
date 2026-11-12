@@ -988,6 +988,10 @@ impl Vfs {
             let dest = tab.mounts.iter().find(|m| m.id == target.mnt.id).cloned().ok_or(ENOENT)?;
             let flags = src.mnt.flags.load(Ordering::Relaxed);
             let top = self.new_mount(&dest, target.path.clone(), src.mnt.sb.clone(), Some(src.ino), root_path, flags, sp.shared);
+            // A copy of a slave is a slave of the same master (clone_mnt), so mounts made
+            // later where it was bound from still show (vold's volume in the /storage
+            // zygote bound from /mnt/user/0 before it was mounted).
+            top.propagation.lock().unwrap().master = sp.master;
             let first = mounts.len();
             mounts.push(top.clone());
             if recursive {
@@ -999,8 +1003,9 @@ impl Vfs {
                         continue;
                     }
                     let Some(parent) = copies.get(&m.parent).cloned() else { continue };
-                    let peer = m.propagation.lock().unwrap().shared;
-                    let c = self.new_mount(&parent, rebase(&m.path, &src.path, &target.path), m.sb.clone(), m.root, m.root_path.clone(), m.flags.load(Ordering::Relaxed), peer);
+                    let p = *m.propagation.lock().unwrap();
+                    let c = self.new_mount(&parent, rebase(&m.path, &src.path, &target.path), m.sb.clone(), m.root, m.root_path.clone(), m.flags.load(Ordering::Relaxed), p.shared);
+                    c.propagation.lock().unwrap().master = p.master;
                     mounts.push(c.clone());
                     copies.insert(m.id, c);
                 }
@@ -1147,6 +1152,11 @@ impl Vfs {
         if path.is_empty() {
             return Err(ENOENT);
         }
+        // A trailing slash names a directory: a link there is followed, whatever
+        // the caller asked (Linux's LOOKUP_FOLLOW | LOOKUP_DIRECTORY), so
+        // `ls -l /sdcard/` lists what the link leads to.
+        let trailing = path.ends_with('/');
+        let follow_last = follow_last || trailing;
         let full = if path.starts_with('/') {
             path.to_string()
         } else {
@@ -1230,7 +1240,11 @@ impl Vfs {
             }
             stack.push(node);
         }
-        Ok(stack.pop().unwrap())
+        let node = stack.pop().unwrap();
+        if trailing && self.stat(&node)?.mode & S_IFMT != S_IFDIR {
+            return Err(ENOTDIR);
+        }
+        Ok(node)
     }
 
     pub fn stat(&self, node: &Node) -> Result<Stat, i64> {

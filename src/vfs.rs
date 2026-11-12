@@ -677,16 +677,15 @@ fn under(path: &str, dir: &str) -> bool {
 /// The mounts in `tab` that propagate_umount takes with `m` (attached on
 /// `dest`): its copies on `dest`'s peers and slaves, with what is beneath them
 /// if `detach`, and only unbusy ones otherwise.
-fn propagated_copies(tab: &Table, dest: &Mount, m: &Mount, detach: bool) -> HashSet<u32> {
+fn propagated_copies(tab: &Table, dest: &Mount, m: &Mount, detach: bool, groups: &HashSet<u32>) -> HashSet<u32> {
     let mut out = HashSet::new();
-    let group = dest.propagation.lock().unwrap().shared;
-    if group == 0 {
+    if groups.is_empty() {
         return out;
     }
     let inner = rebase(&m.path, &dest.path, &dest.root_path);
     for r in tab.mounts.iter().filter(|r| r.id != dest.id && Arc::ptr_eq(&r.sb, &dest.sb)) {
         let p = *r.propagation.lock().unwrap();
-        if (p.shared != group && p.master != group) || !under(&inner, &r.root_path) {
+        if (!groups.contains(&p.shared) && !groups.contains(&p.master)) || !under(&inner, &r.root_path) {
             continue;
         }
         let at = rebase(&inner, &r.root_path, &r.path);
@@ -858,12 +857,39 @@ impl Vfs {
         })
     }
 
+    /// The peer groups an event on `dest` reaches: its own, and, through every namespace,
+    /// that of each shared mount that is a slave of a group it reaches. Linux carries an
+    /// event down through such a mount to its own peers and slaves: vold makes
+    /// /mnt/installer a slave of /mnt/user that is shared again, and zygote binds an
+    /// installer's /storage from a slave of that.
+    fn reach(&self, dest: &Mount, mounts: &[Arc<Mount>]) -> HashSet<u32> {
+        let group = dest.propagation.lock().unwrap().shared;
+        if group == 0 {
+            return HashSet::new();
+        }
+        let tables: Vec<Arc<Table>> = self.spaces.read().unwrap().values().map(|s| s.read().unwrap().clone()).collect();
+        let mut groups = HashSet::from([group]);
+        loop {
+            let before = groups.len();
+            for m in mounts.iter().chain(tables.iter().flat_map(|t| t.mounts.iter())).filter(|m| Arc::ptr_eq(&m.sb, &dest.sb)) {
+                let p = *m.propagation.lock().unwrap();
+                if p.shared != 0 && groups.contains(&p.master) {
+                    groups.insert(p.shared);
+                }
+            }
+            if groups.len() == before {
+                return groups;
+            }
+        }
+    }
+
     /// Linux's propagate_mnt: `tree` (its first mount just attached on
     /// `dest`, the rest beneath it) is copied onto every other mount that
-    /// receives events from `dest`'s peer group (its peers and slaves) where
-    /// the mount point is visible. Copies are peers of what they copy, so
-    /// later mounts on them propagate too.
-    fn propagate(&self, mounts: &mut Vec<Arc<Mount>>, dest: &Mount, tree: &[Arc<Mount>]) {
+    /// receives events from `dest`'s peer group (its peers and slaves, and on
+    /// through the shared slaves in `groups`, from `reach`) where the mount point
+    /// is visible. Copies are peers of what they copy, so later mounts on them
+    /// propagate too.
+    fn propagate(&self, mounts: &mut Vec<Arc<Mount>>, dest: &Mount, tree: &[Arc<Mount>], groups: &HashSet<u32>) {
         let group = dest.propagation.lock().unwrap().shared;
         let Some(top) = tree.first() else { return };
         if group == 0 {
@@ -875,7 +901,7 @@ impl Vfs {
             .filter(|r| r.id != dest.id && !tree.iter().any(|t| t.id == r.id) && Arc::ptr_eq(&r.sb, &dest.sb))
             .filter_map(|r| {
                 let p = *r.propagation.lock().unwrap();
-                (p.shared == group || p.master == group).then(|| (r.clone(), p.shared != group))
+                (groups.contains(&p.shared) || groups.contains(&p.master)).then(|| (r.clone(), p.shared != group))
             })
             .collect();
         for (r, slave) in receivers {
@@ -974,8 +1000,9 @@ impl Vfs {
             let dest = tab.mounts.iter().find(|m| m.id == target.mnt.id).cloned().ok_or(ENOENT)?; // ENOENT: its mount went away meanwhile
             let m = self.new_mount(&dest, target.path.clone(), sb, Some(root), "/".into(), flags, 0);
             mounts.push(m.clone());
-            self.propagate(mounts, &dest, std::slice::from_ref(&m));
-            self.elsewhere(|_, ms| self.propagate(ms, &dest, std::slice::from_ref(&m)));
+            let groups = self.reach(&dest, mounts);
+            self.propagate(mounts, &dest, std::slice::from_ref(&m), &groups);
+            self.elsewhere(|_, ms| self.propagate(ms, &dest, std::slice::from_ref(&m), &groups));
             Ok(())
         })
     }
@@ -1019,8 +1046,9 @@ impl Vfs {
                 }
             }
             let tree = mounts[first..].to_vec();
-            self.propagate(mounts, &dest, &tree);
-            self.elsewhere(|_, ms| self.propagate(ms, &dest, &tree));
+            let groups = self.reach(&dest, mounts);
+            self.propagate(mounts, &dest, &tree, &groups);
+            self.elsewhere(|_, ms| self.propagate(ms, &dest, &tree, &groups));
             Ok(())
         })
     }
@@ -1048,9 +1076,10 @@ impl Vfs {
             }
             // propagate_umount: the copies on the parent's peers and slaves go too (busy ones stay).
             if let Some(dest) = tab.mounts.iter().find(|x| x.id == m.parent).cloned() {
-                gone.extend(propagated_copies(tab, &dest, &m, detach));
+                let groups = self.reach(&dest, mounts);
+                gone.extend(propagated_copies(tab, &dest, &m, detach, &groups));
                 self.elsewhere(|t, ms| {
-                    let ids = propagated_copies(t, &dest, &m, detach);
+                    let ids = propagated_copies(t, &dest, &m, detach, &groups);
                     ms.retain(|x| !ids.contains(&x.id));
                 });
             }

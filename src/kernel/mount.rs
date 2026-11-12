@@ -828,6 +828,44 @@ mod tests {
         assert!(!at("/mnt/user/0/x").unwrap().is_mount_root());
     }
 
+    /// vold binds /mnt/user on /mnt/installer, a slave made shared again; zygote's copy
+    /// of that is a slave, and an installer's /storage is bound from it. A volume
+    /// mounted under /mnt/user reaches that /storage through both, and goes again.
+    #[test]
+    fn events_pass_through_shared_slaves() {
+        let phys = crate::phys::PhysMem::new(Arc::new(NoHv));
+        let tmpfs = || Tmpfs::new(phys.clone(), 0o755);
+        let vfs = Vfs::default();
+        vfs.mount("/", tmpfs());
+        let root = vfs.resolve("/", "/", true).unwrap();
+        for d in ["mnt", "zygote", "storage"] {
+            vfs.mkdir(&root, d, 0o755).unwrap();
+        }
+        let at = |p: &str| vfs.resolve("/", p, true);
+        let sb = |fs: Arc<Tmpfs>| vfs.new_super(fs, "tmpfs", None, 0, "");
+        let mnt = tmpfs();
+        mnt.mkdir_p("user/0/emulated", 0o755);
+        mnt.mkdir_p("installer", 0o755);
+        vfs.mount_at(&at("/mnt").unwrap(), sb(mnt), 0).unwrap();
+        vfs.set_propagation(&at("/mnt").unwrap(), PropagationChange::Shared, false).unwrap();
+        vfs.bind(&at("/mnt/user").unwrap(), &at("/mnt/installer").unwrap(), true).unwrap();
+        vfs.set_propagation(&at("/mnt/installer").unwrap(), PropagationChange::Slave, true).unwrap();
+        vfs.set_propagation(&at("/mnt/installer").unwrap(), PropagationChange::Shared, false).unwrap();
+        vfs.bind(&at("/mnt/installer").unwrap(), &at("/zygote").unwrap(), false).unwrap();
+        vfs.set_propagation(&at("/zygote").unwrap(), PropagationChange::Slave, false).unwrap();
+        vfs.bind(&at("/zygote/0").unwrap(), &at("/storage").unwrap(), false).unwrap();
+        let volume = tmpfs();
+        volume.mkdir_p("0/Download", 0o755);
+        vfs.mount_at(&at("/mnt/user/0/emulated").unwrap(), sb(volume), 0).unwrap();
+        for p in ["/mnt/installer/0/emulated/0/Download", "/zygote/0/emulated/0/Download", "/storage/emulated/0/Download"] {
+            assert!(at(p).is_ok(), "{p}");
+        }
+        vfs.umount(&at("/mnt/user/0/emulated").unwrap(), false).unwrap();
+        for p in ["/mnt/installer/0/emulated/0", "/zygote/0/emulated/0", "/storage/emulated/0"] {
+            assert!(at(p).is_err(), "{p}");
+        }
+    }
+
     /// A trailing slash follows a link and wants a directory.
     #[test]
     fn a_trailing_slash_follows_the_last_link() {

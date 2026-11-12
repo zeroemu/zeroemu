@@ -17,6 +17,9 @@
 //! What is lost is the daemon's say: scoped storage's per-app rules, MediaProvider
 //! learning of files as they are written, and its redaction and transcoding.
 //!
+//! If the daemon goes, the mount keeps working where Linux would fail every access
+//! with ENOTCONN: droidrt never needed it.
+//!
 //! What a mount without default_permissions does is kept: the kernel refuses nothing
 //! on the view (perm.rs checks by the type the mount shows, "fuse"), chmod and chown
 //! succeed and change nothing (FuseDaemon ignores them), and what is created there
@@ -74,8 +77,8 @@ struct ConnState {
     next_unique: u64,
     /// Unmounted, or every descriptor closed: readers get ENODEV.
     aborted: bool,
-    /// The daemon's FUSE_INIT answer: (major, minor, flags).
-    init: Option<(u32, u32, u32)>,
+    /// The daemon has answered FUSE_INIT.
+    initialized: bool,
     /// fsuid and fsgid of the thread that took FUSE_INIT: what the daemon's files
     /// on the lower filesystem would belong to.
     daemon: Option<(u32, u32)>,
@@ -124,7 +127,7 @@ impl Conn {
     /// Who what is created on the mount belongs to, once a daemon has answered.
     pub fn daemon(&self) -> Option<(u32, u32)> {
         let st = self.st.lock().unwrap();
-        st.init.and(st.daemon)
+        st.daemon.filter(|_| st.initialized)
     }
 }
 
@@ -141,6 +144,26 @@ impl Drop for Mounted {
     }
 }
 
+impl Mounted {
+    pub fn new() -> Arc<Mounted> {
+        Arc::new(Mounted { conn: Arc::new(Conn { st: Mutex::new(ConnState::default()), devs: AtomicUsize::new(0) }) })
+    }
+
+    /// Once the mount is in place: `dev` (mount's fd=) joins the connection and the
+    /// daemon's first request, FUSE_INIT, waits for it, from the mounting thread's
+    /// fsuid, fsgid and pid as Linux sends it.
+    pub fn start(&self, dev: &Dev, ids: (u32, u32, u32)) -> Result<(), i64> {
+        dev.attach(&self.conn)?;
+        let mut body = Vec::with_capacity(16);
+        body.extend(7u32.to_le_bytes());
+        body.extend(MINOR.to_le_bytes());
+        body.extend((128u32 << 10).to_le_bytes()); // max_readahead
+        body.extend(INIT_FLAGS.to_le_bytes());
+        self.conn.send(FUSE_INIT, 0, ids, &body);
+        Ok(())
+    }
+}
+
 /// An open /dev/fuse: unattached until a mount or FUSE_DEV_IOC_CLONE gives it a
 /// connection.
 pub struct Dev {
@@ -154,6 +177,11 @@ impl Dev {
 
     fn conn(&self) -> Option<Arc<Conn>> {
         self.conn.lock().unwrap().clone()
+    }
+
+    /// Whether a mount or a clone has already given it a connection.
+    pub fn attached(&self) -> bool {
+        self.conn.lock().unwrap().is_some()
     }
 
     fn attach(&self, conn: &Arc<Conn>) -> Result<(), i64> {
@@ -248,14 +276,10 @@ impl Dev {
         }
         // Only FUSE_INIT is ever sent, so this is its answer.
         let body = &data[OUT_HEADER..];
-        if error == 0 && body.len() >= 8 {
-            let major = u32::from_le_bytes(body[0..4].try_into().unwrap());
-            let minor = u32::from_le_bytes(body[4..8].try_into().unwrap());
-            let flags = if body.len() >= 16 { u32::from_le_bytes(body[12..16].try_into().unwrap()) } else { 0 };
-            if major == 7 {
-                st.init = Some((major, minor.min(MINOR), flags));
-                return Ok(len);
-            }
+        // Its major must be 7; what else it asks for (fuse_init_out) changes nothing here.
+        if error == 0 && body.len() >= 8 && body[0..4] == 7u32.to_le_bytes() {
+            st.initialized = true;
+            return Ok(len);
         }
         // A refused or malformed FUSE_INIT: Linux fails the connection.
         eprintln!("[droidrt] fuse: the daemon refused FUSE_INIT (error {error}, {} bytes)", body.len());
@@ -283,33 +307,6 @@ impl Drop for Dev {
         {
             c.abort();
         }
-    }
-}
-
-impl Mounted {
-    pub fn new() -> Arc<Mounted> {
-        Arc::new(Mounted { conn: Arc::new(Conn { st: Mutex::new(ConnState::default()), devs: AtomicUsize::new(0) }) })
-    }
-
-    /// Once the mount is in place: `dev` (mount's fd=) joins the connection and the
-    /// daemon's first request, FUSE_INIT, waits for it, from the mounting thread's
-    /// fsuid, fsgid and pid as Linux sends it.
-    pub fn start(&self, dev: &Dev, ids: (u32, u32, u32)) -> Result<(), i64> {
-        dev.attach(&self.conn)?;
-        let mut body = Vec::with_capacity(16);
-        body.extend(7u32.to_le_bytes());
-        body.extend(MINOR.to_le_bytes());
-        body.extend((128u32 << 10).to_le_bytes()); // max_readahead
-        body.extend(INIT_FLAGS.to_le_bytes());
-        self.conn.send(FUSE_INIT, 0, ids, &body);
-        Ok(())
-    }
-}
-
-impl Dev {
-    /// Whether a mount or a clone has already given it a connection.
-    pub fn attached(&self) -> bool {
-        self.conn.lock().unwrap().is_some()
     }
 }
 

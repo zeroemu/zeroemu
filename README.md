@@ -38,6 +38,7 @@ arm64 Android on Apple Silicon and Windows on ARM, x86_64 Android on x86_64 PCs.
 | M5: zygote, ART, `system_server`, launcher, apps | done (macOS): Android 16's Pixel launcher in the window, and boot complete about 17 s after start on a first boot and about 12 s after that |
 | M6: input from the window | done (macOS): mouse as touch, scroll as a finger drag, keyboard; Chrome and Play Store open and draw from a tap |
 | Network | done (macOS): Android validates the network, Chrome loads sites over HTTP, HTTPS and QUIC, and `adb forward` and `reverse` work. See below for what a network with no packets can't do |
+| Shared storage | done (macOS), as a stand-in for MediaProvider's FUSE daemon: vold mounts the emulated volume, `/sdcard` has its standard directories, `adb push`/`pull` work there, and apps get their `Android/data` directories. See below |
 | Smoothness | in progress: the renderer draws straight into the window, and one app's GL stream no longer waits on another's. See Performance notes |
 | Windows | no window and never run; compiles (`cargo check --target x86_64-pc-windows-msvc`) |
 
@@ -80,11 +81,18 @@ Known gaps:
   tracefs and bpffs have modes droidrt made up and owners nobody set, so any process may
   read and write what they let root. fs.protected_symlinks isn't applied, and `access()`
   walks the path with the effective ids rather than the real ones.
-- There is no shared storage: without `/dev/fuse` vold can't mount the emulated volume,
-  so `/sdcard` and `/storage/emulated` are the bare mount points vold and zygote leave
-  (0700 root, 0710 shell:everybody), and apps are refused there as on a device whose
-  volume failed to mount. Before permissions were enforced, apps wrote into those
-  directories, in memory that nothing kept.
+- Shared storage has no scoped storage: MediaProvider's daemon is never asked anything
+  after FUSE_INIT (see below), so any app with the volume in its mount namespace may read
+  and write anything there, MediaProvider only learns of new files when it scans, and
+  nothing is redacted or transcoded. Other apps' `Android/data` and `Android/obb`
+  directories stay closed, as vold binds them from `/data/media` with their owners' modes.
+  Files show the labels `/data/media` has rather than `u:object_r:fuse:s0`. vold logs that
+  it can't set the volume's readahead: there is no `/sys/class/bdi/0:N`.
+- POSIX ACLs on tmpfs are stored but not enforced, and new files don't inherit a default
+  ACL: a file an app writes in its `Android/data` directory with umask 077 stays 0600,
+  where the default ACL vold sets would let `ext_data_rw` (adb's shell) read it.
+- File capabilities (`security.capability`) aren't applied on `execve`, so `run-as`
+  can't change its ids and fails.
 - userfaultfd has only what ART's compacting collector uses: SIGBUS mode, on private
   anonymous memory.
 - Guest GLES reaches the renderer over virtio-gpu's pipe, not its shared-memory ring:
@@ -112,6 +120,19 @@ can't add later, nor past ashmem's protection mask), the xattr namespaces' rules
 uid is held to them. droidrt's own device nodes have the modes and owners ueventd.rc
 gives them. `src/kernel/perm.rs` has the shared checks and says which filesystems they
 cover.
+
+Shared storage (`/sdcard`, `/storage/emulated`) is the device's arrangement with the
+round trips left out. vold opens `/dev/fuse`, mounts it at `/mnt/user/0/emulated` and hands
+the descriptor to MediaProvider, whose FUSE daemon reads FUSE_INIT and answers it, so vold,
+StorageManagerService and MediaProvider all see the volume mounted. The mount itself is a
+second view of `/data/media` in `/data`'s tmpfs, served by droidrt directly, so its files are
+saved with `/data` and no file operation waits on a guest process. As on a fuse mount without
+`default_permissions`, nothing is refused there, chmod and chown change nothing, and what is
+created belongs to the daemon's uid, as on the lower filesystem where MediaProvider would make
+it. vold's binds of `/data/media/0/Android/data` and `obb`, and zygote's per-app views, work as
+on a device; `/data`'s tmpfs keeps ext4's inode flags and quota project ids
+(`FS_IOC_SETFLAGS`, `FS_IOC_FSSETXATTR`), which vold sets on each app's directories. See
+`src/kernel/fuse.rs`, and the gaps above for what this leaves out.
 
 M3 so far adds the IPC Android's system services stand on: `eventfd`,
 `epoll`, `timerfd`, `signalfd`, Unix sockets with `SCM_RIGHTS`, tmpfs

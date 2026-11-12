@@ -9,7 +9,10 @@
 //! with ueventd's modes), binderfs, and the read-only images. procfs, sysfs, the
 //! cgroup hierarchies, selinuxfs, devpts, tracefs, bpffs and the stand-in
 //! filesystems have modes droidrt made up and owners nobody set, so they stay
-//! permissive, as their directories do for path walks.
+//! permissive, as their directories do for path walks. A fuse mount (the
+//! shared-storage volume, fuse.rs) shows /data's files with their real owners, and
+//! still nothing is checked there: vold mounts it without default_permissions, so
+//! on Linux the kernel leaves every decision to the daemon.
 
 use super::creds::Creds;
 use super::{Kernel, Thread};

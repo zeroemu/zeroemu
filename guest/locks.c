@@ -1,4 +1,4 @@
-// Freestanding arm64 test of droidrt's advisory file locks: open file
+// Freestanding arm64 test of zeroemu's advisory file locks: open file
 // description (OFD) record locks, which netd's BPF map locking relies on,
 // POSIX record locks (owned by the process), and flock.
 

@@ -258,7 +258,7 @@ impl Kernel {
 
     /// Loads `path` (an ELF or a `#!` script) into `mm` and builds its stack.
     /// Returns the initial register state and the executable's path. `who`, the
-    /// thread calling execve, is held to its permissions; droidrt's own first
+    /// thread calling execve, is held to its permissions; zeroemu's own first
     /// program isn't.
     pub fn load_program(&self, who: Option<&Thread>, mm: &mut AddressSpace, cwd: &str, path: &str, mut argv: Vec<String>, envp: &[String]) -> Result<(CpuState, String), i64> {
         let vfs = self.vfs.as_deref().ok_or(ENOENT)?;
@@ -299,7 +299,7 @@ impl Kernel {
                 continue;
             }
             let main = elf::load(mm, &src, size, &node.path, false).map_err(|e| {
-                eprintln!("[droidrt] exec: {e}");
+                eprintln!("[zeroemu] exec: {e}");
                 ENOEXEC
             })?;
             let mut interp_range = None;
@@ -308,7 +308,7 @@ impl Kernel {
                     let inode = open_exec("/", interp)?;
                     let (isrc, isize) = (vfs.page_source(&inode)?, vfs.stat(&inode)?.size);
                     let li = elf::load(mm, &isrc, isize, interp, true).map_err(|e| {
-                        eprintln!("[droidrt] exec: {e}");
+                        eprintln!("[zeroemu] exec: {e}");
                         ENOEXEC
                     })?;
                     interp_range = Some((li.lo, li.end, inode.path.clone()));
@@ -477,7 +477,7 @@ impl Kernel {
         reaper.child_cv.notify_all();
     }
 
-    /// The root may be a program that never waits for anything (droidrt runs
+    /// The root may be a program that never waits for anything (zeroemu runs
     /// arbitrary ones as pid 1): orphans it adopted and never reaped are
     /// released, oldest first, once there are more than ADOPTED_ZOMBIES.
     fn trim_adopted_zombies(&self, root: &Process) {

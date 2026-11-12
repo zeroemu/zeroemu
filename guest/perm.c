@@ -2,7 +2,7 @@
 // dropped from root to an app's uid may and may not do to files it doesn't own,
 // and what root's capabilities still let through. Each check is what Linux does
 // (fs/namei.c, fs/attr.c, fs/open.c, mm/mmap.c, net/unix/af_unix.c). Runs as root
-// on droidrt's tmpfs; the restricted checks run in a child that drops to uid 10001.
+// on zeroemu's tmpfs; the restricted checks run in a child that drops to uid 10001.
 typedef unsigned long u64;
 typedef long i64;
 typedef unsigned int u32;

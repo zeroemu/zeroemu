@@ -11,7 +11,7 @@
 //! - `/dev/socket/logd` (stream): control commands such as `clear 0` and
 //!   `getLogSize 0`, each answered with a NUL-terminated string.
 //!
-//! `DROIDRT_LOG=<V|D|I|W|E|F|S>` sets the lowest priority printed (default I).
+//! `ZEROEMU_LOG=<V|D|I|W|E|F|S>` sets the lowest priority printed (default I).
 //! Once init starts the real logd on sockets of its own, the kernel still
 //! prints what that logd receives (`tap`), so logs stay on the terminal.
 
@@ -134,7 +134,7 @@ struct Logd {
 fn printer() -> (u8, Instant) {
     static PRINTER: OnceLock<(u8, Instant)> = OnceLock::new();
     *PRINTER.get_or_init(|| {
-        let level = match std::env::var("DROIDRT_LOG").ok().and_then(|v| v.bytes().next()) {
+        let level = match std::env::var("ZEROEMU_LOG").ok().and_then(|v| v.bytes().next()) {
             Some(b'V' | b'v') => 2,
             Some(b'D' | b'd') => 3,
             Some(b'W' | b'w') => 5,
@@ -217,7 +217,7 @@ impl Logd {
             "getLogSizeUsed" | "getLogSizeReadable" => self.used(lids).to_string(),
             "setLogSize" | "setPruneList" | "reinit" => "success".into(),
             "getPruneList" => String::new(),
-            "getStatistics" => format!("droidrt logd: {} bytes in {} entries\n", self.used(u32::MAX), self.logs.lock().unwrap().entries.len()),
+            "getStatistics" => format!("zeroemu logd: {} bytes in {} entries\n", self.used(u32::MAX), self.logs.lock().unwrap().entries.len()),
             _ => "Invalid".into(),
         }
     }

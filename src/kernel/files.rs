@@ -272,7 +272,7 @@ pub struct FdTable {
     fds: Vec<Option<Entry>>,
     /// The process's RLIMIT_NOFILE soft limit: fds must stay below it.
     limit: usize,
-    /// DROIDRT_FD_TRACE: the pid whose table this is, when traced.
+    /// ZEROEMU_FD_TRACE: the pid whose table this is, when traced.
     traced: Option<i32>,
 }
 
@@ -281,11 +281,11 @@ thread_local! {
     pub(super) static CURRENT: std::cell::Cell<(i32, i32, u64)> = const { std::cell::Cell::new((0, 0, 0)) };
 }
 
-/// DROIDRT_FD_TRACE=<name>: log every descriptor added to or removed from
+/// ZEROEMU_FD_TRACE=<name>: log every descriptor added to or removed from
 /// the tables of programs whose path contains it (with who did it).
 pub(super) fn fd_trace_wanted(exe: &str) -> bool {
     static NAME: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-    NAME.get_or_init(|| std::env::var("DROIDRT_FD_TRACE").ok().filter(|v| !v.is_empty())).as_deref().is_some_and(|n| exe.contains(n))
+    NAME.get_or_init(|| std::env::var("ZEROEMU_FD_TRACE").ok().filter(|v| !v.is_empty())).as_deref().is_some_and(|n| exe.contains(n))
 }
 
 fn fd_log(owner: Option<i32>, what: &str, fd: usize, f: Option<&Arc<File>>) {
@@ -2421,7 +2421,7 @@ impl Kernel {
             let ready = ep.collect(t, max.min(1024) as usize, 0);
             if !ready.is_empty() {
                 if fell_back && late_wake_log() {
-                    eprintln!("[droidrt] late wake: tid {} epoll fd {epfd}: only the fallback timeout noticed {} ready events", t.tid, ready.len());
+                    eprintln!("[zeroemu] late wake: tid {} epoll fd {epfd}: only the fallback timeout noticed {} ready events", t.tid, ready.len());
                 }
                 let (size, data_off) = self.arch.epoll_event_layout();
                 let mut out = vec![0u8; ready.len() * size];
@@ -2468,11 +2468,11 @@ fn nap(deadline: Option<Instant>, timer: Option<Instant>) -> Duration {
     until.map_or(IDLE, |d| d.saturating_duration_since(Instant::now()).min(IDLE)).max(Duration::from_micros(50))
 }
 
-/// DROIDRT_LATEWAKE=1: reports readiness nothing announced with EVENTS.bump.
+/// ZEROEMU_LATEWAKE=1: reports readiness nothing announced with EVENTS.bump.
 /// Those files work, but only as fast as the fallback timeout.
 fn late_wake_log() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("DROIDRT_LATEWAKE").is_some())
+    *ON.get_or_init(|| std::env::var_os("ZEROEMU_LATEWAKE").is_some())
 }
 
 /// The namespace node behind an open file, if it keeps one.

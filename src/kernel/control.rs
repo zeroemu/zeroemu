@@ -524,13 +524,13 @@ impl Kernel {
             }
             _ => return Err(EINVAL),
         };
-        eprintln!("[droidrt] {what} requested by pid {}{reason}", t.proc.pid);
+        eprintln!("[zeroemu] {what} requested by pid {}{reason}", t.proc.pid);
         {
             let (lock, cv) = &self.exit;
             lock.lock().unwrap().get_or_insert(code << 8);
             cv.notify_all();
         }
-        // Like the real thing, reboot does not return: droidrt exits under us.
+        // Like the real thing, reboot does not return: zeroemu exits under us.
         loop {
             std::thread::park();
         }

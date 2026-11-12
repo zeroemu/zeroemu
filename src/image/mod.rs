@@ -179,11 +179,11 @@ pub fn invalid(msg: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg.into())
 }
 
-/// The Android SDK image tests read when it is installed: $DROIDRT_TEST_IMAGE,
+/// The Android SDK image tests read when it is installed: $ZEROEMU_TEST_IMAGE,
 /// else the newest arm64 image under ~/Library/Android/sdk (as test-android.sh).
 #[cfg(test)]
 pub fn sdk_image() -> Option<crate::vfs::Vfs> {
-    let path = std::env::var_os("DROIDRT_TEST_IMAGE").map(std::path::PathBuf::from).or_else(|| {
+    let path = std::env::var_os("ZEROEMU_TEST_IMAGE").map(std::path::PathBuf::from).or_else(|| {
         let root = Path::new(&std::env::var_os("HOME")?).join("Library/Android/sdk/system-images");
         let mut found: Vec<_> = std::fs::read_dir(&root).ok()?.flatten().filter_map(|v| {
             let n = v.file_name().into_string().ok()?;

@@ -274,13 +274,13 @@ fn err(e: i64) -> io::Error {
 /// The androidboot.* parameters the Android Emulator passes, in its
 /// virtio-gpu mode: the image's own ranchu vendor init then sets up gfxstream
 /// over virtio-gpu (minigbm gralloc, emulation EGL, ranchu Vulkan), which
-/// droidrt's DRM device and the emulator's host renderer serve.
+/// zeroemu's DRM device and the emulator's host renderer serve.
 const BOOT_ARGS: &str = "androidboot.hardware=ranchu androidboot.selinux=permissive androidboot.qemu=1 \
 androidboot.hardware.gralloc=minigbm androidboot.hardware.gltransport=virtio-gpu-asg \
 androidboot.qemu.gltransport.name=virtio-gpu-asg androidboot.qemu.gltransport.drawFlushInterval=800 \
 androidboot.hardware.vulkan=ranchu androidboot.opengles.version=196609 androidboot.qemu.vsync=60 \
 androidboot.debug.hwui.renderer=skiagl \
-androidboot.hardware.cpu.pagesize=4096 androidboot.qemu.avd_name=droidrt";
+androidboot.hardware.cpu.pagesize=4096 androidboot.qemu.avd_name=zeroemu";
 
 impl ProcFs {
     pub fn new(kernel: Weak<Kernel>) -> Arc<ProcFs> {
@@ -383,7 +383,7 @@ impl ProcFs {
             }
             K::Cpuinfo => text(cpuinfo()),
             K::Stat => {
-                // Busy: what droidrt has used, all its threads together. Idle: the rest
+                // Busy: what zeroemu has used, all its threads together. Idle: the rest
                 // of the cores' time since boot. Spread evenly over the cores.
                 let n = cpus() as u64;
                 let up = kernel.boot.elapsed().as_nanos() as u64 / 10_000_000;
@@ -403,7 +403,7 @@ impl ProcFs {
                 text(format!("{up:.2} {:.2}\n", (up * cpus() as f64 - busy).max(0.0)))
             }
             K::Loadavg => text(format!("0.00 0.00 0.00 1/{} {}\n", kernel.procs.lock().unwrap().len(), kernel.next_id.load(Ordering::Relaxed) - 1)),
-            K::Version => text("Linux version 6.6.0-droidrt (droidrt) #1 SMP PREEMPT\n".into()),
+            K::Version => text("Linux version 6.6.0-zeroemu (zeroemu) #1 SMP PREEMPT\n".into()),
             // Pressure stall information: nothing ever stalls here. Triggers
             // written to these files are accepted and never fire (lmkd and
             // system_server's LowMemDetector need them to exist).
@@ -538,7 +538,7 @@ impl ProcFs {
                     }
                     K::PStat => {
                         // utime, cutime and starttime in clock ticks (USER_HZ, 100). All of a
-                        // thread's time counts as user time: droidrt can't tell its own work
+                        // thread's time counts as user time: zeroemu can't tell its own work
                         // for a thread from the thread's.
                         let cpu = if extra != 0 { thread_of(&p, extra as i32).map_or(0, |t| t.cpu_ns()) } else { p.cpu_ns() };
                         let ticks = |ns: u64| ns / 10_000_000;
@@ -645,7 +645,7 @@ fn cpuinfo() -> String {
                 "processor\t: {i}\nBogoMIPS\t: 48.00\nFeatures\t: fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp asimdhp cpuid asimdrdm lrcpc dcpop asimddp\nCPU implementer\t: 0x61\nCPU architecture: 8\nCPU variant\t: 0x0\nCPU part\t: 0x000\nCPU revision\t: 0\n\n"
             );
         } else {
-            s += &format!("processor\t: {i}\nvendor_id\t: droidrt\nmodel name\t: droidrt virtual CPU\nflags\t\t: fpu sse sse2 ssse3 sse4_1 sse4_2 popcnt avx avx2\n\n");
+            s += &format!("processor\t: {i}\nvendor_id\t: zeroemu\nmodel name\t: zeroemu virtual CPU\nflags\t\t: fpu sse sse2 ssse3 sse4_1 sse4_2 popcnt avx avx2\n\n");
         }
     }
     s
@@ -747,7 +747,7 @@ impl FileSystem for ProcFs {
         }
     }
 
-    /// A trigger on memory pressure fires when droidrt runs short of memory (`pressure`);
+    /// A trigger on memory pressure fires when zeroemu runs short of memory (`pressure`);
     /// those on other resources never do, since it keeps no stall accounting.
     fn trigger(&self, ino: u64, data: &[u8]) -> Option<Arc<std::sync::atomic::AtomicU64>> {
         let (K::PressureFile, _, extra) = decode(ino)? else { return None };

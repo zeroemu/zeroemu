@@ -1,4 +1,4 @@
-// Freestanding arm64 test of droidrt's bpf(2): hash, array, per-CPU and
+// Freestanding arm64 test of zeroemu's bpf(2): hash, array, per-CPU and
 // LPM-trie maps; update flags; key iteration; program loading and info;
 // pinning in bpffs and getting the object back; ids.
 

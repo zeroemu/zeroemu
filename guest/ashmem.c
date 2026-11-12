@@ -1,4 +1,4 @@
-// Freestanding arm64 test of droidrt's /dev/ashmem: name and size ioctls,
+// Freestanding arm64 test of zeroemu's /dev/ashmem: name and size ioctls,
 // shared mappings of one region, the size fixed once mapped, the protection
 // mask, and fstat as libcutils checks it.
 

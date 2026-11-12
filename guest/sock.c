@@ -1,4 +1,4 @@
-// Freestanding arm64 test of droidrt's socket namespace (no libc): AF_UNIX
+// Freestanding arm64 test of zeroemu's socket namespace (no libc): AF_UNIX
 // path bindings as filesystem nodes (bind/stat/connect/unlink/rebind, chmod,
 // lchown, symlinks, hard links) and AF_NETLINK basics (port ids, dumps,
 // acks, audit, uevent multicast). Exits with the failure count.

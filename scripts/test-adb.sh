@@ -17,7 +17,7 @@ check() { # name, then the command that must succeed
 }
 limit() { perl -e 'alarm shift; exec @ARGV' "$@"; }
 
-DROIDRT_BACKGROUND=1 target/release/droidrt --system "$IMG" --boot --ephemeral > "$TMP/boot.log" 2>&1 &
+ZEROEMU_BACKGROUND=1 target/release/zeroemu --system "$IMG" --boot --ephemeral > "$TMP/boot.log" 2>&1 &
 pid=$!
 stop() { kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; rm -rf "${TMP:?}"; }
 trap stop EXIT
@@ -55,7 +55,7 @@ pulls() { A pull /data/local/tmp/big "$TMP/back" >/dev/null && [ "$(shasum -a 25
 check "100 MB pull comes back intact" pulls
 A shell rm /data/local/tmp/big
 
-# Shared storage: vold mounts the emulated volume on /dev/fuse, which droidrt serves
+# Shared storage: vold mounts the emulated volume on /dev/fuse, which zeroemu serves
 # from /data/media, and MediaProvider makes the standard directories on it.
 until A shell ls /sdcard/Download >/dev/null 2>&1 || [ $n -gt 300 ]; do sleep 1; n=$((n + 1)); done
 mounted() { A shell sm list-volumes | grep -q "emulated;0 mounted"; }
@@ -80,18 +80,18 @@ PLAT=$(ls -d "$SDK"/platforms/android-* 2>/dev/null | head -1)/android.jar
 build_sdtest() {
     S=scripts/sdtest O=$TMP/sdtest
     mkdir -p "$O/classes" "$O/dex" &&
-    javac --release 8 -nowarn -cp "$PLAT" -d "$O/classes" "$S/src/org/droidrt/sdtest/Main.java" 2>/dev/null &&
-    "$BT/d8" --min-api 30 --lib "$PLAT" --output "$O/dex" "$O"/classes/org/droidrt/sdtest/*.class &&
+    javac --release 8 -nowarn -cp "$PLAT" -d "$O/classes" "$S/src/dev/zeroemu/sdtest/Main.java" 2>/dev/null &&
+    "$BT/d8" --min-api 30 --lib "$PLAT" --output "$O/dex" "$O"/classes/dev/zeroemu/sdtest/*.class &&
     "$BT/aapt2" link -o "$O/base.apk" -I "$PLAT" --manifest "$S/AndroidManifest.xml" &&
     (cd "$O/dex" && zip -q ../base.apk classes.dex) &&
     "$BT/zipalign" -f 4 "$O/base.apk" "$O/aligned.apk" &&
-    keytool -genkeypair -keystore "$O/key" -storepass android -keypass android -alias k -keyalg RSA -keysize 2048 -validity 1 -dname CN=droidrt >/dev/null 2>&1 &&
+    keytool -genkeypair -keystore "$O/key" -storepass android -keypass android -alias k -keyalg RSA -keysize 2048 -validity 1 -dname CN=zeroemu >/dev/null 2>&1 &&
     "$BT/apksigner" sign --ks "$O/key" --ks-pass pass:android --out "$TMP/sdtest.apk" "$O/aligned.apk"
 }
 external_files() {
-    A install -r "$TMP/sdtest.apk" | grep -q Success && A shell am start -W -n org.droidrt.sdtest/.Main >/dev/null || return 1
-    uid=$(A shell pm list packages -U org.droidrt.sdtest | sed -n 's/.*uid://p' | tr -d '\r')
-    f=/sdcard/Android/data/org.droidrt.sdtest/files/hello.txt
+    A install -r "$TMP/sdtest.apk" | grep -q Success && A shell am start -W -n dev.zeroemu.sdtest/.Main >/dev/null || return 1
+    uid=$(A shell pm list packages -U dev.zeroemu.sdtest | sed -n 's/.*uid://p' | tr -d '\r')
+    f=/sdcard/Android/data/dev.zeroemu.sdtest/files/hello.txt
     m=0
     until A shell ls -ln $f 2>/dev/null | grep -q " $uid "; do sleep 1; m=$((m + 1)); [ $m -gt 20 ] && return 1; done
 }

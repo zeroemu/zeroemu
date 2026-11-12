@@ -1,5 +1,5 @@
 [package]
-name = "droidrt"
+name = "zeroemu"
 version = "0.1.0"
 edition = "2024"
 description = "Run Android's Linux userspace natively on macOS and Windows, without a guest kernel"

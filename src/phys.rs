@@ -253,7 +253,7 @@ impl PhysMem {
         };
         if let Err(e) = self.hv.map_ram(host, gpa, size) {
             ext.free.push((gpa, size));
-            eprintln!("[droidrt] device memory: {e}");
+            eprintln!("[zeroemu] device memory: {e}");
             return Err(crate::errno::ENOMEM);
         }
         ext.live.push(ExtRange { gpa, size, host: host as usize });
@@ -265,7 +265,7 @@ impl PhysMem {
         let Some(i) = ext.live.iter().position(|r| r.gpa == gpa) else { return };
         let range = ext.live.swap_remove(i);
         if let Err(e) = self.hv.unmap_ram(range.gpa, range.size) {
-            eprintln!("[droidrt] device memory unmap: {e}");
+            eprintln!("[zeroemu] device memory unmap: {e}");
         }
         ext.free.push((range.gpa, range.size));
     }
@@ -352,7 +352,7 @@ impl PhysMem {
         let host = unsafe { self.base.as_ptr().add(a.mapped as usize) };
         os::commit(host, MAP_UNIT);
         if let Err(e) = self.hv.map_ram(host, a.mapped, MAP_UNIT) {
-            eprintln!("[droidrt] guest RAM: {e}");
+            eprintln!("[zeroemu] guest RAM: {e}");
             return Err(ENOMEM);
         }
         a.mapped += MAP_UNIT;

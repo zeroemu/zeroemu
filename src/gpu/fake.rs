@@ -1,4 +1,4 @@
-//! A virtio-gpu backend with no renderer. `DROIDRT_GPU=fake` (and the drm
+//! A virtio-gpu backend with no renderer. `ZEROEMU_GPU=fake` (and the drm
 //! unit tests) use it so guest ioctl tests run headless. Host blobs are
 //! ordinary 16 KiB-aligned allocations; fences complete inline.
 

@@ -1,4 +1,4 @@
-// Freestanding arm64 test of droidrt's writable filesystems and shared memory
+// Freestanding arm64 test of zeroemu's writable filesystems and shared memory
 // (no libc): tmpfs files, MAP_SHARED across fork and between processes,
 // memfd passed over a socket and mapped by the receiver (the ashmem pattern).
 // Exits with the failure count.

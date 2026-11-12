@@ -1,11 +1,11 @@
 //! AF_VSOCK, as far as the Android Emulator's guest needs it: the ranchu
 //! HALs reach "the host" through libqemupipe, which connects a vsock stream
 //! to CID 2, port 5000, and writes the service name ("pipe:qemud:sensors"
-//! and its NUL). droidrt is that host. Services it does not provide close
+//! and its NUL). zeroemu is that host. Services it does not provide close
 //! the connection, as the emulator does.
 //!
 //! qemud services frame each message with its length in four hex digits.
-//! The clipboard pipe has binary framing, but droidrt has nothing to say on
+//! The clipboard pipe has binary framing, but zeroemu has nothing to say on
 //! it and drops what it hears.
 //!
 //! A guest can also listen, which is how host adb reaches adbd: the host side
@@ -229,7 +229,7 @@ impl Vsock {
                 "pipe:QemuMiscPipe" => st.service = Some(Service::Misc),
                 "pipe:clipboard" | "pipe:qemud:fingerprintlisten" => st.service = Some(Service::Silent),
                 _ => {
-                    eprintln!("droidrt: no host service {name}");
+                    eprintln!("zeroemu: no host service {name}");
                     st.closed = true;
                     EVENTS.bump_key(Arc::as_ptr(self) as usize);
                     return Ok(data.len());
@@ -526,8 +526,8 @@ fn sensors_message(s: &mut Sensors, out: &mut VecDeque<u8>, msg: &str) {
     if let Some(ms) = msg.strip_prefix("set-delay:") {
         let was = s.delay_ms;
         s.delay_ms = ms.parse().unwrap_or(200);
-        if s.delay_ms != was && std::env::var_os("DROIDRT_SENSOR_TRACE").is_some() {
-            eprintln!("droidrt: sensors asked for every {} ms", s.delay_ms);
+        if s.delay_ms != was && std::env::var_os("ZEROEMU_SENSOR_TRACE").is_some() {
+            eprintln!("zeroemu: sensors asked for every {} ms", s.delay_ms);
         }
     } else if let Some(rest) = msg.strip_prefix("set:") {
         const NAMES: [&str; 9] = ["acceleration", "gyroscope", "magnetic-field", "orientation", "temperature", "proximity", "light", "pressure", "humidity"];

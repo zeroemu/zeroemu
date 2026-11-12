@@ -165,7 +165,7 @@ pub fn key_mask(key: usize) -> Mask {
     Mask::bucket(bucket_of(key))
 }
 
-/// Each slot's guest thread, for DROIDRT_WAKE_STATS to say whom a crowd wake reached.
+/// Each slot's guest thread, for ZEROEMU_WAKE_STATS to say whom a crowd wake reached.
 static SLOT_TIDS: [std::sync::atomic::AtomicI32; SLOTS] = [const { std::sync::atomic::AtomicI32::new(0) }; SLOTS];
 
 /// Records which guest thread sleeps in this thread's slot.
@@ -176,10 +176,10 @@ pub fn set_slot_tid(tid: i32) {
 /// Wakeups sent, for wakeup_stats: how many threads each event woke.
 pub static WAKES: AtomicU64 = AtomicU64::new(0);
 
-/// DROIDRT_WAKE_STATS=1: per key, events and threads woken, for wakeup_stats to name the
+/// ZEROEMU_WAKE_STATS=1: per key, events and threads woken, for wakeup_stats to name the
 /// keys that wake the most.
 static WAKE_STATS: std::sync::LazyLock<Option<Mutex<std::collections::HashMap<usize, (u64, u64)>>>> =
-    std::sync::LazyLock::new(|| std::env::var_os("DROIDRT_WAKE_STATS").map(|_| Mutex::default()));
+    std::sync::LazyLock::new(|| std::env::var_os("ZEROEMU_WAKE_STATS").map(|_| Mutex::default()));
 
 /// The keys that woke the most threads since last asked: (key, events, woken).
 pub fn top_wakers(n: usize) -> Vec<(usize, u64, u64)> {
@@ -242,7 +242,7 @@ impl Events {
                     .map(|i| SLOT_TIDS[i].load(Ordering::Relaxed))
                     .take(40)
                     .collect();
-                eprintln!("droidrt: key {key:#x} woke {woken} threads ({tids:?}), from:\n{}", std::backtrace::Backtrace::force_capture());
+                eprintln!("zeroemu: key {key:#x} woke {woken} threads ({tids:?}), from:\n{}", std::backtrace::Backtrace::force_capture());
             }
         }
     }

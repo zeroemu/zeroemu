@@ -226,7 +226,7 @@ pub fn set_thread_urgency(u: Urgency) {
 
 /// A host thread whose CPU time any thread can read. Each guest thread runs on a host
 /// thread of its own, so this is that guest thread's CPU time: its code in the VM and
-/// droidrt's work on its behalf.
+/// zeroemu's work on its behalf.
 pub struct HostThread {
     #[cfg(target_os = "macos")]
     port: u32,
@@ -323,7 +323,7 @@ pub fn thread_cpu_time() -> std::time::Duration {
     }
 }
 
-/// CPU time of droidrt as a whole: every guest thread and droidrt's own, gone ones too.
+/// CPU time of zeroemu as a whole: every guest thread and zeroemu's own, gone ones too.
 pub fn process_cpu_time() -> std::time::Duration {
     #[cfg(unix)]
     {

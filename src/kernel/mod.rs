@@ -75,7 +75,7 @@ use signal::{Actions, SigInfo};
 pub(super) const ERESTARTSYS: i64 = 512;
 
 /// How often blocked threads re-check for signals and process exit.
-/// Hardware the image declares and droidrt has no driver behind. SystemConfig
+/// Hardware the image declares and zeroemu has no driver behind. SystemConfig
 /// applies these last, whichever file declared the feature.
 /// Properties for a booted device. The emulator's answer to a busy host: Watchdog and
 /// ANR timeouts scale by the multiplier. SurfaceFlinger composes layers with a blur
@@ -185,7 +185,7 @@ pub struct Kernel {
     drm: Option<Arc<drm::Device>>,
     #[allow(dead_code)]
     gpu: Option<Arc<dyn crate::gpu::GpuBackend>>,
-    /// The root process's wait status once it exits; droidrt then exits.
+    /// The root process's wait status once it exits; zeroemu then exits.
     exit: (Mutex<Option<i32>>, Condvar),
 }
 
@@ -239,8 +239,10 @@ struct Persist {
 
 impl Persist {
     /// The trees' structure, padded to a page, then the pages of their files.
-    const MAGIC: &'static [u8] = b"droidrt data 2\n";
-    /// Pages in among the structure, as earlier droidrts wrote.
+    const MAGIC: &'static [u8] = b"zeroemu data 2\n";
+    /// The same, written under the project's old name.
+    const MAGIC_LEGACY: &'static [u8] = b"droidrt data 2\n";
+    /// Pages in among the structure, as the first versions wrote (under the old name).
     const MAGIC_V1: &'static [u8] = b"droidrt data 1\n";
 
     /// `<file><suffix>`: added to the name, so never the name itself, whatever it is.
@@ -297,8 +299,8 @@ impl Persist {
             }
             return Ok(size);
         }
-        if magic != Self::MAGIC {
-            return Err(std::io::Error::other("not a droidrt data file"));
+        if magic != Self::MAGIC && magic != Self::MAGIC_LEGACY {
+            return Err(std::io::Error::other("not a zeroemu data file"));
         }
         let (mut read, mut ordinal) = (Vec::new(), 0);
         for (_, tree) in &self.trees {
@@ -372,20 +374,20 @@ fn apply_extras(v: &Vfs, dev: &crate::tmpfs::Tmpfs, extras: &BootExtras) -> Resu
         put(path, data)?;
     }
     let Some(cmd) = &extras.run else { return Ok(()) };
-    // Its output goes to /dev/kmsg, which droidrt prints.
-    put("/data/local/tmp/.droidrt-run.sh", format!("exec >/dev/kmsg 2>&1\n{cmd}\n").as_bytes())?;
+    // Its output goes to /dev/kmsg, which zeroemu prints.
+    put("/data/local/tmp/.zeroemu-run.sh", format!("exec >/dev/kmsg 2>&1\n{cmd}\n").as_bytes())?;
     let rc = v.resolve("/", "/system/etc/init/hw/init.rc", true).map_err(|e| format!("init.rc: errno {e}"))?;
     let mut text = String::from_utf8_lossy(&v.read_all(&rc).map_err(|e| format!("init.rc: errno {e}"))?).into_owned();
-    text += "\n# Added by droidrt --run.\nservice droidrt_run /system/bin/sh /data/local/tmp/.droidrt-run.sh\n    user root\n    group root\n    seclabel u:r:shell:s0\n    stdio_to_kmsg\n    oneshot\n    disabled\n\non property:init.svc.surfaceflinger=running\n    start droidrt_run\n";
-    dev.write_file(".droidrt/init.rc", 0o644, &text);
-    let src = v.resolve("/", "/dev/.droidrt/init.rc", true).map_err(|e| format!("init.rc copy: errno {e}"))?;
+    text += "\n# Added by zeroemu --run.\nservice zeroemu_run /system/bin/sh /data/local/tmp/.zeroemu-run.sh\n    user root\n    group root\n    seclabel u:r:shell:s0\n    stdio_to_kmsg\n    oneshot\n    disabled\n\non property:init.svc.surfaceflinger=running\n    start zeroemu_run\n";
+    dev.write_file(".zeroemu/init.rc", 0o644, &text);
+    let src = v.resolve("/", "/dev/.zeroemu/init.rc", true).map_err(|e| format!("init.rc copy: errno {e}"))?;
     v.bind(&src, &rc, false).map_err(|e| format!("init.rc bind: errno {e}"))
 }
 
 /// What first-stage init leaves for the second stage beyond the partitions
-/// droidrt already mounted: a writable /metadata, and an fstab describing the
+/// zeroemu already mounted: a writable /metadata, and an fstab describing the
 /// mounts that exist (bound over the vendor's, which names virtio disks
-/// droidrt has no reason to emulate), so `mount_all` has nothing to wait for.
+/// zeroemu has no reason to emulate), so `mount_all` has nothing to wait for.
 fn first_stage_mounts(v: &Vfs, metadata: &Arc<crate::tmpfs::Tmpfs>, dev: &crate::tmpfs::Tmpfs, partitions: &[String]) {
     if let Ok(node) = v.resolve("/", "/metadata", true) {
         let sb = v.new_super(metadata.clone(), "tmpfs", None, 0, "mode=0755");
@@ -393,23 +395,23 @@ fn first_stage_mounts(v: &Vfs, metadata: &Arc<crate::tmpfs::Tmpfs>, dev: &crate:
     }
     // The host's adb key, as /adb_keys: outside /data, so it doesn't expire or depend on
     // what a saved /data holds. This overlays the image's link to its own (empty) file.
-    dev.write_file(".droidrt/adb_keys", 0o644, "");
-    if let (Ok(src), Ok(target)) = (v.resolve("/", "/dev/.droidrt/adb_keys", true), v.resolve("/", "/adb_keys", false)) {
+    dev.write_file(".zeroemu/adb_keys", 0o644, "");
+    if let (Ok(src), Ok(target)) = (v.resolve("/", "/dev/.zeroemu/adb_keys", true), v.resolve("/", "/adb_keys", false)) {
         let _ = v.bind(&src, &target, false);
         if let Some(file) = v.mem_file(&src) {
             adb::set_key_file(file);
         }
     }
     let Ok(hw_fstab) = v.resolve("/", "/vendor/etc/fstab.ranchu", true) else { return };
-    let mut fstab = String::from("# Written by droidrt, which plays first-stage init.\n");
+    let mut fstab = String::from("# Written by zeroemu, which plays first-stage init.\n");
     for (name, mountpoint) in crate::android::PARTITIONS {
         if partitions.iter().any(|p| p == name) {
             fstab += &format!("{name} {mountpoint} erofs ro wait,logical,first_stage_mount\n");
         }
     }
     fstab += "tmpfs /metadata tmpfs nosuid,nodev,noatime,mode=0755 first_stage_mount\n";
-    dev.write_file(".droidrt/fstab.ranchu", 0o644, &fstab);
-    if let Ok(src) = v.resolve("/", "/dev/.droidrt/fstab.ranchu", true) {
+    dev.write_file(".zeroemu/fstab.ranchu", 0o644, &fstab);
+    if let Ok(src) = v.resolve("/", "/dev/.zeroemu/fstab.ranchu", true) {
         let _ = v.bind(&src, &hw_fstab, false);
     }
 }
@@ -436,8 +438,8 @@ fn add_boot_props(v: &mut Vfs, phys: &Arc<PhysMem>) {
                 let mut text = String::from_utf8_lossy(&content).into_owned();
                 if rel == "build.prop" {
                     text.push_str(BOOT_PROPS);
-                    // For debugging: DROIDRT_PROPS="ro.lmk.debug=true other=1".
-                    for prop in std::env::var("DROIDRT_PROPS").unwrap_or_default().split_whitespace() {
+                    // For debugging: ZEROEMU_PROPS="ro.lmk.debug=true other=1".
+                    for prop in std::env::var("ZEROEMU_PROPS").unwrap_or_default().split_whitespace() {
                         text.push_str(prop);
                         text.push('\n');
                     }
@@ -450,7 +452,7 @@ fn add_boot_props(v: &mut Vfs, phys: &Arc<PhysMem>) {
     let etc = crate::tmpfs::Tmpfs::new(phys.clone(), 0o755);
     match copy(v, &etc, DIR, "") {
         Ok(()) => v.mount(DIR, etc),
-        Err(e) => eprintln!("droidrt: {DIR}: errno {e}: boot properties not set"),
+        Err(e) => eprintln!("zeroemu: {DIR}: errno {e}: boot properties not set"),
     }
 }
 
@@ -593,14 +595,14 @@ pub struct Thread {
     own_files: Option<Arc<Mutex<FdTable>>>,
 }
 
-/// DROIDRT_SYSCOUNT=1: what threads have called since the last thread dump, and what
+/// ZEROEMU_SYSCOUNT=1: what threads have called since the last thread dump, and what
 /// came of it: (tid, number, an error, or 0, or 1 for more) -> times. Finds a thread in
 /// a loop.
 static SYSCALL_COUNTS: std::sync::LazyLock<Option<Mutex<HashMap<(i32, u64, i64), u64>>>> =
-    std::sync::LazyLock::new(|| (std::env::var("DROIDRT_SYSCOUNT").as_deref() == Ok("1")).then(Mutex::default));
+    std::sync::LazyLock::new(|| (std::env::var("ZEROEMU_SYSCOUNT").as_deref() == Ok("1")).then(Mutex::default));
 
 /// Where a thread entered the kernel: what a thread dump prints for it. The
-/// registers for its backtrace are read only under DROIDRT_DUMP (they cost a
+/// registers for its backtrace are read only under ZEROEMU_DUMP (they cost a
 /// trip to the hypervisor on every syscall).
 struct SyscallSnap {
     nr: u64,
@@ -611,7 +613,7 @@ struct SyscallSnap {
     since: Instant,
 }
 
-/// DROIDRT_DUMP=<secs>: every that many seconds, print every guest thread,
+/// ZEROEMU_DUMP=<secs>: every that many seconds, print every guest thread,
 /// the syscall it is in, and its backtrace (for diagnosing hangs). SIGUSR1
 /// prints one dump any time, without backtraces unless this is set.
 #[cfg(unix)]
@@ -624,7 +626,7 @@ fn dump_signal() -> libc::sigset_t {
     }
 }
 
-/// Wakeups since last asked, for DROIDRT_GPU_STATS.
+/// Wakeups since last asked, for ZEROEMU_GPU_STATS.
 /// The guest's CLOCK_MONOTONIC now, in nanoseconds.
 pub(crate) fn monotonic_ns() -> u64 {
     evdev::since_boot().as_nanos() as u64
@@ -692,21 +694,21 @@ pub fn reserve_dump_signal() {
     }
 }
 
-/// DROIDRT_FAULTLOG=1 reports every fault that raises a signal, handled or not.
+/// ZEROEMU_FAULTLOG=1 reports every fault that raises a signal, handled or not.
 fn fault_log(addr: u64) -> bool {
     static WANT: std::sync::OnceLock<Option<Option<u64>>> = std::sync::OnceLock::new();
     let want = WANT.get_or_init(|| {
-        let v = std::env::var("DROIDRT_FAULTLOG").ok()?;
+        let v = std::env::var("ZEROEMU_FAULTLOG").ok()?;
         Some(v.strip_prefix("0x").and_then(|h| u64::from_str_radix(h, 16).ok()))
     });
     want.is_some_and(|only| only.is_none_or(|a| a == addr))
 }
 
-/// DROIDRT_STRACE=<name> traces only processes whose executable path
+/// ZEROEMU_STRACE=<name> traces only processes whose executable path
 /// contains it; 1 (or --strace) traces everything.
 fn strace_wanted(t: &Thread) -> bool {
     static ONLY: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-    match ONLY.get_or_init(|| std::env::var("DROIDRT_STRACE").ok().filter(|v| v != "1" && !v.is_empty())) {
+    match ONLY.get_or_init(|| std::env::var("ZEROEMU_STRACE").ok().filter(|v| v != "1" && !v.is_empty())) {
         None => true,
         Some(name) => t.proc.exe.try_lock().is_ok_and(|e| e.contains(name.as_str())),
     }
@@ -714,11 +716,11 @@ fn strace_wanted(t: &Thread) -> bool {
 
 fn dump_after() -> Option<u64> {
     static AFTER: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
-    *AFTER.get_or_init(|| std::env::var("DROIDRT_DUMP").ok().and_then(|v| v.parse().ok()))
+    *AFTER.get_or_init(|| std::env::var("ZEROEMU_DUMP").ok().and_then(|v| v.parse().ok()))
 }
 
 thread_local! {
-    // The guest thread this host thread runs; 0 for droidrt's own threads.
+    // The guest thread this host thread runs; 0 for zeroemu's own threads.
     static GUEST_TID: std::cell::Cell<i32> = const { std::cell::Cell::new(0) };
 }
 
@@ -771,10 +773,10 @@ impl Process {
     }
 }
 
-/// DROIDRT_SCHED_TRACE=1: every change in what the host is told about a thread.
+/// ZEROEMU_SCHED_TRACE=1: every change in what the host is told about a thread.
 fn sched_tracing() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("DROIDRT_SCHED_TRACE").is_some())
+    *ON.get_or_init(|| std::env::var_os("ZEROEMU_SCHED_TRACE").is_some())
 }
 
 impl Thread {
@@ -970,7 +972,7 @@ impl Kernel {
             // Android's Bluetooth stack aborts and restarts for as long as it runs.
             let oem = crate::tmpfs::Tmpfs::new(phys.clone(), 0o755);
             let network = extras.as_ref().is_some_and(|e| e.network);
-            oem.write_file("etc/sysconfig/droidrt.xml", 0o644, &format!("<config>\n{NO_BLUETOOTH}{}</config>\n", if network { ETHERNET } else { "" }));
+            oem.write_file("etc/sysconfig/zeroemu.xml", 0o644, &format!("<config>\n{NO_BLUETOOTH}{}</config>\n", if network { ETHERNET } else { "" }));
             v.mount("/oem", oem);
             add_boot_props(&mut v, &phys);
         }
@@ -980,7 +982,7 @@ impl Kernel {
         if let Some(d) = &drm {
             d.publish(dev.as_ref(), sys.as_ref());
         }
-        net::publish(sys.clone(), extras.as_ref().is_some_and(|e| e.network) || std::env::var("DROIDRT_NET").as_deref() == Ok("1"));
+        net::publish(sys.clone(), extras.as_ref().is_some_and(|e| e.network) || std::env::var("ZEROEMU_NET").as_deref() == Ok("1"));
         power::publish(sys.as_ref());
         let sysctl = sysctl::Sysctl::new();
         // libcutils opens /dev/ashmem<boot id> (init names the node so).
@@ -1011,25 +1013,25 @@ impl Kernel {
                     Ok(true) => true,
                     // Two can't share a device: the second gets one that lasts as long as it does.
                     Ok(false) => {
-                        eprintln!("droidrt: {}: in use by another droidrt; this one's /data won't be kept", p.path.display());
+                        eprintln!("zeroemu: {}: in use by another zeroemu; this one's /data won't be kept", p.path.display());
                         false
                     }
                     Err(e) => {
-                        eprintln!("droidrt: {}: {e}; /data won't be kept", p.path.display());
+                        eprintln!("zeroemu: {}: {e}; /data won't be kept", p.path.display());
                         false
                     }
                 };
                 if keep && !image.wipe {
                     let started = Instant::now();
                     match p.load(v.page_cache().expect("set above")) {
-                        Ok(size) => eprintln!("droidrt: {}: read {} MB in {:.1} s", p.path.display(), size >> 20, started.elapsed().as_secs_f64()),
+                        Ok(size) => eprintln!("zeroemu: {}: read {} MB in {:.1} s", p.path.display(), size >> 20, started.elapsed().as_secs_f64()),
                         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                        // Never saved over: it may only need a newer droidrt, or a look.
+                        // Never saved over: it may only need a newer zeroemu, or a look.
                         Err(e) => {
                             // A name not in use, so as not to lose an earlier one that way.
                             let aside = (0..1000).map(|i| p.beside(&if i == 0 { ".bad".to_string() } else { format!(".bad.{i}") })).find(|n| !n.exists()).unwrap_or_else(|| p.beside(".bad.last"));
                             let moved = std::fs::rename(&p.path, &aside);
-                            eprintln!("droidrt: {}: {e}; starting with an empty /data{}", p.path.display(), if moved.is_ok() { format!(", and keeping the file as {}", aside.display()) } else { String::new() });
+                            eprintln!("zeroemu: {}: {e}; starting with an empty /data{}", p.path.display(), if moved.is_ok() { format!(", and keeping the file as {}", aside.display()) } else { String::new() });
                             if moved.is_err() {
                                 keep = false;
                             }
@@ -1147,7 +1149,7 @@ impl Kernel {
     /// Starts the first process: `mm` already holds the program and its stack.
     /// Prints every guest thread: comm, the syscall it is in, backtrace.
     /// Only try_lock: a dump is for when something holds a lock forever.
-    /// DROIDRT_MEMSTAT=1: where memory has gone, as part of a thread dump.
+    /// ZEROEMU_MEMSTAT=1: where memory has gone, as part of a thread dump.
     fn memory_report(&self) {
         use std::collections::{HashMap, HashSet};
         const MB: u64 = 1 << 20;
@@ -1225,11 +1227,11 @@ impl Kernel {
             }
         });
         let Some(mut procs) = procs else {
-            eprintln!("[droidrt] ---- thread dump: the process table stays locked ----");
+            eprintln!("[zeroemu] ---- thread dump: the process table stays locked ----");
             return;
         };
         procs.sort_by_key(|p| p.pid);
-        eprintln!("[droidrt] ---- thread dump: {} processes ----", procs.len());
+        eprintln!("[zeroemu] ---- thread dump: {} processes ----", procs.len());
         if let Some(counts) = &*SYSCALL_COUNTS {
             let mut busiest: Vec<_> = counts.lock().unwrap().drain().collect();
             busiest.sort_by_key(|&(_, n)| std::cmp::Reverse(n));
@@ -1238,31 +1240,31 @@ impl Kernel {
             }
         }
         if let Some(tid) = binder::lock_taker() {
-            eprintln!("[droidrt] binder lock held by tid {tid}");
+            eprintln!("[zeroemu] binder lock held by tid {tid}");
         }
         for p in procs {
             if p.mm.try_lock().is_err() {
-                eprintln!("[droidrt] {}: address space locked by tid {}", p.pid, p.mm_taker.load(Ordering::Relaxed));
+                eprintln!("[zeroemu] {}: address space locked by tid {}", p.pid, p.mm_taker.load(Ordering::Relaxed));
             }
             if p.files.try_lock().is_err() {
-                eprintln!("[droidrt] {}: fd table locked by tid {}", p.pid, p.files_taker.load(Ordering::Relaxed));
+                eprintln!("[zeroemu] {}: fd table locked by tid {}", p.pid, p.files_taker.load(Ordering::Relaxed));
             }
             if p.creds.try_lock().is_err() {
-                eprintln!("[droidrt] {}: creds locked", p.pid);
+                eprintln!("[zeroemu] {}: creds locked", p.pid);
             }
             let Ok(threads) = p.threads.try_lock().map(|t| t.clone()) else {
-                eprintln!("[droidrt] {}: thread list locked", p.pid);
+                eprintln!("[zeroemu] {}: thread list locked", p.pid);
                 continue;
             };
             let exe = p.exe.try_lock().map(|e| e.clone()).unwrap_or_else(|_| "?".into());
             for t in threads {
                 let comm = t.attrs.try_lock().map(|a| a.comm.clone()).unwrap_or_else(|_| "?".into());
                 let Ok(snap) = t.in_syscall.try_lock().map(|s| s.as_ref().map(|s| (s.nr, s.args, s.pc, s.lr, s.fp, s.since.elapsed()))) else {
-                    eprintln!("[droidrt] {} {} {comm} ({exe}): entering or leaving a syscall", p.pid, t.tid);
+                    eprintln!("[zeroemu] {} {} {comm} ({exe}): entering or leaving a syscall", p.pid, t.tid);
                     continue;
                 };
                 let Some((nr, a, pc, lr, mut fp, held)) = snap else {
-                    eprintln!("[droidrt] {} {} {comm} ({exe}): running", p.pid, t.tid);
+                    eprintln!("[zeroemu] {} {} {comm} ({exe}): running", p.pid, t.tid);
                     continue;
                 };
                 let name = self.arch.sysno(nr).map_or_else(|| format!("syscall_{nr}"), |s| format!("{s:?}"));
@@ -1271,21 +1273,21 @@ impl Kernel {
                     Ok(files) => files.get(a[0] as i32 as i64).map(|f| files::file_name(&f)).unwrap_or_default(),
                     Err(_) => String::new(),
                 };
-                eprintln!("[droidrt] {} {} {comm} ({exe}): {name}({:#x}, {:#x}, {:#x}, {:#x}) for {:.1}s {fd}", p.pid, t.tid, a[0], a[1], a[2], a[3], held.as_secs_f64());
+                eprintln!("[zeroemu] {} {} {comm} ({exe}): {name}({:#x}, {:#x}, {:#x}, {:#x}) for {:.1}s {fd}", p.pid, t.tid, a[0], a[1], a[2], a[3], held.as_secs_f64());
                 if pc == 0 {
-                    continue; // no registers without DROIDRT_DUMP
+                    continue; // no registers without ZEROEMU_DUMP
                 }
                 // The address space may be busy; skip rather than wait.
                 let Ok(mut guard) = p.mm.try_lock() else { continue };
                 let Some(mm) = guard.as_mut() else { continue };
-                eprintln!("[droidrt]     at {}", mm.symbolize(pc));
-                eprintln!("[droidrt]     lr {}", mm.symbolize(lr));
+                eprintln!("[zeroemu]     at {}", mm.symbolize(pc));
+                eprintln!("[zeroemu]     lr {}", mm.symbolize(lr));
                 for _ in 0..12 {
                     let (Ok(next), Ok(ret)) = (mm.read_u64(fp), mm.read_u64(fp + 8)) else { break };
                     if ret == 0 {
                         break;
                     }
-                    eprintln!("[droidrt]     {}", mm.symbolize(ret));
+                    eprintln!("[zeroemu]     {}", mm.symbolize(ret));
                     if next <= fp {
                         break;
                     }
@@ -1394,8 +1396,8 @@ impl Kernel {
         std::thread::sleep(Duration::from_millis(100));
         let started = Instant::now();
         match p.save() {
-            Ok(contents) => eprintln!("droidrt: {}: saved {} MB in {:.1} s", p.path.display(), contents >> 20, started.elapsed().as_secs_f64()),
-            Err(e) => eprintln!("droidrt: {}: not saved: {e}", p.path.display()),
+            Ok(contents) => eprintln!("zeroemu: {}: saved {} MB in {:.1} s", p.path.display(), contents >> 20, started.elapsed().as_secs_f64()),
+            Err(e) => eprintln!("zeroemu: {}: not saved: {e}", p.path.display()),
         }
     }
 
@@ -1412,7 +1414,7 @@ impl Kernel {
     fn spawn(self: &Arc<Self>, thread: Arc<Thread>, state: CpuState) -> Result<(), i64> {
         if self.live_threads.fetch_add(1, Ordering::AcqRel) >= MAX_THREADS {
             self.live_threads.fetch_sub(1, Ordering::AcqRel);
-            eprintln!("[droidrt] thread limit ({MAX_THREADS}) reached");
+            eprintln!("[zeroemu] thread limit ({MAX_THREADS}) reached");
             return Err(EAGAIN);
         }
         let k = self.clone();
@@ -1517,7 +1519,7 @@ impl Kernel {
                     self.force_signal(t, signal::SIGBUS, SigInfo::fault(signal::SIGBUS, BUS_ADRALN, addr), pc);
                 }
                 Exit::Fault { pc, addr, detail } => {
-                    eprintln!("[droidrt] tid {}: guest fault at pc={pc:#x} addr={addr:#x}: {detail}", t.tid);
+                    eprintln!("[zeroemu] tid {}: guest fault at pc={pc:#x} addr={addr:#x}: {detail}", t.tid);
                     if !self.signal_caught(t, signal::SIGILL) {
                         self.crash_report(t, vcpu.as_ref(), "SIGILL", pc, addr, false);
                     }
@@ -1566,7 +1568,7 @@ impl Kernel {
             };
             eprintln!("[strace] {} {name}({:#x}, {:#x}, {:#x}, {:#x}){path} = {shown}", t.tid, a[0], a[1], a[2], a[3]);
         } else if matches!(ret, Ret::Value(v) if v == -ENOSYS) {
-            eprintln!("[droidrt] unimplemented syscall {} ({sysno:?}, {:?})", regs.nr, self.arch);
+            eprintln!("[zeroemu] unimplemented syscall {} ({sysno:?}, {:?})", regs.nr, self.arch);
         }
         ret
     }
@@ -1676,23 +1678,23 @@ impl Kernel {
     fn crash_report(&self, t: &Thread, vcpu: &dyn Vcpu, what: &str, pc: u64, addr: u64, write: bool) {
         let mut mm = t.proc.mm();
         eprintln!(
-            "[droidrt] pid {} tid {} ({}): {what} {} {addr:#x} at {}",
+            "[zeroemu] pid {} tid {} ({}): {what} {} {addr:#x} at {}",
             t.proc.pid,
             t.tid,
             t.proc.exe.lock().unwrap(),
             if write { "writing" } else { "reading" },
             mm.symbolize(pc)
         );
-        eprintln!("[droidrt]   in {}", mm.describe(addr));
+        eprintln!("[zeroemu]   in {}", mm.describe(addr));
         if let CpuState::Aarch64(s) = vcpu.state() {
-            eprintln!("[droidrt]   lr {}", mm.symbolize(s.x[30]));
+            eprintln!("[zeroemu]   lr {}", mm.symbolize(s.x[30]));
             let mut fp = s.x[29];
             for i in 0..16 {
                 let (Ok(next), Ok(ret)) = (mm.read_u64(fp), mm.read_u64(fp + 8)) else { break };
                 if ret == 0 {
                     break;
                 }
-                eprintln!("[droidrt]   #{i:02} {}", mm.symbolize(ret));
+                eprintln!("[zeroemu]   #{i:02} {}", mm.symbolize(ret));
                 if next <= fp {
                     break;
                 }
@@ -1708,16 +1710,16 @@ impl Kernel {
         let Some(f) = t.last_fault.lock().unwrap().take() else { return };
         let mut guard = t.proc.mm.lock().unwrap();
         let Some(mm) = guard.as_mut() else { return };
-        eprintln!("[droidrt]   last fault: tid {} {} {:#x} at {}", t.tid, if f.write { "writing" } else { "reading" }, f.addr, mm.symbolize(f.pc));
-        eprintln!("[droidrt]   in {}", mm.describe(f.addr));
-        eprintln!("[droidrt]   lr {}", mm.symbolize(f.lr));
+        eprintln!("[zeroemu]   last fault: tid {} {} {:#x} at {}", t.tid, if f.write { "writing" } else { "reading" }, f.addr, mm.symbolize(f.pc));
+        eprintln!("[zeroemu]   in {}", mm.describe(f.addr));
+        eprintln!("[zeroemu]   lr {}", mm.symbolize(f.lr));
         let mut fp = f.fp;
         for i in 0..24 {
             let (Ok(next), Ok(ret)) = (mm.read_u64(fp), mm.read_u64(fp + 8)) else { break };
             if ret == 0 {
                 break;
             }
-            eprintln!("[droidrt]   #{i:02} {}", mm.symbolize(ret));
+            eprintln!("[zeroemu]   #{i:02} {}", mm.symbolize(ret));
             if next <= fp {
                 break;
             }

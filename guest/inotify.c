@@ -1,4 +1,4 @@
-// Freestanding arm64 test of droidrt's inotify: a watched directory hears
+// Freestanding arm64 test of zeroemu's inotify: a watched directory hears
 // a file's create, write, close, rename and delete, with names and a shared
 // rename cookie; reads are whole events; removing a watch says IN_IGNORED.
 

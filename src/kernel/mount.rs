@@ -551,7 +551,7 @@ impl Kernel {
             "cgroup2" => {
                 const KNOWN: [&str; 6] = ["nsdelegate", "favordynmods", "memory_localevents", "memory_recursiveprot", "memory_hugetlb_accounting", "pids_localevents"];
                 if let Some((k, _)) = opts.iter().find(|(k, _)| !KNOWN.contains(k)) {
-                    eprintln!("[droidrt] cgroup2: unknown option {k}");
+                    eprintln!("[zeroemu] cgroup2: unknown option {k}");
                     return Err(EINVAL);
                 }
                 if let Some(sb) = vfs.find_super(|sb| sb.fs_type() == "cgroup2") {
@@ -567,7 +567,7 @@ impl Kernel {
                 let o: Vec<String> = opts.iter().map(|(k, v)| v.map_or(k.to_string(), |v| format!("{k}={v}"))).collect();
                 (tmpfs(mode) as Arc<dyn FileSystem>, o.join(","))
             }
-            // tracefs: only trace_marker, which DROIDRT_TRACE keeps (trace.rs).
+            // tracefs: only trace_marker, which ZEROEMU_TRACE keeps (trace.rs).
             "tracefs" => {
                 let fs = tmpfs(0o755);
                 fs.create(1, "trace_marker", 0o020222, super::trace::MARKER_RDEV)?;
@@ -585,7 +585,7 @@ impl Kernel {
 
     /// A fuse mount (fuse.rs): the caller's /dev/fuse, fd=, gets a connection and the
     /// daemon its FUSE_INIT, and the mount shows the emulated volume's files in
-    /// /data/media, served by droidrt itself (an empty directory where there is no
+    /// /data/media, served by zeroemu itself (an empty directory where there is no
     /// /data/media, as in the test guests' world without an image).
     #[allow(clippy::too_many_arguments)]
     fn mount_fuse(&self, t: &Thread, vfs: &Vfs, target: &Node, source: Option<&str>, sb_flags: u64, mnt_flags: u64, data: &str) -> Result<(), i64> {
@@ -632,7 +632,7 @@ impl Kernel {
     }
 
     /// An ext4 or EROFS mount of a loop or device-mapper device, read by
-    /// droidrt's own image readers (read-only).
+    /// zeroemu's own image readers (read-only).
     fn block_super(&self, t: &Thread, vfs: &Vfs, source: Option<&str>, ty: &'static str, sb_flags: u64) -> Result<Arc<Super>, i64> {
         let src = source.ok_or(EINVAL)?;
         let node = self.resolve(t, AT_FDCWD, src, true)?;

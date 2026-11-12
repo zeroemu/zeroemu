@@ -1,4 +1,4 @@
-// Freestanding arm64 test of droidrt's copy-on-write fork: parent and child
+// Freestanding arm64 test of zeroemu's copy-on-write fork: parent and child
 // see their own writes only, including writes the kernel makes for them and
 // after mprotect; a big fork is cheap; and threads writing one page while
 // another thread forks lose nothing.

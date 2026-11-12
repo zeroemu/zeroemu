@@ -1,4 +1,4 @@
-// Freestanding arm64 test of droidrt's binder driver: a thread's transaction
+// Freestanding arm64 test of zeroemu's binder driver: a thread's transaction
 // stack unwinds in order, as in Linux. A call whose target died ends only when
 // the thread is back down to it, or the inner wait takes its BR_DEAD_REPLY and the
 // inner reply reaches a thread waiting for nothing, which libbinder aborts on.

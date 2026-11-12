@@ -82,7 +82,7 @@ pub trait Io {
     fn sync_of(&mut self, fd: i64) -> Result<SyncFile, i64>;
     fn dma_of(&mut self, fd: i64) -> Result<DmaBuf, i64>;
     fn comm(&self) -> String;
-    /// The calling thread's pid and tid, for DROIDRT_TRACE.
+    /// The calling thread's pid and tid, for ZEROEMU_TRACE.
     fn ids(&self) -> (i32, i32) {
         (0, 0)
     }
@@ -586,10 +586,10 @@ impl Open {
     }
 }
 
-/// DROIDRT_DRM_TRACE=1 logs every DRM ioctl and fence.
+/// ZEROEMU_DRM_TRACE=1 logs every DRM ioctl and fence.
 fn trace() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("DROIDRT_DRM_TRACE").is_some())
+    *ON.get_or_init(|| std::env::var_os("ZEROEMU_DRM_TRACE").is_some())
 }
 
 pub fn ioctl(o: &Open, cmd: u64, arg: u64, io: &mut dyn Io) -> Result<i64, i64> {
@@ -742,7 +742,7 @@ fn version(arg: u64, io: &mut dyn Io) -> Result<i64, i64> {
     wu32(&mut b, 8, 0);
     copy_str(io, &mut b, 16, "virtio_gpu")?;
     copy_str(io, &mut b, 32, "0")?;
-    copy_str(io, &mut b, 48, "droidrt virtio GPU")?;
+    copy_str(io, &mut b, 48, "zeroemu virtio GPU")?;
     store(io, arg, &b)?;
     Ok(0)
 }
@@ -889,7 +889,7 @@ fn virt_context_init(o: &Open, arg: u64, io: &mut dyn Io) -> Result<i64, i64> {
     let mut capset = 0u32;
     let mut rings = 0u32;
     let mut mask = 0u32;
-    let mut name = "droidrt".to_string();
+    let mut name = "zeroemu".to_string();
     for i in 0..n {
         let param = ru64(&raw, i * 16);
         let value = ru64(&raw, i * 16 + 8);
@@ -1462,9 +1462,9 @@ fn mode_rmfb(o: &Open, arg: u64, io: &mut dyn Io) -> Result<i64, i64> {
 }
 
 fn present(o: &Open, fb: u32, user: u64, event: bool) -> Result<(), i64> {
-    // Debugging: DROIDRT_DUMP_RES=<dir> saves, on every 40th flip, each
+    // Debugging: ZEROEMU_DUMP_RES=<dir> saves, on every 40th flip, each
     // display-sized resource as the host renderer sees it.
-    if let Ok(dir) = std::env::var("DROIDRT_DUMP_RES") {
+    if let Ok(dir) = std::env::var("ZEROEMU_DUMP_RES") {
         static FLIPS: AtomicU64 = AtomicU64::new(0);
         let n = FLIPS.fetch_add(1, Ordering::Relaxed);
         if n % 40 == 20 && n < 400 {

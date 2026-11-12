@@ -1,4 +1,4 @@
-// Freestanding test of droidrt's M2 kernel (no libc), built for arm64 and
+// Freestanding test of zeroemu's M2 kernel (no libc), built for arm64 and
 // x86_64: threads via raw clone + futex, fork/pipe/wait4, mprotect faults
 // delivered to a SIGSEGV handler (which fixes the page and returns through
 // rt_sigreturn), munmap, mremap, and a huge PROT_NONE reservation. Exits

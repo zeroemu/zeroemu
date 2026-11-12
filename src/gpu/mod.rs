@@ -1,4 +1,4 @@
-//! The GPU behind droidrt's virtio-gpu device: an interface the kernel's
+//! The GPU behind zeroemu's virtio-gpu device: an interface the kernel's
 //! DRM driver (src/kernel/drm) calls, implemented on the host by Google's
 //! gfxstream renderer, the one the Android Emulator itself uses, loaded from
 //! the installed emulator (libgfxstream_backend.dylib / gfxstream_backend.dll).
@@ -54,7 +54,7 @@ pub fn save_shown_frame(_path: &str) -> std::io::Result<()> {
 }
 
 /// Resizes the window's content to `w` x `h` points, as a user dragging its edge
-/// would (for tests: DROIDRT_INPUT_FIFO's `resize`).
+/// would (for tests: ZEROEMU_INPUT_FIFO's `resize`).
 pub fn resize_window(w: f64, h: f64) {
     #[cfg(target_os = "macos")]
     window::resize(w, h);
@@ -205,7 +205,7 @@ pub fn open(width: u32, height: u32) -> Result<Arc<dyn GpuBackend>, String> {
     gfxstream::open(width, height)
 }
 
-/// In-memory backend (`DROIDRT_GPU=fake`): no renderer, no window.
+/// In-memory backend (`ZEROEMU_GPU=fake`): no renderer, no window.
 pub fn fake() -> Arc<dyn GpuBackend> {
     fake::Fake::new()
 }
@@ -235,7 +235,7 @@ pub fn selftest() -> Result<i32, String> {
     let cb = cb_tok.clone();
     gpu.set_fence_handler(Arc::new(move |f| {
         cb.store(thread_token(), Ordering::Relaxed);
-        eprintln!("droidrt: fence {} ctx {} flags {:#x} ring {}", f.fence_id, f.ctx_id, f.flags, f.ring_idx);
+        eprintln!("zeroemu: fence {} ctx {} flags {:#x} ring {}", f.fence_id, f.ctx_id, f.flags, f.ring_idx);
     }));
     // The guest calls these from a vCPU thread. The present is bounced onto
     // this thread through the window ops, so pump while the worker runs.
@@ -257,8 +257,8 @@ pub fn selftest() -> Result<i32, String> {
     pump_for(3.0);
     screenshot();
     let report = slot.lock().unwrap_or_else(|p| p.into_inner()).take().unwrap_or_else(|| Err("gpu selftest thread failed".into()))?;
-    eprintln!("droidrt: main-thread {main_tok}");
-    eprintln!("droidrt: fence-callback-thread {}", cb_tok.load(Ordering::Relaxed));
+    eprintln!("zeroemu: main-thread {main_tok}");
+    eprintln!("zeroemu: fence-callback-thread {}", cb_tok.load(Ordering::Relaxed));
     eprintln!("{report}");
     Ok(0)
 }
@@ -326,7 +326,7 @@ fn exercise(gpu: &dyn GpuBackend) -> Result<String, String> {
 }
 
 fn probe_blob(gpu: &dyn GpuBackend) -> String {
-    if let Err(e) = gpu.context_create(1, "droidrt", 0) {
+    if let Err(e) = gpu.context_create(1, "zeroemu", 0) {
         return format!("blob: context_create errno {e}");
     }
     let blob = Blob { blob_mem: BLOB_MEM_HOST3D, blob_flags: BLOB_FLAG_USE_MAPPABLE, blob_id: 0, size: 65536 };
@@ -371,18 +371,18 @@ fn screenshot() {
     #[cfg(target_os = "macos")]
     {
         let Some(id) = window::window_id() else {
-            eprintln!("droidrt: no window id for screencapture");
+            eprintln!("zeroemu: no window id for screencapture");
             return;
         };
-        let path = "/tmp/droidrt-gpu-selftest.png";
+        let path = "/tmp/zeroemu-gpu-selftest.png";
         match std::process::Command::new("screencapture").args(["-l", &id.to_string(), "-o", "-x", path]).status() {
-            Ok(s) if s.success() => eprintln!("droidrt: wrote {path}"),
-            Ok(s) => eprintln!("droidrt: screencapture exited {s}"),
-            Err(e) => eprintln!("droidrt: screencapture: {e}"),
+            Ok(s) if s.success() => eprintln!("zeroemu: wrote {path}"),
+            Ok(s) => eprintln!("zeroemu: screencapture exited {s}"),
+            Err(e) => eprintln!("zeroemu: screencapture: {e}"),
         }
     }
     #[cfg(not(target_os = "macos"))]
     {
-        eprintln!("droidrt: screencapture is macOS-only");
+        eprintln!("zeroemu: screencapture is macOS-only");
     }
 }

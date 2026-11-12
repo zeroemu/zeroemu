@@ -1,6 +1,6 @@
 // Freestanding arm64 test of sockets with a network behind them: the name server, and
 // TCP to servers on the host through 10.0.2.2. Run by scripts/test-tcp.py with
-// DROIDRT_NET=1, which starts the servers and passes their ports:
+// ZEROEMU_NET=1, which starts the servers and passes their ports:
 //   tcp echo silent closes resets refused sink pieces adb-server half-resets udp-echo
 
 typedef unsigned long u64;

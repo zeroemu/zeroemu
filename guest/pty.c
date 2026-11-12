@@ -1,4 +1,4 @@
-// Freestanding arm64 test of droidrt's pseudo-terminals (no libc): what
+// Freestanding arm64 test of zeroemu's pseudo-terminals (no libc): what
 // bionic's posix_openpt/grantpt/unlockpt/ptsname and logwrap do with
 // /dev/ptmx, the slave's output processing, termios and window size, and
 // the hangup a master sees once its slaves close.

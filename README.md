@@ -1,10 +1,10 @@
-# droidrt
+# zeroemu
 
 Run Android's userspace natively on macOS and Windows, with no emulated
 hardware and no guest kernel.
 
 The Android Emulator boots a complete virtual phone: a Linux kernel, virtual
-devices, and a GPU command stream forwarded to the host. droidrt instead runs
+devices, and a GPU command stream forwarded to the host. zeroemu instead runs
 Android's unmodified Linux binaries directly on the host CPU inside a minimal
 hardware VM, and implements the Linux kernel ABI in Rust on the host side. It
 is the same idea as Fuchsia's Starnix, aimed at desktop OSes.
@@ -78,7 +78,7 @@ Known gaps:
 - `O_PATH` descriptors can be read and mapped, and `/dev/zero` can't be mapped.
 - File permissions are Linux's (see below) only where owners and modes are real: tmpfs,
   binderfs and the images. `/proc`, `/sys`, the cgroup hierarchies, selinuxfs, devpts,
-  tracefs and bpffs have modes droidrt made up and owners nobody set, so any process may
+  tracefs and bpffs have modes zeroemu made up and owners nobody set, so any process may
   read and write what they let root. fs.protected_symlinks isn't applied, and `access()`
   walks the path with the effective ids rather than the real ones.
 - Shared storage has no scoped storage: MediaProvider's daemon is never asked anything
@@ -97,7 +97,7 @@ Known gaps:
   anonymous memory.
 - Guest GLES reaches the renderer over virtio-gpu's pipe, not its shared-memory ring:
   gfxstream's guest library picks the pipe for the emulator's own EGL. Each GL call that
-  waits for an answer is a round trip through droidrt (a few hundred a second while an
+  waits for an answer is a round trip through zeroemu (a few hundred a second while an
   app scrolls).
 - SELinux is permissive: selinuxfs, process and socket contexts, and exec
   domain transitions follow the image's CIL policy (with file labels from
@@ -117,7 +117,7 @@ and executable mappings, write permission on a socket to connect to it, a descri
 for reading to map it and for writing to map it shared and writable (which `mprotect`
 can't add later, nor past ashmem's protection mask), the xattr namespaces' rules, and
 `CAP_SYS_ADMIN` for device-mapper. Root with its capabilities passes as on Linux; an app's
-uid is held to them. droidrt's own device nodes have the modes and owners ueventd.rc
+uid is held to them. zeroemu's own device nodes have the modes and owners ueventd.rc
 gives them. `src/kernel/perm.rs` has the shared checks and says which filesystems they
 cover.
 
@@ -125,7 +125,7 @@ Shared storage (`/sdcard`, `/storage/emulated`) is the device's arrangement with
 round trips left out. vold opens `/dev/fuse`, mounts it at `/mnt/user/0/emulated` and hands
 the descriptor to MediaProvider, whose FUSE daemon reads FUSE_INIT and answers it, so vold,
 StorageManagerService and MediaProvider all see the volume mounted. The mount itself is a
-second view of `/data/media` in `/data`'s tmpfs, served by droidrt directly, so its files are
+second view of `/data/media` in `/data`'s tmpfs, served by zeroemu directly, so its files are
 saved with `/data` and no file operation waits on a guest process. As on a fuse mount without
 `default_permissions`, nothing is refused there, chmod and chown change nothing, and what is
 created belongs to the daemon's uid, as on the lower filesystem where MediaProvider would make
@@ -168,23 +168,23 @@ cargo run --release -- --system $IMG --ls /system/bin    # inspect the image wit
 ```
 
 Android log records (`liblog`, i.e. `ALOGI` and friends) print to stderr as
-`<secs since start> <pid> <tid> <prio> <tag>: <message>`; `DROIDRT_LOG=<V|D|I|W|E|F|S>`
+`<secs since start> <pid> <tid> <prio> <tag>: <message>`; `ZEROEMU_LOG=<V|D|I|W|E|F|S>`
 sets the lowest priority shown (default `I`; `S` silences them).
 
 `--boot` runs Android's own `init` in a window (`--headless` for none,
-`DROIDRT_BACKGROUND=1` to open it behind other windows without taking focus). A device keeps its `/data`
+`ZEROEMU_BACKGROUND=1` to open it behind other windows without taking focus). A device keeps its `/data`
 and `/metadata` between boots, in one file per system image in the user's application
 data, saved when the window closes, on SIGINT, SIGTERM or SIGHUP, or when Android shuts down:
 `--data <file>` puts it elsewhere, `--ephemeral` keeps nothing, and `--wipe-data` starts
-over. A second droidrt on the same file keeps nothing, and one that can't read the file
+over. A second zeroemu on the same file keeps nothing, and one that can't read the file
 moves it aside as `<file>.bad` rather than saving over it. `--ram <MB>` says how much memory
 the guest believes it has (4096 by default, as AVDs do). It needs the Android
-Emulator installed: droidrt loads its GPU renderer, `libgfxstream_backend`,
-from the SDK (or `DROIDRT_GFXSTREAM=<path>`), with the SDK's ANGLE on Metal
+Emulator installed: zeroemu loads its GPU renderer, `libgfxstream_backend`,
+from the SDK (or `ZEROEMU_GFXSTREAM=<path>`), with the SDK's ANGLE on Metal
 underneath (`ANGLE_DEFAULT_PLATFORM` overrides). For development, `--push
 <host file>:<guest path>` copies a file into the booted device (e.g. into
 `/data/local/tmp`) and `--run "<cmd>"` runs a shell command once SurfaceFlinger
-is up, its output on stderr. `droidrt --gpu-selftest` checks the renderer and
+is up, its output on stderr. `zeroemu --gpu-selftest` checks the renderer and
 window alone.
 
 Host `adb` finds a booted device as it finds an emulator, as `emulator-5554` or the
@@ -205,49 +205,49 @@ foreground, nice 10 or worse and the `background` and `dex2oat` cgroups as
 background. Background threads take turns on half the host's cores, as a phone
 would keep them to its little ones.
 
-`DROIDRT_STRACE=1` (or `--strace`) logs every syscall (`DROIDRT_STRACE=<name>`:
-only of programs whose path contains it); `DROIDRT_BINDER_TRACE=1`
-logs every binder transaction; `DROIDRT_WATCHDOG=<secs>` forces a stuck guest
+`ZEROEMU_STRACE=1` (or `--strace`) logs every syscall (`ZEROEMU_STRACE=<name>`:
+only of programs whose path contains it); `ZEROEMU_BINDER_TRACE=1`
+logs every binder transaction; `ZEROEMU_WATCHDOG=<secs>` forces a stuck guest
 out of the VM and dumps its registers. Fatal faults print a backtrace as
 library+offset, and writes to `/dev/kmsg` (where `servicemanager` and `init`
-log) appear on stderr. `DROIDRT_DUMP=<secs>` prints, every that many seconds,
+log) appear on stderr. `ZEROEMU_DUMP=<secs>` prints, every that many seconds,
 each guest thread with the syscall it is in, for how long, and its backtrace;
-`kill -USR1` on droidrt prints one such dump at any time (without backtraces
-unless `DROIDRT_DUMP` is set). `DROIDRT_DAC_LOG=1` logs every file permission refusal: the process, its ids and
+`kill -USR1` on zeroemu prints one such dump at any time (without backtraces
+unless `ZEROEMU_DUMP` is set). `ZEROEMU_DAC_LOG=1` logs every file permission refusal: the process, its ids and
 groups, the syscall, the path, and the mode and owner that refused it (or the rule:
-sticky directory, owner only, a missing capability). `DROIDRT_DAC=0` turns file
-permissions off altogether, as before droidrt had them, to tell whether one is behind a
-failure. `DROIDRT_FD_TRACE=<name>` logs every descriptor
+sticky directory, owner only, a missing capability). `ZEROEMU_DAC=0` turns file
+permissions off altogether, as before zeroemu had them, to tell whether one is behind a
+failure. `ZEROEMU_FD_TRACE=<name>` logs every descriptor
 added to or removed from the tables of programs whose path contains it.
-`DROIDRT_INPUT_FIFO=<path>` takes lines from a host FIFO as if from the window,
+`ZEROEMU_INPUT_FIFO=<path>` takes lines from a host FIFO as if from the window,
 for tests that must not touch the host's mouse: `down X Y`, `move X Y`, `up X Y`,
 `wheel X Y DX DY` (0 to 1 across the display), `key CODE 1|0` (Linux key codes),
 `resize W H` (the window's content, in points), and `shot PATH`, which writes the frame on
-show as a BMP. `DROIDRT_GPU_STATS=1` prints the display's frame rate every five seconds
+show as a BMP. `ZEROEMU_GPU_STATS=1` prints the display's frame rate every five seconds
 (and black frames, when frames are read back), and
-`DROIDRT_SCHED_TRACE=1` each change in a thread's host priority.
-`DROIDRT_NET_TRACE=1` logs each network socket call and where connections go.
-`DROIDRT_BINDER_RING=1` keeps each thread's last binder events, ioctls included, and
+`ZEROEMU_SCHED_TRACE=1` each change in a thread's host priority.
+`ZEROEMU_NET_TRACE=1` logs each network socket call and where connections go.
+`ZEROEMU_BINDER_RING=1` keeps each thread's last binder events, ioctls included, and
 prints them when its process is killed by a signal.
-`DROIDRT_SYSCOUNT=1` adds to each thread dump what each thread has called since the
+`ZEROEMU_SYSCOUNT=1` adds to each thread dump what each thread has called since the
 last, which finds a thread in a loop: send `SIGUSR1` twice, a few seconds apart.
-`DROIDRT_MEMSTAT=1` adds to each thread dump where memory has gone, by kind and by file.
-`DROIDRT_GPU_STATS=1`'s line also says how many sleeping threads events woke and how many
-vCPUs were made each second; `DROIDRT_WAKE_STATS=1` adds the keys that woke the most, and
+`ZEROEMU_MEMSTAT=1` adds to each thread dump where memory has gone, by kind and by file.
+`ZEROEMU_GPU_STATS=1`'s line also says how many sleeping threads events woke and how many
+vCPUs were made each second; `ZEROEMU_WAKE_STATS=1` adds the keys that woke the most, and
 prints where a key that wakes over a hundred threads at once is announced from.
-`DROIDRT_SENSOR_TRACE=1` logs the rates the sensors HAL asks for.
-`DROIDRT_PROPS="name=value ..."` adds Android properties at boot (`ro.lmk.debug=true`
+`ZEROEMU_SENSOR_TRACE=1` logs the rates the sensors HAL asks for.
+`ZEROEMU_PROPS="name=value ..."` adds Android properties at boot (`ro.lmk.debug=true`
 makes `lmkd` say what it decides).
-`DROIDRT_TRACE=<file>` writes Android's own trace markers to a host file, each with the
-guest's monotonic time, pid and tid, with droidrt's GPU ioctls on the guest thread that made
-them; turn Android's tags on with `DROIDRT_PROPS=debug.atrace.tags.enableflags=0x86e`
+`ZEROEMU_TRACE=<file>` writes Android's own trace markers to a host file, each with the
+guest's monotonic time, pid and tid, with zeroemu's GPU ioctls on the guest thread that made
+them; turn Android's tags on with `ZEROEMU_PROPS=debug.atrace.tags.enableflags=0x86e`
 (graphics, input, view, window and activity managers, HALs). Tracing slows the guest
 little enough to measure frames with it.
-`DROIDRT_DRM_TRACE=1` logs GPU ioctls, transfers and fences;
-`DROIDRT_GPU_LOG=<E|W|I|D>` shows the renderer's own log; `DROIDRT_READBACK=1` reads each
-frame back for the window to draw, as droidrt did before the renderer drew into the window
-itself, and `DROIDRT_GPU_SERIAL=1` sends every GPU call through one thread again;
-`DROIDRT_SAVE_FRAMES=<dir>` (with `DROIDRT_READBACK=1`) and `DROIDRT_DUMP_RES=<dir>` save
+`ZEROEMU_DRM_TRACE=1` logs GPU ioctls, transfers and fences;
+`ZEROEMU_GPU_LOG=<E|W|I|D>` shows the renderer's own log; `ZEROEMU_READBACK=1` reads each
+frame back for the window to draw, as zeroemu did before the renderer drew into the window
+itself, and `ZEROEMU_GPU_SERIAL=1` sends every GPU call through one thread again;
+`ZEROEMU_SAVE_FRAMES=<dir>` (with `ZEROEMU_READBACK=1`) and `ZEROEMU_DUMP_RES=<dir>` save
 displayed frames and GPU buffers as raw pixels.
 
 On macOS, `cargo run` signs the binary with the `com.apple.security.hypervisor`
@@ -281,7 +281,7 @@ Measured on an M1 Pro with the default 4 GB, as Activity Monitor shows it:
   Pages nothing has mapped stay up to 256 MB and then go, oldest first. ELF segments map
   from the file.
 - Files on `/data` take their turn with those. Their pages can leave memory for the data
-  file they were last saved in, unchanged, or a scratch file that goes when droidrt does.
+  file they were last saved in, unchanged, or a scratch file that goes when zeroemu does.
 - The guest is told it has 4 GB. Past that, what the page cache holds goes first, and then
   `/proc/pressure/memory` wakes Android's own `lmkd`, which closes the least important apps
   as on a phone. Frames can go past what the guest is told, up to the 32 GB ceiling, if it
@@ -321,13 +321,13 @@ the app list included): the median frame went from 29 ms to 18 ms and janky fram
 
 - The renderer draws each frame into the window itself, as the Android Emulator does,
   at the screen's real pixel density. Before, SurfaceFlinger waited 3 ms per frame while
-  droidrt read the frame back, then copied it twice more to show it.
-- GPU calls went through one droidrt thread, so a read on one app's GL pipe, which
+  zeroemu read the frame back, then copied it twice more to show it.
+- GPU calls went through one zeroemu thread, so a read on one app's GL pipe, which
   waits for the renderer's answer, held up every other app and SurfaceFlinger's
   composition. Pipe transfers now run on the thread that asked, one at a time per
   context; only creating or freeing a GPU buffer or context waits for the ones under way,
   as the renderer's maps of them have no lock of their own.
-- droidrt tells macOS its work is user-initiated, so App Nap doesn't throttle it while
+- zeroemu tells macOS its work is user-initiated, so App Nap doesn't throttle it while
   its window is covered: a device keeps running in the background, as a phone's apps do
   with the screen off, and under App Nap frames took about eight times as long. The Mac
   can still sleep.
@@ -338,7 +338,7 @@ the app list included): the median frame went from 29 ms to 18 ms and janky fram
 What's left is mostly the first time something is drawn: a shader compiled, or icons
 uploaded, can cost 50 to 150 ms.
 
-CPU, as macOS counts droidrt's threads (Activity Monitor's figure), a settled device:
+CPU, as macOS counts zeroemu's threads (Activity Monitor's figure), a settled device:
 
 | | Before | Now |
 |---|---|---|
@@ -357,7 +357,7 @@ CPU, as macOS counts droidrt's threads (Activity Monitor's figure), a settled de
   back when places run short.
 - The emulated sensors sent all nine sensors' readings every 10 ms, the fastest rate
   anything had asked for, each reading waking the sensors HAL. The HAL makes Android's
-  events itself, at each sensor's rate, from the last reading it got, so droidrt now
+  events itself, at each sensor's rate, from the last reading it got, so zeroemu now
   sends a reading once, when the HAL turns the sensor on.
 - The window's event loop wakes every 50 ms rather than every 8 once the renderer draws
   into the window itself.
@@ -365,7 +365,7 @@ CPU, as macOS counts droidrt's threads (Activity Monitor's figure), a settled de
 Android sees CPU time too now: `/proc/<pid>/stat` and `/proc/stat`, `getrusage`, and
 the CPU-time clocks (`CLOCK_THREAD_CPUTIME_ID` was the time since boot), so `top`,
 `dumpsys cpuinfo` and ART's own accounting work. All of a thread's time counts as user
-time: droidrt can't tell the time it spends on a thread's behalf from the thread's own.
+time: zeroemu can't tell the time it spends on a thread's behalf from the thread's own.
 
 What idle CPU is left is mostly Android's: the composer calls SurfaceFlinger with a
 vsync 60 times a second whatever is on screen, as the emulator's images tell

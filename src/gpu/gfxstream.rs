@@ -238,7 +238,7 @@ impl Worker {
     }
 }
 
-/// What droidrt knows of a pipe resource.
+/// What zeroemu knows of a pipe resource.
 #[derive(Clone, Copy, Default)]
 struct Pipe {
     /// Its first write, the guest's connect, has been made.
@@ -263,7 +263,7 @@ pub struct Gfxstream {
     fences: Arc<Mutex<FenceSlot>>,
     /// The last scanout read back for the window.
     frame: Mutex<Vec<u8>>,
-    /// The renderer draws scanouts into the window itself, rather than droidrt
+    /// The renderer draws scanouts into the window itself, rather than zeroemu
     /// reading them back to show.
     direct: AtomicBool,
     /// The resource last shown.
@@ -348,7 +348,7 @@ fn install_window_ops(lib: *mut c_void) {
     let name = CString::new("_ZN9gfxstream4host31set_gfxstream_window_operationsERK20gfxstream_window_ops").unwrap();
     let p = unsafe { libc::dlsym(lib, name.as_ptr()) };
     if p.is_null() {
-        eprintln!("droidrt: set_gfxstream_window_operations missing");
+        eprintln!("zeroemu: set_gfxstream_window_operations missing");
         return;
     }
     let set: unsafe extern "C" fn(*const WindowOps) = unsafe { std::mem::transmute(p) };
@@ -356,7 +356,7 @@ fn install_window_ops(lib: *mut c_void) {
 }
 
 fn log_max_from_env() -> u32 {
-    match std::env::var("DROIDRT_GPU_LOG").ok().as_deref() {
+    match std::env::var("ZEROEMU_GPU_LOG").ok().as_deref() {
         None => DEBUG_ERROR,
         Some("0" | "S" | "silent") => 0,
         Some("1" | "E" | "error") => 1,
@@ -379,7 +379,7 @@ extern "C" fn on_debug(_user: *mut c_void, dbg: *const CDebug) {
     eprintln!("gfxstream: {msg}");
 }
 
-/// DROIDRT_GPU_STATS=1: every five seconds, how many frames went to the window and
+/// ZEROEMU_GPU_STATS=1: every five seconds, how many frames went to the window and
 /// what showing them cost the composer: reading each back, or handing it to the
 /// renderer to draw (`frame` is None). A frame's budget is 16 ms.
 fn flush_stats(took: Duration, frame: Option<&[u8]>) {
@@ -392,7 +392,7 @@ fn flush_stats(took: Duration, frame: Option<&[u8]>) {
     }
     static ON: OnceLock<bool> = OnceLock::new();
     static STATS: Mutex<Option<Window>> = Mutex::new(None);
-    if !*ON.get_or_init(|| std::env::var_os("DROIDRT_GPU_STATS").is_some()) {
+    if !*ON.get_or_init(|| std::env::var_os("ZEROEMU_GPU_STATS").is_some()) {
         return;
     }
     let mut g = STATS.lock().unwrap_or_else(|p| p.into_inner());
@@ -407,7 +407,7 @@ fn flush_stats(took: Duration, frame: Option<&[u8]>) {
     let elapsed = w.since.elapsed();
     if elapsed >= Duration::from_secs(5) {
         eprintln!(
-            "droidrt: display {:.1} fps, {} black, {} avg {:.1} ms, worst {:.1} ms, window {}; {}",
+            "zeroemu: display {:.1} fps, {} black, {} avg {:.1} ms, worst {:.1} ms, window {}; {}",
             w.frames as f64 / elapsed.as_secs_f64(),
             w.black,
             if frame.is_some() { "readback" } else { "post" },
@@ -495,8 +495,8 @@ impl Gfxstream {
             unsafe { std::env::set_var("ANGLE_DEFAULT_PLATFORM", "metal") };
         }
         // The guest's gralloc is minigbm, as in the Android Emulator's
-        // virtio-gpu mode; DROIDRT_GPU_FEATURES overrides ("Name:enabled,...").
-        let features = std::ffi::CString::new(std::env::var("DROIDRT_GPU_FEATURES").unwrap_or_else(|_| "Minigbm:enabled".into())).unwrap_or_default();
+        // virtio-gpu mode; ZEROEMU_GPU_FEATURES overrides ("Name:enabled,...").
+        let features = std::ffi::CString::new(std::env::var("ZEROEMU_GPU_FEATURES").unwrap_or_else(|_| "Minigbm:enabled".into())).unwrap_or_default();
         let user = Arc::into_raw(self.fences.clone()) as usize as u64;
         let mut params = [
             Param { key: PARAM_USER_DATA, value: user },
@@ -526,13 +526,13 @@ impl Gfxstream {
 #[cfg(target_os = "macos")]
 impl Gfxstream {
     /// Has the renderer draw each scanout straight into the window, as the Android
-    /// Emulator does, instead of droidrt reading it back. gfxstream's own
+    /// Emulator does, instead of zeroemu reading it back. gfxstream's own
     /// setup_window entry point fixes the pixel ratio at 1, which showed a magnified
     /// corner on Retina screens; the method it ends in takes the real ratio.
-    /// DROIDRT_READBACK=1 keeps the old way.
+    /// ZEROEMU_READBACK=1 keeps the old way.
     fn attach_window(self: &Arc<Self>) {
         let Some((get_fb, setup)) = self.api.subwindow else { return };
-        if std::env::var_os("DROIDRT_READBACK").is_some() {
+        if std::env::var_os("ZEROEMU_READBACK").is_some() {
             return;
         }
         let me = Arc::downgrade(self);
@@ -549,7 +549,7 @@ impl Gfxstream {
             g.direct.store(up, Ordering::Release);
             window::set_drawing(up);
             if !up {
-                eprintln!("droidrt: the renderer can't draw into the window ({p:?}); reading frames back");
+                eprintln!("zeroemu: the renderer can't draw into the window ({p:?}); reading frames back");
             }
         };
         let me = Arc::downgrade(self);
@@ -575,7 +575,7 @@ impl Drop for Gfxstream {
         // Once it has drawn into the window, the renderer can't be torn down: its
         // teardown destroys the post worker that posts queued on the UI thread still
         // point at, and removes the subwindow off the UI thread. This only happens as
-        // droidrt exits, which frees everything anyway.
+        // zeroemu exits, which frees everything anyway.
         if live && !self.subwindow.load(Ordering::Acquire) {
             self.exclusive(|| unsafe { (self.api.teardown)() });
         }
@@ -817,7 +817,7 @@ impl Gfxstream {
         let b = c_box(&t.bx);
         let call = || unsafe { f(handle, t.ctx_id, t.level, t.stride, t.layer_stride, &b, t.offset, std::ptr::null(), 0) };
         static SERIAL: OnceLock<bool> = OnceLock::new();
-        let serial = *SERIAL.get_or_init(|| std::env::var_os("DROIDRT_GPU_SERIAL").is_some());
+        let serial = *SERIAL.get_or_init(|| std::env::var_os("ZEROEMU_GPU_SERIAL").is_some());
         let pipe = if serial { None } else { self.pipes.lock().unwrap_or_else(|p| p.into_inner()).get(&handle).copied() };
         match pipe {
             None => ck(self.worker.run(call)),
@@ -865,7 +865,7 @@ impl Gfxstream {
 }
 
 fn backend_path() -> Result<std::path::PathBuf, String> {
-    if let Ok(p) = std::env::var("DROIDRT_GFXSTREAM") {
+    if let Ok(p) = std::env::var("ZEROEMU_GFXSTREAM") {
         return Ok(std::path::PathBuf::from(p));
     }
     let name = if cfg!(windows) { "gfxstream_backend.dll" } else { "libgfxstream_backend.dylib" };

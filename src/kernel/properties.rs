@@ -261,7 +261,7 @@ impl Properties {
         Some(String::from_utf8_lossy(&bytes).into_owned())
     }
 
-    /// Loads build.prop files the way init does at boot, plus droidrt's own.
+    /// Loads build.prop files the way init does at boot, plus zeroemu's own.
     pub fn load_defaults(&self, vfs: &Vfs) {
         const FILES: [&str; 8] = [
             "/system/etc/prop.default",
@@ -315,13 +315,13 @@ impl Properties {
         }
         for (k, v) in [
             ("ro.property_service.version", "2"),
-            ("ro.hardware", "droidrt"),
-            ("ro.boot.hardware", "droidrt"),
+            ("ro.hardware", "zeroemu"),
+            ("ro.boot.hardware", "zeroemu"),
             ("ro.boot.selinux", "permissive"),
             ("ro.debuggable", "1"),
             ("ro.secure", "0"),
             ("ro.adb.secure", "0"),
-            ("ro.kernel.droidrt", "1"),
+            ("ro.kernel.zeroemu", "1"),
             ("persist.sys.timezone", "UTC"),
         ] {
             let _ = self.set(None, k, v);

@@ -1,4 +1,4 @@
-// Freestanding arm64 test of droidrt's SELinux interface (no libc, no image):
+// Freestanding arm64 test of zeroemu's SELinux interface (no libc, no image):
 // selinuxfs before and after a policy load (the CIL is written to the tmpfs
 // root first), its transaction files, booleans and status page,
 // /proc/<pid>/attr, and SO_PEERSEC. Exits with the failure count.

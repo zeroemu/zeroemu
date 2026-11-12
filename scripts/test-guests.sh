@@ -1,10 +1,10 @@
 #!/bin/sh
-# Builds the freestanding test guests and runs every one under droidrt.
+# Builds the freestanding test guests and runs every one under zeroemu.
 set -u
 cd "$(dirname "$0")/.."
 cargo build --release 2>&1 | grep -E "^(warning|error)" -A6
 case "$(uname -s)" in
-    Darwin) codesign -s - -f --entitlements entitlements.plist target/release/droidrt 2>/dev/null ;;
+    Darwin) codesign -s - -f --entitlements entitlements.plist target/release/zeroemu 2>/dev/null ;;
 esac
 scripts/build-guests.sh >/dev/null 2>&1 || { echo "guest build failed"; exit 1; }
 bad=0
@@ -13,7 +13,7 @@ for t in m2 m3 shm binder binder_nested binder_refs binder_unwind mounts creds s
     [ -x "$bin" ] || continue
     # Only this one sees the network interface, which the others don't expect.
     net=0; [ "$t" = ifcfg ] && net=1
-    out=$(DROIDRT_NET=$net DROIDRT_GPU=fake perl -e 'alarm 90; exec @ARGV' target/release/droidrt "$bin" alpha beta 2>&1)
+    out=$(ZEROEMU_NET=$net ZEROEMU_GPU=fake perl -e 'alarm 90; exec @ARGV' target/release/zeroemu "$bin" alpha beta 2>&1)
     if printf '%s\n' "$out" | grep -q "all checks passed" && ! printf '%s\n' "$out" | grep -qE "^FAIL|panicked|internal error"; then
         printf '%-16s ok\n' "$t"
     else

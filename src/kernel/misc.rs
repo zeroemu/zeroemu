@@ -20,7 +20,7 @@ impl Kernel {
                 };
                 let mut out = [0u8; 65 * 6];
                 let (host, domain) = (self.sysctl.get("kernel/hostname"), self.sysctl.get("kernel/domainname"));
-                for (i, f) in ["Linux", &host, "6.6.0-droidrt", "#1 SMP PREEMPT droidrt", machine, &domain].iter().enumerate() {
+                for (i, f) in ["Linux", &host, "6.6.0-zeroemu", "#1 SMP PREEMPT zeroemu", machine, &domain].iter().enumerate() {
                     let n = f.len().min(64);
                     out[i * 65..i * 65 + n].copy_from_slice(&f.as_bytes()[..n]);
                 }
@@ -196,7 +196,7 @@ impl Kernel {
             }
             // Disk quotas are off (installd then counts by hand); it asks per mount.
             quotactl => Err(ESRCH),
-            // The drivers a module would bring are droidrt's own.
+            // The drivers a module would bring are zeroemu's own.
             finit_module | init_module | delete_module => Ok(0),
             // The guest's clock is the host's: nothing to set.
             settimeofday => Ok(0),

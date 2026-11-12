@@ -3,7 +3,7 @@
 //! its own, so one host thread sleeps until the next deadline.
 //!
 //! Timers on CPU-time clocks are refused and ITIMER_VIRTUAL and ITIMER_PROF
-//! only store their values: droidrt keeps no per-process CPU accounting, and
+//! only store their values: zeroemu keeps no per-process CPU accounting, and
 //! wall time would kill processes, those signals being fatal by default.
 //!
 //! A pending signal is one entry per number (signal.rs), so a timer that fires

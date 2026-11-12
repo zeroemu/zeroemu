@@ -1,4 +1,4 @@
-// Freestanding arm64 test of droidrt's credentials and process control (no
+// Freestanding arm64 test of zeroemu's credentials and process control (no
 // libc): uids/gids and groups, capabilities and securebits, prctl, seccomp,
 // rlimits, scheduling and I/O priorities, process groups and sessions,
 // reparenting to pid 1 and to a subreaper, parent-death signals, waitid,
@@ -479,12 +479,12 @@ static void prctls(void) {
     check(sys(NR_personality, 0xffffffff) == 0 && sys(NR_personality, 0x0040000) == 0 && sys(NR_personality, 0xffffffff) == 0x0040000, "personality: query and set");
     check(sys(NR_personality, 0) == 0x0040000 && sys(NR_personality, 8 /* PER_LINUX32 */) == -EINVAL, "no PER_LINUX32 on arm64");
 
-    check(sys(NR_sethostname, "droidrt-test", 12) == 0 && sys(NR_setdomainname, "example", 7) == 0, "sethostname/setdomainname");
+    check(sys(NR_sethostname, "zeroemu-test", 12) == 0 && sys(NR_setdomainname, "example", 7) == 0, "sethostname/setdomainname");
     char uts[65 * 6];
     sys(NR_uname, uts);
-    check(seq(uts + 65, "droidrt-test", 13) && seq(uts + 325, "example", 8), "uname reflects them");
+    check(seq(uts + 65, "zeroemu-test", 13) && seq(uts + 325, "example", 8), "uname reflects them");
     readfile("/proc/sys/kernel/hostname");
-    check(seq(buf, "droidrt-test\n", 14), "/proc/sys/kernel/hostname");
+    check(seq(buf, "zeroemu-test\n", 14), "/proc/sys/kernel/hostname");
     check(sys(NR_sethostname, uts, 65) == -EINVAL, "names over 64 bytes: EINVAL");
 }
 

@@ -1,6 +1,6 @@
 #!/bin/sh
 # End-to-end checks against a real Android SDK system image: runs bionic's
-# dynamic linker, toybox, and mksh from the image under droidrt.
+# dynamic linker, toybox, and mksh from the image under zeroemu.
 #
 #   scripts/test-android.sh [path/to/system.img]
 #
@@ -16,14 +16,14 @@ fi
 echo "image: $IMG"
 
 cargo build -q --release || exit 1
-BIN=target/release/droidrt
+BIN=target/release/zeroemu
 case "$(uname -s)" in
     Darwin) codesign -s - -f --entitlements entitlements.plist "$BIN" 2>/dev/null ;;
 esac
 
 pass=0
 fail=0
-# check <name> <expected substring> <droidrt args...>
+# check <name> <expected substring> <zeroemu args...>
 check() {
     name="$1"
     want="$2"
@@ -39,7 +39,7 @@ check() {
     fi
 }
 
-check "toybox echo"         "hello droidrt"       /system/bin/toybox echo hello droidrt
+check "toybox echo"         "hello zeroemu"       /system/bin/toybox echo hello zeroemu
 check "uname"               "Linux"               /system/bin/toybox uname -s
 check "id"                  "uid=0(root)"         /system/bin/toybox id
 check "symlink into APEX"   "-> /apex/com.android.runtime/bin/linker64" /system/bin/toybox ls -l /system/bin/linker64
@@ -90,12 +90,12 @@ check "apexd --bootstrap"   "/apex/com.android.runtime/bin/linker64" /system/bin
 # properties and binder
 check "getprop"             "16"                  /system/bin/getprop ro.build.version.release
 check "derived fingerprint" "release-keys"        /system/bin/getprop ro.build.fingerprint
-check "setprop round trip"  "value=world"         /system/bin/sh -c 'setprop debug.droidrt.t world && echo "value=$(getprop debug.droidrt.t)"'
+check "setprop round trip"  "value=world"         /system/bin/sh -c 'setprop debug.zeroemu.t world && echo "value=$(getprop debug.zeroemu.t)"'
 check "ro.* is read-only"   "still 36"            /system/bin/sh -c 'setprop ro.build.version.sdk 1 2>/dev/null; echo "still $(getprop ro.build.version.sdk)"'
 check "servicemanager"      "manager: [android.os.IServiceManager]" /system/bin/sh -c 'servicemanager 2>/dev/null & sleep 0.5; service list; kill %1'
 check "service check"       "Service manager: found" /system/bin/sh -c 'servicemanager 2>/dev/null & sleep 0.5; service check manager; kill %1'
 # logd (kernel-side): records print to stderr and read back through logcat
-check "log to stderr"       "I droidrt-test: hello log" /system/bin/log -t droidrt-test "hello log"
+check "log to stderr"       "I zeroemu-test: hello log" /system/bin/log -t zeroemu-test "hello log"
 check "kmsg keeps digits"   "[kmsg] 12 apples"    /system/bin/sh -c 'echo "<6>12 apples" > /dev/kmsg' 
 check "iptables tables keep rules" "-A oem_in -p tcp -m tcp --dport 22 -j DROP" /system/bin/sh -c 'printf "*filter\n:oem_in -\n-A INPUT -j oem_in\n-A oem_in -p tcp --dport 22 -j DROP\nCOMMIT\n" | iptables-restore && iptables -S'
 check "ip6tables has the mangle hooks" "-P POSTROUTING ACCEPT" /system/bin/ip6tables -t mangle -S
@@ -110,7 +110,7 @@ check "EROFS label"         "u:object_r:init_exec:s0 /system/bin/init" /system/b
 check "ext4 APEX label"     "u:object_r:adbd_exec:s0 /apex/com.android.adbd/bin/adbd" /system/bin/toybox ls -Z /apex/com.android.adbd/bin/adbd
 check "tmpfs mount labels"  "/dev=u:object_r:device:s0 /dev/socket=u:object_r:socket_device:s0" /system/bin/sh -c 'echo $(ls -Zd /dev /dev/socket | while read c p; do echo "$p=$c"; done)'
 check "chcon on tmpfs"      "u:object_r:system_file:s0 f" /system/bin/sh -c 'cd /data/local/tmp && echo x > f && chcon u:object_r:system_file:s0 f && ls -Z f'
-check "setfattr/getfattr"   'user.droidrt="hello"' /system/bin/sh -c 'touch /tmp/f && setfattr -n user.droidrt -v hello /tmp/f && getfattr -d -n user.droidrt /tmp/f'
+check "setfattr/getfattr"   'user.zeroemu="hello"' /system/bin/sh -c 'touch /tmp/f && setfattr -n user.zeroemu -v hello /tmp/f && getfattr -d -n user.zeroemu /tmp/f'
 check "image is read-only"  "Read-only file system" /system/bin/toybox chcon u:object_r:shell_exec:s0 /system/bin/sh
 check "restorecon relabels" "from u:object_r:system_file:s0 to u:object_r:shell_data_file:s0" /system/bin/sh -c 'touch /data/local/tmp/f && chcon u:object_r:system_file:s0 /data/local/tmp/f && restorecon -v /data/local/tmp/f 2>&1'
 # credentials, limits, scheduling, process tree
@@ -120,7 +120,7 @@ check "renice"              "nice=4"              /system/bin/sh -c 'renice -n 4
 check "nice"                " 26 6 1 "            /system/bin/toybox nice -n 6 cat /proc/self/stat
 check "chrt"                "policy: SCHED_FIFO"  /system/bin/sh -c 'chrt -f -p $$ 10; chrt -p $$'
 check "ionice"              "Best-effort: prio 3" /system/bin/sh -c 'ionice -c 2 -n 3 -p $$; ionice -p $$'
-check "hostname"            "droidrt-host"        /system/bin/sh -c 'hostname droidrt-host; uname -n'
+check "hostname"            "zeroemu-host"        /system/bin/sh -c 'hostname zeroemu-host; uname -n'
 check "setsid"              "own session"         /system/bin/toybox setsid /system/bin/sh -c '[ "$(cut -d" " -f6 /proc/$$/stat)" = $$ ] && echo "own session"'
 check "orphan adopted by 1" "ppid=1 ok"           /system/bin/sh -c '(sh -c "sleep 0.3; echo ppid=\$(cut -d\" \" -f4 /proc/\$\$/stat) ok" &); sleep 0.6'
 # Unix sockets are filesystem nodes; netlink answers
@@ -141,7 +141,7 @@ check "runcon"              "now u:r:logd:s0 was u:r:shell:s0" /system/bin/runco
 check "ps -Z"               "u:r:shell:s0  "      /system/bin/toybox ps -Z
 check "setenforce"          "Permissive Enforcing" /system/bin/sh -c 'a=$(getenforce); setenforce 1; echo "$a $(getenforce)"'
 
-# Exit status needs its own path: the program's code must become droidrt's.
+# Exit status needs its own path: the program's code must become zeroemu's.
 perl -e 'alarm 60; exec @ARGV' "$BIN" --system "$IMG" /system/bin/sh -c 'exit 3' >/dev/null 2>&1
 if [ $? -eq 3 ]; then pass=$((pass + 1)); echo "ok   exit code propagates"; else fail=$((fail + 1)); echo "FAIL exit code propagates"; fi
 

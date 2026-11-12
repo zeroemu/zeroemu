@@ -648,7 +648,7 @@ pub(crate) fn io_errno(e: io::Error) -> i64 {
     if let Some(Errno(n)) = e.get_ref().and_then(|i| i.downcast_ref::<Errno>()) {
         return *n;
     }
-    eprintln!("[droidrt] vfs I/O error: {e}");
+    eprintln!("[zeroemu] vfs I/O error: {e}");
     EIO
 }
 
@@ -938,7 +938,7 @@ impl Vfs {
     /// need not exist); the first mount must be "/".
     pub fn mount(&self, path: &str, fs: Arc<dyn FileSystem>) {
         let image = matches!(fs.fs_type(), "erofs" | "ext4");
-        let source = if image { "/dev/block/droidrt" } else { fs.fs_type() };
+        let source = if image { "/dev/block/zeroemu" } else { fs.fs_type() };
         let ro = if image { MS_RDONLY } else { 0 };
         // What Linux would show for these mounts' options.
         let options = match fs.fs_type() {
@@ -1176,7 +1176,7 @@ impl Vfs {
         node.mnt.sb.fs.clone()
     }
 
-    /// Path resolution for droidrt's own use, which no permission applies to.
+    /// Path resolution for zeroemu's own use, which no permission applies to.
     pub fn resolve(&self, cwd: &str, path: &str, follow_last: bool) -> Result<Node, i64> {
         self.resolve_as(cwd, path, follow_last, None)
     }
@@ -1513,9 +1513,9 @@ impl Vfs {
     }
 }
 
-/// DROIDRT_MEMSTAT=1: thread dumps also say where memory has gone.
+/// ZEROEMU_MEMSTAT=1: thread dumps also say where memory has gone.
 pub fn memstat_on() -> bool {
-    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var("DROIDRT_MEMSTAT").as_deref() == Ok("1"));
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var("ZEROEMU_MEMSTAT").as_deref() == Ok("1"));
     *ON
 }
 

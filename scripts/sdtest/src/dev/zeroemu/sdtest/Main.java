@@ -1,4 +1,4 @@
-package org.droidrt.sdtest;
+package dev.zeroemu.sdtest;
 
 import android.app.Activity;
 import android.os.Bundle;

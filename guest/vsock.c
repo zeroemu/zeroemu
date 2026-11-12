@@ -1,6 +1,6 @@
 // Freestanding arm64 test of a guest vsock listener, driven by scripts/test-net.py
 // over a host TCP port: an echo, as adbd's transport would use it. Run as
-//   droidrt --adb-port <port> target/guest/vsock_aarch64
+//   zeroemu --adb-port <port> target/guest/vsock_aarch64
 
 typedef unsigned long u64;
 typedef long i64;

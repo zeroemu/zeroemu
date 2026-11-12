@@ -1,4 +1,4 @@
-//! The network interfaces droidrt shows: loopback, the TUN devices programs
+//! The network interfaces zeroemu shows: loopback, the TUN devices programs
 //! create (system_server's Thread network makes "thread-wpan"), and for a device on
 //! the network, eth1. No packets pass through any of them: guest sockets are
 //! connected to host sockets directly, and these exist so that Android believes

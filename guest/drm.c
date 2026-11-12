@@ -1,7 +1,7 @@
-// Freestanding arm64 test of droidrt's virtio-gpu DRM node: version and
+// Freestanding arm64 test of zeroemu's virtio-gpu DRM node: version and
 // capsets, a guest blob and a host-visible blob (mmap both), PRIME, a
 // sync_file fence, and one atomic page flip. Exits 0 with no device, so the
-// default headless run stays green; DROIDRT_GPU=fake is what exercises it.
+// default headless run stays green; ZEROEMU_GPU=fake is what exercises it.
 
 typedef unsigned long u64;
 typedef long i64;

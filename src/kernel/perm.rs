@@ -5,10 +5,10 @@
 //! its work; this module is what they share.
 //!
 //! Only files whose owner and mode are real are checked: tmpfs (init and its
-//! daemons chown and chmod it as on a device, and droidrt makes its device nodes
+//! daemons chown and chmod it as on a device, and zeroemu makes its device nodes
 //! with ueventd's modes), binderfs, and the read-only images. procfs, sysfs, the
 //! cgroup hierarchies, selinuxfs, devpts, tracefs, bpffs and the stand-in
-//! filesystems have modes droidrt made up and owners nobody set, so they stay
+//! filesystems have modes zeroemu made up and owners nobody set, so they stay
 //! permissive, as their directories do for path walks. A fuse mount (the
 //! shared-storage volume, fuse.rs) shows /data's files with their real owners, and
 //! still nothing is checked there: vold mounts it without default_permissions, so
@@ -44,7 +44,7 @@ pub const AID_GRAPHICS: u32 = 1003;
 pub const AID_INPUT: u32 = 1004;
 pub const AID_VPN: u32 = 1016;
 
-/// Makes a device node droidrt provides as ueventd would leave it: the mode and
+/// Makes a device node zeroemu provides as ueventd would leave it: the mode and
 /// owner /system/etc/ueventd.rc (or the vendor's) gives it, or ueventd's own
 /// default, 0600 root root, where no line names it. Returns its inode.
 pub fn device_node(fs: &dyn crate::vfs::FileSystem, dir: u64, name: &str, mode: u32, rdev: u64, owner: (u32, u32)) -> Result<u64, i64> {
@@ -55,15 +55,15 @@ pub fn device_node(fs: &dyn crate::vfs::FileSystem, dir: u64, name: &str, mode: 
     Ok(ino)
 }
 
-/// DROIDRT_DAC=0: nothing in this module refuses anything, as before droidrt had it.
+/// ZEROEMU_DAC=0: nothing in this module refuses anything, as before zeroemu had it.
 pub fn enforcing() -> bool {
-    static ON: LazyLock<bool> = LazyLock::new(|| std::env::var("DROIDRT_DAC").as_deref() != Ok("0"));
+    static ON: LazyLock<bool> = LazyLock::new(|| std::env::var("ZEROEMU_DAC").as_deref() != Ok("0"));
     *ON
 }
 
-/// DROIDRT_DAC_LOG=1: every refusal is logged, with who asked and what refused.
+/// ZEROEMU_DAC_LOG=1: every refusal is logged, with who asked and what refused.
 fn logging() -> bool {
-    static ON: LazyLock<bool> = LazyLock::new(|| std::env::var("DROIDRT_DAC_LOG").as_deref() == Ok("1"));
+    static ON: LazyLock<bool> = LazyLock::new(|| std::env::var("ZEROEMU_DAC_LOG").as_deref() == Ok("1"));
     *ON
 }
 
@@ -96,7 +96,7 @@ impl Kernel {
             let call = self.arch.sysno(nr).map_or_else(|| nr.to_string(), |s| format!("{s:?}"));
             let exe = t.proc.exe.lock().unwrap().clone();
             eprintln!(
-                "[droidrt] dac: pid {} ({exe}) uid {} gid {} groups {:?} {call} {path}: {what} refused by {:o} {}:{} ({})",
+                "[zeroemu] dac: pid {} ({exe}) uid {} gid {} groups {:?} {call} {path}: {what} refused by {:o} {}:{} ({})",
                 t.proc.pid,
                 c.fsuid,
                 c.fsgid,
@@ -276,7 +276,7 @@ impl Kernel {
     pub(super) fn may_mknod(&self, t: &Thread, mode: u32) -> Result<(), i64> {
         if enforcing() && matches!(mode & S_IFMT, S_IFCHR | S_IFBLK) && !self.creds(t).capable(CAP_MKNOD) {
             if logging() {
-                eprintln!("[droidrt] dac: pid {} mknod of a device without CAP_MKNOD (EPERM)", t.proc.pid);
+                eprintln!("[zeroemu] dac: pid {} mknod of a device without CAP_MKNOD (EPERM)", t.proc.pid);
             }
             return Err(EPERM);
         }
@@ -289,7 +289,7 @@ impl Kernel {
             return Ok(());
         }
         if logging() {
-            eprintln!("[droidrt] dac: pid {} ({}) {what} without capability {cap} ({})", t.proc.pid, t.proc.exe.lock().unwrap(), if err == EACCES { "EACCES" } else { "EPERM" });
+            eprintln!("[zeroemu] dac: pid {} ({}) {what} without capability {cap} ({})", t.proc.pid, t.proc.exe.lock().unwrap(), if err == EACCES { "EACCES" } else { "EPERM" });
         }
         Err(err)
     }

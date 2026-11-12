@@ -3,7 +3,7 @@
 //! input configuration expects: /vendor/usr/idc/virtio_input_multi_touch_1.idc
 //! makes the first a touchscreen, and qwerty2.idc the second a full keyboard.
 //!
-//! DROIDRT_INPUT_FIFO=<path>: lines from this host FIFO are injected as if they
+//! ZEROEMU_INPUT_FIFO=<path>: lines from this host FIFO are injected as if they
 //! came from the window, for testing without the host's mouse: `down X Y`,
 //! `move X Y` and `up X Y` with X and Y from 0 to 1, `wheel X Y DX DY` with the
 //! same scale, `key CODE 1|0`, and `shot PATH`, which writes the frame on show.
@@ -366,9 +366,9 @@ pub fn key(code: u16, down: bool) {
     d.post(&[(EV_KEY, code, down as i32)]);
 }
 
-/// Serves DROIDRT_INPUT_FIFO, if set.
+/// Serves ZEROEMU_INPUT_FIFO, if set.
 pub fn start_input_fifo() {
-    let Ok(path) = std::env::var("DROIDRT_INPUT_FIFO") else { return };
+    let Ok(path) = std::env::var("ZEROEMU_INPUT_FIFO") else { return };
     let _ = std::thread::Builder::new().name("input-fifo".into()).spawn(move || {
         use std::io::BufRead;
         loop {
@@ -399,7 +399,7 @@ pub fn start_input_fifo() {
                     }
                     ["shot", path] => {
                         if let Err(e) = crate::gpu::save_shown_frame(path) {
-                            eprintln!("droidrt: shot {path}: {e}");
+                            eprintln!("zeroemu: shot {path}: {e}");
                         }
                     }
                     ["key", code, state] => {
@@ -407,7 +407,7 @@ pub fn start_input_fifo() {
                             key(code, *state != "0");
                         }
                     }
-                    _ => eprintln!("droidrt: bad input line {line:?}"),
+                    _ => eprintln!("zeroemu: bad input line {line:?}"),
                 }
             }
         }

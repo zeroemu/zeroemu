@@ -1,4 +1,4 @@
-// Freestanding arm64 test of droidrt's /dev/tun and interface ioctls, as
+// Freestanding arm64 test of zeroemu's /dev/tun and interface ioctls, as
 // Android's Thread network service uses them: create "thread-wpan", set its
 // MTU and bring it up through an inet socket, see it in /sys/class/net, and
 // see it go away when the device closes.

@@ -168,15 +168,15 @@ struct BThread {
     /// outgoing one it waits on (top).
     stack: Vec<TxnId>,
     looper: u32,
-    /// DROIDRT_BINDER_RING=1: what's happened lately, for when a process aborts.
+    /// ZEROEMU_BINDER_RING=1: what's happened lately, for when a process aborts.
     ring: VecDeque<String>,
 }
 
-/// DROIDRT_BINDER_RING=1: keeps each thread's last binder events, and prints them when
+/// ZEROEMU_BINDER_RING=1: keeps each thread's last binder events, and prints them when
 /// its process is killed by a signal. A thread given a reply it isn't waiting for has
 /// aborted long after whatever went wrong.
 fn ring_on() -> bool {
-    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var("DROIDRT_BINDER_RING").as_deref() == Ok("1"));
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var("ZEROEMU_BINDER_RING").as_deref() == Ok("1"));
     *ON
 }
 
@@ -411,10 +411,10 @@ pub fn readable(b: &BinderFile, tid: i32) -> bool {
     th.is_some_and(|t| !t.todo.is_empty()) || (th.is_none_or(|t| t.stack.is_empty()) && !p.todo.is_empty())
 }
 
-/// DROIDRT_BINDER_TRACE=1 logs every transaction.
+/// ZEROEMU_BINDER_TRACE=1 logs every transaction.
 fn tracing() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("DROIDRT_BINDER_TRACE").is_some())
+    *ON.get_or_init(|| std::env::var_os("ZEROEMU_BINDER_TRACE").is_some())
 }
 
 fn align8(v: u64) -> u64 {
@@ -1081,7 +1081,7 @@ impl Kernel {
                 drop(g);
             }
             _ => {
-                eprintln!("[droidrt] binder: unsupported command {cmd:#x}");
+                eprintln!("[zeroemu] binder: unsupported command {cmd:#x}");
                 return Err(EINVAL);
             }
         }
@@ -1224,7 +1224,7 @@ impl Kernel {
         let total = data_len + offs_len + out.sg_size + if want_secctx { align8(caller_ctx.len() as u64) } else { 0 };
         let buffer = if out.too_big { None } else { w.alloc(to, total) };
         let Some(buffer) = buffer else {
-            eprintln!("[droidrt] binder: no receive buffer space in pid {}", w.procs[&to].pid);
+            eprintln!("[zeroemu] binder: no receive buffer space in pid {}", w.procs[&to].pid);
             w.transaction_failed(me, t.tid, answering, to, to_thread);
             drop(g);
             return;

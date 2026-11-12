@@ -104,7 +104,7 @@ impl Hypervisor for Hvf {
             return Err(format!("hv_vcpu_create failed ({ret:#x})"));
         }
         let mut v = HvfVcpu { id, exit, flush_pending: true };
-        if let Some(secs) = std::env::var("DROIDRT_WATCHDOG").ok().and_then(|s| s.parse::<u64>().ok()) {
+        if let Some(secs) = std::env::var("ZEROEMU_WATCHDOG").ok().and_then(|s| s.parse::<u64>().ok()) {
             // Debug aid: force an exit after `secs` so a guest stuck without
             // trapping (e.g. an EL1 exception loop) gets its state dumped.
             std::thread::spawn(move || {
@@ -207,7 +207,7 @@ impl Vcpu for HvfVcpu {
             let exit = unsafe { *self.exit };
             match exit.reason {
                 HV_EXIT_REASON_EXCEPTION => {}
-                HV_EXIT_REASON_CANCELED if std::env::var_os("DROIDRT_WATCHDOG").is_some() => {
+                HV_EXIT_REASON_CANCELED if std::env::var_os("ZEROEMU_WATCHDOG").is_some() => {
                     return Exit::Fault {
                         pc: self.reg(HV_REG_PC),
                         addr: self.sys(HV_SYS_REG_FAR_EL1),

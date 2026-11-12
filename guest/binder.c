@@ -1,4 +1,4 @@
-// Freestanding arm64 test of droidrt's binder driver (no libc), speaking the
+// Freestanding arm64 test of zeroemu's binder driver (no libc), speaking the
 // raw protocol: a context manager and a client in separate processes, with
 // object and fd translation, a one-way call, refcount notifications, and a
 // death notification. Exits with the failure count.

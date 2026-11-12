@@ -1,4 +1,4 @@
-//! droidrt: runs Android's (Linux) userspace binaries directly on the host CPU
+//! zeroemu: runs Android's (Linux) userspace binaries directly on the host CPU
 //! inside a kernel-less hardware VM, implementing the Linux syscall ABI in Rust.
 
 mod android;
@@ -23,15 +23,15 @@ use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-const USAGE: &str = "usage: droidrt [--system <system.img>] [--strace] [--display] <program> [args...]
-       droidrt --system <system.img> --boot [--headless] [--data <file> | --ephemeral] [--wipe-data]
+const USAGE: &str = "usage: zeroemu [--system <system.img>] [--strace] [--display] <program> [args...]
+       zeroemu --system <system.img> --boot [--headless] [--data <file> | --ephemeral] [--wipe-data]
                [--adb-port <port> | --no-adb] [--no-net] [--ram <MB>]
                [--push <host>:<guest>]... [--run <cmd>] [init args...]
-       droidrt --system <system.img> --ls <path> | --cat <path>
-       droidrt --gpu-selftest";
+       zeroemu --system <system.img> --ls <path> | --cat <path>
+       zeroemu --gpu-selftest";
 
 fn main() -> ExitCode {
-    // A panic is a droidrt bug. Unhandled, it kills only the host thread that
+    // A panic is a zeroemu bug. Unhandled, it kills only the host thread that
     // was running one guest thread, which then freezes without a trace; stop
     // everything loudly instead.
     kernel::reserve_dump_signal();
@@ -41,7 +41,7 @@ fn main() -> ExitCode {
     std::panic::set_hook(Box::new(move |info| {
         default(info);
         kernel::trace::flush_if_free();
-        eprintln!("[droidrt] internal error in {}; stopping", std::thread::current().name().unwrap_or("?"));
+        eprintln!("[zeroemu] internal error in {}; stopping", std::thread::current().name().unwrap_or("?"));
         std::process::exit(101);
     }));
     let result = run();
@@ -49,7 +49,7 @@ fn main() -> ExitCode {
     match result {
         Ok(code) => ExitCode::from(code as u8),
         Err(e) => {
-            eprintln!("droidrt: {e}");
+            eprintln!("zeroemu: {e}");
             ExitCode::from(127)
         }
     }
@@ -60,7 +60,7 @@ fn run() -> Result<i32, String> {
     let mut root = PathBuf::from("/");
     let mut system: Option<PathBuf> = None;
     let mut inspect: Option<(String, String)> = None;
-    let mut strace = std::env::var_os("DROIDRT_STRACE").is_some();
+    let mut strace = std::env::var_os("ZEROEMU_STRACE").is_some();
     let mut boot = false;
     let mut push: Vec<(String, Vec<u8>)> = Vec::new();
     let mut run: Option<String> = None;
@@ -81,7 +81,7 @@ fn run() -> Result<i32, String> {
             "--ls" | "--cat" => inspect = Some((flag.clone(), args.next().ok_or(USAGE)?)),
             "--strace" => strace = true,
             // Android's init as pid 1. First-stage init's work (mounting
-            // partitions, loading SELinux policy) is done by droidrt itself,
+            // partitions, loading SELinux policy) is done by zeroemu itself,
             // so init starts at its second stage. A window comes with it
             // unless --headless is also given.
             "--boot" => boot = true,
@@ -149,9 +149,9 @@ fn run() -> Result<i32, String> {
         kernel::adb::start(adb_port);
     }
     // --headless wins over both --display and the window --boot implies.
-    // DROIDRT_GPU=fake is the in-memory virtio-gpu (guest tests, no window).
+    // ZEROEMU_GPU=fake is the in-memory virtio-gpu (guest tests, no window).
     let show = !headless && (display || boot);
-    let fake = std::env::var("DROIDRT_GPU").as_deref() == Ok("fake");
+    let fake = std::env::var("ZEROEMU_GPU").as_deref() == Ok("fake");
     let gpu: Option<Arc<dyn gpu::GpuBackend>> = if fake {
         Some(gpu::fake())
     } else if show {
@@ -276,7 +276,12 @@ fn default_data_image(system: &std::path::Path) -> Option<PathBuf> {
     // FNV-1a of the image's path: a device per image.
     let path = std::fs::canonicalize(system).ok()?;
     let id = path.to_string_lossy().bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ b as u64).wrapping_mul(0x0100_0000_01b3));
-    Some(base.join("droidrt").join(format!("data-{id:016x}.img")))
+    // Devices saved under the project's old name move with it.
+    let (dir, legacy) = (base.join("zeroemu"), base.join("droidrt"));
+    if !dir.exists() && legacy.is_dir() && std::fs::rename(&legacy, &dir).is_ok() {
+        eprintln!("zeroemu: moved saved devices from {} to {}", legacy.display(), dir.display());
+    }
+    Some(dir.join(format!("data-{id:016x}.img")))
 }
 
 fn inspect_image(vfs: &vfs::Vfs, cmd: &str, path: &str) -> Result<i32, String> {

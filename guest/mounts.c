@@ -1,4 +1,4 @@
-// Freestanding arm64 test of droidrt's mount layer (no libc): mount(2) and
+// Freestanding arm64 test of zeroemu's mount layer (no libc): mount(2) and
 // umount2(2) on the guest's tmpfs root, propagation, tmpfs size limits,
 // /proc/self/mountinfo and its poll notification, unshare/setns and
 // /proc/self/ns, sysctl writes, and pipe sizes (F_GETPIPE_SZ/F_SETPIPE_SZ).

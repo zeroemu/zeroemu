@@ -1,14 +1,14 @@
-//! DROIDRT_TRACE=<file>: Android's trace markers go to a host file. atrace,
+//! ZEROEMU_TRACE=<file>: Android's trace markers go to a host file. atrace,
 //! SurfaceFlinger, HWUI, the composer and the framework write them to tracefs's
-//! `trace_marker` when their tags are on (`DROIDRT_PROPS=debug.atrace.tags.enableflags=<hex>`).
+//! `trace_marker` when their tags are on (`ZEROEMU_PROPS=debug.atrace.tags.enableflags=<hex>`).
 //! Each becomes a line: the guest's CLOCK_MONOTONIC in microseconds, the writer's pid
 //! and tid, and the marker as written ("B|pid|name", "E|pid", "C|pid|name|value", ...).
-//! droidrt adds its own as pid 0, from host threads, on the same clock.
+//! zeroemu adds its own as pid 0, from host threads, on the same clock.
 
 use std::io::Write;
 use std::sync::{Mutex, OnceLock};
 
-/// trace_marker's device number: a character device of droidrt's own (Linux's is a
+/// trace_marker's device number: a character device of zeroemu's own (Linux's is a
 /// regular file; nothing that writes to it looks).
 pub const MARKER_RDEV: u64 = (1 << 8) | 12;
 
@@ -16,7 +16,7 @@ static OUT: OnceLock<Option<Mutex<std::io::BufWriter<std::fs::File>>>> = OnceLoc
 
 fn out() -> Option<&'static Mutex<std::io::BufWriter<std::fs::File>>> {
     OUT.get_or_init(|| {
-        let path = std::env::var_os("DROIDRT_TRACE")?;
+        let path = std::env::var_os("ZEROEMU_TRACE")?;
         match std::fs::File::create(&path) {
             Ok(f) => {
                 // What a kill or crash would lose is at most a quarter second of it.
@@ -29,7 +29,7 @@ fn out() -> Option<&'static Mutex<std::io::BufWriter<std::fs::File>>> {
                 Some(Mutex::new(std::io::BufWriter::with_capacity(1 << 20, f)))
             }
             Err(e) => {
-                eprintln!("droidrt: DROIDRT_TRACE {}: {e}", std::path::Path::new(&path).display());
+                eprintln!("zeroemu: ZEROEMU_TRACE {}: {e}", std::path::Path::new(&path).display());
                 None
             }
         }
@@ -50,7 +50,7 @@ pub fn marker(pid: i32, tid: i32, data: &[u8]) {
     let _ = out.lock().unwrap_or_else(|p| p.into_inner()).write_all(line.as_bytes());
 }
 
-/// A slice of droidrt's work for a guest thread, shown on that thread: ends when
+/// A slice of zeroemu's work for a guest thread, shown on that thread: ends when
 /// dropped.
 pub struct GuestSpan(i32, i32);
 
@@ -65,7 +65,7 @@ impl Drop for GuestSpan {
     }
 }
 
-/// A slice of droidrt's own work, as pid 0 on a host thread: ends when dropped.
+/// A slice of zeroemu's own work, as pid 0 on a host thread: ends when dropped.
 pub struct Span(Option<&'static str>);
 
 pub fn span(name: &'static str) -> Span {

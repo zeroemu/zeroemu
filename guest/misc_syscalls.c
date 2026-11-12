@@ -1,4 +1,4 @@
-// Freestanding arm64 test of droidrt's msync, mlock family, mincore, sendfile,
+// Freestanding arm64 test of zeroemu's msync, mlock family, mincore, sendfile,
 // copy_file_range and the quota and module stubs.
 
 typedef unsigned long u64;

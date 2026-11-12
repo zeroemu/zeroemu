@@ -2,7 +2,7 @@
 //! first stage would hand to secilc): classes and permissions with their
 //! kernel numbering, booleans, initial SIDs, policy capabilities, types and
 //! attributes, roles, users, and type transitions. Access rules (allow,
-//! neverallow, …) are skipped without being parsed: droidrt allows everything.
+//! neverallow, …) are skipped without being parsed: zeroemu allows everything.
 
 use std::collections::HashMap;
 

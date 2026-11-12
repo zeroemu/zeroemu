@@ -1,4 +1,4 @@
-// Dereferences NULL; droidrt must report a clean guest fault, not crash.
+// Dereferences NULL; zeroemu must report a clean guest fault, not crash.
     .global _start
     .text
 _start:

@@ -8,7 +8,7 @@
 //!
 //! Raw sockets and AF_KEY are something else, there for netd's iptables: legacy
 //! ip_tables / ip6_tables get and replace whole tables through socket options on a raw
-//! socket. droidrt keeps those tables (nothing filters).
+//! socket. zeroemu keeps those tables (nothing filters).
 //!
 //! Sockets on this device reach each other with no host socket at all. A datagram socket
 //! that sends beyond the device gets one host socket of its own, with a thread reading it.
@@ -111,9 +111,9 @@ const UDP_QUEUE: usize = 212992;
 const BUF_MAX: u32 = 262144;
 const MTU: i32 = 1500;
 
-/// DROIDRT_NET_TRACE=1: one line per route decision and per host connection.
+/// ZEROEMU_NET_TRACE=1: one line per route decision and per host connection.
 fn tracing() -> bool {
-    static ON: LazyLock<bool> = LazyLock::new(|| std::env::var("DROIDRT_NET_TRACE").as_deref() == Ok("1"));
+    static ON: LazyLock<bool> = LazyLock::new(|| std::env::var("ZEROEMU_NET_TRACE").as_deref() == Ok("1"));
     *ON
 }
 

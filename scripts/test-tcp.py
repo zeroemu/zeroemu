@@ -105,9 +105,9 @@ keep_udp = udp_echo()
 keep_udp2 = udp_echo()
 ports += [keep_sink[1], keep_pieces[1], keep_adb[1], keep_half[1], keep_udp[1], keep_udp2[1]]
 
-env = dict(os.environ, DROIDRT_GPU="fake", DROIDRT_NET="1", ANDROID_ADB_SERVER_PORT=str(keep_adb[1]))
+env = dict(os.environ, ZEROEMU_GPU="fake", ZEROEMU_NET="1", ANDROID_ADB_SERVER_PORT=str(keep_adb[1]))
 started = time.time()
-guest = subprocess.Popen([f"{ROOT}/target/release/droidrt", f"{ROOT}/target/guest/tcp_aarch64"] + [str(p) for p in ports],
+guest = subprocess.Popen([f"{ROOT}/target/release/zeroemu", f"{ROOT}/target/guest/tcp_aarch64"] + [str(p) for p in ports],
                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env, text=True)
 threading.Timer(240, guest.kill).start()
 failed = True

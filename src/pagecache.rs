@@ -109,7 +109,7 @@ const KEPT_WHERE: u64 = KEPT_IN_IMAGE | KEPT_IN_SCRATCH;
 const KEPT_SHIFT: u32 = 62;
 
 /// Where the pages of /data go when they leave memory: the data image they were
-/// last saved in, unchanged, or else a scratch file that goes when droidrt does.
+/// last saved in, unchanged, or else a scratch file that goes when zeroemu does.
 #[derive(Default)]
 pub struct Store {
     image: OnceLock<File>,
@@ -152,7 +152,7 @@ impl Store {
             _ => return Err(EIO),
         };
         read_exact_at(file, buf, offset).map_err(|e| {
-            eprintln!("[droidrt] reading a page of /data back: {e}");
+            eprintln!("[zeroemu] reading a page of /data back: {e}");
             EIO
         })
     }
@@ -189,7 +189,7 @@ impl Store {
         wrote.map_err(|e| {
             self.last_failure.store(now, Ordering::Relaxed);
             if !self.complained.swap(true, Ordering::Relaxed) {
-                eprintln!("[droidrt] pages of /data stay in memory: {e}");
+                eprintln!("[zeroemu] pages of /data stay in memory: {e}");
             }
             EIO
         })
@@ -211,7 +211,7 @@ impl Store {
 /// A name for a scratch file not used yet.
 fn scratch_path() -> std::path::PathBuf {
     static NEXT: AtomicU64 = AtomicU64::new(0);
-    std::env::temp_dir().join(format!("droidrt-{}-{}.scratch", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)))
+    std::env::temp_dir().join(format!("zeroemu-{}-{}.scratch", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)))
 }
 
 /// A file only this process has: it goes when the process does, however that happens.

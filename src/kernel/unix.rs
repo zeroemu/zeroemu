@@ -298,7 +298,7 @@ fn service_socket(vfs: &Vfs, path: &str, ty: u32, perm: u32, owner: (u32, u32), 
                 let _ = vfs.set_attr(&node, None, Some(owner), None);
                 st.node = Some(node_key(&vfs.fs_arc(&node), node.ino));
             }
-            Err(e) => eprintln!("[droidrt] {path}: cannot create the socket (errno {e})"),
+            Err(e) => eprintln!("[zeroemu] {path}: cannot create the socket (errno {e})"),
         }
     }
     sock
@@ -1109,7 +1109,7 @@ impl Kernel {
                     // domain, as /proc/<pid>/attr/current says.
                     SO_PEERSEC if st.connected => b"u:r:su:s0\0".to_vec(),
                     opt => st.opts.get(opt).ok_or_else(|| {
-                        eprintln!("[droidrt] getsockopt(AF_UNIX, SOL_SOCKET, {opt}) unsupported");
+                        eprintln!("[zeroemu] getsockopt(AF_UNIX, SOL_SOCKET, {opt}) unsupported");
                         ENOPROTOOPT
                     })?,
                 };

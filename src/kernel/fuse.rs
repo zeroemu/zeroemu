@@ -8,8 +8,8 @@
 //! StorageManagerService to MediaProvider, whose FuseDaemon (libfuse) answers every
 //! request from /data/media and decides per app what each may see and do.
 //!
-//! droidrt keeps the device's side of that but not the round trips: the mount is a
-//! second view of /data/media's directory in /data's tmpfs, served by droidrt
+//! zeroemu keeps the device's side of that but not the round trips: the mount is a
+//! second view of /data/media's directory in /data's tmpfs, served by zeroemu
 //! directly, and the daemon only ever hears FUSE_INIT. That is enough for vold,
 //! StorageManagerService and MediaProvider to believe the volume is up (the daemon's
 //! session counts as started once it has answered FUSE_INIT), the files are /data's
@@ -18,7 +18,7 @@
 //! learning of files as they are written, and its redaction and transcoding.
 //!
 //! If the daemon goes, the mount keeps working where Linux would fail every access
-//! with ENOTCONN: droidrt never needed it.
+//! with ENOTCONN: zeroemu never needed it.
 //!
 //! What a mount without default_permissions does is kept: the kernel refuses nothing
 //! on the view (perm.rs checks by the type the mount shows, "fuse"), chmod and chown
@@ -56,7 +56,7 @@ const NOTIFY_CODES: std::ops::RangeInclusive<i32> = 1..=7;
 /// Protocol 7.31, Linux 5.4's, whose FUSE_INIT has no flags2: none of the later
 /// features (passthrough among them) is offered.
 const MINOR: u32 = 31;
-/// What Linux 5.4 offers in FUSE_INIT's flags. None of it changes what droidrt does,
+/// What Linux 5.4 offers in FUSE_INIT's flags. None of it changes what zeroemu does,
 /// since nothing after FUSE_INIT is ever asked; it is what libfuse expects to see.
 const INIT_FLAGS: u32 = 1 | 1 << 1 | 1 << 3 | 1 << 4 | 1 << 5 | 1 << 6 | 1 << 7 | 1 << 8 | 1 << 9 | 1 << 10 | 1 << 11 | 1 << 12 | 1 << 13 | 1 << 14 | 1 << 15 | 1 << 16 | 1 << 17 | 1 << 18 | 1 << 19 | 1 << 20 | 1 << 21 | 1 << 22 | 1 << 23 | 1 << 24 | 1 << 25;
 
@@ -261,7 +261,7 @@ impl Dev {
             return Err(EINVAL);
         }
         if unique == 0 {
-            // Cache invalidations and the like: droidrt caches nothing for the daemon.
+            // Cache invalidations and the like: zeroemu caches nothing for the daemon.
             return if NOTIFY_CODES.contains(&error) { Ok(len) } else { Err(EINVAL) };
         }
         if error > 0 || error <= -512 {
@@ -282,7 +282,7 @@ impl Dev {
             return Ok(len);
         }
         // A refused or malformed FUSE_INIT: Linux fails the connection.
-        eprintln!("[droidrt] fuse: the daemon refused FUSE_INIT (error {error}, {} bytes)", body.len());
+        eprintln!("[zeroemu] fuse: the daemon refused FUSE_INIT (error {error}, {} bytes)", body.len());
         drop(st);
         c.abort();
         Ok(len)

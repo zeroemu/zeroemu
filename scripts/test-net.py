@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests droidrt's host connections, which adb uses, from the host side.
+"""Tests zeroemu's host connections, which adb uses, from the host side.
 
 Runs guest/vsock.c with a host port, and checks what arrives at this end: it connects
 before the guest listens, pushes 4 MiB through an echo with a slow reader, half-closes,
@@ -13,9 +13,9 @@ with socket.socket() as probe:
     probe.bind(("127.0.0.1", 0))
     PORT = probe.getsockname()[1]
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-ENV = dict(os.environ, DROIDRT_GPU="fake", ANDROID_ADB_SERVER_PORT="1")
+ENV = dict(os.environ, ZEROEMU_GPU="fake", ANDROID_ADB_SERVER_PORT="1")
 guest = subprocess.Popen(
-    [f"{ROOT}/target/release/droidrt", "--adb-port", str(PORT), f"{ROOT}/target/guest/vsock_aarch64"],
+    [f"{ROOT}/target/release/zeroemu", "--adb-port", str(PORT), f"{ROOT}/target/guest/vsock_aarch64"],
     stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=ENV, text=True)
 failures = []
 

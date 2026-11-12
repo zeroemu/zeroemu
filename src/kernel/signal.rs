@@ -330,7 +330,7 @@ impl Kernel {
         let blocked = t.mask.load(Ordering::Relaxed) & bit(sig) != 0;
         if act.handler == SIG_DFL || act.handler == SIG_IGN || blocked {
             eprintln!(
-                "[droidrt] pid {} tid {} ({}): {} at pc={pc:#x} addr={:#x}",
+                "[zeroemu] pid {} tid {} ({}): {} at pc={pc:#x} addr={:#x}",
                 t.proc.pid,
                 t.tid,
                 t.proc.exe.lock().unwrap(),
@@ -364,7 +364,7 @@ impl Kernel {
                         if d == Default_::Core || self.strace {
                             super::binder::dump_rings(t.proc.pid);
                             eprintln!(
-                                "[droidrt] pid {} ({}) killed by {}",
+                                "[zeroemu] pid {} ({}) killed by {}",
                                 t.proc.pid,
                                 t.proc.exe.lock().unwrap(),
                                 sig_name(sig)
@@ -406,7 +406,7 @@ impl Kernel {
                 }
                 Err(e) => {
                     eprintln!(
-                        "[droidrt] pid {}: cannot deliver {} (errno {e}); killing it",
+                        "[zeroemu] pid {}: cannot deliver {} (errno {e}); killing it",
                         t.proc.pid,
                         sig_name(sig)
                     );
@@ -687,7 +687,7 @@ impl Kernel {
             Ok(b) => b,
             Err(_) => {
                 eprintln!(
-                    "[droidrt] pid {}: bad signal frame at {frame:#x}",
+                    "[zeroemu] pid {}: bad signal frame at {frame:#x}",
                     t.proc.pid
                 );
                 self.exit_group(&t.proc, SIGSEGV as i32 | 0x80, None);
@@ -837,7 +837,7 @@ impl Kernel {
 
     fn bad_sigframe(&self, t: &Thread, frame: u64) -> Ret {
         eprintln!(
-            "[droidrt] pid {}: bad signal frame at {frame:#x}",
+            "[zeroemu] pid {}: bad signal frame at {frame:#x}",
             t.proc.pid
         );
         self.exit_group(&t.proc, SIGSEGV as i32 | 0x80, None);
@@ -855,7 +855,7 @@ const FRAME_SIZE: u64 = UC + 4560;
 
 /// Offsets in Linux's x86_64 `struct rt_sigframe` (pretcode, ucontext, siginfo).
 /// `ucontext` is 304 bytes: flags, link, 24-byte `stack_t`, 256-byte
-/// `sigcontext`, 8-byte kernel `sigset_t`. User CS/SS are droidrt's GDT slots
+/// `sigcontext`, 8-byte kernel `sigset_t`. User CS/SS are zeroemu's GDT slots
 /// (`hv::x86::SEL_UCODE` / `SEL_UDATA`), not Linux's 0x33/0x2b.
 const X64_UC: u64 = 8;
 const X64_SC: u64 = 48;

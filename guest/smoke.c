@@ -1,4 +1,4 @@
-// Freestanding Linux smoke test for droidrt (no libc). Builds for arm64 and
+// Freestanding Linux smoke test for zeroemu (no libc). Builds for arm64 and
 // x86_64; exercises the initial stack, memory syscalls, time, randomness,
 // FP/SIMD, and exit codes. Prints "ok <name>" per check, exits with the
 // number of failures.

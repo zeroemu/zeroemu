@@ -1,4 +1,4 @@
-// Freestanding arm64 test of things droidrt once got wrong where ordinary programs
+// Freestanding arm64 test of things zeroemu once got wrong where ordinary programs
 // could tell: each check is what Linux does.
 typedef unsigned long u64;
 typedef long i64;

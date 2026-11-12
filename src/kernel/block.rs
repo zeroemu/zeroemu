@@ -1,11 +1,11 @@
 //! Block devices: loop devices and device-mapper, so Android's apexd can
 //! activate APEXes itself, as on a phone: a loop device over the .apex file
 //! at the payload's offset, dm-verity on top, then mount("/dev/block/dm-N",
-//! "/apex/<name>@<version>", "ext4"), which opens droidrt's own ext4/EROFS
+//! "/apex/<name>@<version>", "ext4"), which opens zeroemu's own ext4/EROFS
 //! reader on the device.
 //!
 //! dm-verity maps reads straight through to its data device: the image
-//! readers validate structure, and droidrt is not a security boundary.
+//! readers validate structure, and zeroemu is not a security boundary.
 //! The kernel also does ueventd's part for these devices: /dev/block nodes,
 //! /dev/block/mapper/{<name>,by-uuid/<uuid>} links, and /sys/block entries.
 
@@ -204,7 +204,7 @@ mod dm {
     pub const GET_TARGET_VERSION: u64 = 17;
 }
 
-/// The targets droidrt implements, with the versions Linux 6.6 reports.
+/// The targets zeroemu implements, with the versions Linux 6.6 reports.
 const TARGETS: [(&str, [u32; 3]); 4] = [("linear", [1, 4, 0]), ("verity", [1, 9, 0]), ("zero", [1, 2, 0]), ("error", [1, 6, 0])];
 
 enum Map {
@@ -585,7 +585,7 @@ impl Blocks {
                     }
                     b.offset = le64(info, 24);
                     b.sizelimit = le64(info, 32);
-                    // Everything droidrt can back a loop device with is read-only.
+                    // Everything zeroemu can back a loop device with is read-only.
                     b.flags = flags | LO_FLAGS_READ_ONLY;
                     let fname = cstr_field(&info[56..120]);
                     if !fname.is_empty() {

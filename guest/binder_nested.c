@@ -1,4 +1,4 @@
-// Freestanding arm64 test of droidrt's binder driver: a thread in the middle
+// Freestanding arm64 test of zeroemu's binder driver: a thread in the middle
 // of an incoming sync call must not be handed another one when it reads after
 // its own one-way call. It would nest it, and its two replies would pop the
 // transactions in the wrong order, swapping them between the two callers.
@@ -127,7 +127,7 @@ static void send_txn(int fd, u32 cmd, u32 target, u32 code, u32 flags, void *dat
 // Repro: a single-threaded context manager (like servicemanager) is handling a
 // sync call from A when it makes a one-way call (like onClients/onRegistration).
 // Meanwhile B's sync call sits in the manager's process todo. Linux never gives
-// process work to a thread with a non-empty transaction stack; droidrt does.
+// process work to a thread with a non-empty transaction stack; zeroemu does.
 static void putn(u64 v) { char b[24]; int i = 23; b[i] = 0; do { b[--i] = '0' + v % 10; v /= 10; } while (v); puts_(b + i); }
 static const char *name(u32 c) {
     switch (c) { case BR_NOOP: return "BR_NOOP"; case BR_TRANSACTION_COMPLETE: return "BR_TRANSACTION_COMPLETE";

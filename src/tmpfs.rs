@@ -184,9 +184,11 @@ const ACL_NAMES: [&str; 2] = ["system.posix_acl_access", "system.posix_acl_defau
 /// ext4's inode flags and quota project id (FS_IOC_GETFLAGS, FS_IOC_FSGETXATTR), kept
 /// among the attributes under names no guest can reach, so they are saved with /data:
 /// vold gives each app's directories in /data/media a project id to inherit.
-const FLAGS_NAME: &str = "droidrt.flags";
-const PROJID_NAME: &str = "droidrt.projid";
-const INTERNAL: &str = "droidrt.";
+const FLAGS_NAME: &str = "zeroemu.flags";
+const PROJID_NAME: &str = "zeroemu.projid";
+const INTERNAL: &str = "zeroemu.";
+/// The prefix /data files saved under the project's old name (droidrt) use.
+const LEGACY_INTERNAL: &str = "droidrt.";
 /// FS_PROJINHERIT_FL: children take the directory's project id, and directories the flag.
 pub const FS_PROJINHERIT_FL: u32 = 0x2000_0000;
 
@@ -807,7 +809,7 @@ impl Tmpfs {
         Ok(SavedTree { pending, ..tree })
     }
 
-    /// As `read_saved`, for a file an earlier droidrt wrote, with the pages in among
+    /// As `read_saved`, for a file an earlier zeroemu wrote, with the pages in among
     /// the structure. They all go through memory, once.
     pub fn read_saved_v1(&self, r: &mut impl io::Read) -> io::Result<SavedTree> {
         const NO_MORE_PAGES: u64 = u64::MAX;
@@ -844,6 +846,11 @@ impl Tmpfs {
             let mut xattrs = BTreeMap::new();
             for _ in 0..attrs {
                 let name = get_string(r)?;
+                // Files saved before the project was renamed keep its old prefix.
+                let name = match name.strip_prefix(LEGACY_INTERNAL) {
+                    Some(rest) => format!("{INTERNAL}{rest}"),
+                    None => name,
+                };
                 xattrs.insert(name, get_bytes(r)?);
             }
             let kind = match get_u64(r)? {
@@ -1119,7 +1126,7 @@ mod saved_tests {
         f.write_at(0, &want).unwrap();
         let (bytes, structure, _) = saved(&a);
 
-        let dir = std::env::temp_dir().join(format!("droidrt-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("zeroemu-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("saved");
         std::fs::write(&path, &bytes).unwrap();

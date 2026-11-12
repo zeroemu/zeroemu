@@ -128,10 +128,10 @@ unsafe fn msg_next_event(app: *mut c_void, sel: *mut c_void, mask: u64, until: *
     unsafe { f(app, sel, mask, until, mode, dequeue) }
 }
 
-/// DROIDRT_BACKGROUND=1: open the window without taking the keyboard or coming
+/// ZEROEMU_BACKGROUND=1: open the window without taking the keyboard or coming
 /// forward, for tests run while someone uses the Mac.
 pub fn background() -> bool {
-    std::env::var_os("DROIDRT_BACKGROUND").is_some_and(|v| !v.is_empty() && v != "0")
+    std::env::var_os("ZEROEMU_BACKGROUND").is_some_and(|v| !v.is_empty() && v != "0")
 }
 
 pub fn open(fb_w: u32, fb_h: u32) -> Result<NativeWindow, String> {
@@ -168,7 +168,7 @@ pub fn open(fb_w: u32, fb_h: u32) -> Result<NativeWindow, String> {
         if window.is_null() {
             return Err("NSWindow init failed".into());
         }
-        let title = msg_cstr(cls("NSString"), sel("stringWithUTF8String:"), "droidrt");
+        let title = msg_cstr(cls("NSString"), sel("stringWithUTF8String:"), "zeroemu");
         msg_id(window, sel("setTitle:"), title);
         msg_bool(window, sel("setReleasedWhenClosed:"), 0); // this stays pointed at it
         msg_void(window, sel("center"));
@@ -182,11 +182,11 @@ pub fn open(fb_w: u32, fb_h: u32) -> Result<NativeWindow, String> {
         }
         msg_void(app, sel("finishLaunching"));
         // A device keeps running when its window is covered or minimized, as a phone's
-        // apps do with its screen off: no App Nap, which throttled a covered droidrt's
+        // apps do with its screen off: no App Nap, which throttled a covered zeroemu's
         // threads and timers until frames took ten times as long. The Mac may still sleep.
         const USER_INITIATED_ALLOWING_IDLE_SYSTEM_SLEEP: u64 = 0x00ef_ffff;
         let info = msg0(cls("NSProcessInfo"), sel("processInfo"));
-        let reason = msg_cstr(cls("NSString"), sel("stringWithUTF8String:"), "droidrt runs an Android device");
+        let reason = msg_cstr(cls("NSString"), sel("stringWithUTF8String:"), "zeroemu runs an Android device");
         let begin: unsafe extern "C" fn(*mut c_void, *mut c_void, u64, *mut c_void) -> *mut c_void =
             std::mem::transmute(objc_msgSend as *const ());
         let activity = begin(info, sel("beginActivityWithOptions:reason:"), USER_INITIATED_ALLOWING_IDLE_SYSTEM_SLEEP, reason);
@@ -207,7 +207,7 @@ pub fn open(fb_w: u32, fb_h: u32) -> Result<NativeWindow, String> {
         }
         let px_w = (win_w * dpr).round().max(1.0);
         let px_h = (win_h * dpr).round().max(1.0);
-        eprintln!("droidrt: window {win_w:.0}x{win_h:.0} points ({px_w:.0}x{px_h:.0} px, dpr {dpr}) for {fb_w}x{fb_h} (id {number})");
+        eprintln!("zeroemu: window {win_w:.0}x{win_h:.0} points ({px_w:.0}x{px_h:.0} px, dpr {dpr}) for {fb_w}x{fb_h} (id {number})");
         Ok(NativeWindow {
             handle: window,
             width: win_w as i32,
@@ -250,9 +250,9 @@ static FRAME_NEW: AtomicBool = AtomicBool::new(false);
 
 /// Called from any thread with a scanout's pixels.
 pub fn present(w: u32, h: u32, stride: u32, fourcc: u32, pixels: &[u8]) {
-    // Debugging: DROIDRT_SAVE_FRAMES=<dir> keeps every 8th frame shown (60 at
+    // Debugging: ZEROEMU_SAVE_FRAMES=<dir> keeps every 8th frame shown (60 at
     // most) as raw pixels, named by time since the first.
-    if let Ok(dir) = std::env::var("DROIDRT_SAVE_FRAMES") {
+    if let Ok(dir) = std::env::var("ZEROEMU_SAVE_FRAMES") {
         static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         static T0: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
         let n = N.fetch_add(1, Ordering::Relaxed);

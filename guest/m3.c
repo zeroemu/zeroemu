@@ -1,4 +1,4 @@
-// Freestanding arm64 test of droidrt's IPC layer (no libc): eventfd, epoll,
+// Freestanding arm64 test of zeroemu's IPC layer (no libc): eventfd, epoll,
 // timerfd, signalfd, and AF_UNIX sockets (socketpair, named stream servers,
 // seqpacket, datagrams, SCM_RIGHTS, SCM_CREDENTIALS, SO_PEERCRED). Exits with
 // the failure count.
@@ -178,7 +178,7 @@ int cmain(void) {
 
     // ---- named stream server in a child; SO_PEERCRED ----
     struct sockaddr_un addr;
-    u64 alen = abstract_addr(&addr, "droidrt-test");
+    u64 alen = abstract_addr(&addr, "zeroemu-test");
     int srv = (int)sys(NR_socket, 1, SOCK_STREAM, 0);
     check(sys(NR_bind, srv, &addr, alen) == 0 && sys(NR_listen, srv, 8) == 0, "bind + listen on an abstract name");
     pid = fork_();
@@ -198,7 +198,7 @@ int cmain(void) {
     check(n == 4 && seq(buf, "ping", 4) && wait_status(pid) == 0, "accept + request/response across processes");
     check(cred[0] == (u32)pid, "SO_PEERCRED names the client process");
     struct sockaddr_un taken;
-    u64 tlen = abstract_addr(&taken, "droidrt-test");
+    u64 tlen = abstract_addr(&taken, "zeroemu-test");
     int dup_srv = (int)sys(NR_socket, 1, SOCK_STREAM, 0);
     check(sys(NR_bind, dup_srv, &taken, tlen) == -98, "a bound name is in use (EADDRINUSE)");
 
@@ -213,7 +213,7 @@ int cmain(void) {
 
     // ---- datagrams with SCM_CREDENTIALS (how logd identifies writers) ----
     struct sockaddr_un daddr;
-    u64 dlen = abstract_addr(&daddr, "droidrt-logdw");
+    u64 dlen = abstract_addr(&daddr, "zeroemu-logdw");
     int dsrv = (int)sys(NR_socket, 1, SOCK_DGRAM, 0);
     sys(NR_bind, dsrv, &daddr, dlen);
     int on = 1;

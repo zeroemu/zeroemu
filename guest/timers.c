@@ -1,4 +1,4 @@
-// Freestanding arm64 test of droidrt's POSIX timers and interval timers:
+// Freestanding arm64 test of zeroemu's POSIX timers and interval timers:
 // expiry signals with their siginfo, periodic timers and overruns, thread
 // targets, deletion, and what fork and exec do to them.
 

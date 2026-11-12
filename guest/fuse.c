@@ -1,4 +1,4 @@
-// Freestanding arm64 test of droidrt's /dev/fuse and fuse mounts (no libc), as
+// Freestanding arm64 test of zeroemu's /dev/fuse and fuse mounts (no libc), as
 // vold and MediaProvider's daemon use them: mount with fd=, the daemon taking
 // FUSE_INIT from a second thread by splice (as libfuse reads) and answering it,
 // FUSE_DEV_IOC_CLONE, the device's refusals, and the mount showing /data/media
@@ -293,7 +293,7 @@ int cmain(void) {
     check(sys(NR_ioctl, d, FS_IOC_FSGETXATTR, fsx) == 0 && fsx[3] == 1234 && !(fsx[0] & FS_XFLAG_PROJINHERIT), "a new file inherits the id only");
     sys(NR_close, d);
     n = sys(NR_listxattr, "/data/media/0/app", buf, sizeof buf);
-    check(n >= 0 && !contains(buf, n, "droidrt"), "listxattr shows none of it");
+    check(n >= 0 && !contains(buf, n, "zeroemu"), "listxattr shows none of it");
     d = (int)sys(NR_openat, AT_FDCWD, "/tmp/f/0/app", O_RDONLY, 0);
     check(sys(NR_ioctl, d, FS_IOC_GETFLAGS, &fl) == -ENOTTY, "through the fuse mount: ENOTTY (the daemon answers no ioctls)");
     sys(NR_close, d);

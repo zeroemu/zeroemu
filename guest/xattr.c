@@ -1,4 +1,4 @@
-// Freestanding test of droidrt's extended attributes (no libc), built for
+// Freestanding test of zeroemu's extended attributes (no libc), built for
 // arm64 and x86_64: the *xattr syscalls' Linux semantics on tmpfs (flags,
 // sizes, namespaces, symlinks, fds of every kind), labels inherited from the
 // parent directory, attributes following the inode through rename and link,

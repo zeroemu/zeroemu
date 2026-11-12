@@ -1,5 +1,5 @@
 // Freestanding arm64 test of the interface Android is shown for the network, doing
-// what netd and IpClient do with eth1. Run with DROIDRT_NET=1.
+// what netd and IpClient do with eth1. Run with ZEROEMU_NET=1.
 
 typedef unsigned long u64;
 typedef long i64;

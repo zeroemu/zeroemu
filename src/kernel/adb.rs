@@ -1,5 +1,5 @@
 //! Host adb reaches the device as it reaches an emulator: the adb server talks to
-//! a loopback port, and droidrt connects that to a guest vsock listener on port 5555,
+//! a loopback port, and zeroemu connects that to a guest vsock listener on port 5555,
 //! which adbd opens. Guest networking is not involved, so adb stays available for
 //! debugging it. adbd's own RSA check stays on: loopback is open to anyone on the host.
 //! The host's public key is offered as /adb_keys, as the emulator does for this image
@@ -50,7 +50,7 @@ pub fn start(port: Option<u16>) {
         }),
     };
     let Some((listener, console)) = listener else {
-        eprintln!("droidrt: no free port for adb");
+        eprintln!("zeroemu: no free port for adb");
         return;
     };
     let Ok(addr) = listener.local_addr() else { return };

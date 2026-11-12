@@ -107,6 +107,8 @@ pub enum Kind {
     Vsock(Arc<super::vsock::Vsock>),
     /// /dev/tun (net.rs).
     Tun(super::net::Tun),
+    /// /dev/fuse (fuse.rs).
+    Fuse(super::fuse::Dev),
     /// /dev/input/event* (evdev.rs).
     Evdev(Arc<super::evdev::Client>),
     /// userfaultfd (uffd.rs).
@@ -477,6 +479,7 @@ pub(super) fn poll_mask(f: &File, t: &Thread, depth: u32) -> super::wait::Mask {
         Kind::Drm(d) => key_bit(d.key()),
         Kind::Sync(s) => s.mask(),
         Kind::DmaBuf(_) => key_bit(super::drm::GPU_KEY),
+        Kind::Fuse(d) => d.key().map_or_else(Mask::plain, key_bit),
         _ => Mask::plain(),
     }
 }
@@ -496,6 +499,7 @@ pub(super) fn poll_ready(f: &File, t: &Thread, depth: u32) -> u16 {
         Kind::Inotify(i) => if i.pending() > 0 { POLLIN } else { 0 },
         Kind::Vsock(v) => v.poll(),
         Kind::Tun(_) => POLLOUT,
+        Kind::Fuse(d) => d.poll(),
         Kind::Evdev(c) => POLLOUT | if c.readable() { POLLIN } else { 0 },
         Kind::Uffd(_) => 0, // no events: it works in SIGBUS mode
         Kind::Binder(b) => {
@@ -884,6 +888,16 @@ impl Kernel {
                     Kind::Binder(b) => return self.binder_ioctl(t, &f, b, cmd, a[2]),
                     Kind::Ashmem(m) => return m.ioctl(cmd, a[2], &mut AshmemIo { t }),
                     Kind::Tun(n) => return n.ioctl(cmd, a[2], &mut AshmemIo { t }),
+                    // FUSE_DEV_IOC_CLONE names the descriptor whose connection to join.
+                    Kind::Fuse(d) => {
+                        let other = if cmd == 0x8004_e500 { Some(t.files().get(t.proc.mm().read_u32(a[2])? as i32 as i64)?) } else { None };
+                        let other = match other.as_deref().map(|o| &o.kind) {
+                            Some(Kind::Fuse(o)) => Some(o),
+                            Some(_) => return Err(EINVAL),
+                            None => None,
+                        };
+                        return d.ioctl(cmd, other);
+                    }
                     Kind::Uffd(u) => return u.ioctl(t, cmd, a[2]),
                     Kind::Evdev(c) => {
                         let (ret, bytes) = c.ioctl(cmd, || t.proc.mm().read_u32(a[2]).map(|v| v as i32))?;
@@ -1287,6 +1301,7 @@ impl Kernel {
                 r if super::drm::is_node(r) => Kind::Drm(self.drm.as_ref().ok_or(ENXIO)?.open(r)),
                 r if r == super::ashmem::rdev() => Kind::Ashmem(super::ashmem::Ashmem::new()),
                 r if r == super::net::tun_rdev() => Kind::Tun(super::net::Tun::new()),
+                r if r == super::fuse::rdev() => Kind::Fuse(super::fuse::Dev::new()),
                 r if block::major(r) == super::evdev::INPUT_MAJOR => Kind::Evdev(super::evdev::open(r).ok_or(ENXIO)?),
                 rdev => binder::file_for(t, rdev).ok_or(ENXIO)?,
             },
@@ -1344,16 +1359,18 @@ impl Kernel {
     }
 
     /// A new node belongs to its creator; a set-gid directory passes on its group,
-    /// and to subdirectories the bit itself (inode_init_owner).
+    /// and to subdirectories the bit itself (inode_init_owner). On a fuse mount the
+    /// creator is the daemon, which makes the file on the lower filesystem.
     pub(super) fn init_owner(&self, t: &Thread, dir: &Node, node: &Node) {
         const S_ISGID: u32 = 0o2000;
         let Ok(vfs) = self.vfs() else { return };
         let (Ok(parent), Ok(new)) = (vfs.stat(dir), vfs.stat(node)) else { return };
         let c = self.creds(t);
+        let (fsuid, fsgid) = super::fuse::conn_of(dir).and_then(|c| c.daemon()).unwrap_or((c.fsuid, c.fsgid));
         let inherits = parent.mode & S_ISGID != 0;
-        let gid = if inherits { parent.gid } else { c.fsgid };
-        if (c.fsuid, gid) != (new.uid, new.gid) {
-            let _ = vfs.set_attr(node, None, Some((c.fsuid, gid)), None);
+        let gid = if inherits { parent.gid } else { fsgid };
+        if (fsuid, gid) != (new.uid, new.gid) {
+            let _ = vfs.set_attr(node, None, Some((fsuid, gid)), None);
         }
         if inherits && new.mode & S_IFMT == S_IFDIR {
             let _ = vfs.set_attr(node, Some(new.mode & 0o7777 | S_ISGID), None, None);
@@ -1389,6 +1406,10 @@ impl Kernel {
         if vfs.readonly(node) {
             return Err(EROFS);
         }
+        // MediaProvider's daemon never changes a mode or owner, and says it did.
+        if super::fuse::is_fuse(vfs, node) {
+            return Ok(());
+        }
         let mode = if super::perm::enforcing() { self.chmod_mode(t, node, mode)? } else { mode };
         vfs.set_attr(node, Some(mode), None, None)
     }
@@ -1398,6 +1419,9 @@ impl Kernel {
         let vfs = self.vfs()?;
         if vfs.readonly(node) {
             return Err(EROFS);
+        }
+        if super::fuse::is_fuse(vfs, node) {
+            return Ok(());
         }
         let mode = self.chown_check(t, node, uid, gid)?;
         vfs.set_attr(node, mode, Some((uid, gid)), None)
@@ -1828,6 +1852,7 @@ impl Kernel {
             Kind::Evdev(c) => c.read(t, count, f.nonblock())?,
             Kind::Uffd(_) => return Err(EAGAIN), // nothing ever waits to be read
             // No packets ever come in.
+            Kind::Fuse(d) => d.read(t, count, f.nonblock())?,
             Kind::Tun(_) if f.nonblock() => return Err(EAGAIN),
             Kind::Tun(_) => loop {
                 if t.interrupted() {
@@ -1951,6 +1976,7 @@ impl Kernel {
                 r => r?,
             },
             Kind::Tun(_) => data.len(), // sent nowhere
+            Kind::Fuse(d) => d.write(&data)?,
             Kind::Evdev(_) => data.len(), // LEDs and the like: there are none
             Kind::Uffd(_) => return Err(EINVAL),
             Kind::Pty(p) => p.write(t, &data, f.nonblock())?,
@@ -2018,6 +2044,7 @@ impl Kernel {
             Kind::Ashmem(a) => Stat { mode: 0o020666, rdev: super::ashmem::rdev(), nlink: 1, size: a.size(), ..Default::default() },
             Kind::Evdev(_) => Stat { mode: 0o020660, nlink: 1, ..Default::default() },
             Kind::Tun(_) => Stat { mode: 0o020660, rdev: super::net::tun_rdev(), nlink: 1, ..Default::default() },
+            Kind::Fuse(_) => Stat { mode: 0o020600, rdev: super::fuse::rdev(), nlink: 1, ..Default::default() },
             Kind::DmaBuf(b) => Stat { mode: 0o600, nlink: 1, size: b.size(), ..Default::default() },
             Kind::Binder(_) => Stat { mode: 0o020666, nlink: 1, rdev: 0xa36, ..Default::default() },
             Kind::Block(b) => Stat { mode: S_IFBLK | 0o600, nlink: 1, rdev: b.devt, ..Default::default() },
@@ -2414,6 +2441,7 @@ pub(super) fn file_name(f: &File) -> String {
         Kind::Ashmem(a) => a.map_name(),
         Kind::Inotify(_) => "anon_inode:inotify".into(),
         Kind::Tun(_) => "/dev/tun".into(),
+        Kind::Fuse(_) => "/dev/fuse".into(),
         Kind::Evdev(_) => "/dev/input/event".into(),
         Kind::Vsock(v) => format!("socket:[{}]", Arc::as_ptr(v) as usize % 100_000),
         Kind::Event(_) => "anon_inode:[eventfd]".into(),

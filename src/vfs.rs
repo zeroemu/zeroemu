@@ -426,6 +426,12 @@ const ROOT_PARENT: u32 = 1;
 /// A filesystem instance (Linux's superblock), shared by its bind mounts.
 pub struct Super {
     pub fs: Arc<dyn FileSystem>,
+    /// What it is mounted as when that isn't the filesystem's own type: the fuse
+    /// stand-in serves /data/media's tmpfs as "fuse". See `fs_type`.
+    pub ty: Option<&'static str>,
+    /// What the kernel keeps with this instance (a fuse connection). It goes when
+    /// the superblock does: with the last mount of it and the last file open on it.
+    pub private: Option<Arc<dyn std::any::Any + Send + Sync>>,
     /// st_dev of its files.
     pub dev: u64,
     /// The mount(2) source, as /proc/mounts shows it.
@@ -434,6 +440,14 @@ pub struct Super {
     pub flags: AtomicU64,
     /// Filesystem-specific options for /proc/mounts ("mode=755").
     pub options: Mutex<String>,
+}
+
+impl Super {
+    /// For /proc/mounts, statfs and permissions: what it is mounted as. (Asked of the
+    /// filesystem each time: a lazily opened image only knows once it is open.)
+    pub fn fs_type(&self) -> &'static str {
+        self.ty.unwrap_or_else(|| self.fs.fs_type())
+    }
 }
 
 /// Mount propagation as /proc/<pid>/mountinfo shows it: peer group ids, 0 for none.
@@ -802,8 +816,14 @@ impl Vfs {
     }
 
     pub fn new_super(&self, fs: Arc<dyn FileSystem>, source: &str, dev: Option<u64>, flags: u64, options: &str) -> Arc<Super> {
+        self.new_super_as(fs, None, None, source, dev, flags, options)
+    }
+
+    /// A superblock that shows `fs` as type `ty`, with what the kernel keeps for it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_super_as(&self, fs: Arc<dyn FileSystem>, ty: Option<&'static str>, private: Option<Arc<dyn std::any::Any + Send + Sync>>, source: &str, dev: Option<u64>, flags: u64, options: &str) -> Arc<Super> {
         let dev = dev.unwrap_or_else(|| self.anon_dev());
-        Arc::new(Super { fs, dev, source: source.to_string(), flags: AtomicU64::new(flags), options: Mutex::new(options.to_string()) })
+        Arc::new(Super { fs, ty, private, dev, source: source.to_string(), flags: AtomicU64::new(flags), options: Mutex::new(options.to_string()) })
     }
 
     /// A mount of `sb` (its subtree at `root`) attached on `parent` at `path`.
@@ -933,6 +953,12 @@ impl Vfs {
     /// Mounts a new filesystem instance on `target` (mount(2) without MS_BIND).
     pub fn mount_at(&self, target: &Node, sb: Arc<Super>, flags: u64) -> Result<(), i64> {
         let root = sb.fs.root().map_err(io_errno)?;
+        self.mount_at_root(target, sb, root, flags)
+    }
+
+    /// Mounts a new instance whose root is the directory `root` of its filesystem
+    /// rather than the filesystem's own root (the fuse stand-in's /data/media).
+    pub fn mount_at_root(&self, target: &Node, sb: Arc<Super>, root: u64, flags: u64) -> Result<(), i64> {
         if sb.fs.stat(root).map_err(io_errno)?.mode & S_IFMT == S_IFDIR && self.stat(target)?.mode & S_IFMT != S_IFDIR {
             return Err(ENOTDIR);
         }
@@ -1248,7 +1274,7 @@ impl Vfs {
     }
 
     pub fn fs_type(&self, node: &Node) -> &'static str {
-        self.fs(node).fs_type()
+        node.mnt.sb.fs_type()
     }
 
     /// Whether writes can land: a writable filesystem or kernel file, on a read-write mount.

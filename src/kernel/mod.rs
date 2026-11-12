@@ -22,6 +22,7 @@ mod uffd;
 mod epoll;
 mod files;
 mod futex;
+mod fuse;
 mod dns;
 mod inet;
 mod inotify;
@@ -466,6 +467,8 @@ fn mount_tmpfs(vfs: &mut Vfs, phys: &Arc<PhysMem>) -> (Arc<crate::tmpfs::Tmpfs>,
     for (name, rdev) in binder::DEVICES {
         dev.create(1, name, 0o020666, rdev).expect("tmpfs /dev");
     }
+    // Not in ueventd.rc either: vold opens it as root.
+    dev.create(1, "fuse", 0o020600, fuse::rdev()).expect("tmpfs /dev");
     dev.mkdir_p("socket", 0o755);
     dev.mkdir_p("pts", 0o755);
     let input = dev.mkdir_p("input", 0o755);

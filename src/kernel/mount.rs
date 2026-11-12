@@ -17,6 +17,7 @@ use std::sync::atomic::Ordering;
 
 const AT_FDCWD: i64 = -100;
 const S_IFBLK: u32 = 0o060000;
+const S_IFDIR: u32 = 0o040000;
 const ENOTBLK: i64 = 15;
 
 const MS_REMOUNT: u64 = 32;
@@ -153,7 +154,7 @@ fn super_options(m: &Mount) -> String {
             s += name;
         }
     }
-    if seclabel(m.sb.fs.fs_type()) {
+    if seclabel(m.sb.fs_type()) {
         s += ",seclabel";
     }
     s
@@ -183,7 +184,7 @@ fn rw(ro: bool) -> &'static str {
 pub fn proc_mounts(vfs: &Vfs) -> String {
     let mut s = String::new();
     for m in vfs.mount_list() {
-        let _ = writeln!(s, "{} {} {} {}{}{}{} 0 0", mangle(&m.sb.source), mangle(&m.path), m.sb.fs.fs_type(), rw(m.readonly()), super_options(&m), mount_options(&m), fs_options(&m));
+        let _ = writeln!(s, "{} {} {} {}{}{}{} 0 0", mangle(&m.sb.source), mangle(&m.path), m.sb.fs_type(), rw(m.readonly()), super_options(&m), mount_options(&m), fs_options(&m));
     }
     s
 }
@@ -216,7 +217,7 @@ pub fn mountinfo(vfs: &Vfs) -> String {
             mangle(&m.path),
             rw(mnt_ro),
             mount_options(&m),
-            m.sb.fs.fs_type(),
+            m.sb.fs_type(),
             mangle(&m.sb.source),
             rw(sb_ro),
             super_options(&m),
@@ -391,10 +392,10 @@ impl Kernel {
         } else if flags & MS_REMOUNT != 0 {
             let m = vfs.mount_root(&target)?;
             // The image readers cannot write: their superblocks stay read-only.
-            let image = matches!(m.sb.fs.fs_type(), "erofs" | "ext4");
+            let image = matches!(m.sb.fs_type(), "erofs" | "ext4");
             m.sb.flags.store(sb_flags | if image { MS_RDONLY } else { 0 }, Ordering::Relaxed);
             m.flags.store(mnt_flags, Ordering::Relaxed);
-            if m.sb.fs.fs_type() == "tmpfs" && !data.is_empty() {
+            if m.sb.fs_type() == "tmpfs" && !data.is_empty() {
                 let mut o = m.sb.options.lock().unwrap();
                 *o = remount_tmpfs_options(&o, &data)?;
                 if let Some((_, Some(size))) = parse_options(&data).into_iter().find(|(k, _)| *k == "size") {
@@ -419,6 +420,8 @@ impl Kernel {
             let src = source.filter(|s| !s.is_empty()).ok_or(EINVAL)?;
             let src = self.resolve(t, AT_FDCWD, &src, true)?;
             vfs.move_mount(&src, &target)?;
+        } else if fstype.as_deref() == Some("fuse") {
+            self.mount_fuse(t, vfs, &target, source.as_deref(), sb_flags, mnt_flags, &data)?;
         } else {
             let sb = self.new_super(t, vfs, source.as_deref(), fstype.as_deref().ok_or(EINVAL)?, sb_flags, &data)?;
             vfs.mount_at(&target, sb, mnt_flags)?;
@@ -436,7 +439,7 @@ impl Kernel {
             return self.block_super(t, vfs, source, ty, sb_flags);
         }
         if SINGLE_INSTANCE.contains(&ty)
-            && let Some(sb) = vfs.find_super(|sb| sb.fs.fs_type() == ty)
+            && let Some(sb) = vfs.find_super(|sb| sb.fs_type() == ty)
         {
             return Ok(sb);
         }
@@ -476,7 +479,7 @@ impl Kernel {
                 (fs, o.join(","))
             }
             "proc" => {
-                let fs = vfs.find_super(|sb| sb.fs.fs_type() == "proc").map(|sb| sb.fs.clone()).unwrap_or_else(|| super::procfs::ProcFs::new(Arc::downgrade(self)));
+                let fs = vfs.find_super(|sb| sb.fs_type() == "proc").map(|sb| sb.fs.clone()).unwrap_or_else(|| super::procfs::ProcFs::new(Arc::downgrade(self)));
                 let mut o = Vec::new();
                 if let Some((_, Some(g))) = opts.iter().find(|(k, _)| *k == "gid") {
                     o.push(format!("gid={g}"));
@@ -540,7 +543,7 @@ impl Kernel {
                 }
                 let key = o.join(",");
                 // A hierarchy with these controllers already exists: mounting shows it again.
-                if let Some(sb) = vfs.find_super(|sb| sb.fs.fs_type() == "cgroup" && *sb.options.lock().unwrap() == key) {
+                if let Some(sb) = vfs.find_super(|sb| sb.fs_type() == "cgroup" && *sb.options.lock().unwrap() == key) {
                     return Ok(sb);
                 }
                 (CgroupFs::new(Arc::downgrade(self), false, ctl, noprefix) as Arc<dyn FileSystem>, key)
@@ -551,7 +554,7 @@ impl Kernel {
                     eprintln!("[droidrt] cgroup2: unknown option {k}");
                     return Err(EINVAL);
                 }
-                if let Some(sb) = vfs.find_super(|sb| sb.fs.fs_type() == "cgroup2") {
+                if let Some(sb) = vfs.find_super(|sb| sb.fs_type() == "cgroup2") {
                     return Ok(sb);
                 }
                 let o: Vec<&str> = opts.iter().map(|(k, _)| *k).collect();
@@ -580,6 +583,54 @@ impl Kernel {
         Ok(vfs.new_super(fs, src, None, sb_flags, &options))
     }
 
+    /// A fuse mount (fuse.rs): the caller's /dev/fuse, fd=, gets a connection and the
+    /// daemon its FUSE_INIT, and the mount shows the emulated volume's files in
+    /// /data/media, served by droidrt itself (an empty directory where there is no
+    /// /data/media, as in the test guests' world without an image).
+    #[allow(clippy::too_many_arguments)]
+    fn mount_fuse(&self, t: &Thread, vfs: &Vfs, target: &Node, source: Option<&str>, sb_flags: u64, mnt_flags: u64, data: &str) -> Result<(), i64> {
+        let (mut fd, mut rootmode, mut uid, mut gid) = (None, None, None, None);
+        let mut shown = Vec::new();
+        for (k, v) in parse_options(data).into_iter().filter(|(k, _)| !is_security_option(k)) {
+            match k {
+                "fd" => fd = Some(number(v)?),
+                "rootmode" => rootmode = Some(u32::from_str_radix(v.ok_or(EINVAL)?, 8).map_err(|_| EINVAL)?),
+                "user_id" => uid = Some(number(v)?),
+                "group_id" => gid = Some(number(v)?),
+                "default_permissions" | "allow_other" => shown.push(k.to_string()),
+                "max_read" => shown.push(format!("max_read={}", number(v)?)),
+                "blksize" | "subtype" | "source" => {}
+                _ => return Err(EINVAL), // fs/fuse knows no other
+            }
+        }
+        // fuse_fill_super: these four must be given.
+        let (Some(fd), Some(rootmode), Some(uid), Some(gid)) = (fd, rootmode, uid, gid) else { return Err(EINVAL) };
+        if rootmode & 0o170000 != S_IFDIR {
+            return Err(EINVAL); // a file as the root: nothing here serves one
+        }
+        let file = t.files().get(fd as i64)?;
+        let super::files::Kind::Fuse(dev) = &file.kind else { return Err(EINVAL) };
+        if dev.attached() {
+            return Err(EINVAL);
+        }
+        let lower = self.resolve(t, AT_FDCWD, super::fuse::LOWER, true).ok().filter(|n| vfs.stat(n).is_ok_and(|st| st.mode & 0o170000 == S_IFDIR));
+        let (fs, root) = match &lower {
+            Some(n) => (vfs.fs_arc(n), n.ino),
+            None => {
+                let fs = Tmpfs::new(self.phys.clone(), 0o755);
+                let root = fs.root().map_err(|_| EIO)?;
+                (fs as Arc<dyn FileSystem>, root)
+            }
+        };
+        // As fuse_show_options prints them.
+        let options = [format!("user_id={uid}"), format!("group_id={gid}")].into_iter().chain(shown).collect::<Vec<_>>().join(",");
+        let mounted = super::fuse::Mounted::new();
+        let sb = vfs.new_super_as(fs, Some("fuse"), Some(mounted.clone()), source.unwrap_or("none"), None, sb_flags, &options);
+        vfs.mount_at_root(target, sb, root, mnt_flags)?;
+        let c = self.creds(t);
+        mounted.start(dev, (c.fsuid, c.fsgid, t.proc.pid as u32))
+    }
+
     /// An ext4 or EROFS mount of a loop or device-mapper device, read by
     /// droidrt's own image readers (read-only).
     fn block_super(&self, t: &Thread, vfs: &Vfs, source: Option<&str>, ty: &'static str, sb_flags: u64) -> Result<Arc<Super>, i64> {
@@ -591,7 +642,7 @@ impl Kernel {
         }
         let dev = self.blocks.device(st.rdev).ok_or(ENXIO)?;
         // Already mounted: Linux hands out the same superblock.
-        if let Some(sb) = vfs.find_super(|sb| sb.dev == st.rdev && sb.fs.fs_type() == ty) {
+        if let Some(sb) = vfs.find_super(|sb| sb.dev == st.rdev && sb.fs_type() == ty) {
             return Ok(sb);
         }
         if dev.len() == 0 {
@@ -617,7 +668,7 @@ impl Kernel {
             return Err(EAGAIN); // marked for expiry; nothing ever expires it
         }
         for m in vfs.umount(&node, flags & MNT_DETACH != 0)? {
-            let ty = m.sb.fs.fs_type();
+            let ty = m.sb.fs_type();
             if SINGLE_INSTANCE.contains(&ty) || ty.starts_with("cgroup") {
                 vfs.keep(&m.sb);
             }

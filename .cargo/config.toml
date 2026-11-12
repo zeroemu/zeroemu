@@ -1,5 +1,2 @@
 [target.aarch64-apple-darwin]
 runner = "scripts/macos-runner.sh"
-
-[target.x86_64-apple-darwin]
-runner = "scripts/macos-runner.sh"

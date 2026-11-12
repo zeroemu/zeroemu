@@ -355,6 +355,8 @@ fn install_window_ops(lib: *mut c_void) {
     unsafe { set(&WINDOW_OPS) };
 }
 
+/// ZEROEMU_GPU_LOG, else the renderer's errors: when the window stays black, they
+/// are the only clue.
 fn log_max_from_env() -> u32 {
     match std::env::var("ZEROEMU_GPU_LOG").ok().as_deref() {
         None => DEBUG_ERROR,
@@ -376,7 +378,21 @@ extern "C" fn on_debug(_user: *mut c_void, dbg: *const CDebug) {
         return;
     }
     let msg = unsafe { CStr::from_ptr(d.message) }.to_string_lossy();
+    if d.debug_type == DEBUG_ERROR && !explicit_log() && EVERY_BOOT.iter().any(|m| msg.contains(m)) {
+        return;
+    }
     eprintln!("gfxstream: {msg}");
+}
+
+/// Errors the renderer reports at every boot that works, which say nothing wrong:
+/// the guest's driver asking for capability sets this renderer doesn't have, and
+/// resources let go after the context that held them. They print only when
+/// ZEROEMU_GPU_LOG asks for the renderer's log.
+const EVERY_BOOT: &[&str] = &["Incorrect capability set specified", "failed to detach resource"];
+
+fn explicit_log() -> bool {
+    static SET: OnceLock<bool> = OnceLock::new();
+    *SET.get_or_init(|| std::env::var_os("ZEROEMU_GPU_LOG").is_some())
 }
 
 /// ZEROEMU_GPU_STATS=1: every five seconds, how many frames went to the window and
@@ -452,8 +468,10 @@ fn c_box(b: &Box3) -> CBox {
 }
 
 pub fn open(width: u32, height: u32) -> Result<Arc<dyn GpuBackend>, String> {
+    // Before the window: a missing renderer is an error with no window to show.
+    let path = backend_path()?;
     let win = window::open(width, height)?;
-    let lib = load_backend(&backend_path()?)?;
+    let lib = load_backend(&path)?;
     let api = load_api(lib)?;
     let gfx = Arc::new(Gfxstream {
         api,
@@ -864,32 +882,9 @@ impl Gfxstream {
     }
 }
 
+/// The renderer library: ZEROEMU_GFXSTREAM, else the SDK's Android Emulator's.
 fn backend_path() -> Result<std::path::PathBuf, String> {
-    if let Ok(p) = std::env::var("ZEROEMU_GFXSTREAM") {
-        return Ok(std::path::PathBuf::from(p));
-    }
-    let name = if cfg!(windows) { "gfxstream_backend.dll" } else { "libgfxstream_backend.dylib" };
-    if let Some(root) = std::env::var("ANDROID_SDK_ROOT").ok().or_else(|| std::env::var("ANDROID_HOME").ok()) {
-        return Ok(std::path::PathBuf::from(root).join("emulator").join("lib64").join(name));
-    }
-    default_sdk(name)
-}
-
-#[cfg(target_os = "macos")]
-fn default_sdk(name: &str) -> Result<std::path::PathBuf, String> {
-    let home = std::env::var("HOME").map_err(|_| "HOME is unset".to_string())?;
-    Ok(std::path::PathBuf::from(home).join("Library/Android/sdk/emulator/lib64").join(name))
-}
-
-#[cfg(windows)]
-fn default_sdk(name: &str) -> Result<std::path::PathBuf, String> {
-    let local = std::env::var("LOCALAPPDATA").map_err(|_| "LOCALAPPDATA is unset".to_string())?;
-    Ok(std::path::PathBuf::from(local).join("Android/Sdk/emulator/lib64").join(name))
-}
-
-#[cfg(not(any(target_os = "macos", windows)))]
-fn default_sdk(_name: &str) -> Result<std::path::PathBuf, String> {
-    Err("gfxstream: no emulator library path".into())
+    crate::sdk::require_renderer().map(|r| r.path).map_err(|p| p.to_string())
 }
 
 fn cast_sym<T>(p: *mut c_void, name: &str) -> Result<T, String> {

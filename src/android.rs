@@ -25,7 +25,7 @@ fn super_partitions(path: &Path) -> io::Result<Vec<lp::LogicalPartition>> {
     let sup = gpt::partitions(&disk)?
         .into_iter()
         .find(|p| p.name == "super")
-        .ok_or_else(|| io::Error::other(format!("{}: no `super` partition", path.display())))?;
+        .ok_or_else(|| io::Error::other("no `super` partition"))?;
     lp::partitions(&sup.dev)
 }
 

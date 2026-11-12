@@ -3,7 +3,9 @@
 use super::{Dev, ExtentDev, invalid, le32, le64};
 use std::io;
 
-const SECTOR: u64 = 512;
+pub const SECTOR: u64 = 512;
+/// What a GPT header, at the second sector, starts with.
+pub const SIGNATURE: &[u8; 8] = b"EFI PART";
 
 pub struct Partition {
     pub name: String,
@@ -12,7 +14,7 @@ pub struct Partition {
 
 pub fn partitions(disk: &Dev) -> io::Result<Vec<Partition>> {
     let header = disk.read_vec(SECTOR, 92)?;
-    if &header[..8] != b"EFI PART" {
+    if header[..8] != SIGNATURE[..] {
         return Err(invalid("no GPT header"));
     }
     let entries_lba = le64(&header, 72);

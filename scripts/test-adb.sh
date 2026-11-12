@@ -1,12 +1,13 @@
 #!/bin/sh
 # End-to-end test of host adb against a booted device: boots (ephemeral), then uses the
 # real adb tool. The device appears in the running adb server as emulator-NNNN for
-# the length of the test. Needs ANDROID_HOME or the SDK in its usual place, and the image
-# in IMG. A private adb server, on its own port and with its own key, checks that a key
-# adbd doesn't know is refused.
+# the length of the test. Finds the SDK as zeroemu does (ANDROID_HOME, ANDROID_SDK_ROOT,
+# then its usual place), and boots the image in IMG, by default the tested one. A
+# private adb server, on its own port and with its own key, checks that a key adbd
+# doesn't know is refused.
 set -u
 cd "$(dirname "$0")/.."
-SDK=${ANDROID_HOME:-$HOME/Library/Android/sdk}
+SDK=${ANDROID_HOME:-${ANDROID_SDK_ROOT:-$HOME/Library/Android/sdk}}
 ADB=$SDK/platform-tools/adb
 IMG=${IMG:-$SDK/system-images/android-36.1/google_apis_playstore/arm64-v8a/system.img}
 TMP=$(mktemp -d)

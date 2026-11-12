@@ -8,6 +8,10 @@ pub type hv_return_t = i32;
 pub type hv_vcpu_t = u64;
 
 pub const HV_SUCCESS: hv_return_t = 0;
+/// The process lacks the com.apple.security.hypervisor entitlement.
+pub const HV_DENIED: hv_return_t = 0xfae9_4007_u32 as hv_return_t;
+/// No hardware virtualization: inside a VM, for one.
+pub const HV_UNSUPPORTED: hv_return_t = 0xfae9_400f_u32 as hv_return_t;
 
 pub const HV_MEMORY_READ: u64 = 1 << 0;
 pub const HV_MEMORY_WRITE: u64 = 1 << 1;

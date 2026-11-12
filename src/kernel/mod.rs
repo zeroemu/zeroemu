@@ -684,6 +684,19 @@ pub fn reserve_exit_signals() {
     }
 }
 
+/// Prints Android's log from W rather than I unless ZEROEMU_LOG says otherwise, and
+/// zeroemu's notes for its developers not at all: for a boot, whose log is long.
+/// Before anything is printed.
+pub fn quiet_logs() {
+    logd::set_default_level(logd::WARN);
+}
+
+/// Whether zeroemu's notes for its developers print: at ZEROEMU_LOG=I or more
+/// verbose, the default for a program.
+pub fn verbose() -> bool {
+    logd::shows(logd::INFO)
+}
+
 /// Holds SIGUSR1 for the dump thread's sigwait. Call before any thread
 /// starts: threads inherit the mask, and one that took the signal itself
 /// would die of it.
@@ -1024,7 +1037,11 @@ impl Kernel {
                 if keep && !image.wipe {
                     let started = Instant::now();
                     match p.load(v.page_cache().expect("set above")) {
-                        Ok(size) => eprintln!("zeroemu: {}: read {} MB in {:.1} s", p.path.display(), size >> 20, started.elapsed().as_secs_f64()),
+                        Ok(size) => {
+                            if verbose() {
+                                eprintln!("zeroemu: {}: read {} MB in {:.1} s", p.path.display(), size >> 20, started.elapsed().as_secs_f64());
+                            }
+                        }
                         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                         // Never saved over: it may only need a newer zeroemu, or a look.
                         Err(e) => {
@@ -1567,7 +1584,7 @@ impl Kernel {
                 Ret::ExitThread => "<exit>".into(),
             };
             eprintln!("[strace] {} {name}({:#x}, {:#x}, {:#x}, {:#x}){path} = {shown}", t.tid, a[0], a[1], a[2], a[3]);
-        } else if matches!(ret, Ret::Value(v) if v == -ENOSYS) {
+        } else if matches!(ret, Ret::Value(v) if v == -ENOSYS) && verbose() {
             eprintln!("[zeroemu] unimplemented syscall {} ({sysno:?}, {:?})", regs.nr, self.arch);
         }
         ret

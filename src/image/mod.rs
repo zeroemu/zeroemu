@@ -179,19 +179,13 @@ pub fn invalid(msg: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg.into())
 }
 
-/// The Android SDK image tests read when it is installed: $ZEROEMU_TEST_IMAGE,
-/// else the newest arm64 image under ~/Library/Android/sdk (as test-android.sh).
+/// The Android SDK image tests read: $ZEROEMU_TEST_IMAGE, else the image zeroemu
+/// is tested with, when it is installed (as test-android.sh). None skips the test.
 #[cfg(test)]
 pub fn sdk_image() -> Option<crate::vfs::Vfs> {
     let path = std::env::var_os("ZEROEMU_TEST_IMAGE").map(std::path::PathBuf::from).or_else(|| {
-        let root = Path::new(&std::env::var_os("HOME")?).join("Library/Android/sdk/system-images");
-        let mut found: Vec<_> = std::fs::read_dir(&root).ok()?.flatten().filter_map(|v| {
-            let n = v.file_name().into_string().ok()?;
-            let ver: Vec<u32> = n.strip_prefix("android-")?.split('.').map(|p| p.parse().unwrap_or(0)).collect();
-            std::fs::read_dir(v.path()).ok()?.flatten().map(|f| f.path().join("arm64-v8a/system.img")).find(|p| p.is_file()).map(|p| (ver, p))
-        }).collect();
-        found.sort();
-        found.pop().map(|(_, p)| p)
+        let sdk = crate::sdk::find().filter(|s| s.exists())?;
+        sdk.images().into_iter().find(|i| i.is_tested() && i.system_img().is_file()).map(|i| i.system_img())
     })?;
     match crate::android::open_system_image(&path, true) {
         Ok(v) => Some(v),

@@ -551,7 +551,9 @@ impl Kernel {
             "cgroup2" => {
                 const KNOWN: [&str; 6] = ["nsdelegate", "favordynmods", "memory_localevents", "memory_recursiveprot", "memory_hugetlb_accounting", "pids_localevents"];
                 if let Some((k, _)) = opts.iter().find(|(k, _)| !KNOWN.contains(k)) {
-                    eprintln!("[zeroemu] cgroup2: unknown option {k}");
+                    if super::verbose() {
+                        eprintln!("[zeroemu] cgroup2: unknown option {k}");
+                    }
                     return Err(EINVAL);
                 }
                 if let Some(sb) = vfs.find_super(|sb| sb.fs_type() == "cgroup2") {

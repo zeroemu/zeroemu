@@ -11,13 +11,15 @@
 //! - `/dev/socket/logd` (stream): control commands such as `clear 0` and
 //!   `getLogSize 0`, each answered with a NUL-terminated string.
 //!
-//! `ZEROEMU_LOG=<V|D|I|W|E|F|S>` sets the lowest priority printed (default I).
+//! `ZEROEMU_LOG=<V|D|I|W|E|F|S>` sets the lowest priority printed: by default W for
+//! a boot and I for a program. zeroemu's own developer notes print at I or below.
 //! Once init starts the real logd on sockets of its own, the kernel still
 //! prints what that logd receives (`tap`), so logs stay on the terminal.
 
 use super::unix::{self, Service, Socket};
 use crate::vfs::Vfs;
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
@@ -130,6 +132,18 @@ struct Logd {
     logs: Mutex<Logs>,
 }
 
+/// Android's priorities: 2 V, 3 D, 4 I, 5 W, 6 E, 7 F.
+pub const INFO: u8 = 4;
+pub const WARN: u8 = 5;
+
+/// The lowest priority printed when ZEROEMU_LOG doesn't say.
+static DEFAULT_LEVEL: AtomicU8 = AtomicU8::new(INFO);
+
+/// Sets what ZEROEMU_LOG defaults to; before anything is printed.
+pub fn set_default_level(level: u8) {
+    DEFAULT_LEVEL.store(level, Ordering::Relaxed);
+}
+
 /// (lowest priority printed to stderr, time zero), fixed at first use.
 fn printer() -> (u8, Instant) {
     static PRINTER: OnceLock<(u8, Instant)> = OnceLock::new();
@@ -137,14 +151,31 @@ fn printer() -> (u8, Instant) {
         let level = match std::env::var("ZEROEMU_LOG").ok().and_then(|v| v.bytes().next()) {
             Some(b'V' | b'v') => 2,
             Some(b'D' | b'd') => 3,
-            Some(b'W' | b'w') => 5,
+            Some(b'I' | b'i') => INFO,
+            Some(b'W' | b'w') => WARN,
             Some(b'E' | b'e') => 6,
             Some(b'F' | b'f') => 7,
             Some(b'S' | b's') => u8::MAX,
-            _ => 4,
+            _ => DEFAULT_LEVEL.load(Ordering::Relaxed),
         };
         (level, Instant::now())
     })
+}
+
+/// Whether records of priority `prio` print.
+pub fn shows(prio: u8) -> bool {
+    prio >= printer().0
+}
+
+/// The priority of a /dev/kmsg record, from its syslog level (the N of a `<N>`
+/// prefix, facility included; Linux takes a record without one as a warning).
+pub fn kmsg_prio(level: Option<u32>) -> u8 {
+    match level.map(|l| l & 7) {
+        Some(0..=3) => 6,
+        Some(4) | None => WARN,
+        Some(5 | 6) => INFO,
+        Some(_) => 3,
+    }
 }
 
 /// AID_LOGD and AID_STATSD, which own these sockets on a device.

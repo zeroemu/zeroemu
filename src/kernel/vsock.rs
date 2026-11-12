@@ -229,7 +229,9 @@ impl Vsock {
                 "pipe:QemuMiscPipe" => st.service = Some(Service::Misc),
                 "pipe:clipboard" | "pipe:qemud:fingerprintlisten" => st.service = Some(Service::Silent),
                 _ => {
-                    eprintln!("zeroemu: no host service {name}");
+                    if super::verbose() {
+                        eprintln!("zeroemu: no host service {name}");
+                    }
                     st.closed = true;
                     EVENTS.bump_key(Arc::as_ptr(self) as usize);
                     return Ok(data.len());

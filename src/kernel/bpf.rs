@@ -490,7 +490,9 @@ impl Kernel {
             // BPF_TOKEN_CREATE (Linux 6.9): libbpf probes for it.
             36 => Err(EINVAL),
             _ => {
-                eprintln!("[zeroemu] unimplemented bpf command {cmd}");
+                if super::verbose() {
+                    eprintln!("[zeroemu] unimplemented bpf command {cmd}");
+                }
                 Err(EINVAL)
             }
         }

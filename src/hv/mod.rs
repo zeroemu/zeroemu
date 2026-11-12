@@ -209,8 +209,7 @@ pub fn set_thread_urgency(u: Urgency) {
     #[cfg(windows)]
     {
         unsafe extern "system" {
-            fn GetCurrentThread() -> *mut std::ffi::c_void;
-            fn SetThreadPriority(thread: *mut std::ffi::c_void, priority: i32) -> i32;
+            fn SetThreadPriority(thread: usize, priority: i32) -> i32;
         }
         let priority = match u {
             Urgency::Display => 2,    // THREAD_PRIORITY_HIGHEST
@@ -356,13 +355,23 @@ pub trait Hypervisor: Send + Sync {
     fn max_vcpus(&self) -> usize;
 }
 
-pub fn create() -> Result<Arc<dyn Hypervisor>, String> {
+/// The process's VM. There can be one: macOS allows no more.
+pub fn create() -> Result<Arc<dyn Hypervisor>, crate::Problem> {
     #[cfg(target_os = "macos")]
     return hvf::Hvf::new().map(|h| Arc::new(h) as Arc<dyn Hypervisor>);
     #[cfg(windows)]
-    return whp::Whp::new().map(|h| Arc::new(h) as Arc<dyn Hypervisor>);
+    return whp::Whp::new().map(|h| Arc::new(h) as Arc<dyn Hypervisor>).map_err(|e| crate::Problem::new(e, [] as [&str; 0]));
     #[cfg(not(any(target_os = "macos", windows)))]
-    Err("no hypervisor backend for this OS yet (KVM is planned)".into())
+    Err(crate::Problem::new("no hypervisor backend for this OS yet (KVM is planned)", [] as [&str; 0]))
+}
+
+/// Whether this process may create a VM: makes one and lets it go again. Not for
+/// a process that will boot, which keeps the one `create` makes.
+pub fn probe() -> Result<(), crate::Problem> {
+    #[cfg(target_os = "macos")]
+    return hvf::Hvf::probe();
+    #[cfg(not(target_os = "macos"))]
+    create().map(drop)
 }
 
 /// A hypervisor that is never asked for anything, for tests of what only needs memory.

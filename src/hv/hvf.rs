@@ -45,15 +45,66 @@ const CPSR_MODE_MASK: u64 = 0xf;
 pub struct Hvf;
 
 impl Hvf {
-    pub fn new() -> Result<Self, String> {
-        let ret = unsafe { hv_vm_create(ptr::null_mut()) };
+    /// The process's VM. Hypervisor.framework allows one per process.
+    pub fn new() -> Result<Self, crate::Problem> {
+        let ret = vm_create();
         if ret != HV_SUCCESS {
-            return Err(format!(
-                "hv_vm_create failed ({ret:#x}); is the binary signed with the \
-                 com.apple.security.hypervisor entitlement?"
-            ));
+            return Err(no_vm(ret));
         }
         Ok(Hvf)
+    }
+
+    /// Creates a VM and destroys it again: whether this process may have one.
+    pub fn probe() -> Result<(), crate::Problem> {
+        let ret = vm_create();
+        if ret != HV_SUCCESS {
+            return Err(no_vm(ret));
+        }
+        unsafe { hv_vm_destroy() };
+        Ok(())
+    }
+}
+
+/// hv_vm_create, with every signal blocked while it runs. It starts
+/// Hypervisor.framework's virtual-clock thread
+/// (com.apple.virtualization.thread.virtual-clock), which keeps the signal mask of
+/// the thread that called it. Were SIGINT, SIGTERM or SIGHUP open there, macOS
+/// could hand Ctrl-C or a kill to that thread, whose default action ends zeroemu
+/// before the thread that saves /data sees the signal. Blocked there, they go to
+/// zeroemu's own threads, whatever order main sets their masks in.
+fn vm_create() -> hv_return_t {
+    unsafe {
+        let mut all: libc::sigset_t = std::mem::zeroed();
+        let mut old: libc::sigset_t = std::mem::zeroed();
+        libc::sigfillset(&mut all);
+        libc::pthread_sigmask(libc::SIG_BLOCK, &all, &mut old);
+        let ret = hv_vm_create(ptr::null_mut());
+        libc::pthread_sigmask(libc::SIG_SETMASK, &old, ptr::null_mut());
+        ret
+    }
+}
+
+/// Why hv_vm_create refused, and what to do about it.
+fn no_vm(ret: hv_return_t) -> crate::Problem {
+    match ret {
+        HV_DENIED => {
+            let exe = std::env::current_exe().map(|p| crate::sdk::shell_quote(&p.to_string_lossy())).unwrap_or_else(|_| "zeroemu".into());
+            crate::Problem::new(
+                "this binary isn't signed with the hypervisor entitlement (com.apple.security.hypervisor), so macOS won't let it create a VM",
+                [
+                    format!("codesign -s - -f --entitlements entitlements.plist {exe}"),
+                    "(entitlements.plist is in the release archive and in the repository)".into(),
+                ],
+            )
+        }
+        HV_UNSUPPORTED => crate::Problem::new(
+            "hardware virtualization isn't available here, as inside a VM or on a CI runner (hv_vm_create: HV_UNSUPPORTED)",
+            ["run zeroemu on a Mac with Apple Silicon, outside any VM"],
+        ),
+        _ => crate::Problem::new(
+            format!("hardware virtualization isn't available (hv_vm_create returned {ret:#x}), as happens inside a VM or on a CI runner"),
+            ["run zeroemu on a Mac with Apple Silicon, outside any VM"],
+        ),
     }
 }
 

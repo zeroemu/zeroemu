@@ -1993,11 +1993,13 @@ impl Kernel {
                 // "<prio>tag: message" records, one per write.
                 let text = String::from_utf8_lossy(&data);
                 // Only a "<priority>" prefix: a message may itself start with digits.
-                let text = match text.strip_prefix('<').and_then(|r| r.split_once('>')) {
-                    Some((prio, rest)) if prio.chars().all(|c| c.is_ascii_digit()) => rest,
-                    _ => &text,
+                let (level, text) = match text.strip_prefix('<').and_then(|r| r.split_once('>')) {
+                    Some((prio, rest)) if prio.chars().all(|c| c.is_ascii_digit()) => (prio.parse().ok(), rest),
+                    _ => (None, &*text),
                 };
-                eprintln!("[kmsg] {}", text.trim_end());
+                if super::logd::shows(super::logd::kmsg_prio(level)) {
+                    eprintln!("[kmsg] {}", text.trim_end());
+                }
                 data.len()
             }
             Kind::Pipe(end) if end.write => match end.pipe.write(t, &data, f.nonblock()) {

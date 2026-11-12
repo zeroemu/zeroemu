@@ -1081,7 +1081,9 @@ impl Kernel {
                 drop(g);
             }
             _ => {
-                eprintln!("[zeroemu] binder: unsupported command {cmd:#x}");
+                if super::verbose() {
+                    eprintln!("[zeroemu] binder: unsupported command {cmd:#x}");
+                }
                 return Err(EINVAL);
             }
         }
@@ -1224,7 +1226,9 @@ impl Kernel {
         let total = data_len + offs_len + out.sg_size + if want_secctx { align8(caller_ctx.len() as u64) } else { 0 };
         let buffer = if out.too_big { None } else { w.alloc(to, total) };
         let Some(buffer) = buffer else {
-            eprintln!("[zeroemu] binder: no receive buffer space in pid {}", w.procs[&to].pid);
+            if super::verbose() {
+                eprintln!("[zeroemu] binder: no receive buffer space in pid {}", w.procs[&to].pid);
+            }
             w.transaction_failed(me, t.tid, answering, to, to_thread);
             drop(g);
             return;

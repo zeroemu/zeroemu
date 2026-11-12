@@ -36,24 +36,31 @@ static HOST_PORT: AtomicU16 = AtomicU16::new(0);
 static KEYS: OnceLock<Arc<crate::tmpfs::MemFile>> = OnceLock::new();
 static LAST_KEY: Mutex<Vec<u8>> = Mutex::new(Vec::new());
 
-fn listen(port: u16) -> Option<TcpListener> {
-    TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], port))).ok()
+fn listen(port: u16) -> std::io::Result<TcpListener> {
+    TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], port)))
 }
 
 /// Starts listening on `port`, or on the first free pair an emulator could have.
-pub fn start(port: Option<u16>) {
+/// Returns the port host adb connects to; adb names the device emulator-<port - 1>.
+pub fn start(port: Option<u16>) -> Option<u16> {
     let listener = match port {
-        Some(p) => listen(p).map(|l| (l, None)),
+        Some(p) => match listen(p) {
+            Ok(l) => Some((l, None)),
+            Err(e) => {
+                eprintln!("zeroemu: can't listen on port {p} ({e}); no adb");
+                return None;
+            }
+        },
         None => (FIRST_CONSOLE..=LAST_CONSOLE).step_by(2).find_map(|console| {
-            let c = listen(console)?;
-            Some((listen(console + 1)?, Some(c)))
+            let c = listen(console).ok()?;
+            Some((listen(console + 1).ok()?, Some(c)))
         }),
     };
     let Some((listener, console)) = listener else {
-        eprintln!("zeroemu: no free port for adb");
-        return;
+        eprintln!("zeroemu: no free port pair from {FIRST_CONSOLE} to {}; no adb", LAST_CONSOLE + 1);
+        return None;
     };
-    let Ok(addr) = listener.local_addr() else { return };
+    let addr = listener.local_addr().ok()?;
     HOST_PORT.store(addr.port(), Ordering::Relaxed);
     // There is no console. Accept and close, or `adb emu` would wait forever for one.
     if let Some(c) = console {
@@ -69,6 +76,7 @@ pub fn start(port: Option<u16>) {
         }
     });
     notify_server();
+    Some(addr.port())
 }
 
 /// One host connection: held open until a guest listener takes it.

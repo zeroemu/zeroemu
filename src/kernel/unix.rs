@@ -1109,7 +1109,9 @@ impl Kernel {
                     // domain, as /proc/<pid>/attr/current says.
                     SO_PEERSEC if st.connected => b"u:r:su:s0\0".to_vec(),
                     opt => st.opts.get(opt).ok_or_else(|| {
-                        eprintln!("[zeroemu] getsockopt(AF_UNIX, SOL_SOCKET, {opt}) unsupported");
+                        if super::verbose() {
+                            eprintln!("[zeroemu] getsockopt(AF_UNIX, SOL_SOCKET, {opt}) unsupported");
+                        }
                         ENOPROTOOPT
                     })?,
                 };

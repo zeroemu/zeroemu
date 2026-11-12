@@ -183,7 +183,8 @@ pub fn open(fb_w: u32, fb_h: u32) -> Result<NativeWindow, String> {
         msg_void(app, sel("finishLaunching"));
         // A device keeps running when its window is covered or minimized, as a phone's
         // apps do with its screen off: no App Nap, which throttled a covered zeroemu's
-        // threads and timers until frames took ten times as long. The Mac may still sleep.
+        // threads and timers until frames took about eight times as long. The Mac may
+        // still sleep.
         const USER_INITIATED_ALLOWING_IDLE_SYSTEM_SLEEP: u64 = 0x00ef_ffff;
         let info = msg0(cls("NSProcessInfo"), sel("processInfo"));
         let reason = msg_cstr(cls("NSString"), sel("stringWithUTF8String:"), "zeroemu runs an Android device");
@@ -207,7 +208,9 @@ pub fn open(fb_w: u32, fb_h: u32) -> Result<NativeWindow, String> {
         }
         let px_w = (win_w * dpr).round().max(1.0);
         let px_h = (win_h * dpr).round().max(1.0);
-        eprintln!("zeroemu: window {win_w:.0}x{win_h:.0} points ({px_w:.0}x{px_h:.0} px, dpr {dpr}) for {fb_w}x{fb_h} (id {number})");
+        if crate::kernel::verbose() {
+            eprintln!("zeroemu: window {win_w:.0}x{win_h:.0} points ({px_w:.0}x{px_h:.0} px, dpr {dpr}) for {fb_w}x{fb_h} (id {number})");
+        }
         Ok(NativeWindow {
             handle: window,
             width: win_w as i32,

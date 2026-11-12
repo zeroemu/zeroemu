@@ -236,6 +236,7 @@ pub enum Scroll {
     /// A trackpad gesture's fingers landed.
     Begin,
     /// A trackpad gesture moved.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))] // only the macOS window has a trackpad
     Change,
     /// A trackpad gesture's fingers lifted.
     End,
@@ -252,6 +253,7 @@ struct ScrollFinger {
     /// Travel before landing.
     pending: (f64, f64),
     last: Instant,
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))] // read by scroll_idle
     wheel: bool,
 }
 
@@ -264,6 +266,7 @@ const SCROLL_SLOP: f64 = 0.01;
 /// A finger keeps out of the screen's edges, where gestures of their own start.
 const SCROLL_INSET: f64 = 0.1;
 /// A trackpad gesture that never said it ended.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // read by scroll_idle
 const SCROLL_LOST: Duration = Duration::from_secs(1);
 
 fn clamp_to_screen(p: (f64, f64)) -> (f64, f64) {
@@ -325,11 +328,13 @@ fn lift(held: &mut Option<ScrollFinger>) {
 
 /// Lifts a scroll's finger now: something else is about to use the slot, or the
 /// window is no longer in charge.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // called by the macOS window
 pub fn scroll_cancel() {
     lift(&mut SCROLLING.lock().unwrap());
 }
 
 /// Lifts a mouse wheel's finger once the wheel has been still for `after`.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // called by the macOS window
 pub fn scroll_idle(after: Duration) {
     let mut held = SCROLLING.lock().unwrap();
     if held.as_ref().is_some_and(|f| f.last.elapsed() >= if f.wheel { after } else { SCROLL_LOST }) {
@@ -338,6 +343,7 @@ pub fn scroll_idle(after: Duration) {
 }
 
 /// Lets go of every key that is down: the window will not see them released.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // called by the macOS window
 pub fn release_keys() {
     let d = &*KEYBOARD;
     let down: Vec<u16> = {

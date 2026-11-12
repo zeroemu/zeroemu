@@ -4,11 +4,13 @@
 #
 #   scripts/test-android.sh [path/to/system.img]
 #
-# Defaults to the newest arm64 image in the Android SDK.
+# Defaults to the image zeroemu is tested with, in the Android SDK found as zeroemu
+# finds it: ANDROID_HOME, ANDROID_SDK_ROOT, then its usual place.
 set -u
 cd "$(dirname "$0")/.."
 
-IMG="${1:-$(ls -d "$HOME"/Library/Android/sdk/system-images/android-*/*/arm64-v8a/system.img 2>/dev/null | sort -V | tail -1)}"
+SDK=${ANDROID_HOME:-${ANDROID_SDK_ROOT:-$HOME/Library/Android/sdk}}
+IMG="${1:-$SDK/system-images/android-36.1/google_apis_playstore/arm64-v8a/system.img}"
 if [ ! -f "$IMG" ]; then
     echo "skip: no Android system image found (pass one as an argument)"
     exit 0

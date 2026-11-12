@@ -2,7 +2,14 @@
 name = "zeroemu"
 version = "0.1.0"
 edition = "2024"
-description = "Run Android's Linux userspace natively on macOS and Windows, without a guest kernel"
+# File::try_lock needs 1.89 (let-chains need 1.88).
+rust-version = "1.89"
+description = "Runs Android's own system image on the host CPU with no guest kernel; Linux's system calls are implemented in Rust"
+license = "Apache-2.0"
+repository = "https://github.com/zeroemu/zeroemu"
+readme = "README.md"
+keywords = ["android", "hypervisor", "emulator", "linux-abi", "runtime"]
+categories = ["emulators", "virtualization", "os", "development-tools"]
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

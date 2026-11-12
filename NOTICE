@@ -1,0 +1,15 @@
+zeroemu
+Copyright 2026 The zeroemu Authors
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+zeroemu's binary and release archive include no code from Google or the Android
+Open Source Project. zeroemu loads the Android Emulator's GPU renderer
+(libgfxstream_backend) and reads Android system images from the user's own Android
+SDK installation; those are covered by Google's Android SDK terms, not by this
+licence.
+
+testdata/sepolicy_mini.cil, used only by unit tests, holds declarations taken
+from the SELinux policy in an Android SDK system image. That policy comes from
+the Android Open Source Project (system/sepolicy and the emulator's device
+policy), which publishes it as open source.

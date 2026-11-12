@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  macos:
+    name: macOS (Apple Silicon)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy
+          rustup default stable
+          rustc --version
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Check with the oldest supported Rust
+        # Cargo.toml's rust-version: File::try_lock needs 1.89.
+        run: |
+          rustup toolchain install 1.89 --profile minimal
+          cargo +1.89 check --locked --all-targets
+
+      - name: Clippy
+        # Warnings don't fail the build yet: there are some to clear first.
+        run: cargo clippy --release --locked
+
+      - name: Unit tests
+        # The unit tests don't create a VM. GitHub's macOS runners have no nested
+        # virtualization, so the guest and boot tests (scripts/test-*.sh and
+        # scripts/test-*.py) run on developers' Macs instead.
+        run: cargo test --release --locked
+
+      - name: Build the test guests
+        run: scripts/build-guests.sh
+
+  windows-check:
+    name: Windows compile check
+    # The Windows backend has never run; this only keeps it compiling. cargo check
+    # doesn't link, so any host can check the Windows target.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add x86_64-pc-windows-msvc
+          rustc --version
+
+      - name: Check
+        run: cargo check --release --locked --target x86_64-pc-windows-msvc

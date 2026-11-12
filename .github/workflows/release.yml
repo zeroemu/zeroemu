@@ -1,0 +1,105 @@
+name: Release
+
+# Builds, signs and publishes zeroemu-<version>-aarch64-apple-darwin.tar.gz when a
+# tag such as v0.1.0 is pushed. Written by hand rather than with cargo-dist, which
+# can't sign with entitlements.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    name: Build, sign and publish
+    runs-on: macos-15
+    permissions:
+      contents: write      # gh release create
+      id-token: write      # sign the provenance attestation
+      attestations: write  # store it
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustc --version
+
+      - name: Check that the tag matches Cargo.toml
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          crate=$(cargo metadata --no-deps --locked --format-version 1 | jq -r '.packages[] | select(.name == "zeroemu") | .version')
+          if [ "$version" != "$crate" ]; then
+            echo "::error::tag $GITHUB_REF_NAME doesn't match the version in Cargo.toml ($crate)"
+            exit 1
+          fi
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+          echo "NAME=zeroemu-$version-aarch64-apple-darwin" >> "$GITHUB_ENV"
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Sign
+        # Hypervisor.framework won't create a VM for a binary without this
+        # entitlement. An ad-hoc signature can carry it.
+        run: codesign -s - -f --entitlements entitlements.plist target/release/zeroemu
+
+      - name: Check the signature and version
+        run: |
+          codesign --verify --strict --verbose=2 target/release/zeroemu
+          codesign -d --entitlements - target/release/zeroemu > entitlements.txt 2>&1
+          cat entitlements.txt
+          if ! grep -q com.apple.security.hypervisor entitlements.txt; then
+            echo "::error::the signed binary has no com.apple.security.hypervisor entitlement"
+            exit 1
+          fi
+          test "$(target/release/zeroemu --version)" = "zeroemu $VERSION"
+
+      - name: Package
+        # NOTICE goes in, since Apache-2.0 (section 4(d)) asks that copies carry it.
+        # COPYFILE_DISABLE and the tar flags keep macOS extended attributes and
+        # AppleDouble (._*) files out of the archive. cp -X copies no attributes.
+        run: |
+          mkdir stage dist
+          cp -X target/release/zeroemu LICENSE NOTICE README.md entitlements.plist stage/
+          COPYFILE_DISABLE=1 tar --no-xattrs --no-mac-metadata \
+            --uid 0 --gid 0 --uname root --gname wheel \
+            -czf "dist/$NAME.tar.gz" -C stage zeroemu LICENSE NOTICE README.md entitlements.plist
+          (cd dist && shasum -a 256 "$NAME.tar.gz" > SHA256SUMS)
+          tar -tvzf "dist/$NAME.tar.gz"
+          cat dist/SHA256SUMS
+
+      - name: Check the package
+        run: |
+          test "$(tar -tzf "dist/$NAME.tar.gz" | LC_ALL=C sort | tr '\n' ' ')" = "LICENSE NOTICE README.md entitlements.plist zeroemu "
+          mkdir unpacked
+          tar -xzf "dist/$NAME.tar.gz" -C unpacked
+          codesign --verify --strict unpacked/zeroemu
+          codesign -d --entitlements - unpacked/zeroemu 2>&1 | grep -q com.apple.security.hypervisor
+          (cd dist && shasum -a 256 -c SHA256SUMS)
+
+      - name: Attest build provenance
+        uses: actions/attest@v4
+        with:
+          subject-path: |
+            dist/${{ env.NAME }}.tar.gz
+            stage/zeroemu
+
+      - name: Create the release
+        # Every release is a pre-release while zeroemu is a developer preview.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sed -e "s|@REPO@|$GITHUB_REPOSITORY|g" -e "s|@TAG@|$GITHUB_REF_NAME|g" -e "s|@VERSION@|$VERSION|g" \
+            .github/release-notes.md > notes.md
+          gh release create "$GITHUB_REF_NAME" \
+            --verify-tag --prerelease \
+            --title "zeroemu $VERSION" \
+            --notes-file notes.md --generate-notes \
+            "dist/$NAME.tar.gz" dist/SHA256SUMS

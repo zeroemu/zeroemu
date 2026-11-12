@@ -1,13 +1,257 @@
 # zeroemu
 
-Run Android's userspace natively on macOS and Windows, with no emulated
-hardware and no guest kernel.
+**Zero emulation.**
 
-The Android Emulator boots a complete virtual phone: a Linux kernel, virtual
-devices, and a GPU command stream forwarded to the host. zeroemu instead runs
-Android's unmodified Linux binaries directly on the host CPU inside a minimal
-hardware VM, and implements the Linux kernel ABI in Rust on the host side. It
-is the same idea as Fuchsia's Starnix, aimed at desktop OSes.
+zeroemu runs Android on a Mac without emulating a phone. It boots the same system
+image as the Android Emulator, from Google's Android SDK, but runs Android's programs
+directly on the Mac's CPU. There is no Linux kernel inside: when Android calls the
+kernel, the call comes to zeroemu, which implements Linux's system calls in Rust.
+Android's own `init`, system services, ART and apps run unmodified. They draw through
+the Android Emulator's GPU renderer, which zeroemu loads from the emulator package in
+your SDK, into a window on your Mac.
+
+> **Developer preview (v0.1.0).** zeroemu runs on Apple Silicon Macs only. One system
+> image is tested: Android 16 QPR2 with Google Play
+> (`system-images;android-36.1;google_apis_playstore;arm64-v8a`), with Android Emulator
+> 37.1.11 and 37.2.13. A Windows backend is in progress: it compiles but has never run.
+> zeroemu is a developer tool, not a sandbox; read [SECURITY.md](SECURITY.md) before
+> running apps you don't trust.
+
+## Quick start
+
+```sh
+# 1. Install zeroemu, in a new folder. This short form checks nothing; see Install
+#    for a checked download, Homebrew and source builds.
+mkdir zeroemu && cd zeroemu
+curl -L https://github.com/zeroemu/zeroemu/releases/download/v0.1.0/zeroemu-0.1.0-aarch64-apple-darwin.tar.gz | tar xz
+
+# 2. Install the Android SDK pieces (or use Android Studio's SDK Manager; see below).
+#    If you installed the Command-line Tools from Android Studio (SDK Tools tab),
+#    sdkmanager isn't on your PATH: run it as
+#    ~/Library/Android/sdk/cmdline-tools/latest/bin/sdkmanager
+sdkmanager "emulator" "platform-tools" "system-images;android-36.1;google_apis_playstore;arm64-v8a"
+
+# 3. Check that a boot should work; it prints the fix for anything missing
+./zeroemu doctor
+
+# 4. Boot Android in a window
+./zeroemu
+```
+
+## Install
+
+zeroemu is one command-line program. macOS lets a program create a virtual machine only
+if it is signed with the `com.apple.security.hypervisor` entitlement. An ad-hoc
+signature can carry it, so no Apple developer account is needed. The release binary and
+the Homebrew build are signed already; if you build zeroemu yourself, you sign it.
+
+You need a Mac with Apple Silicon (M1 or later). zeroemu has been tested on macOS 26 on
+an M1 Pro. Older versions of macOS are untested.
+
+### From GitHub Releases
+
+The short form downloads and unpacks in one step, and checks nothing:
+
+```sh
+mkdir zeroemu && cd zeroemu
+curl -L https://github.com/zeroemu/zeroemu/releases/download/v0.1.0/zeroemu-0.1.0-aarch64-apple-darwin.tar.gz | tar xz
+./zeroemu --version
+```
+
+To check the download before you unpack it, keep the archive and the release's
+`SHA256SUMS` file:
+
+```sh
+mkdir zeroemu && cd zeroemu
+curl -LO https://github.com/zeroemu/zeroemu/releases/download/v0.1.0/zeroemu-0.1.0-aarch64-apple-darwin.tar.gz
+curl -LO https://github.com/zeroemu/zeroemu/releases/download/v0.1.0/SHA256SUMS
+shasum -a 256 -c SHA256SUMS
+gh attestation verify zeroemu-0.1.0-aarch64-apple-darwin.tar.gz --repo zeroemu/zeroemu
+tar xzf zeroemu-0.1.0-aarch64-apple-darwin.tar.gz
+./zeroemu --version
+```
+
+`shasum` checks that the archive is the one the release lists. `gh attestation verify`
+uses the [GitHub CLI](https://cli.github.com) to check the release's build provenance
+attestation: that GitHub Actions built the archive from this repository.
+
+The archive holds `zeroemu`, `LICENSE`, `NOTICE`, `README.md` and `entitlements.plist`
+with no folder around them, so extract it in an empty folder. To run zeroemu from
+anywhere, move it to a folder in your `PATH`. On Apple Silicon Macs, `/usr/local/bin`
+often doesn't exist yet, and writing to it needs `sudo`:
+
+```sh
+sudo mkdir -p /usr/local/bin && sudo mv zeroemu /usr/local/bin/
+```
+
+Downloads made with `curl` aren't quarantined. A file downloaded in a browser is, and
+macOS then refuses to run zeroemu, because it is signed ad hoc rather than by a
+registered developer. Since macOS Sequoia there is no Control-click way around this.
+Remove the quarantine flag instead:
+
+```sh
+xattr -d com.apple.quarantine ./zeroemu
+```
+
+### With Homebrew
+
+```sh
+brew install zeroemu/tap/zeroemu
+```
+
+The formula builds zeroemu from source (Homebrew installs Rust for the build) and signs it.
+
+### From source
+
+You need Rust 1.89 or newer ([rustup](https://rustup.rs)) and the Xcode Command Line
+Tools (`xcode-select --install`).
+
+```sh
+git clone https://github.com/zeroemu/zeroemu
+cd zeroemu
+cargo build --release
+codesign -s - -f --entitlements entitlements.plist target/release/zeroemu
+```
+
+Every `cargo build` relinks the binary and drops the signature, so sign it again after
+each build. `cargo run` signs it for you, through the runner in `.cargo/config.toml`.
+
+`cargo install` has no step after installing, so if you use it, sign the installed
+binary yourself:
+
+```sh
+cargo install --git https://github.com/zeroemu/zeroemu --tag v0.1.0 --locked
+curl -LO https://raw.githubusercontent.com/zeroemu/zeroemu/v0.1.0/entitlements.plist
+codesign -s - -f --entitlements entitlements.plist "${CARGO_HOME:-$HOME/.cargo}/bin/zeroemu"
+```
+
+Without the entitlement, zeroemu can't create its virtual machine and stops with an
+error that names it. `zeroemu doctor` checks for it.
+
+## The Android SDK pieces
+
+zeroemu brings no part of Android with it. It uses these packages from Google's
+Android SDK:
+
+| Package | What zeroemu uses it for |
+|---|---|
+| `emulator` (Android Emulator) | Its GPU renderer, `libgfxstream_backend`, with ANGLE on Metal underneath. zeroemu loads the library; it doesn't run the emulator |
+| `system-images;android-36.1;google_apis_playstore;arm64-v8a` (Google Play ARM 64 v8a System Image, Android 16 QPR2) | Android itself. zeroemu reads the image directly; nothing is extracted to disk |
+| `platform-tools` | Only `adb`, if you want it. zeroemu runs without it |
+
+Together they take about 3.5 GB.
+
+**With Android Studio:** open the SDK Manager (Tools > SDK Manager, or More Actions >
+SDK Manager on the welcome screen). On the SDK Tools tab, check Android Emulator and
+Android SDK Platform-Tools. On the SDK Platforms tab, check Show Package Details, find
+API level 36.1, and check Google Play ARM 64 v8a System Image.
+
+**On the command line:** `sdkmanager` comes with the Android SDK Command-line Tools
+(from Android Studio's SDK Tools tab, or `brew install --cask android-commandlinetools`,
+which needs Java). Android Studio's copy isn't on your `PATH`; run it as
+`~/Library/Android/sdk/cmdline-tools/latest/bin/sdkmanager`:
+
+```sh
+sdkmanager "emulator" "platform-tools" "system-images;android-36.1;google_apis_playstore;arm64-v8a"
+```
+
+Google now marks `sdkmanager` as deprecated in favour of its new Android CLI, but it
+still works.
+
+**Where zeroemu looks for the SDK:** in `ANDROID_HOME`, then `ANDROID_SDK_ROOT` (which
+Google calls deprecated), then `~/Library/Android/sdk`, where Android Studio puts it. For
+an SDK anywhere else, set `ANDROID_HOME`. Homebrew's `android-commandlinetools`, for
+example, keeps its SDK here:
+
+```sh
+export ANDROID_HOME="$(brew --prefix)/share/android-commandlinetools"
+```
+
+`ZEROEMU_GFXSTREAM=<path>` loads the renderer library from a path of your choice.
+
+**Emulator versions:** zeroemu is tested with Android Emulator 37.1.11 and 37.2.13.
+37.2.13 is the release `sdkmanager` and Android Studio install as of November 2026.
+zeroemu calls a few of the renderer's internal functions by name, so another emulator
+release can break it.
+37.3, on Google's preview channel, is untested. `zeroemu doctor` says which release you
+have, and warns if it isn't 37.1 or 37.2. If a newer release doesn't work, open an
+issue; a tested one can be installed by hand from Google's
+[emulator archive](https://developer.android.com/studio/emulator_archive).
+
+## Usage
+
+```
+zeroemu [options]       Boot Android in a window. --boot means the same.
+zeroemu images          List the system images installed in the SDK, and whether each can boot
+zeroemu doctor          Check everything a boot needs, and print the exact fix for each problem
+zeroemu --help, -h      Show usage
+zeroemu --version, -V   Print the version
+```
+
+`zeroemu images` marks each image `tested`, `untested`, or `unsupported:` with the
+reason. `zeroemu doctor` exits with 0 when a boot should work, and 1 otherwise.
+
+Boot options:
+
+| Option | |
+|---|---|
+| `--image <name>` | Boot an installed image: `android-36.1`, `android-36.1/google_apis_playstore`, or the SDK package path `system-images;android-36.1;google_apis_playstore;arm64-v8a`. The ABI is always the host's |
+| `--system <path>` | Boot a `system.img` file, or the folder that holds it |
+| `--data <file>` | Keep the device's `/data` in this file instead of the default one |
+| `--ephemeral` | Keep nothing: start with an empty `/data` and throw it away at exit |
+| `--wipe-data` | Start over with an empty `/data` |
+| `--ram <MB>` | How much memory Android believes it has: 4096 by default, as AVDs do |
+| `--no-net` | No network |
+| `--adb-port <port>` | Listen for adb on this port, rather than the first free emulator port |
+| `--no-adb` | No adb |
+| `--headless` | No window and no GPU. The boot stops at SurfaceFlinger, which needs the GPU, so it never reaches the home screen |
+| `--push <host>:<guest>`, `--run <cmd>` | For development: copy a file into the device, or run a shell command once SurfaceFlinger is up. See [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) |
+
+Without `--image` or `--system`, zeroemu boots the tested image if it is installed. If
+it isn't, zeroemu stops with a message that lists the images you have and the command
+that installs the tested one. Use `--image` to pick an untested image.
+
+What you see:
+
+- A window with a 1080x2400 phone display, scaled to fit your screen. Android finishes
+  booting about 17 seconds after start on a first boot, and about 12 seconds on later
+  boots.
+- The mouse is a finger, and scrolling drags one (a flick becomes a fling). F1 is Home,
+  Escape is Back, and F2 is recent apps; on a MacBook keyboard, hold Fn for F1 and F2.
+  Other keys type into Android.
+- The terminal shows Android's warnings and errors, and the renderer's errors.
+  `ZEROEMU_LOG=I` shows more of Android's log, and `ZEROEMU_LOG=S` hides it.
+  `ZEROEMU_GPU_LOG=<S|E|W|I|D>` sets how much of the renderer's own log shows.
+- Host `adb` sees the device as an emulator: `adb devices` lists it as `emulator-5554`,
+  or the next free pair of ports. adbd keeps its key check, and your own key
+  (`~/.android/adbkey.pub`) is already authorized.
+- Each image keeps its own `/data`, in `~/Library/Application Support/zeroemu`. It is
+  saved on a clean exit: closing the window, Ctrl-C in the terminal, or powering off
+  from Android. A crash or `kill -9` loses what happened since the last save. There is
+  no menu bar, so Cmd-Q doesn't quit.
+- `ZEROEMU_BACKGROUND=1` opens the window behind your other windows, without taking focus.
+
+## Supported images
+
+| Image | State |
+|---|---|
+| `android-36.1` `google_apis_playstore` `arm64-v8a` (Android 16 QPR2 with Google Play) | **Tested**, with emulator 37.1.11 and 37.2.13 |
+| Other `google_apis_playstore` `arm64-v8a` images with 4 KB pages | **Untested:** `zeroemu images` says whether zeroemu can read each. One boot of `android-36` (Android 16) brought adb up, but its system services never started |
+| Google APIs (`google_apis`), AOSP (`default`), ATD, Wear OS, Android TV and Google TV images | **Not supported yet:** their partitions are ext4, and zeroemu reads only EROFS |
+| Google Play images for Android 12, 13 and 14 (API 31, 33 and 34) | **Not supported yet:** their partitions are ext4 too |
+| Images older than Android 10 | **Not supported:** they have no `super` partition |
+| 16 KB page-size images (tags containing `ps16k`) | **Not supported yet:** zeroemu assumes 4 KB pages |
+| `x86_64` images | **Can't run on Apple Silicon:** zeroemu runs guest code on the host CPU, so the image's instruction set must be the host's |
+
+`zeroemu images` shows what it thinks of each image you have installed. If you try an
+untested image, please open an issue with what happened.
+
+## How it works
+
+The Android Emulator boots a complete virtual phone: a Linux kernel, virtual devices,
+and a GPU command stream forwarded to the host. zeroemu instead runs Android's
+unmodified Linux binaries directly on the host CPU inside a minimal hardware VM, and
+implements the Linux kernel ABI in Rust on the host side.
 
 ```
  guest (EL0 / ring 3)        Android binaries: init, servicemanager, ART, apps…
@@ -22,356 +266,75 @@ is the same idea as Fuchsia's Starnix, aimed at desktop OSes.
  host                        macOS / Windows
 ```
 
-The guest ISA always matches the host CPU, so guest code runs at native speed:
-arm64 Android on Apple Silicon and Windows on ARM, x86_64 Android on x86_64 PCs.
+The guest's instruction set always matches the host CPU, so guest code runs at native
+speed: arm64 Android on Apple Silicon, and, once the Windows backend runs, x86_64
+Android on x86_64 PCs. Guest code runs at the lowest privilege level, and every system
+call or fault leaves the VM for zeroemu. The GPU is a virtio-gpu device backed by
+the Android Emulator's renderer, so Android's graphics stack runs unmodified.
 
-## Status
+How this compares:
 
-| Milestone | State |
-|---|---|
-| M0: kernel-less VM, static ELF, basic syscalls (macOS) | done |
-| M0: Windows Hypervisor Platform backend (x86_64) | ported to paged memory; builds clean, **not yet run on Windows** |
-| M1: Android's own `linker64`, `toybox`, and `mksh` straight from an SDK `system.img` | done (macOS, Android 16 image) |
-| M2: demand paging, threads, futex, `fork`/`execve`/`wait4`, pipes, signals | done on macOS; x86_64 written (signal frames, TLB shootdown), untested |
-| M3: binder, `servicemanager`, property service, `logd`, `init` | done (macOS) |
-| M4: SurfaceFlinger, with Android's graphics stack unmodified on a virtio-gpu device backed by the Android Emulator's gfxstream renderer | done (macOS) |
-| M5: zygote, ART, `system_server`, launcher, apps | done (macOS): Android 16's Pixel launcher in the window, and boot complete about 17 s after start on a first boot and about 12 s after that |
-| M6: input from the window | done (macOS): mouse as touch, scroll as a finger drag, keyboard; Chrome and Play Store open and draw from a tap |
-| Network | done (macOS): Android validates the network, Chrome loads sites over HTTP, HTTPS and QUIC, and `adb forward` and `reverse` work. See below for what a network with no packets can't do |
-| Shared storage | done (macOS), as a stand-in for MediaProvider's FUSE daemon: vold mounts the emulated volume, `/sdcard` has its standard directories, `adb push`/`pull` work there, and apps get their `Android/data` directories. See below |
-| Smoothness | in progress: the renderer draws straight into the window, and one app's GL stream no longer waits on another's. See Performance notes |
-| Windows | no window and never run; compiles (`cargo check --target x86_64-pc-windows-msvc`) |
+- **The Android Emulator** runs a Linux kernel and virtual devices in a QEMU virtual
+  machine. zeroemu uses the same system images and the same GPU renderer, without the
+  kernel or the devices.
+- **Waydroid and Anbox** run Android in a container that shares the host's Linux kernel,
+  so they need a Linux host. zeroemu implements Linux's system calls itself, so it runs
+  on macOS.
+- **Windows Subsystem for Android** ran Android with its own Linux kernel in a Hyper-V
+  virtual machine. Microsoft has discontinued it.
+- **Fuchsia's Starnix, gVisor and WSL 1** implement Linux's system calls outside the
+  Linux kernel, to run Linux programs unmodified. zeroemu is the same idea, aimed at
+  Android on desktop systems. gVisor's KVM platform is the closest: it too uses
+  hardware virtualization, and a kernel written in a memory-safe language (Go there)
+  takes the programs' system calls.
 
-M1 reads the image directly; nothing is extracted to disk. The chain is
-`system.img` (GPT) → `super` (dynamic partitions) → EROFS with LZ4 → `.apex`
-zip (CRC-checked) → `original_apex` (deflate, for compressed APEXes) → ext4
-payload, mounted at `/apex/<name>` on first use. A program launch takes ~50 ms.
+[docs/INTERNALS.md](docs/INTERNALS.md) says how each part works.
 
-M2 gives each process its own page tables (39-bit VA on arm64, 48-bit on
-x86_64), built by `mm` and populated on page faults, so bionic's 8 GiB
-allocator reservation costs nothing until touched. Each guest thread runs on
-its own host thread with its own vCPU; `fork` copies the address space, and
-signals use Linux-compatible frames, so mksh pipelines, `$(...)`, background
-jobs, `trap`, and `kill` all work. 40 rounds of `$(ls /system/bin | wc -l)`
-(120 processes) take ~1 s.
+## Status and known gaps
 
-Known gaps:
+On Apple Silicon Macs, Android 16's Pixel launcher, Chrome and the Play Store run in the
+window. The network works: Chrome loads sites over HTTP, HTTPS and QUIC. adb works,
+including `forward`, `reverse`, `push` and `pull`, and so does shared storage (`/sdcard`).
+On an M1 Pro, a device uses about 3.3 GB of memory five minutes after a first boot,
+and 16% of one core when it sits idle at the home screen. Smoothness is being worked on;
+see [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
 
-- The network has no packets. Guest sockets connect to host sockets directly, so
-  what depends on seeing traffic doesn't apply: `VpnService` (a VPN app's traffic goes
-  straight out while Android believes it's tunnelled), packet capture, and per-app
-  firewalling. An app without the INTERNET permission still gets out. A background
-  restriction can block an app's DNS while its TCP still works.
-- 10.0.2.2 is the host's loopback for every app on the device, as on the emulator,
-  except for the adb server and devices' own ports.
-- There's no IPv6, no ICMP (`ping` resolves and never hears back) and no incoming
-  connections except through `adb forward`.
-- The name server answers from the host's resolver: A records only, with a made-up TTL,
-  no CNAMEs or HTTPS records, and every failure is SERVFAIL.
-- Android thinks eth1 is unmetered, so Google's services download what they like once
-  it's up, into a `/data` that's saved whole.
-- `/data` is only saved at a clean exit. A kill or a crash loses what happened since the
-  last boot's save.
-- On Windows, nothing saves `/data` on Ctrl-C or when the console closes.
-- A mapping of a file doesn't raise SIGBUS past the file's end: it reads zeros. A read
-  of a hole through a private mapping stays zeros if the file is written there later.
-- `O_PATH` descriptors can be read and mapped, and `/dev/zero` can't be mapped.
-- File permissions are Linux's (see below) only where owners and modes are real: tmpfs,
-  binderfs and the images. `/proc`, `/sys`, the cgroup hierarchies, selinuxfs, devpts,
-  tracefs and bpffs have modes zeroemu made up and owners nobody set, so any process may
-  read and write what they let root. fs.protected_symlinks isn't applied, and `access()`
-  walks the path with the effective ids rather than the real ones.
-- Shared storage has no scoped storage: MediaProvider's daemon is never asked anything
-  after FUSE_INIT (see below), so any app with the volume in its mount namespace may read
-  and write anything there, MediaProvider only learns of new files when it scans, and
-  nothing is redacted or transcoded. Other apps' `Android/data` and `Android/obb`
-  directories stay closed, as vold binds them from `/data/media` with their owners' modes.
-  Files show the labels `/data/media` has rather than `u:object_r:fuse:s0`. vold logs that
-  it can't set the volume's readahead: there is no `/sys/class/bdi/0:N`.
-- POSIX ACLs on tmpfs are stored but not enforced, and new files don't inherit a default
-  ACL: a file an app writes in its `Android/data` directory with umask 077 stays 0600,
-  where the default ACL vold sets would let `ext_data_rw` (adb's shell) read it.
-- File capabilities (`security.capability`) aren't applied on `execve`, so `run-as`
-  can't change its ids and fails.
-- userfaultfd has only what ART's compacting collector uses: SIGBUS mode, on private
-  anonymous memory.
-- Guest GLES reaches the renderer over virtio-gpu's pipe, not its shared-memory ring:
-  gfxstream's guest library picks the pipe for the emulator's own EGL. Each GL call that
-  waits for an answer is a round trip through zeroemu (a few hundred a second while an
-  app scrolls).
-- SELinux is permissive: selinuxfs, process and socket contexts, and exec
-  domain transitions follow the image's CIL policy (with file labels from
-  the images' xattrs), but no access is ever denied.
-- Images older than Android 10 (no `super` partition) aren't supported.
-- APEX mount names come from file names (`com.android.tzdata6` should be
-  `com.android.tzdata`); reading `apex_manifest.pb` lazily would fix it.
-- `/linkerconfig/ld.config.txt` is not generated, so the linker warns and uses
-  its default search paths.
+Not there yet:
 
-File permissions follow Linux's rules (fs/namei.c, fs/attr.c, mm/mmap.c): search
-permission on every directory a path walks through, read and write by open's access mode
-(and write for `O_TRUNC`), write and search on the directory to create, remove, rename or
-link, the sticky bit, chmod and utimes by the owner, chown by `CAP_CHOWN` (and set-uid and
-set-gid dropped as Linux drops them), execute permission and `noexec` mounts for `execve`
-and executable mappings, write permission on a socket to connect to it, a descriptor open
-for reading to map it and for writing to map it shared and writable (which `mprotect`
-can't add later, nor past ashmem's protection mask), the xattr namespaces' rules, and
-`CAP_SYS_ADMIN` for device-mapper. Root with its capabilities passes as on Linux; an app's
-uid is held to them. zeroemu's own device nodes have the modes and owners ueventd.rc
-gives them. `src/kernel/perm.rs` has the shared checks and says which filesystems they
-cover.
+- Windows: no window, and never run. Intel Macs: no backend.
+- One tested image (see above).
+- The network has no packets: VPN apps, packet capture, `ping`, IPv6 and incoming
+  connections (other than `adb forward`) don't work, and apps without the INTERNET
+  permission still get out.
+- `/data` is saved only on a clean exit.
+- SELinux is permissive, and `/sdcard` has no scoped storage.
 
-Shared storage (`/sdcard`, `/storage/emulated`) is the device's arrangement with the
-round trips left out. vold opens `/dev/fuse`, mounts it at `/mnt/user/0/emulated` and hands
-the descriptor to MediaProvider, whose FUSE daemon reads FUSE_INIT and answers it, so vold,
-StorageManagerService and MediaProvider all see the volume mounted. The mount itself is a
-second view of `/data/media` in `/data`'s tmpfs, served by zeroemu directly, so its files are
-saved with `/data` and no file operation waits on a guest process. As on a fuse mount without
-`default_permissions`, nothing is refused there, chmod and chown change nothing, and what is
-created belongs to the daemon's uid, as on the lower filesystem where MediaProvider would make
-it. vold's binds of `/data/media/0/Android/data` and `obb`, and zygote's per-app views, work as
-on a device; `/data`'s tmpfs keeps ext4's inode flags and quota project ids
-(`FS_IOC_SETFLAGS`, `FS_IOC_FSSETXATTR`), which vold sets on each app's directories. See
-`src/kernel/fuse.rs`, and the gaps above for what this leaves out.
+The full list is in [docs/KNOWN-GAPS.md](docs/KNOWN-GAPS.md), and the milestones in
+[docs/INTERNALS.md](docs/INTERNALS.md#milestones).
 
-M3 so far adds the IPC Android's system services stand on: `eventfd`,
-`epoll`, `timerfd`, `signalfd`, Unix sockets with `SCM_RIGHTS`, tmpfs
-(`/dev`, `/data`, `/tmp`, …) with `MAP_SHARED` and `memfd`, `/proc`, `/sys`,
-a permissive selinuxfs built from the image's CIL policy, the property area
-and property service (as init provides them), a binder driver, and logd's
-sockets. Android's own
-`servicemanager` runs, and `service list` / `service check` talk to it over
-binder. Every process's liblog output is printed to stderr, and Android's
-`logcat` (dump, stream, `-c`, `-g`) reads it back from the kernel's buffer.
-Path-bound Unix sockets are `S_IFSOCK` nodes, as on Linux (`ls -l
-/dev/socket` lists the kernel's own services), so init can unlink them and
-bind its own; once the real logd owns `/dev/socket/logdw`, the kernel still
-prints what it receives.
+## Documentation
 
-## Build and run
+- [docs/INTERNALS.md](docs/INTERNALS.md): how each part works, the milestones and the design rules
+- [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md): building, tests, development commands and every debugging variable
+- [docs/PERFORMANCE.md](docs/PERFORMANCE.md): memory, CPU and frame-time measurements
+- [docs/KNOWN-GAPS.md](docs/KNOWN-GAPS.md): what is missing or different
+- [docs/RELEASING.md](docs/RELEASING.md): setting up the repository and making a release
+- [CONTRIBUTING.md](CONTRIBUTING.md) and [SECURITY.md](SECURITY.md)
 
-Requires Rust 1.85+ and, on macOS, Xcode's clang (to build the test guests).
+## Legal
 
-```sh
-./scripts/build-guests.sh                 # static Linux test binaries (arm64 + x86_64)
-cargo run -- target/guest/smoke_aarch64 alpha beta
-cargo run -- --strace target/guest/hello_aarch64
+zeroemu's binary and release archive contain no Google code: no system image, no
+emulator and no renderer, and zeroemu downloads none of them. (The source has one test
+file, `testdata/sepolicy_mini.cil`, with declarations taken from AOSP's SELinux policy;
+see [NOTICE](NOTICE).) You install the Android SDK and its images yourself, under the
+licences `sdkmanager` or the SDK Manager shows when you install them: the
+[Android SDK License Agreement](https://developer.android.com/studio/terms) and the
+image's own terms. zeroemu reads them from your SDK. The Google Play system image's
+licence limits its use to developing and debugging apps, so zeroemu is a developer tool.
 
-IMG=~/Library/Android/sdk/system-images/android-36.1/google_apis_playstore/arm64-v8a/system.img
-cargo run --release -- --system $IMG /system/bin/toybox ls -l /apex/com.android.art/bin
-cargo run --release -- --system $IMG /system/bin/sh      # Android's mksh, reading stdin
-cargo run --release -- --system $IMG --ls /system/bin    # inspect the image without running anything
-./scripts/test-android.sh                                # end-to-end checks against the image
-./scripts/test-net.py                                    # host connections, from the host side
-./scripts/test-tcp.py                                    # guest sockets, against real servers on the host
-./scripts/test-adb.sh                                    # boots, and uses real adb against it
-```
+zeroemu is not affiliated with or endorsed by Google. Android is a trademark of Google
+LLC.
 
-Android log records (`liblog`, i.e. `ALOGI` and friends) print to stderr as
-`<secs since start> <pid> <tid> <prio> <tag>: <message>`; `ZEROEMU_LOG=<V|D|I|W|E|F|S>`
-sets the lowest priority shown (default `I`; `S` silences them).
+## Licence
 
-`--boot` runs Android's own `init` in a window (`--headless` for none,
-`ZEROEMU_BACKGROUND=1` to open it behind other windows without taking focus). A device keeps its `/data`
-and `/metadata` between boots, in one file per system image in the user's application
-data, saved when the window closes, on SIGINT, SIGTERM or SIGHUP, or when Android shuts down:
-`--data <file>` puts it elsewhere, `--ephemeral` keeps nothing, and `--wipe-data` starts
-over. A second zeroemu on the same file keeps nothing, and one that can't read the file
-moves it aside as `<file>.bad` rather than saving over it. `--ram <MB>` says how much memory
-the guest believes it has (4096 by default, as AVDs do). It needs the Android
-Emulator installed: zeroemu loads its GPU renderer, `libgfxstream_backend`,
-from the SDK (or `ZEROEMU_GFXSTREAM=<path>`), with the SDK's ANGLE on Metal
-underneath (`ANGLE_DEFAULT_PLATFORM` overrides). For development, `--push
-<host file>:<guest path>` copies a file into the booted device (e.g. into
-`/data/local/tmp`) and `--run "<cmd>"` runs a shell command once SurfaceFlinger
-is up, its output on stderr. `zeroemu --gpu-selftest` checks the renderer and
-window alone.
-
-Host `adb` finds a booted device as it finds an emulator, as `emulator-5554` or the
-next pair of ports free. adbd keeps its RSA check, and the key in `~/.android/adbkey.pub`
-is offered as `/adb_keys`, so the user's own adb is authorized and no other is. Guest
-networking isn't involved. `--adb-port <port>` picks the port and `--no-adb` turns this off.
-
-A device has a network, as `eth1` at 10.0.2.15 with the name server at 10.0.2.3. It's a
-NAT without packets: a guest's sockets and ports are its own, and a host socket appears
-only when a connection really goes out. `--no-net` leaves the network out altogether.
-
-In the window, the mouse is a finger and scrolling drags one (a person's flick
-becomes a fling). F1 is Home, Escape is Back, F2 is recent apps.
-
-Guest threads take their host priority from what Android says about them: real-time
-policies and nice -4 or better count as display work, the `top-app` cgroup as
-foreground, nice 10 or worse and the `background` and `dex2oat` cgroups as
-background. Background threads take turns on half the host's cores, as a phone
-would keep them to its little ones.
-
-`ZEROEMU_STRACE=1` (or `--strace`) logs every syscall (`ZEROEMU_STRACE=<name>`:
-only of programs whose path contains it); `ZEROEMU_BINDER_TRACE=1`
-logs every binder transaction; `ZEROEMU_WATCHDOG=<secs>` forces a stuck guest
-out of the VM and dumps its registers. Fatal faults print a backtrace as
-library+offset, and writes to `/dev/kmsg` (where `servicemanager` and `init`
-log) appear on stderr. `ZEROEMU_DUMP=<secs>` prints, every that many seconds,
-each guest thread with the syscall it is in, for how long, and its backtrace;
-`kill -USR1` on zeroemu prints one such dump at any time (without backtraces
-unless `ZEROEMU_DUMP` is set). `ZEROEMU_DAC_LOG=1` logs every file permission refusal: the process, its ids and
-groups, the syscall, the path, and the mode and owner that refused it (or the rule:
-sticky directory, owner only, a missing capability). `ZEROEMU_DAC=0` turns file
-permissions off altogether, as before zeroemu had them, to tell whether one is behind a
-failure. `ZEROEMU_FD_TRACE=<name>` logs every descriptor
-added to or removed from the tables of programs whose path contains it.
-`ZEROEMU_INPUT_FIFO=<path>` takes lines from a host FIFO as if from the window,
-for tests that must not touch the host's mouse: `down X Y`, `move X Y`, `up X Y`,
-`wheel X Y DX DY` (0 to 1 across the display), `key CODE 1|0` (Linux key codes),
-`resize W H` (the window's content, in points), and `shot PATH`, which writes the frame on
-show as a BMP. `ZEROEMU_GPU_STATS=1` prints the display's frame rate every five seconds
-(and black frames, when frames are read back), and
-`ZEROEMU_SCHED_TRACE=1` each change in a thread's host priority.
-`ZEROEMU_NET_TRACE=1` logs each network socket call and where connections go.
-`ZEROEMU_BINDER_RING=1` keeps each thread's last binder events, ioctls included, and
-prints them when its process is killed by a signal.
-`ZEROEMU_SYSCOUNT=1` adds to each thread dump what each thread has called since the
-last, which finds a thread in a loop: send `SIGUSR1` twice, a few seconds apart.
-`ZEROEMU_MEMSTAT=1` adds to each thread dump where memory has gone, by kind and by file.
-`ZEROEMU_GPU_STATS=1`'s line also says how many sleeping threads events woke and how many
-vCPUs were made each second; `ZEROEMU_WAKE_STATS=1` adds the keys that woke the most, and
-prints where a key that wakes over a hundred threads at once is announced from.
-`ZEROEMU_SENSOR_TRACE=1` logs the rates the sensors HAL asks for.
-`ZEROEMU_PROPS="name=value ..."` adds Android properties at boot (`ro.lmk.debug=true`
-makes `lmkd` say what it decides).
-`ZEROEMU_TRACE=<file>` writes Android's own trace markers to a host file, each with the
-guest's monotonic time, pid and tid, with zeroemu's GPU ioctls on the guest thread that made
-them; turn Android's tags on with `ZEROEMU_PROPS=debug.atrace.tags.enableflags=0x86e`
-(graphics, input, view, window and activity managers, HALs). Tracing slows the guest
-little enough to measure frames with it.
-`ZEROEMU_DRM_TRACE=1` logs GPU ioctls, transfers and fences;
-`ZEROEMU_GPU_LOG=<E|W|I|D>` shows the renderer's own log; `ZEROEMU_READBACK=1` reads each
-frame back for the window to draw, as zeroemu did before the renderer drew into the window
-itself, and `ZEROEMU_GPU_SERIAL=1` sends every GPU call through one thread again;
-`ZEROEMU_SAVE_FRAMES=<dir>` (with `ZEROEMU_READBACK=1`) and `ZEROEMU_DUMP_RES=<dir>` save
-displayed frames and GPU buffers as raw pixels.
-
-On macOS, `cargo run` signs the binary with the `com.apple.security.hypervisor`
-entitlement (see `scripts/macos-runner.sh`); without it the VM cannot be created.
-On Windows, enable the "Windows Hypervisor Platform" optional feature.
-
-## Design rules
-
-- `src/kernel.rs`, `src/elf.rs`, and `src/arch.rs` must not use POSIX APIs. Windows
-  has no `fork`, `mmap`, or signals, so processes, address spaces, and file
-  descriptors are implemented inside the runtime and never delegated to the host.
-- Syscalls are decoded through `arch::Sysno`, so one implementation serves both
-  the arm64 (generic) and x86_64 syscall tables.
-- `mm` owns all page tables. Backends contribute only kernel-window pages
-  (trap stubs at `paging::KERNEL_WINDOW`, mapped privileged-only into every
-  address space) and enter the guest on the page-table root they are given.
-
-## Memory
-
-Measured on an M1 Pro with the default 4 GB, as Activity Monitor shows it:
-
-| | Activity Monitor |
-|---|---|
-| Five minutes after a first boot, nothing opened | 3.3 GB |
-| 16 apps opened one after another | 5.6 GB |
-| Those closed again | 4.2 GB |
-| Five minutes after a first boot, before this was looked at | about 14 GB |
-
-- Files on the system image live in a page cache: read and decompressed a page at a time when
-  wanted, one copy each, in guest memory, shared by whatever maps them until it writes.
-  Pages nothing has mapped stay up to 256 MB and then go, oldest first. ELF segments map
-  from the file.
-- Files on `/data` take their turn with those. Their pages can leave memory for the data
-  file they were last saved in, unchanged, or a scratch file that goes when zeroemu does.
-- The guest is told it has 4 GB. Past that, what the page cache holds goes first, and then
-  `/proc/pressure/memory` wakes Android's own `lmkd`, which closes the least important apps
-  as on a phone. Frames can go past what the guest is told, up to the 32 GB ceiling, if it
-  takes `lmkd` a moment; nothing else stops them.
-- Frames are kept together by process in 64 KB blocks, each its own memory object, and whole
-  blocks go back to the host beyond 64 MB free. A block with any frame in use can't, so
-  closing apps gives back less than they took; the rest gets reused first.
-
-Measure with `top -l 1 -pid <pid> -stats mem` or `footprint <pid>`, which agree. `ps`'s RSS
-leaves out what macOS has compressed, and can be a tenth of the truth. They agree because
-blocks are *purgeable* memory objects, never marked volatile: macOS charges ordinary memory
-once for the host's mapping of a page and again for the VM's, and Activity Monitor would show
-guest memory twice. This is accounting: the page exists once either way.
-
-## Performance notes
-
-A syscall round trip (guest → host → guest) is ~1.0 µs on an M1 Pro (1M
-`getpid` calls in 1.0 s), about 10x a native syscall. Planned mitigations:
-
-- a vDSO page so `clock_gettime` / `gettimeofday` never exit the VM;
-- fewer register accesses per exit;
-- implementing binder transactions and futex wakeups without extra round trips.
-
-Smoothness, measured on an M1 Pro: flinging the launcher's app list 48 times, with a settled
-`/data` and the window covered, as Android's own frame statistics (`dumpsys gfxinfo`)
-count it, two runs each:
-
-| | Janky frames | Median frame | 90th percentile | 99th percentile |
-|---|---|---|---|---|
-| Frames read back into host memory (before) | 7.6%, 7.0% | 19, 19 ms | 23, 22 ms | 28, 29 ms |
-| The renderer draws into the window | 5.0%, 5.1% | 12, 14 ms | 21, 21 ms | 25, 28 ms |
-| And threads stop waking each other for nothing (CPU, below) | 1.2%, 1.0% | 8, 8 ms | 11, 10 ms | 20, 19 ms |
-
-A freshly booted device, still busy setting itself up, gains more (one run each, opening
-the app list included): the median frame went from 29 ms to 18 ms and janky frames from
-30% to 16%. What changed:
-
-- The renderer draws each frame into the window itself, as the Android Emulator does,
-  at the screen's real pixel density. Before, SurfaceFlinger waited 3 ms per frame while
-  zeroemu read the frame back, then copied it twice more to show it.
-- GPU calls went through one zeroemu thread, so a read on one app's GL pipe, which
-  waits for the renderer's answer, held up every other app and SurfaceFlinger's
-  composition. Pipe transfers now run on the thread that asked, one at a time per
-  context; only creating or freeing a GPU buffer or context waits for the ones under way,
-  as the renderer's maps of them have no lock of their own.
-- zeroemu tells macOS its work is user-initiated, so App Nap doesn't throttle it while
-  its window is covered: a device keeps running in the background, as a phone's apps do
-  with the screen off, and under App Nap frames took about eight times as long. The Mac
-  can still sleep.
-- Fence, vblank and page-flip times were on the wall clock rather than the guest's
-  monotonic clock, so Android's frame statistics said every frame took five seconds,
-  and SurfaceFlinger's vsync model was fed times it couldn't use.
-
-What's left is mostly the first time something is drawn: a shader compiled, or icons
-uploaded, can cost 50 to 150 ms.
-
-CPU, as macOS counts zeroemu's threads (Activity Monitor's figure), a settled device:
-
-| | Before | Now |
-|---|---|---|
-| Idle at the home screen | 51% of a core | 16% |
-| Flinging the app list | 270-320% | 95% |
-
-- Threads asleep in poll, epoll and the like are woken by keys their files hash onto.
-  There were 63 keys for well over a thousand sleeping threads, so every event woke
-  dozens of threads that had nothing to do, and that was most of the idle CPU. There
-  are now 4096. Netlink sockets, ptys, GPU fences and DRM events have keys of their own,
-  where each of their events used to wake everyone or every GPU waiter.
-- A vCPU belongs to its host thread, and the hypervisor allows 64. Threads that went to
-  sleep holding one kept it for as long as they slept, which kept the pool short, so
-  every thread that blocked for a moment gave its own up and made a new one when it
-  woke: 150 a second at idle. Now threads asleep in the kernel for a second give theirs
-  back when places run short.
-- The emulated sensors sent all nine sensors' readings every 10 ms, the fastest rate
-  anything had asked for, each reading waking the sensors HAL. The HAL makes Android's
-  events itself, at each sensor's rate, from the last reading it got, so zeroemu now
-  sends a reading once, when the HAL turns the sensor on.
-- The window's event loop wakes every 50 ms rather than every 8 once the renderer draws
-  into the window itself.
-
-Android sees CPU time too now: `/proc/<pid>/stat` and `/proc/stat`, `getrusage`, and
-the CPU-time clocks (`CLOCK_THREAD_CPUTIME_ID` was the time since boot), so `top`,
-`dumpsys cpuinfo` and ART's own accounting work. All of a thread's time counts as user
-time: zeroemu can't tell the time it spends on a thread's behalf from the thread's own.
-
-What idle CPU is left is mostly Android's: the composer calls SurfaceFlinger with a
-vsync 60 times a second whatever is on screen, as the emulator's images tell
-SurfaceFlinger not to trust present fences, and it keeps hardware vsync on for as long
-as it doesn't.
-
-Smoothness is expected to come from what disappears: there is no virtual GPU
-pipe, no second compositor, no guest kernel scheduler, and no virtual device
-emulation.
+Apache-2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).

@@ -9,6 +9,7 @@ typedef long i64;
 typedef unsigned int u32;
 typedef unsigned short u16;
 
+#define NR_listxattr 11
 #define NR_ioctl 29
 #define NR_mkdirat 34
 #define NR_umount2 39
@@ -50,6 +51,13 @@ typedef unsigned short u16;
 #define EINVAL 22
 #define FUSE_DEV_IOC_CLONE 0x8004e500
 #define FUSE_INIT 26
+#define FS_IOC_GETFLAGS 0x80086601
+#define FS_IOC_SETFLAGS 0x40086602
+#define FS_IOC_FSGETXATTR 0x801c581f
+#define FS_IOC_FSSETXATTR 0x401c5820
+#define FS_PROJINHERIT_FL 0x20000000
+#define FS_XFLAG_PROJINHERIT 0x200
+#define ENOTTY 25
 
 static i64 sys6(i64 n, i64 a, i64 b, i64 c, i64 d, i64 e, i64 f) {
     register i64 x8 __asm__("x8") = n;
@@ -262,7 +270,36 @@ int cmain(void) {
     sys(NR_newfstatat, AT_FDCWD, "/tmp/f/0/hello", st, 0);
     check((((u32 *)st)[4] & 0777) == 0644, "and changes nothing");
 
+    // vold's quota setup on /data/media: a project id that new files and directories inherit.
+    sys(NR_mkdirat, AT_FDCWD, "/data/media/0/app", 0770);
+    int d = (int)sys(NR_openat, AT_FDCWD, "/data/media/0/app", O_RDONLY, 0);
+    u32 fsx[7] = {0};
+    check(sys(NR_ioctl, d, FS_IOC_FSGETXATTR, fsx) == 0 && fsx[3] == 0, "FS_IOC_FSGETXATTR: no project id yet");
+    fsx[3] = 1234;
+    check(sys(NR_ioctl, d, FS_IOC_FSSETXATTR, fsx) == 0, "FS_IOC_FSSETXATTR sets one");
+    u32 fl = 0;
+    check(sys(NR_ioctl, d, FS_IOC_GETFLAGS, &fl) == 0 && fl == 0, "FS_IOC_GETFLAGS");
+    fl = FS_PROJINHERIT_FL;
+    check(sys(NR_ioctl, d, FS_IOC_SETFLAGS, &fl) == 0, "FS_IOC_SETFLAGS: project id inheritance");
+    sys(NR_close, d);
+    sys(NR_mkdirat, AT_FDCWD, "/data/media/0/app/files", 0770);
+    put("/data/media/0/app/files/f", "x");
+    d = (int)sys(NR_openat, AT_FDCWD, "/data/media/0/app/files", O_RDONLY, 0);
+    fsx[0] = fsx[3] = 0;
+    check(sys(NR_ioctl, d, FS_IOC_FSGETXATTR, fsx) == 0 && fsx[3] == 1234 && (fsx[0] & FS_XFLAG_PROJINHERIT), "a new directory inherits the id and passes it on");
+    sys(NR_close, d);
+    d = (int)sys(NR_openat, AT_FDCWD, "/data/media/0/app/files/f", O_RDONLY, 0);
+    fsx[0] = fsx[3] = 0;
+    check(sys(NR_ioctl, d, FS_IOC_FSGETXATTR, fsx) == 0 && fsx[3] == 1234 && !(fsx[0] & FS_XFLAG_PROJINHERIT), "a new file inherits the id only");
+    sys(NR_close, d);
+    n = sys(NR_listxattr, "/data/media/0/app", buf, sizeof buf);
+    check(n >= 0 && !contains(buf, n, "droidrt"), "listxattr shows none of it");
+    d = (int)sys(NR_openat, AT_FDCWD, "/tmp/f/0/app", O_RDONLY, 0);
+    check(sys(NR_ioctl, d, FS_IOC_GETFLAGS, &fl) == -ENOTTY, "through the fuse mount: ENOTTY (the daemon answers no ioctls)");
+    sys(NR_close, d);
+
     // An app's uid: the kernel refuses nothing on the mount, as without default_permissions.
+    put("/tmp/notmine", "root's");
     i64 pid = fork_();
     if (pid == 0) {
         if (sys(NR_setgroups, 0, 0) || sys(NR_setresgid, 10001, 10001, 10001) || sys(NR_setresuid, 10001, 10001, 10001)) sys(NR_exit_group, 99);
@@ -270,12 +307,16 @@ int cmain(void) {
         int fd = (int)sys(NR_openat, AT_FDCWD, "/tmp/f/0/hello", O_RDWR, 0);
         if (fd < 0) bad |= 1;
         if (sys(NR_openat, AT_FDCWD, "/data/media/0/hello", O_RDONLY, 0) != -EACCES) bad |= 2;
-        if (put("/tmp/f/0/app", "app") != 0) bad |= 4;
+        if (put("/tmp/f/0/new", "app") != 0) bad |= 4;
+        // Not the owner: FS_IOC_SETFLAGS is EPERM, as chmod would be.
+        int nm = (int)sys(NR_openat, AT_FDCWD, "/tmp/notmine", O_RDONLY, 0);
+        u32 f0 = 0;
+        if (nm < 0 || sys(NR_ioctl, nm, FS_IOC_SETFLAGS, &f0) != -EPERM) bad |= 8;
         sys(NR_exit_group, bad);
     }
     int ws = wait_(pid);
-    check(((ws >> 8) & 0xff) == 0, "uid 10001 opens and creates on the mount; /data/media still refuses it");
-    sys(NR_newfstatat, AT_FDCWD, "/data/media/0/app", st, 0);
+    check(((ws >> 8) & 0xff) == 0, "uid 10001 opens and creates on the mount; /data/media still refuses it; FS_IOC_SETFLAGS on root's file: EPERM");
+    sys(NR_newfstatat, AT_FDCWD, "/data/media/0/new", st, 0);
     check(((u32 *)st)[6] == 0, "what it created there belongs to the daemon (root here)");
 
     // A daemon of another uid: what is created belongs to it, as on the lower filesystem.

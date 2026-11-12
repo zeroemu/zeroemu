@@ -149,6 +149,14 @@ pub trait FileSystem: Send + Sync {
     fn removexattr(&self, _ino: u64, _name: &str) -> Result<(), i64> {
         Err(if self.writable() { EOPNOTSUPP } else { EROFS })
     }
+    /// ext4's inode flags and quota project id (FS_IOC_GETFLAGS, FS_IOC_FSGETXATTR):
+    /// tmpfs keeps them, since /data is ext4 on a device and vold sets them there.
+    fn fs_flags(&self, _ino: u64) -> Result<(u32, u32), i64> {
+        Err(ENOTTY)
+    }
+    fn set_fs_flags(&self, _ino: u64, _flags: u32, _projid: u32) -> Result<(), i64> {
+        Err(ENOTTY)
+    }
 }
 
 pub const XATTR_CREATE: u32 = 1;
@@ -1444,6 +1452,17 @@ impl Vfs {
 
     pub fn removexattr(&self, node: &Node, name: &str) -> Result<(), i64> {
         self.fs(node).removexattr(node.ino, name)
+    }
+
+    pub fn fs_flags(&self, node: &Node) -> Result<(u32, u32), i64> {
+        self.fs(node).fs_flags(node.ino)
+    }
+
+    pub fn set_fs_flags(&self, node: &Node, flags: u32, projid: u32) -> Result<(), i64> {
+        if self.readonly(node) {
+            return Err(EROFS);
+        }
+        self.fs(node).set_fs_flags(node.ino, flags, projid)
     }
 
     pub fn readdir(&self, node: &Node) -> Result<Vec<Dirent>, i64> {

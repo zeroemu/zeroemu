@@ -181,6 +181,15 @@ pub struct Xattrs(BTreeMap<String, Vec<u8>>);
 
 const ACL_NAMES: [&str; 2] = ["system.posix_acl_access", "system.posix_acl_default"];
 
+/// ext4's inode flags and quota project id (FS_IOC_GETFLAGS, FS_IOC_FSGETXATTR), kept
+/// among the attributes under names no guest can reach, so they are saved with /data:
+/// vold gives each app's directories in /data/media a project id to inherit.
+const FLAGS_NAME: &str = "droidrt.flags";
+const PROJID_NAME: &str = "droidrt.projid";
+const INTERNAL: &str = "droidrt.";
+/// FS_PROJINHERIT_FL: children take the directory's project id, and directories the flag.
+pub const FS_PROJINHERIT_FL: u32 = 0x2000_0000;
+
 /// tmpfs stores security.*, trusted.*, user.* and POSIX ACLs, as with
 /// CONFIG_TMPFS_POSIX_ACL: /data lives here and Android expects ext4's ACLs.
 /// Anything else is EOPNOTSUPP on get, set and remove. ACLs are stored, not
@@ -219,7 +228,29 @@ impl Xattrs {
     }
 
     pub fn list(&self) -> Vec<String> {
-        self.0.keys().cloned().collect()
+        self.0.keys().filter(|k| !k.starts_with(INTERNAL)).cloned().collect()
+    }
+
+    fn internal(&self, name: &str) -> u32 {
+        self.0.get(name).and_then(|v| v.as_slice().try_into().ok()).map_or(0, u32::from_le_bytes)
+    }
+
+    fn set_internal(&mut self, name: &str, v: u32) {
+        if v == 0 {
+            self.0.remove(name);
+        } else {
+            self.0.insert(name.to_string(), v.to_le_bytes().to_vec());
+        }
+    }
+
+    /// (inode flags, project id).
+    pub fn fs_flags(&self) -> (u32, u32) {
+        (self.internal(FLAGS_NAME), self.internal(PROJID_NAME))
+    }
+
+    pub fn set_fs_flags(&mut self, flags: u32, projid: u32) {
+        self.set_internal(FLAGS_NAME, flags);
+        self.set_internal(PROJID_NAME, projid);
     }
 
     pub fn remove(&mut self, name: &str) -> Result<(), i64> {
@@ -229,9 +260,15 @@ impl Xattrs {
         self.0.remove(name).map(|_| ()).ok_or(ENODATA)
     }
 
-    /// What a new child of a directory with these attributes starts with.
-    fn inherited(&self) -> Xattrs {
-        Xattrs(self.0.get_key_value(XATTR_SELINUX).map(|(k, v)| (k.clone(), v.clone())).into_iter().collect())
+    /// What a new child of a directory with these attributes starts with: its label,
+    /// and its project id where the directory passes it on (ext4_new_inode).
+    fn inherited(&self, is_dir: bool) -> Xattrs {
+        let mut x = Xattrs(self.0.get_key_value(XATTR_SELINUX).map(|(k, v)| (k.clone(), v.clone())).into_iter().collect());
+        let (flags, projid) = self.fs_flags();
+        if flags & FS_PROJINHERIT_FL != 0 {
+            x.set_fs_flags(if is_dir { FS_PROJINHERIT_FL } else { 0 }, projid);
+        }
+        x
     }
 }
 
@@ -306,7 +343,7 @@ impl Tmpfs {
             parent.nlink += 1;
         }
         // New nodes take their directory's label, until policy-driven labeling exists.
-        let xattrs = parent.xattrs.inherited();
+        let xattrs = parent.xattrs.inherited(is_dir);
         nodes.insert(ino, Node { mode, uid: 0, gid: 0, nlink: if is_dir { 2 } else { 1 }, mtime: now(), kind, xattrs });
         Ok(ino)
     }
@@ -603,6 +640,15 @@ impl FileSystem for Tmpfs {
 
     fn removexattr(&self, ino: u64, name: &str) -> Result<(), i64> {
         self.nodes.lock().unwrap().get_mut(&ino).ok_or(ENOENT)?.xattrs.remove(name)
+    }
+
+    fn fs_flags(&self, ino: u64) -> Result<(u32, u32), i64> {
+        Ok(self.nodes.lock().unwrap().get(&ino).ok_or(ENOENT)?.xattrs.fs_flags())
+    }
+
+    fn set_fs_flags(&self, ino: u64, flags: u32, projid: u32) -> Result<(), i64> {
+        self.nodes.lock().unwrap().get_mut(&ino).ok_or(ENOENT)?.xattrs.set_fs_flags(flags, projid);
+        Ok(())
     }
 }
 

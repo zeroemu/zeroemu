@@ -77,6 +77,15 @@ pub fn handles(no: Sysno) -> bool {
     )
 }
 
+// Inode flags and the quota project id (inode_flags_ioctl).
+const FS_IOC_GETFLAGS: u64 = 0x8008_6601;
+const FS_IOC_SETFLAGS: u64 = 0x4008_6602;
+const FS_IOC32_GETFLAGS: u64 = 0x8004_6601;
+const FS_IOC32_SETFLAGS: u64 = 0x4004_6602;
+const FS_IOC_FSGETXATTR: u64 = 0x801c_581f;
+const FS_IOC_FSSETXATTR: u64 = 0x401c_5820;
+const INODE_FLAG_IOCTLS: [u64; 6] = [FS_IOC_GETFLAGS, FS_IOC_SETFLAGS, FS_IOC32_GETFLAGS, FS_IOC32_SETFLAGS, FS_IOC_FSGETXATTR, FS_IOC_FSSETXATTR];
+
 pub enum Kind {
     Stdin,
     Stdout,
@@ -944,6 +953,14 @@ impl Kernel {
                     Kind::Inet(s) if matches!(cmd, 0x541b | 0x5411 | 0x8905 | 0x8906) => return self.inet_queue_ioctl(t, s, cmd, a[2]),
                     // Socket ioctls (SIOC*): the interfaces.
                     Kind::Inet(_) if (0x8900..0x89ff).contains(&cmd) => return self.inet_ioctl(t, cmd, a[2]),
+                    Kind::Node(_) | Kind::Mem(_) if INODE_FLAG_IOCTLS.contains(&cmd) => {
+                        let node = match &f.kind {
+                            Kind::Node(nf) => nf.lock().unwrap().node.clone(),
+                            Kind::Mem(m) => m.node.clone().ok_or(ENOTTY)?,
+                            _ => unreachable!(),
+                        };
+                        return self.inode_flags_ioctl(t, &node, cmd, a[2]);
+                    }
                     _ => {}
                 }
                 const FIONCLEX: u64 = 0x5450;
@@ -1397,6 +1414,50 @@ impl Kernel {
             Kind::Mem(_) => Ok(f),
             Kind::Node(_) => Err(EINVAL),
             _ => Err(EINVAL),
+        }
+    }
+
+    /// FS_IOC_GETFLAGS and FS_IOC_SETFLAGS, FS_IOC_FSGETXATTR and FS_IOC_FSSETXATTR on
+    /// a file of /data's tmpfs, which stands in for ext4: vold marks each app's
+    /// directories in shared storage with a quota project id its files inherit.
+    fn inode_flags_ioctl(&self, t: &Thread, node: &Node, cmd: u64, arg: u64) -> Result<i64, i64> {
+        const FS_XFLAG_PROJINHERIT: u32 = 0x200;
+        let vfs = self.vfs()?;
+        // A fuse daemon would be asked, and MediaProvider's answers no ioctls.
+        if super::fuse::is_fuse(vfs, node) {
+            return Err(ENOTTY);
+        }
+        let (flags, projid) = vfs.fs_flags(node)?;
+        let projinherit = crate::tmpfs::FS_PROJINHERIT_FL;
+        match cmd {
+            FS_IOC_GETFLAGS | FS_IOC32_GETFLAGS => t.proc.mm().write_u32(arg, flags).map(|_| 0),
+            FS_IOC_FSGETXATTR => {
+                let mut fsx = [0u8; 28];
+                fsx[0..4].copy_from_slice(&(if flags & projinherit != 0 { FS_XFLAG_PROJINHERIT } else { 0 }).to_le_bytes());
+                fsx[12..16].copy_from_slice(&projid.to_le_bytes());
+                t.proc.mm().write(arg, &fsx).map(|_| 0)
+            }
+            _ => {
+                // inode_owner_or_capable, as for chmod.
+                if super::perm::enforcing() && super::perm::applies(vfs, node) && !self.creds(t).owns(&vfs.stat(node)?) {
+                    return Err(EPERM);
+                }
+                if cmd == FS_IOC_FSSETXATTR {
+                    let mut fsx = [0u8; 28];
+                    t.proc.mm().read(arg, &mut fsx)?;
+                    let xflags = u32::from_le_bytes(fsx[0..4].try_into().unwrap());
+                    let projid = u32::from_le_bytes(fsx[12..16].try_into().unwrap());
+                    let flags = flags & !projinherit | if xflags & FS_XFLAG_PROJINHERIT != 0 { projinherit } else { 0 };
+                    return vfs.set_fs_flags(node, flags, projid).map(|_| 0);
+                }
+                let new = t.proc.mm().read_u32(arg)?;
+                // Kept, though nothing acts on them; immutable and append-only would need enforcing.
+                const SETTABLE: u32 = 0x1 | 0x2 | 0x4 | 0x8 | 0x40 | 0x80 | 0x1_0000 | 0x2_0000 | 0x8_0000 | 0x2000_0000 | 0x4000_0000;
+                if new & !SETTABLE != 0 {
+                    return Err(EOPNOTSUPP);
+                }
+                vfs.set_fs_flags(node, new, projid).map(|_| 0)
+            }
         }
     }
 

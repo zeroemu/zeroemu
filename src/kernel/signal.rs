@@ -8,8 +8,10 @@
 use super::{Kernel, Process, Ret, Thread};
 use crate::errno::*;
 use crate::hv::{CpuState, SyscallRegs, Vcpu};
-use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::collections::HashMap;
+use std::ops::{Deref, DerefMut};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, LockResult, Mutex, MutexGuard, PoisonError};
 
 pub const SIGILL: u32 = 4;
 pub const SIGKILL: u32 = 9;
@@ -51,6 +53,86 @@ const UNBLOCKABLE: u64 = bit(SIGKILL) | bit(SIGSTOP);
 
 const fn bit(sig: u32) -> u64 {
     1 << (sig - 1)
+}
+
+/// Pending signals of a thread or a process, one entry per number, with a summary
+/// of the numbers that the run loop reads on every way into the guest without the
+/// lock: most of the time nothing is pending, and the process's set is shared by all
+/// of its threads. Linux keeps the same summary (`struct sigpending`'s `signal` set
+/// beside its queue, include/linux/signal_types.h) for the same reason.
+#[derive(Default)]
+pub struct Pending {
+    map: Mutex<HashMap<u32, SigInfo>>,
+    /// The numbers in `map`, as bits. Written only under the lock, when a guard is
+    /// dropped, so a sender's insert is in it before the sender kicks anyone.
+    bits: AtomicU64,
+}
+
+pub struct PendingGuard<'a> {
+    bits: &'a AtomicU64,
+    map: MutexGuard<'a, HashMap<u32, SigInfo>>,
+}
+
+impl Pending {
+    /// As `Mutex::lock`: every change goes through the guard, which brings the
+    /// summary up to date before it lets go of the lock.
+    pub fn lock(&self) -> LockResult<PendingGuard<'_>> {
+        match self.map.lock() {
+            Ok(map) => Ok(PendingGuard { bits: &self.bits, map }),
+            Err(e) => Err(PoisonError::new(PendingGuard { bits: &self.bits, map: e.into_inner() })),
+        }
+    }
+
+    /// The numbers pending, without the lock. A signal sent after this is read
+    /// kicks the thread it is for, which makes it look again.
+    pub fn bits(&self) -> u64 {
+        self.bits.load(Ordering::Acquire)
+    }
+}
+
+impl Deref for PendingGuard<'_> {
+    type Target = HashMap<u32, SigInfo>;
+    fn deref(&self) -> &Self::Target {
+        &self.map
+    }
+}
+
+impl DerefMut for PendingGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.map
+    }
+}
+
+impl Drop for PendingGuard<'_> {
+    fn drop(&mut self) {
+        let bits = self.map.keys().filter(|&&s| (1..=64).contains(&s)).fold(0, |b, &s| b | bit(s));
+        self.bits.store(bits, Ordering::Release);
+    }
+}
+
+/// The mask a sigsuspend, ppoll, pselect or epoll_pwait replaced, to put back once
+/// the handler of the signal that ended it has run (Linux's saved_sigmask and
+/// TIF_RESTORE_SIGMASK, kernel/signal.c). Only its own thread reads or writes it, so
+/// it needs no lock, only to be shareable.
+#[derive(Default)]
+pub struct SavedMask {
+    set: AtomicBool,
+    mask: AtomicU64,
+}
+
+impl SavedMask {
+    pub fn put(&self, mask: u64) {
+        self.mask.store(mask, Ordering::Relaxed);
+        self.set.store(true, Ordering::Relaxed);
+    }
+
+    pub fn take(&self) -> Option<u64> {
+        self.set.swap(false, Ordering::Relaxed).then(|| self.mask.load(Ordering::Relaxed))
+    }
+
+    pub fn is_set(&self) -> bool {
+        self.set.load(Ordering::Relaxed)
+    }
 }
 
 #[derive(Clone, Copy, Default, Debug)]
@@ -211,9 +293,27 @@ fn ignored(act: &SigAction, sig: u32, init: bool) -> bool {
 }
 
 impl Thread {
-    pub(super) fn has_deliverable_signal(&self) -> bool {
+    /// Whether a signal it doesn't block is pending, ignored or not: what
+    /// deliver_signals would act on. Read without a lock.
+    fn unblocked_pending(&self) -> bool {
         let mask = self.mask.load(Ordering::Relaxed) & !UNBLOCKABLE;
-        let unmasked = |p: &std::collections::HashMap<u32, SigInfo>| {
+        (self.pending.bits() | self.proc.pending.bits()) & !mask != 0
+    }
+
+    /// Whether deliver_signals has anything to do before the thread goes back into
+    /// the guest: a signal to take, or a mask to put back. The run loop asks this on
+    /// every way in, so it takes no lock (Linux tests TIF_SIGPENDING and
+    /// TIF_RESTORE_SIGMASK on its way back to user space, arch/arm64/kernel/entry-common.c).
+    pub(super) fn signals_to_look_at(&self) -> bool {
+        self.saved_mask.is_set() || self.unblocked_pending()
+    }
+
+    pub(super) fn has_deliverable_signal(&self) -> bool {
+        if !self.unblocked_pending() {
+            return false;
+        }
+        let mask = self.mask.load(Ordering::Relaxed) & !UNBLOCKABLE;
+        let unmasked = |p: &HashMap<u32, SigInfo>| {
             p.keys().copied().filter(|&s| bit(s) & mask == 0).collect::<Vec<_>>()
         };
         let mut sigs = unmasked(&self.pending.lock().unwrap());
@@ -386,12 +486,7 @@ impl Kernel {
                     state.set_return(-EINTR as u64);
                 }
             }
-            let old_mask = t
-                .saved_mask
-                .lock()
-                .unwrap()
-                .take()
-                .unwrap_or(t.mask.load(Ordering::Relaxed));
+            let old_mask = t.saved_mask.take().unwrap_or(t.mask.load(Ordering::Relaxed));
             match self.setup_frame(t, &mut state, sig, &info, &act, old_mask) {
                 Ok(()) => {
                     vcpu.set_state(&state);
@@ -422,7 +517,7 @@ impl Kernel {
             rewind(&mut state, &regs);
             vcpu.set_state(&state);
         }
-        if let Some(m) = t.saved_mask.lock().unwrap().take() {
+        if let Some(m) = t.saved_mask.take() {
             t.mask.store(m, Ordering::Relaxed); // sigsuspend woke without a handler
         }
     }
@@ -501,7 +596,7 @@ impl Kernel {
             Err(e) => return -e,
         };
         let old = t.mask.swap(mask & !UNBLOCKABLE, Ordering::Relaxed);
-        *t.saved_mask.lock().unwrap() = Some(old);
+        t.saved_mask.put(old);
         while !t.interrupted() {
             super::vcpus::blocking();
             t.nap(super::IDLE);
@@ -558,7 +653,7 @@ impl Kernel {
 
     /// The signals pending for the thread or its process.
     pub(super) fn sys_rt_sigpending(&self, t: &Thread, set: u64) -> i64 {
-        let bits = [&t.pending, &t.proc.pending].iter().flat_map(|p| p.lock().unwrap().keys().copied().collect::<Vec<u32>>()).fold(0u64, |acc, s| acc | bit(s));
+        let bits = t.pending.bits() | t.proc.pending.bits();
         match t.proc.mm().write_u64(set, bits) {
             Ok(()) => 0,
             Err(e) => -e,

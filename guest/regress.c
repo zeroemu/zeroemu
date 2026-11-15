@@ -23,6 +23,7 @@ typedef unsigned int u32;
 #define NR_kill 129
 #define NR_tkill 130
 #define NR_rt_sigaction 134
+#define NR_rt_sigprocmask 135
 #define NR_setresuid 147
 #define NR_setresgid 149
 #define NR_gettid 178
@@ -100,12 +101,22 @@ static i64 reap(i64 pid, i64 ms) {
 static volatile int handled;
 static void handler(int s) { (void)s; handled++; }
 
+// Spins in user code, with no syscall, until a signal's handler says to stop.
+static volatile int spin_tid, spin_stop, spin_done;
+static void spin_handler(int s) { (void)s; spin_stop = 1; }
+static void spin_on(void *arg) {
+    (void)arg;
+    spin_tid = (int)sys(NR_gettid);
+    while (!spin_stop) {}
+    spin_done = 1;
+}
+
 static int fa, fb;
 static volatile i64 w1_ret = 99, w2_ret = 99;
 static void waiter1(void *arg) { (void)arg; i64 ts[2] = {0, 300000000}; w1_ret = sys(NR_futex, &fa, 0 /* WAIT */, 0, ts); }
 static void waiter2(void *arg) { (void)arg; i64 ts[2] = {3, 0}; w2_ret = sys(NR_futex, &fb, 0 /* WAIT */, 0, ts); }
-static char stacks[2][16384] __attribute__((aligned(16)));
-static int ctid[2];
+static char stacks[3][16384] __attribute__((aligned(16)));
+static int ctid[3];
 
 struct bwr { u64 wsize, wcons, wbuf, rsize, rcons, rbuf; };
 // binder_buffer_object: a scatter-gather buffer, and where in its parent its address goes.
@@ -201,6 +212,29 @@ int cmain(void) {
         sys(NR_exit_group, handled ? 0 : 3);
     }
     check(reap(pid, 3000) == 0, "sa_restorer is ignored without SA_RESTORER");
+
+    // --- a blocked signal runs its handler as soon as it is unblocked: Linux delivers it
+    // on the way back from sigprocmask, before the next instruction
+    handled = 0;
+    i64 usr1[4] = {(i64)handler, 0, 0, 0};
+    sys(NR_rt_sigaction, 10 /* SIGUSR1 */, usr1, 0, 8);
+    u64 block = 1UL << 9, old = 0;
+    sys(NR_rt_sigprocmask, 0 /* SIG_BLOCK */, &block, &old, 8);
+    sys(NR_tkill, sys(NR_gettid), 10);
+    int before = handled;
+    sys(NR_rt_sigprocmask, 2 /* SIG_SETMASK */, &old, 0, 8);
+    int after = handled;
+    check(before == 0 && after == 1, "a pending signal runs once unblocked, before sigprocmask returns");
+
+    // --- a signal reaches a thread that spins in user code and never makes a syscall
+    i64 usr2[4] = {(i64)spin_handler, 0, 0, 0};
+    sys(NR_rt_sigaction, 12 /* SIGUSR2 */, usr2, 0, 8);
+    spawn(stacks[2] + 16384, spin_on, 0, &ctid[2]);
+    for (int i = 0; i < 200 && !spin_tid; i++) nap_ms(5);
+    nap_ms(20); // well into its loop
+    sys(NR_tkill, spin_tid, 12);
+    for (int i = 0; i < 200 && !spin_done; i++) nap_ms(5);
+    check(spin_done, "a signal interrupts a thread spinning in user code");
 
     // --- an exclusive load across a 16-byte boundary
     pid = fork_();

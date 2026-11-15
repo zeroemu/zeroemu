@@ -8,7 +8,7 @@ use crate::pagecache::{PageCache, PageSource};
 use crate::paging::{self, KERNEL_WINDOW, PROT_EXEC, PROT_READ, PROT_WRITE, USER_TOP};
 use crate::phys::{PAGE, PhysMem};
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 /// Lowest mappable address (Linux's mmap_min_addr on Android).
@@ -373,6 +373,41 @@ impl Drop for SharedObject {
     }
 }
 
+/// Where an address space's TLB flushes stand. Every thread compares the two on
+/// every way into the guest, so they are kept apart from the address space's lock:
+/// `gen` changes only under that lock, and a thread takes it only when it is behind.
+#[derive(Default)]
+pub struct TlbGen {
+    /// Bumped when entries are removed or downgraded.
+    changed: AtomicU64,
+    /// Every flush asked for up to this generation has run in the guest.
+    flushed: AtomicU64,
+}
+
+impl TlbGen {
+    /// Whether translations the page tables no longer allow may still be cached.
+    /// A bump that lands just after this is read is as one that came just after the
+    /// lock was let go: the thread that bumped flushes before it next runs guest code.
+    pub fn behind(&self) -> bool {
+        self.flushed.load(Ordering::Acquire) < self.changed.load(Ordering::Acquire)
+    }
+
+    pub fn current(&self) -> u64 {
+        self.changed.load(Ordering::Acquire)
+    }
+
+    /// A flush asked for at generation `g` has run.
+    pub fn flushed_to(&self, g: u64) {
+        self.flushed.fetch_max(g, Ordering::Release);
+    }
+
+    /// Under the address space's lock, after the entries changed and with what they
+    /// pointed at already in `stale`.
+    fn bump(&self) {
+        self.changed.fetch_add(1, Ordering::Release);
+    }
+}
+
 /// What an unmap left behind: frames and shared objects that must outlive the
 /// next TLB flush.
 #[derive(Default)]
@@ -527,13 +562,13 @@ pub struct AddressSpace {
     pub arg_start: u64,
     pub arg_end: u64,
     pub brk: u64,
-    /// Bumped when entries are removed or downgraded. `flushed_gen` catches up
-    /// once a TLB flush has run in the guest. A thread behind on this flushes
-    /// before re-entering, even if another thread has asked for a flush too:
-    /// that one may be preempted, and this thread must not run on old entries.
-    /// `stale` frames may be freed only after the flush.
-    pub tlb_gen: u64,
-    pub flushed_gen: u64,
+    /// Bumped when entries are removed or downgraded; `flushed` catches up once a
+    /// TLB flush has run in the guest. A thread behind on this flushes before
+    /// re-entering, even if another thread has asked for a flush too: that one may
+    /// be preempted, and this thread must not run on old entries. `stale` frames may
+    /// be freed only after the flush. Shared with the run loops of the process's
+    /// threads, and carried over by exec to the address space that replaces this one.
+    pub tlb: Arc<TlbGen>,
     stale: Stale,
 }
 
@@ -560,8 +595,7 @@ impl AddressSpace {
             arg_start: 0,
             arg_end: 0,
             brk: 0,
-            tlb_gen: 0,
-            flushed_gen: 0,
+            tlb: Arc::default(),
             stale: Stale::default(),
         })
     }
@@ -791,7 +825,7 @@ impl AddressSpace {
             }
         }
         if freed {
-            self.tlb_gen += 1;
+            self.tlb.bump();
         }
         Ok(())
     }
@@ -803,7 +837,7 @@ impl AddressSpace {
             return Err(EINVAL);
         }
         if self.clear_pages(start, start.saturating_add(page_up(len))) {
-            self.tlb_gen += 1;
+            self.tlb.bump();
         }
         Ok(())
     }
@@ -908,7 +942,7 @@ impl AddressSpace {
         self.phys.write_pte(slot, e);
         // Sibling threads may read it through old entries until the flush.
         self.stale.frames.push(frame);
-        self.tlb_gen += 1;
+        self.tlb.bump();
         Ok(e)
     }
 
@@ -959,7 +993,7 @@ impl AddressSpace {
             changed = true;
         });
         if changed {
-            self.tlb_gen += 1;
+            self.tlb.bump();
         }
         Ok(())
     }
@@ -1037,7 +1071,7 @@ impl AddressSpace {
             let slot = walk(&self.phys, owner, &mut self.tables, self.root.root, 0, dst + off, true)?.unwrap();
             self.phys.write_u64(slot, e);
         }
-        self.tlb_gen += 1;
+        self.tlb.bump();
         Ok(dst)
     }
 
@@ -1206,7 +1240,7 @@ impl AddressSpace {
                 self.phys.write_u64(slot, self.entry_for(frame, prot, shared));
             }
             // Either way the entry now allows it; a stale TLB entry caused the fault.
-            self.tlb_gen += 1;
+            self.tlb.bump();
             return Ok(());
         }
         let frame = self.populate(start, &vma, page, write).map_err(|_| SEGV_MAPERR)?;
@@ -1432,7 +1466,7 @@ impl AddressSpace {
         }
         // Entries already changed are changed, whether or not the rest followed.
         if downgraded {
-            self.tlb_gen += 1;
+            self.tlb.bump();
         }
         match failed {
             Some(e) => Err(e),
@@ -1441,6 +1475,12 @@ impl AddressSpace {
     }
 
     /// What was unmapped since the last flush; release it once that happened.
+    /// exec: this address space replaces `old` for the same threads, whose run loops
+    /// keep watching the flush state they started with.
+    pub fn replace_tlb(&mut self, old: &AddressSpace) {
+        self.tlb = old.tlb.clone();
+    }
+
     pub fn take_stale(&mut self) -> Stale {
         std::mem::take(&mut self.stale)
     }

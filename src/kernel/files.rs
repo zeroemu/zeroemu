@@ -2229,7 +2229,7 @@ impl Kernel {
     fn restore_mask(&self, t: &Thread, old: Option<u64>, r: &Result<i64, i64>) {
         if let Some(m) = old {
             if matches!(r, Err(EINTR)) {
-                *t.saved_mask.lock().unwrap() = Some(m);
+                t.saved_mask.put(m);
             } else {
                 t.mask.store(m, Ordering::Relaxed);
             }

@@ -78,9 +78,11 @@ the app list included): the median frame went from 29 ms to 18 ms and janky fram
 What's left is mostly the first time something is drawn: a shader compiled, or icons
 uploaded, can cost 50 to 150 ms.
 
-Smoothness is expected to come from what disappears: there is no virtual GPU
-pipe, no second compositor, no guest kernel scheduler, and no virtual device
-emulation.
+The graphics path is the Android Emulator's: GL calls go through the same gfxstream pipe
+to the same renderer. What differs is the kernel. zeroemu has no guest kernel and no
+emulated devices, but each syscall and page fault leaves the VM, where a guest kernel
+would handle it without an exit, and each guest thread that sleeps or wakes is a host
+thread doing the same.
 
 ## CPU
 

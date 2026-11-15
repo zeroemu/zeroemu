@@ -601,6 +601,12 @@ pub struct Thread {
 static SYSCALL_COUNTS: std::sync::LazyLock<Option<Mutex<HashMap<(i32, u64, i64), u64>>>> =
     std::sync::LazyLock::new(|| (std::env::var("ZEROEMU_SYSCOUNT").as_deref() == Ok("1")).then(Mutex::default));
 
+/// With ZEROEMU_SYSCOUNT too: every exit from the guest since the last thread dump, by
+/// kind (syscall, page fault, kick, anything else), and the time page faults took.
+static EXITS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+static FAULT_NS: AtomicU64 = AtomicU64::new(0);
+static EXITS_SINCE: Mutex<Option<Instant>> = Mutex::new(None);
+
 /// Where a thread entered the kernel: what a thread dump prints for it. The
 /// registers for its backtrace are read only under ZEROEMU_DUMP (they cost a
 /// trip to the hypervisor on every syscall).
@@ -1251,6 +1257,32 @@ impl Kernel {
         eprintln!("[zeroemu] ---- thread dump: {} processes ----", procs.len());
         if let Some(counts) = &*SYSCALL_COUNTS {
             let mut busiest: Vec<_> = counts.lock().unwrap().drain().collect();
+            let now = Instant::now();
+            let since = EXITS_SINCE.lock().unwrap().replace(now);
+            let secs = since.map_or(0.0, |s| (now - s).as_secs_f64()).max(0.001);
+            let [sys, faults, kicks, other] = [0, 1, 2, 3].map(|i| EXITS[i].swap(0, Ordering::Relaxed));
+            // The first dump has no start to divide by: it only starts the count.
+            if since.is_none() {
+                FAULT_NS.store(0, Ordering::Relaxed);
+                eprintln!("[exits] counting from now; the next dump gives the rates");
+            } else {
+                eprintln!(
+                    "[exits] {secs:.1} s: {:.0}/s syscalls, {:.0}/s page faults taking {:.1}% of a core, {:.0}/s kicks, {other} other",
+                    sys as f64 / secs,
+                    faults as f64 / secs,
+                    FAULT_NS.swap(0, Ordering::Relaxed) as f64 / secs / 1e7,
+                    kicks as f64 / secs
+                );
+                let mut by_nr: HashMap<u64, u64> = HashMap::new();
+                for &((_, nr, _), n) in &busiest {
+                    *by_nr.entry(nr).or_default() += n;
+                }
+                let mut by_nr: Vec<_> = by_nr.into_iter().collect();
+                by_nr.sort_by_key(|&(_, n)| std::cmp::Reverse(n));
+                for (nr, n) in by_nr.into_iter().take(30) {
+                    eprintln!("[exits] {:.0}/s {:?}", n as f64 / secs, self.arch.sysno(nr));
+                }
+            }
             busiest.sort_by_key(|&(_, n)| std::cmp::Reverse(n));
             for ((tid, nr, result), n) in busiest.into_iter().take(40) {
                 eprintln!("[syscount] {n} tid {tid} {:?} ({nr}) -> {result}", self.arch.sysno(nr));
@@ -1494,6 +1526,15 @@ impl Kernel {
                 drop(mm);
                 stale.release(&self.phys);
             }
+            if SYSCALL_COUNTS.is_some() {
+                let kind = match exit {
+                    Exit::Syscall => 0,
+                    Exit::PageFault { .. } => 1,
+                    Exit::Interrupted => 2,
+                    _ => 3,
+                };
+                EXITS[kind].fetch_add(1, Ordering::Relaxed);
+            }
             match exit {
                 Exit::Syscall => {
                     let regs = vcpu.syscall_regs();
@@ -1508,7 +1549,11 @@ impl Kernel {
                     }
                 }
                 Exit::PageFault { pc, addr, write, exec } => {
+                    let started = SYSCALL_COUNTS.is_some().then(Instant::now);
                     let faulted = t.proc.mm().fault(addr, write, exec);
+                    if let Some(s) = started {
+                        FAULT_NS.fetch_add(s.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                    }
                     if faulted == Err(crate::mm::FAULT_UFFD) {
                         const BUS_ADRERR: i32 = 2;
                         if !self.signal_caught(t, signal::SIGBUS) {

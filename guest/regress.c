@@ -33,6 +33,7 @@ typedef unsigned int u32;
 #define NR_clone 220
 #define NR_mmap 222
 #define NR_mprotect 226
+#define NR_madvise 233
 #define NR_wait4 260
 #define NR_socketpair 199
 
@@ -68,6 +69,7 @@ static void check(int cond, const char *name) {
     puts_("\n");
     if (!cond) failures++;
 }
+static int seq(const char *a, const char *b, u64 n) { while (n--) if (*a++ != *b++) return 0; return 1; }
 static int streq(const char *a, const char *b) { while (*a && *a == *b) a++, b++; return *a == *b; }
 static void nap_ms(i64 ms) { i64 ts[2] = {ms / 1000, (ms % 1000) * 1000000}; sys(NR_nanosleep, ts, 0); }
 
@@ -129,6 +131,30 @@ static int dtype_of(char *buf, i64 n, const char *name) {
     }
     return -1;
 }
+
+// A number in a /proc file: after `tag` if there is one, or else the `nth` field
+// (from 0) of its first line.
+static char pbuf[4096] __attribute__((aligned(4096)));
+static i64 proc_num(const char *path, const char *tag, int nth) {
+    i64 fd = sys(NR_openat, -100, path, 0, 0);
+    i64 n = fd < 0 ? -1 : sys(NR_read, fd, pbuf, sizeof pbuf - 1);
+    sys(NR_close, fd);
+    if (n <= 0) return -1;
+    pbuf[n] = 0;
+    char *p = pbuf;
+    if (tag) {
+        for (u64 len = slen(tag); *p && !(*p == *tag && seq(p, tag, len)); p++) {}
+        if (!*p) return -1;
+        p += slen(tag);
+    } else {
+        for (; nth > 0 && *p; p++) if (*p == ' ') nth--;
+    }
+    while (*p == ' ' || *p == '\t') p++;
+    i64 v = 0;
+    for (; *p >= '0' && *p <= '9'; p++) v = v * 10 + (*p - '0');
+    return v;
+}
+static i64 resident(void) { return proc_num("/proc/self/statm", 0, 1); }
 
 // Whether `want` is among the commands the driver returns next.
 static u32 rbuf[256];
@@ -285,6 +311,29 @@ int cmain(void) {
     check(dtype_of(dents, dn, "status") == 8 && dtype_of(dents, dn, "fd") == 4 && dtype_of(dents, dn, "exe") == 10 && dtype_of(dents, dn, "task") == 4,
           "readdir of /proc/self gives each entry's type");
     sys(NR_close, pd);
+
+    // --- RSS: pages counted as they come and go, as Linux's mm counters count them
+    memset(pbuf, 0, sizeof pbuf);
+    i64 r0 = resident();
+    char *mem = (char *)sys(NR_mmap, 0, 64 * 4096, 3, 0x22, -1, 0);
+    for (int i = 0; i < 64; i++) mem[i * 4096] = 1;
+    i64 r1 = resident();
+    sys(NR_madvise, mem, 16 * 4096, 4 /* MADV_DONTNEED */);
+    i64 r2 = resident();
+    char *grown = (char *)sys(NR_mremap, mem, 64 * 4096, 4096 * 4096, 1 /* MREMAP_MAYMOVE */);
+    i64 r3 = resident();
+    check(r1 - r0 == 64 && r1 - r2 == 16 && r3 == r2, "statm's resident pages follow touching, MADV_DONTNEED and mremap");
+    check(proc_num("/proc/self/status", "VmRSS:", 0) == r3 * 4 && proc_num("/proc/self/stat", 0, 23) == r3, "status's VmRSS and stat's rss say the same");
+    pid = fork_();
+    if (pid == 0) {
+        i64 c0 = resident();
+        char *more = (char *)sys(NR_mmap, 0, 8 * 4096, 3, 0x22, -1, 0);
+        for (int i = 0; i < 8; i++) more[i * 4096] = 1;
+        sys(NR_exit_group, c0 > 48 && resident() - c0 == 8 ? 0 : 3);
+    }
+    check(reap(pid, 3000) == 0, "a forked child has the pages it shares, and counts its own");
+    sys(NR_munmap, grown, 4096 * 4096);
+    check(resident() == r0, "munmap gives them back");
 
     puts_(failures ? "SOME CHECKS FAILED\n" : "all checks passed\n");
     return failures;

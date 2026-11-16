@@ -443,6 +443,8 @@ impl CachedFile {
             let chunk = &buf[((idx - first) * PAGE) as usize..];
             unsafe { std::ptr::copy_nonoverlapping(chunk.as_ptr(), phys.host(frame), chunk.len().min(PAGE as usize)) };
             phys.mark_cached(frame);
+            // Nothing writes it again: whoever writes to a mapping of it gets a copy.
+            phys.freeze(frame);
             frames.push((idx as u32, frame));
         }
         self.state.lock().unwrap().pages.extend(frames.iter().copied());

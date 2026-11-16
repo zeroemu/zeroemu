@@ -92,6 +92,54 @@ const ALL: [K; 52] = [
     K::AttrCurrent, K::AttrPrev, K::AttrExec, K::AttrFscreate, K::AttrKeycreate, K::AttrSockcreate,
     K::ConfigGz, K::Net, K::NetDev, K::Vmstat, K::Zoneinfo,
 ];
+
+/// /proc's own entries, besides sys, pressure and the processes.
+const ROOT_DIR: [(&str, K); 16] = [
+    ("self", K::Self_),
+    ("thread-self", K::ThreadSelf),
+    ("meminfo", K::Meminfo),
+    ("cpuinfo", K::Cpuinfo),
+    ("stat", K::Stat),
+    ("uptime", K::Uptime),
+    ("loadavg", K::Loadavg),
+    ("version", K::Version),
+    ("filesystems", K::Filesystems),
+    ("cmdline", K::Cmdline),
+    ("mounts", K::Mounts),
+    ("cgroups", K::Cgroups),
+    ("config.gz", K::ConfigGz),
+    ("net", K::Net),
+    ("vmstat", K::Vmstat),
+    ("zoneinfo", K::Zoneinfo),
+];
+
+/// A process's directory.
+const PID_DIR: [(&str, K); 20] = [
+    ("cmdline", K::PCmdline),
+    ("comm", K::PComm),
+    ("exe", K::PExe),
+    ("cwd", K::PCwd),
+    ("fd", K::PFd),
+    ("maps", K::PMaps),
+    ("status", K::PStatus),
+    ("stat", K::PStat),
+    ("statm", K::PStatm),
+    ("task", K::PTask),
+    ("attr", K::PAttr),
+    ("mounts", K::PMounts),
+    ("mountinfo", K::PMountinfo),
+    ("oom_score_adj", K::POom),
+    ("oom_adj", K::POomAdj),
+    ("oom_score", K::POomScore),
+    ("timerslack_ns", K::PTimerslack),
+    ("ns", K::PNs),
+    ("cgroup", K::PCgroup),
+    ("environ", K::PEnviron),
+];
+
+/// A thread's directory: the process's view, with the thread's comm and attributes.
+const TASK_DIR: [(&str, K); 6] = [("comm", K::PComm), ("stat", K::PStat), ("status", K::PStatus), ("attr", K::PAttr), ("cgroup", K::PCgroup), ("ns", K::PNs)];
+
 const ATTR_K: [K; 6] = [K::AttrCurrent, K::AttrPrev, K::AttrExec, K::AttrFscreate, K::AttrKeycreate, K::AttrSockcreate];
 
 /// (pid, tid, index into selinux::ATTRS) of an attr file.
@@ -363,27 +411,7 @@ impl ProcFs {
         let d = |items: &[(&str, K)]| Ok(Content::Dir(items.iter().map(|(n, k)| (n.to_string(), mk(*k, pid, extra))).collect()));
         match k {
             K::Root => {
-                let mut v: Vec<(String, u64)> = [
-                    ("self", K::Self_),
-                    ("thread-self", K::ThreadSelf),
-                    ("meminfo", K::Meminfo),
-                    ("cpuinfo", K::Cpuinfo),
-                    ("stat", K::Stat),
-                    ("uptime", K::Uptime),
-                    ("loadavg", K::Loadavg),
-                    ("version", K::Version),
-                    ("filesystems", K::Filesystems),
-                    ("cmdline", K::Cmdline),
-                    ("mounts", K::Mounts),
-                    ("cgroups", K::Cgroups),
-                    ("config.gz", K::ConfigGz),
-                    ("net", K::Net),
-                    ("vmstat", K::Vmstat),
-                    ("zoneinfo", K::Zoneinfo),
-                ]
-                .iter()
-                .map(|(n, k)| (n.to_string(), mk(*k, 0, 0)))
-                .collect();
+                let mut v: Vec<(String, u64)> = ROOT_DIR.iter().map(|(n, k)| (n.to_string(), mk(*k, 0, 0))).collect();
                 v.push(("sys".into(), mk(K::Sysctl, 0, Sysctl::root() as u64)));
                 v.push(("pressure".into(), mk(K::Pressure, 0, 0)));
                 let mut pids: Vec<i32> = kernel.procs.lock().unwrap().values().map(|p| p.pid).collect();
@@ -481,28 +509,7 @@ impl ProcFs {
 
             K::Pid => {
                 self.proc_or_zombie(pid)?;
-                d(&[
-                    ("cmdline", K::PCmdline),
-                    ("comm", K::PComm),
-                    ("exe", K::PExe),
-                    ("cwd", K::PCwd),
-                    ("fd", K::PFd),
-                    ("maps", K::PMaps),
-                    ("status", K::PStatus),
-                    ("stat", K::PStat),
-                    ("statm", K::PStatm),
-                    ("task", K::PTask),
-                    ("attr", K::PAttr),
-                    ("mounts", K::PMounts),
-                    ("mountinfo", K::PMountinfo),
-                    ("oom_score_adj", K::POom),
-                    ("oom_adj", K::POomAdj),
-                    ("oom_score", K::POomScore),
-                    ("timerslack_ns", K::PTimerslack),
-                    ("ns", K::PNs),
-                    ("cgroup", K::PCgroup),
-                    ("environ", K::PEnviron),
-                ])
+                d(&PID_DIR)
             }
             K::PCmdline => {
                 let p = self.proc(pid)?;
@@ -619,8 +626,7 @@ impl ProcFs {
                 let tids: Vec<i32> = p.threads.lock().unwrap().iter().map(|t| t.tid).collect();
                 Ok(Content::Dir(tids.into_iter().map(|t| (t.to_string(), mk(K::Task, pid, t as u64))).collect()))
             }
-            // A thread directory: the process's view, with the thread's comm and attributes.
-            K::Task => Ok(Content::Dir([("comm", K::PComm), ("stat", K::PStat), ("status", K::PStatus), ("attr", K::PAttr), ("cgroup", K::PCgroup), ("ns", K::PNs)].iter().map(|(n, k)| (n.to_string(), mk(*k, pid, extra))).collect())),
+            K::Task => d(&TASK_DIR),
             K::PAttr => Ok(Content::Dir(super::selinux::ATTRS.iter().zip(ATTR_K).map(|(n, k)| (n.to_string(), mk(k, pid, extra))).collect())),
             K::AttrCurrent | K::AttrPrev | K::AttrExec | K::AttrFscreate | K::AttrKeycreate | K::AttrSockcreate => {
                 let (_, tid, which) = attr_node(ino).ok_or_else(|| err(ENOENT))?;
@@ -851,6 +857,29 @@ impl FileSystem for ProcFs {
         {
             let pid = th.proc.pid;
             return Ok(Some(mk(K::Pid, pid, if tid == pid { 0 } else { tid as u64 })));
+        }
+        // /proc and the fixed directories are looked in without being listed: every open
+        // of a process's file looks names up in both, and a list of /proc names every process.
+        let fixed = |table: &[(&str, K)], pid: i32, extra: u64| table.iter().find(|(n, _)| *n == name).map(|(_, k)| mk(*k, pid, extra));
+        match decode(dir) {
+            Some((K::Pid, pid, extra)) => {
+                self.proc_or_zombie(pid)?;
+                return Ok(fixed(&PID_DIR, pid, extra));
+            }
+            Some((K::Task, pid, extra)) => return Ok(fixed(&TASK_DIR, pid, extra)),
+            Some((K::Root, _, _)) => {
+                return Ok(match name {
+                    "sys" => Some(mk(K::Sysctl, 0, Sysctl::root() as u64)),
+                    "pressure" => Some(mk(K::Pressure, 0, 0)),
+                    // A process none of whose threads is left, a zombie, keeps its directory
+                    // until it is reaped. Its number, as readdir spells it.
+                    _ => match name.parse::<i32>() {
+                        Ok(pid) => self.kernel()?.process(pid).filter(|p| p.pid.to_string() == name).map(|p| mk(K::Pid, p.pid, 0)),
+                        Err(_) => fixed(&ROOT_DIR, 0, 0),
+                    },
+                });
+            }
+            _ => {}
         }
         match self.content(dir)? {
             Content::Dir(entries) => Ok(entries.into_iter().find(|(n, _)| n == name).map(|(_, i)| i)),

@@ -311,6 +311,23 @@ int cmain(void) {
     check(dtype_of(dents, dn, "status") == 8 && dtype_of(dents, dn, "fd") == 4 && dtype_of(dents, dn, "exe") == 10 && dtype_of(dents, dn, "task") == 4,
           "readdir of /proc/self gives each entry's type");
     sys(NR_close, pd);
+    check(sys(NR_newfstatat, -100, "/proc/self/nonesuch", pst, 0) == -2 && sys(NR_newfstatat, -100, "/proc/nonesuch", pst, 0) == -2, "names /proc doesn't have aren't there");
+    check(sys(NR_newfstatat, -100, "/proc/thread-self/stat", pst, 0) == 0 && sys(NR_newfstatat, -100, "/proc/thread-self/maps", pst, 0) == -2 &&
+          sys(NR_newfstatat, -100, "/proc/sys/kernel", pst, 0) == 0 && sys(NR_newfstatat, -100, "/proc/pressure/memory", pst, 0) == 0 &&
+          sys(NR_newfstatat, -100, "/proc/meminfo", pst, 0) == 0, "a thread's directory, /proc/sys, /proc/pressure and /proc/meminfo are found");
+    pid = fork_();
+    if (pid == 0) sys(NR_exit_group, 0);
+    // A zombie keeps its directory until it is reaped.
+    char zpath[32], digits[12];
+    int nd = 0, zi = 0;
+    for (const char *t = "/proc/"; *t; t++) zpath[zi++] = *t;
+    for (i64 v = pid; v; v /= 10) digits[nd++] = (char)('0' + v % 10);
+    while (nd) zpath[zi++] = digits[--nd];
+    for (const char *t = "/stat"; *t; t++) zpath[zi++] = *t;
+    zpath[zi] = 0;
+    nap_ms(100);
+    i64 zst = sys(NR_newfstatat, -100, zpath, pst, 0);
+    check(reap(pid, 3000) == 0 && zst == 0 && sys(NR_newfstatat, -100, zpath, pst, 0) == -2, "a zombie's /proc directory is there until it is reaped");
 
     // --- RSS: pages counted as they come and go, as Linux's mm counters count them
     memset(pbuf, 0, sizeof pbuf);

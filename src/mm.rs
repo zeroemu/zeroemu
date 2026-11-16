@@ -184,6 +184,29 @@ impl SharedObject {
         Ok(frame)
     }
 
+    /// As `map_frame`, but None if the page would have to be read back first, and it
+    /// leaves making room to whoever reads one (see `PageRead`). Mapping a page in
+    /// memory, or a new one, adds nothing that making room could take: a mapped page
+    /// can't go.
+    fn map_frame_nowait(&self, idx: usize) -> Option<Result<u64, i64>> {
+        if idx >= MAX_PAGES {
+            return Some(Err(EFAULT));
+        }
+        let mut pages = self.pages.lock().unwrap();
+        if pages.len() <= idx {
+            pages.resize(idx + 1, Slot::default());
+        }
+        if pages[idx].frame == 0 && pages[idx].kept != 0 && self.pager.is_some() {
+            return None;
+        }
+        let frame = self.in_memory(&mut pages, idx, true);
+        if let Ok(frame) = frame {
+            pages[idx].frame |= DIRTY;
+            self.phys.share(frame);
+        }
+        Some(frame)
+    }
+
     /// For each (page, 0) of `pages`, the frame holding it if it is in memory now (and,
     /// with a pager, mapped somewhere already), with a hold on it for a mapping, as
     /// `map_frame` gives (`dirty` for a shared mapping that may write it); the others
@@ -380,6 +403,18 @@ impl PageSource for SharedObject {
         Ok(v)
     }
 
+    fn page_nowait(&self, idx: u64) -> Option<Result<Option<u64>, i64>> {
+        let mut pages = self.pages.lock().unwrap();
+        let Some(idx) = usize::try_from(idx).ok().filter(|&i| pages.get(i).is_some_and(|s| s.frame != 0 || s.kept != 0)) else { return Some(Ok(None)) };
+        if pages[idx].frame == 0 && self.pager.is_some() {
+            return None;
+        }
+        Some(self.in_memory(&mut pages, idx, true).map(|frame| {
+            self.phys.share(frame);
+            Some(frame)
+        }))
+    }
+
     fn resident(&self, pages: &mut [(u64, u64)]) {
         // A private mapping never writes the object's frames: it copies them first.
         self.resident_frames(pages, false);
@@ -440,6 +475,82 @@ pub struct UffdCtx {
 
 /// `AddressSpace::fault`'s answer for a page a userfaultfd must supply: SIGBUS.
 pub const FAULT_UFFD: i32 = -1;
+/// `AddressSpace::fault`'s answer for a page that has to be read first: `take_read`
+/// says what, for the caller to read with the address space unlocked.
+pub const FAULT_READ: i32 = -2;
+
+/// A page a fault would have had to read in: from the image (decompressing a window of
+/// it), or back from the host's disk for a file on /data. Every thread of the process
+/// takes the address space's lock on its way back into the guest, so `fault` leaves the
+/// read to its caller to do unlocked, as Linux lets go of mmap_lock to wait for a page
+/// (VM_FAULT_RETRY, filemap_fault in mm/filemap.c). The fault then starts over, since the
+/// mapping may have changed meanwhile, and takes the page read if it still wants it.
+pub struct PageRead {
+    from: PageFrom,
+    idx: u64,
+    /// Once read: what `page` (or `map_frame`) gave, with its hold for the mapping.
+    got: Option<Result<Option<u64>, i64>>,
+}
+
+enum PageFrom {
+    File(Arc<dyn PageSource>),
+    Shared(Arc<SharedObject>),
+}
+
+/// Where a mapping's page comes from, as its VMA says.
+enum Wanted<'a> {
+    File(&'a Arc<dyn PageSource>),
+    Shared(&'a Arc<SharedObject>),
+}
+
+impl Wanted<'_> {
+    fn page(&self, idx: u64) -> Result<Option<u64>, i64> {
+        match self {
+            Wanted::File(src) => src.page(idx),
+            Wanted::Shared(obj) => obj.map_frame(idx as usize).map(Some),
+        }
+    }
+
+    fn page_nowait(&self, idx: u64) -> Option<Result<Option<u64>, i64>> {
+        match self {
+            Wanted::File(src) => src.page_nowait(idx),
+            Wanted::Shared(obj) => obj.map_frame_nowait(idx as usize).map(|got| got.map(Some)),
+        }
+    }
+
+    fn to_owned(&self) -> PageFrom {
+        match self {
+            Wanted::File(src) => PageFrom::File((*src).clone()),
+            Wanted::Shared(obj) => PageFrom::Shared((*obj).clone()),
+        }
+    }
+}
+
+impl PageRead {
+    /// Reads the page in (and makes room in the page cache, which may write some out).
+    pub fn run(&mut self) {
+        let from = match &self.from {
+            PageFrom::File(src) => Wanted::File(src),
+            PageFrom::Shared(obj) => Wanted::Shared(obj),
+        };
+        self.got = Some(from.page(self.idx));
+    }
+
+    fn is(&self, from: &Wanted<'_>, idx: u64) -> bool {
+        self.idx == idx
+            && match (&self.from, from) {
+                (PageFrom::File(a), Wanted::File(b)) => std::ptr::addr_eq(Arc::as_ptr(a), Arc::as_ptr(*b)),
+                (PageFrom::Shared(a), Wanted::Shared(b)) => Arc::ptr_eq(a, b),
+                _ => false,
+            }
+    }
+
+    fn release(self, phys: &PhysMem) {
+        if let Some(Ok(Some(frame))) = self.got {
+            phys.free(frame);
+        }
+    }
+}
 
 /// What fork does with a mapping (madvise; binder's area is never inherited).
 #[derive(Clone, Copy, PartialEq, Default)]
@@ -514,6 +625,68 @@ fn bump_offset(b: &mut Backing, add: u64) {
     }
 }
 
+/// The mapping at `addr`: `AddressSpace::find`, for a caller that changes the tables
+/// while it looks at the mapping.
+fn find_in(vmas: &BTreeMap<u64, Vma>, addr: u64) -> Option<(u64, &Vma)> {
+    let (&start, vma) = vmas.range(..=addr).next_back()?;
+    (addr < vma.end).then_some((start, vma))
+}
+
+/// What populating a page takes of its address space, borrowed apart from its mappings.
+struct Filler<'a> {
+    phys: &'a PhysMem,
+    owner: u32,
+    read: &'a mut Option<PageRead>,
+}
+
+impl Filler<'_> {
+    /// The frame for a page not yet present, with a hold on it for this mapping.
+    /// About to be written, a page of a file is copied at once.
+    /// Unless `wait`, a page that would have to be read first is left in `read` for
+    /// `fault`'s caller, and this fails (see `PageRead`).
+    fn populate(&mut self, vma_start: u64, vma: &Vma, page: u64, write: bool, wait: bool) -> Result<u64, i64> {
+        if let Backing::Shared { obj, offset } = &vma.backing {
+            let idx = (offset + (page - vma_start)) / PAGE;
+            return self.source_page(Wanted::Shared(obj), idx, wait).map(|f| f.expect("a shared object has every page"));
+        }
+        if let Backing::Dev { mem, offset } = &vma.backing {
+            let off = offset + (page - vma_start);
+            if off >= mem.len {
+                return Err(EFAULT);
+            }
+            return Ok(mem.gpa + off);
+        }
+        let Backing::File { src, offset } = &vma.backing else { return self.phys.alloc_for(self.owner) };
+        let Some(frame) = self.source_page(Wanted::File(src), (offset + (page - vma_start)) / PAGE, wait)? else { return self.phys.alloc_for(self.owner) };
+        if !write || self.phys.is_sole_owner(frame) {
+            return Ok(frame);
+        }
+        let copy = self.phys.alloc_for(self.owner);
+        if let Ok(copy) = copy {
+            unsafe { std::ptr::copy_nonoverlapping(self.phys.host(frame), self.phys.host(copy), PAGE as usize) };
+        }
+        self.phys.free(frame);
+        copy
+    }
+
+    /// Page `idx` of a mapping's source, with a hold on it for the mapping: one read
+    /// already (see `PageRead`), or one in memory, or unless `wait`, none.
+    fn source_page(&mut self, from: Wanted<'_>, idx: u64, wait: bool) -> Result<Option<u64>, i64> {
+        if let Some(read) = self.read.take_if(|r| r.got.is_some() && r.is(&from, idx)) {
+            return read.got.expect("checked");
+        }
+        if wait {
+            return from.page(idx);
+        }
+        from.page_nowait(idx).unwrap_or_else(|| {
+            if let Some(old) = self.read.replace(PageRead { from: from.to_owned(), idx, got: None }) {
+                old.release(self.phys);
+            }
+            Err(EAGAIN)
+        })
+    }
+}
+
 /// Finds (optionally creating) the leaf entry for `va`, starting from `table`
 /// at `level`. Returns the guest-physical address of the entry.
 fn walk(phys: &PhysMem, owner: u32, owned: &mut Vec<u64>, mut table: u64, level: usize, va: u64, create: bool) -> Result<Option<u64>, i64> {
@@ -559,6 +732,9 @@ pub struct AddressSpace {
     pub tlb_gen: u64,
     pub flushed_gen: u64,
     stale: Stale,
+    /// Between a fault that answered FAULT_READ and its next try: what it wants read,
+    /// then what was read. Never set while the address space is unlocked.
+    read: Option<PageRead>,
 }
 
 impl AddressSpace {
@@ -587,6 +763,7 @@ impl AddressSpace {
             tlb_gen: 0,
             flushed_gen: 0,
             stale: Stale::default(),
+            read: None,
         })
     }
 
@@ -617,8 +794,7 @@ impl AddressSpace {
     }
 
     fn find(&self, addr: u64) -> Option<(u64, &Vma)> {
-        let (&start, vma) = self.vmas.range(..=addr).next_back()?;
-        (addr < vma.end).then_some((start, vma))
+        find_in(&self.vmas, addr)
     }
 
     fn is_free(&self, start: u64, end: u64) -> bool {
@@ -1201,7 +1377,10 @@ impl AddressSpace {
         const SEGV_MAPERR: i32 = 1;
         const SEGV_ACCERR: i32 = 2;
         let page = page_down(addr);
-        let Some((start, vma)) = self.find(page) else { return Err(SEGV_MAPERR) };
+        let owner = self.owner();
+        // Borrowed apart from the tables, not cloned: a clone counts references that every
+        // process mapping the same file shares, on every fault.
+        let Some((start, vma)) = find_in(&self.vmas, page) else { return Err(SEGV_MAPERR) };
         let ok = if exec {
             vma.prot & PROT_EXEC != 0
         } else if write {
@@ -1212,8 +1391,8 @@ impl AddressSpace {
         if !ok {
             return Err(SEGV_ACCERR);
         }
-        let (prot, vma) = (vma.prot, vma.clone());
-        let slot = walk(&self.phys, self.owner(), &mut self.tables, self.root.root, 0, page, true).map_err(|_| SEGV_MAPERR)?.unwrap();
+        let prot = vma.prot;
+        let slot = walk(&self.phys, owner, &mut self.tables, self.root.root, 0, page, true).map_err(|_| SEGV_MAPERR)?.unwrap();
         let e = self.phys.read_u64(slot);
         if !paging::is_valid(e) && vma.uffd().is_some() {
             return Err(FAULT_UFFD);
@@ -1233,10 +1412,11 @@ impl AddressSpace {
             self.tlb_gen += 1;
             return Ok(());
         }
-        let frame = self.populate(start, &vma, page, write).map_err(|_| SEGV_MAPERR)?;
+        let frame = Filler { phys: &self.phys, owner, read: &mut self.read }.populate(start, vma, page, write, false);
+        let frame = frame.map_err(|_| if self.read.as_ref().is_some_and(|r| r.got.is_none()) { FAULT_READ } else { SEGV_MAPERR })?;
         let shared = matches!(vma.backing, Backing::Shared { .. } | Backing::Dev { .. });
         self.phys.write_pte(slot, self.entry_for(frame, prot, shared));
-        self.fault_around(start, &vma, page, slot, write);
+        self.fault_around(start, vma, page, slot, write);
         Ok(())
     }
 
@@ -1331,30 +1511,38 @@ impl AddressSpace {
         self.tables.len() + 1
     }
 
-    /// The frame for a page not yet present, with a hold on it for this mapping.
-    /// About to be written, a page of a file is copied at once.
-    fn populate(&self, vma_start: u64, vma: &Vma, page: u64, write: bool) -> Result<u64, i64> {
-        if let Backing::Shared { obj, offset } = &vma.backing {
-            return obj.map_frame(((offset + (page - vma_start)) / PAGE) as usize);
-        }
-        if let Backing::Dev { mem, offset } = &vma.backing {
-            let off = offset + (page - vma_start);
-            if off >= mem.len {
-                return Err(EFAULT);
+    /// After FAULT_READ: what to read before the fault tries again.
+    pub fn take_read(&mut self) -> Option<PageRead> {
+        self.read.take()
+    }
+
+    /// A page read for a fault about to try again, which takes it if it still wants it.
+    pub fn give_read(&mut self, read: PageRead) {
+        self.forget_read();
+        self.read = Some(read);
+    }
+
+    /// A fault with its reads done as `Kernel::page_fault` does them, for tests.
+    #[cfg(test)]
+    pub fn fault_reading(&mut self, addr: u64, write: bool, exec: bool) -> Result<(), i32> {
+        loop {
+            let faulted = self.fault(addr, write, exec);
+            if faulted != Err(FAULT_READ) {
+                self.forget_read();
+                return faulted;
             }
-            return Ok(mem.gpa + off);
+            let mut read = self.take_read().unwrap();
+            read.run();
+            self.give_read(read);
         }
-        let Backing::File { src, offset } = &vma.backing else { return self.phys.alloc_for(self.owner()) };
-        let Some(frame) = src.page((offset + (page - vma_start)) / PAGE)? else { return self.phys.alloc_for(self.owner()) };
-        if !write || self.phys.is_sole_owner(frame) {
-            return Ok(frame);
+    }
+
+    /// Lets go of a page read that its fault didn't take: the mapping changed meanwhile,
+    /// or another thread mapped the page first.
+    pub fn forget_read(&mut self) {
+        if let Some(read) = self.read.take() {
+            read.release(&self.phys);
         }
-        let copy = self.phys.alloc_for(self.owner());
-        if let Ok(copy) = copy {
-            unsafe { std::ptr::copy_nonoverlapping(self.phys.host(frame), self.phys.host(copy), PAGE as usize) };
-        }
-        self.phys.free(frame);
-        copy
     }
 
     /// Host pointer to the byte at `va`, faulting the page in. `force` skips
@@ -1362,15 +1550,16 @@ impl AddressSpace {
     fn host_ptr(&mut self, va: u64, write: bool, force: bool) -> Result<*mut u8, i64> {
         let va = crate::arch::untag(va);
         let page = page_down(va);
-        let (start, vma) = self.find(page).ok_or(EFAULT)?;
+        let owner = self.owner();
+        let (start, vma) = find_in(&self.vmas, page).ok_or(EFAULT)?;
         if !force {
             let ok = if write { vma.prot & PROT_WRITE != 0 } else { vma.prot & (PROT_READ | PROT_WRITE | PROT_EXEC) != 0 };
             if !ok {
                 return Err(EFAULT);
             }
         }
-        let vma = vma.clone();
-        let slot = walk(&self.phys, self.owner(), &mut self.tables, self.root.root, 0, page, true)?.unwrap();
+        let (prot, shared) = (vma.prot, matches!(vma.backing, Backing::Shared { .. } | Backing::Dev { .. }));
+        let slot = walk(&self.phys, owner, &mut self.tables, self.root.root, 0, page, true)?.unwrap();
         let mut e = self.phys.read_u64(slot);
         if !paging::is_valid(e) {
             // Only the userfaultfd may supply it, and all it knows of are the guest's
@@ -1378,13 +1567,13 @@ impl AddressSpace {
             if vma.uffd().is_some() {
                 return Err(EFAULT);
             }
-            let frame = self.populate(start, &vma, page, write)?;
-            e = self.entry_for(frame, vma.prot, matches!(vma.backing, Backing::Shared { .. } | Backing::Dev { .. }));
+            let frame = Filler { phys: &self.phys, owner, read: &mut self.read }.populate(start, vma, page, write, true)?;
+            e = self.entry_for(frame, prot, shared);
             self.phys.write_pte(slot, e);
-        } else if write && !matches!(vma.backing, Backing::Shared { .. } | Backing::Dev { .. }) && !self.phys.is_sole_owner(paging::addr(e)) {
+        } else if write && !shared && !self.phys.is_sole_owner(paging::addr(e)) {
             // The kernel writes past the page tables: it must not reach a frame
             // another process still shares.
-            e = self.break_cow(slot, paging::addr(e), vma.prot)?;
+            e = self.break_cow(slot, paging::addr(e), prot)?;
         }
         Ok(unsafe { self.phys.host(paging::addr(e)).add((va - page) as usize) })
     }
@@ -1559,6 +1748,7 @@ impl Drop for AddressSpace {
         }
         let phys = self.phys.clone();
         self.stale.release(&phys);
+        self.forget_read();
         for f in self.tables.drain(..) {
             phys.free(f);
         }
@@ -1605,6 +1795,36 @@ mod tests {
         assert_eq!(a.residency(at, at + PAGE * 2), [0, 0]);
         assert_eq!(a.read_vec(at + PAGE, 1).unwrap(), [1], "it comes back");
         assert_eq!(a.residency(at, at + PAGE * 2), [0, 1]);
+    }
+
+    /// A page of /data that left memory is read back with the address space unlocked,
+    /// and what the guest sees is the same.
+    #[test]
+    fn a_shared_page_on_disk_is_read_back_outside_the_fault() {
+        let phys = PhysMem::new(Arc::new(crate::hv::NoHv));
+        let cache = PageCache::new(phys.clone());
+        cache.limit_idle(0);
+        let kernel = KernelWindow::new(&phys, &[]).unwrap();
+        let obj = SharedObject::with_pager(phys.clone(), Some(cache.clone()));
+        obj.write(0, &[5; 8192]).unwrap();
+        cache.reclaim(1 << 20);
+        assert!(!obj.in_memory_now(PAGE));
+        let mut a = AddressSpace::new(phys.clone(), &kernel, 1).unwrap();
+        let at = a.map(Placement::Fixed(1 << 30), PAGE * 2, PROT_READ, Backing::Shared { obj: obj.clone(), offset: 0 }).unwrap();
+        assert_eq!(a.fault(at + PAGE, false, false), Err(FAULT_READ));
+        assert!(!obj.in_memory_now(PAGE), "nothing read under the lock");
+        let mut read = a.take_read().unwrap();
+        read.run();
+        a.give_read(read);
+        a.fault(at + PAGE, false, false).unwrap();
+        a.forget_read();
+        assert_eq!(a.read_vec(at + PAGE, 1).unwrap(), [5]);
+        // Private mappings of it too.
+        let mut b = AddressSpace::new(phys.clone(), &kernel, 2).unwrap();
+        let at = b.map(Placement::Fixed(1 << 30), PAGE * 2, PROT_READ, Backing::File { src: obj, offset: 0 }).unwrap();
+        cache.reclaim(1 << 20);
+        b.fault_reading(at, false, false).unwrap();
+        assert_eq!(b.read_vec(at, 1).unwrap(), [5]);
     }
 
     /// mremap's tables come first, so its failing can't lose what was mapped. (Nothing

@@ -2,7 +2,7 @@
 
 use super::{Kernel, Thread};
 use crate::errno::*;
-use crate::mm::{Backing, OnFork, PROT_ALL, Placement, SharedObject};
+use crate::mm::{Backing, FAULT_READ, OnFork, PROT_ALL, Placement, SharedObject};
 use crate::phys::PAGE;
 
 const MAP_SHARED: u64 = 0x01;
@@ -23,6 +23,24 @@ const MADV_KEEPONFORK: u64 = 19;
 const PROT_IGNORED: u32 = 0x0100_0000 | 0x0200_0000 | 0x10 | 0x20;
 
 impl Kernel {
+    /// A guest page fault: `AddressSpace::fault` with the address space locked, except
+    /// while a page it needs is read in (see `mm::PageRead`). Each time round, the fault
+    /// starts over: the mapping may have changed while the lock was let go.
+    pub(super) fn page_fault(&self, t: &Thread, addr: u64, write: bool, exec: bool) -> Result<(), i32> {
+        let mut mm = t.proc.mm();
+        loop {
+            let faulted = mm.fault(addr, write, exec);
+            let Some(mut read) = (faulted == Err(FAULT_READ)).then(|| mm.take_read()).flatten() else {
+                mm.forget_read();
+                return faulted;
+            };
+            drop(mm);
+            read.run();
+            mm = t.proc.mm();
+            mm.give_read(read);
+        }
+    }
+
     pub(super) fn sys_brk(&self, t: &Thread, want: u64) -> i64 {
         t.proc.mm().set_brk(want) as i64
     }

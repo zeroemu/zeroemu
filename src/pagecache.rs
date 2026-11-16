@@ -22,6 +22,11 @@ pub trait PageSource: Send + Sync {
     /// The frame holding page `idx`, with a hold on it for the caller. None where
     /// the file has no such page: the caller's own zeros will do.
     fn page(&self, idx: u64) -> Result<Option<u64>, i64>;
+    /// As `page`, but None where that would read anything: a fault, which mustn't
+    /// while it has the address space locked (see `mm::PageRead`).
+    fn page_nowait(&self, idx: u64) -> Option<Result<Option<u64>, i64>> {
+        Some(self.page(idx))
+    }
     /// `len` bytes from `off`, or as many as there are (some sources read zeros
     /// past their end: they don't know where that is, and the caller does).
     fn read_bytes(&self, off: u64, len: usize) -> Result<Vec<u8>, i64>;
@@ -522,6 +527,19 @@ impl PageSource for CachedFile {
         self.read(off, len)
     }
 
+    fn page_nowait(&self, idx: u64) -> Option<Result<Option<u64>, i64>> {
+        if idx.saturating_mul(PAGE) >= self.size || idx > u32::MAX as u64 {
+            return Some(Ok(None));
+        }
+        // A window being read counts as not there: waiting for it is waiting for a read.
+        let mut st = self.state.lock().unwrap();
+        let entry = st.pages.get_mut(&(idx as u32))?;
+        *entry |= REFERENCED;
+        let frame = *entry & !REFERENCED;
+        self.cache.phys.share(frame);
+        Some(Ok(Some(frame)))
+    }
+
     fn resident(&self, pages: &mut [(u64, u64)]) {
         // Under the lock, as in `page`: `try_evict` can't take one between the look and the hold.
         let st = self.state.lock().unwrap();
@@ -566,7 +584,7 @@ impl ReadAt for CachedFile {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mm::{AddressSpace, Backing, KernelWindow, Placement, SharedObject};
+    use crate::mm::{AddressSpace, Backing, FAULT_READ, KernelWindow, Placement, SharedObject};
     use crate::paging::{PROT_READ, PROT_WRITE};
     use crate::vfs::{Dirent, Stat};
     use std::sync::atomic::AtomicUsize;
@@ -745,7 +763,7 @@ mod tests {
         let mut b = AddressSpace::new(phys.clone(), &kernel, 2).unwrap();
         let other = b.map(Placement::Fixed(1 << 30), PAGE * WINDOW_PAGES * 2, PROT_READ, Backing::File { src: file.clone(), offset: 0 }).unwrap();
         for i in (0..WINDOW_PAGES * 2).step_by(2) {
-            b.fault(other + PAGE * i, false, false).unwrap();
+            b.fault_reading(other + PAGE * i, false, false).unwrap();
         }
         let evens: Vec<u8> = (0..w * 2).map(|i| (i % 2 == 0) as u8).collect();
         assert_eq!(b.residency(other, other + PAGE * WINDOW_PAGES * 2), evens);
@@ -754,14 +772,14 @@ mod tests {
         let mut a = AddressSpace::new(phys.clone(), &kernel, 1).unwrap();
         let len = PAGE * (WINDOW_PAGES + 4);
         let at = a.map(Placement::Fixed((1 << 30) + (2 << 20)), len, PROT_READ, Backing::File { src: file.clone(), offset: PAGE * 3 }).unwrap();
-        a.fault(at + PAGE * 2, false, false).unwrap();
+        a.fault_reading(at + PAGE * 2, false, false).unwrap();
         // The page faulted, and the first window's even pages from the fourth on.
         let mut want = vec![0u8; w + 4];
         for p in [1, 2, 3, 5, 7, 9, 11] {
             want[p] = 1;
         }
         assert_eq!(a.residency(at, at + len), want);
-        a.fault(at + PAGE * (WINDOW_PAGES - 2), false, false).unwrap();
+        a.fault_reading(at + PAGE * (WINDOW_PAGES - 2), false, false).unwrap();
         for p in [13, 14, 15, 17, 19] {
             want[p] = 1;
         }
@@ -793,11 +811,11 @@ mod tests {
         let mut b = AddressSpace::new(phys.clone(), &kernel, 2).unwrap();
         let other = b.map(Placement::Hint(0), PAGE * 4, PROT_READ, Backing::File { src: file.clone(), offset: 0 }).unwrap();
         for i in 0..4 {
-            b.fault(other + PAGE * i, false, false).unwrap();
+            b.fault_reading(other + PAGE * i, false, false).unwrap();
         }
         let mut a = AddressSpace::new(phys.clone(), &kernel, 1).unwrap();
         let at = a.map(Placement::Hint(0), PAGE * 4, PROT_READ | PROT_WRITE, Backing::File { src: file, offset: 0 }).unwrap();
-        a.fault(at + PAGE, false, false).unwrap();
+        a.fault_reading(at + PAGE, false, false).unwrap();
         assert_eq!(a.residency(at, at + PAGE * 4), [0, 1, 0, 0]);
     }
 
@@ -820,6 +838,39 @@ mod tests {
         let mut b = [0u8; 1];
         obj.read(PAGE * 3, &mut b);
         assert_eq!(b, [7]);
+    }
+
+    /// A fault that would read the image leaves that to its caller, to do with the address
+    /// space unlocked, and takes the page read when it tries again. If the mapping changed
+    /// meanwhile, the page read goes unused, and so does its hold.
+    #[test]
+    fn a_fault_reads_with_the_address_space_unlocked() {
+        let (phys, _cache, fake, file) = fixture(PAGE * WINDOW_PAGES * 2);
+        let kernel = KernelWindow::new(&phys, &[]).unwrap();
+        let mut a = AddressSpace::new(phys.clone(), &kernel, 1).unwrap();
+        let at = a.map(Placement::Fixed(1 << 30), PAGE * 4, PROT_READ, Backing::File { src: file.clone(), offset: 0 }).unwrap();
+        assert_eq!(a.fault(at + 9, false, false), Err(FAULT_READ));
+        assert_eq!(fake.reads.load(Ordering::Relaxed), 0);
+        let mut read = a.take_read().unwrap();
+        read.run();
+        assert_eq!(fake.reads.load(Ordering::Relaxed), 1);
+        a.give_read(read);
+        a.fault(at + 9, false, false).unwrap();
+        a.forget_read();
+        assert_eq!(a.read_vec(at + 9, 1).unwrap(), [9]);
+        let other = (1 << 30) + (2 << 20);
+        let b = a.map(Placement::Fixed(other), PAGE, PROT_READ, Backing::File { src: file.clone(), offset: PAGE * WINDOW_PAGES }).unwrap();
+        assert_eq!(a.fault(b, false, false), Err(FAULT_READ));
+        let mut read = a.take_read().unwrap();
+        read.run();
+        a.map(Placement::Fixed(b), PAGE, PROT_READ | PROT_WRITE, Backing::Anon).unwrap();
+        a.give_read(read);
+        a.fault(b, true, false).unwrap();
+        a.forget_read();
+        assert_eq!(a.read_vec(b, 1).unwrap(), [0], "the new mapping's zeros");
+        let mut mapped = 0;
+        a.each_resident(&mut |_, v, _, _| mapped += matches!(v.backing, Backing::File { .. }) as u64);
+        assert_eq!(phys.cached_idle_frames(), phys.cached_frames() - mapped, "no hold left behind");
     }
 
     /// Files as the image holds them, read through the cache, against what the

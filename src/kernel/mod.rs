@@ -1550,7 +1550,7 @@ impl Kernel {
                 }
                 Exit::PageFault { pc, addr, write, exec } => {
                     let started = SYSCALL_COUNTS.is_some().then(Instant::now);
-                    let faulted = t.proc.mm().fault(addr, write, exec);
+                    let faulted = self.page_fault(t, addr, write, exec);
                     if let Some(s) = started {
                         FAULT_NS.fetch_add(s.elapsed().as_nanos() as u64, Ordering::Relaxed);
                     }

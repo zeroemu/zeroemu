@@ -1,8 +1,8 @@
 //! The clocks clock_gettime reads that aren't CPU time: CLOCK_MONOTONIC, BOOTTIME and
 //! REALTIME, their coarse, raw and alarm forms, and TAI (kernel/time/posix-timers.c).
 //! Each is CLOCK_MONOTONIC plus an offset, as in Linux's timekeeping, so that they
-//! are computed in one place from a few numbers, which code in the guest (a vDSO)
-//! can be handed and compute the same way, to the nanosecond:
+//! are computed in one place from a few numbers, which the vDSO (vdso.rs) is handed
+//! and computes the same way, to the nanosecond:
 //!
 //! - CLOCK_MONOTONIC is the host counter's ticks since its zero (hv::clock), in
 //!   nanoseconds: what guest code reads from CNTVCT_EL0. It stops while the host
@@ -95,9 +95,14 @@ pub fn now_ns(id: u32) -> Option<u64> {
 }
 
 impl super::Kernel {
-    /// Keeps CLOCK_REALTIME with the host's wall clock: called ten times a second.
+    /// Keeps CLOCK_REALTIME with the host's wall clock, the vDSO's too: called ten
+    /// times a second.
     pub(super) fn tick_clocks(&self) {
-        refresh();
+        if refresh()
+            && let Some(v) = &self.vdso
+        {
+            v.update();
+        }
     }
 }
 

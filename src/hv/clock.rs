@@ -3,10 +3,14 @@
 //! the vCPU's vtimer offset (hv_vcpu.h), and hvf.rs sets that offset to `zero().0` on
 //! every vCPU it makes: guest code then reads the ticks since CLOCK_MONOTONIC's zero,
 //! the same on every vCPU, however late it was made. The kernel's CLOCK_MONOTONIC
-//! counts from that zero in the same ticks.
+//! (kernel/clock.rs) and the vDSO count from that zero in the same ticks.
 
 use std::sync::OnceLock;
 use std::time::Instant;
+
+/// Whether guest code reads this counter, from `zero().0`: CNTVCT_EL0 under
+/// Hypervisor.framework. The vDSO needs it.
+pub const GUEST_COUNTER: bool = cfg!(target_os = "macos");
 
 #[cfg(target_os = "macos")]
 unsafe extern "C" {

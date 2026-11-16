@@ -97,6 +97,9 @@ Tracing:
 
 - `ZEROEMU_STRACE=1` (or `--strace`) logs every syscall (`ZEROEMU_STRACE=<name>`:
   only of programs whose path contains it).
+- `ZEROEMU_NO_VDSO=1` gives arm64 programs no vDSO, so their `clock_gettime`,
+  `gettimeofday` and `clock_getres` calls are syscalls again, which `ZEROEMU_STRACE`
+  logs and `ZEROEMU_SYSCOUNT` counts. With the vDSO they never leave the VM.
 - `ZEROEMU_BINDER_TRACE=1` logs every binder transaction.
 - `ZEROEMU_BINDER_RING=1` keeps each thread's last binder events, ioctls included, and
   prints them when its process is killed by a signal.

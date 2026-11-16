@@ -189,6 +189,7 @@ const AT_SECURE: u64 = 23;
 const AT_RANDOM: u64 = 25;
 const AT_HWCAP2: u64 = 26;
 const AT_EXECFN: u64 = 31;
+const AT_SYSINFO_EHDR: u64 = 33;
 
 /// Maps the main stack and lays out argc/argv/envp/auxv; returns the initial SP.
 pub fn build_stack(mm: &mut AddressSpace, main: &Image, interp_base: u64, argv: &[String], envp: &[String]) -> Result<u64, i64> {
@@ -220,7 +221,11 @@ pub fn build_stack(mm: &mut AddressSpace, main: &Image, interp_base: u64, argv: 
     phys::random_bytes(&mut random);
     let random = push_bytes(mm, &random)?;
 
-    let auxv: [(u64, u64); 18] = [
+    // Linux puts the vDSO's address first (ARCH_DLINFO, arch/arm64/include/asm/elf.h).
+    // Without one (x86_64 guests, ZEROEMU_NO_VDSO) the entry is left out, as on a
+    // kernel built without a vDSO, and bionic makes the syscalls.
+    let vdso = crate::kernel::vdso::base().map(|b| (AT_SYSINFO_EHDR, b));
+    let auxv: Vec<(u64, u64)> = vdso.into_iter().chain([
         (AT_PHDR, main.phdr),
         (AT_PHENT, 56),
         (AT_PHNUM, main.phnum),
@@ -239,7 +244,7 @@ pub fn build_stack(mm: &mut AddressSpace, main: &Image, interp_base: u64, argv: 
         (AT_RANDOM, random),
         (AT_EXECFN, execfn),
         (AT_NULL, 0),
-    ];
+    ]).collect();
     let words = 1 + argv_ptrs.len() + 1 + envp_ptrs.len() + 1 + auxv.len() * 2;
     if words as u64 * 8 + (STACK_TOP - sp) > STACK_SIZE / 4 {
         return Err(E2BIG);

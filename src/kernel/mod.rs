@@ -50,6 +50,7 @@ mod timers;
 pub(crate) mod trace;
 mod unix;
 mod vcpus;
+pub(crate) mod vdso;
 mod vsock;
 mod wait;
 mod xattr;
@@ -168,6 +169,8 @@ pub struct Kernel {
     pub(crate) pressure: pressure::Pressure,
     /// Where signal handlers return to: one page, the same in every process.
     sigpage: Arc<crate::mm::SharedObject>,
+    /// The vDSO and its [vvar] page, the same in every process (arm64 only).
+    vdso: Option<vdso::Vdso>,
     /// The vCPUs guest threads share.
     vcpus: Arc<vcpus::Pool>,
     futex: futex::Futexes,
@@ -984,6 +987,7 @@ impl Kernel {
         v.set_page_cache(crate::pagecache::PageCache::new(phys.clone()));
         let sigpage = crate::mm::SharedObject::new(phys.clone());
         sigpage.write(0, &signal::trampoline_page()).map_err(|e| format!("signal page: errno {e}"))?;
+        let vdso = vdso::Vdso::new(&phys).map_err(|e| format!("vDSO: errno {e}"))?;
         let (dev, data) = mount_tmpfs(&mut v, &phys);
         let mut persist = None;
         if boot {
@@ -1114,6 +1118,7 @@ impl Kernel {
             persist,
             pressure: pressure::Pressure::default(),
             sigpage,
+            vdso,
             futex: futex::Futexes::default(),
             root_pid: AtomicI32::new(0),
             props,
@@ -1139,6 +1144,9 @@ impl Kernel {
         // Where signal handlers return to (Linux puts this in the vDSO).
         mm.map(Placement::Fixed(signal::SIGRETURN_TRAMPOLINE), PAGE, PROT_READ | PROT_EXEC, Backing::File { src: self.sigpage.clone(), offset: 0 })?;
         mm.set_name(signal::SIGRETURN_TRAMPOLINE, PAGE, "[sigpage]");
+        if let Some(v) = &self.vdso {
+            v.map(&mut mm)?;
+        }
         Ok(mm)
     }
 

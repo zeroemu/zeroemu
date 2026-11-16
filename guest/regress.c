@@ -132,6 +132,18 @@ static int dtype_of(char *buf, i64 n, const char *name) {
     return -1;
 }
 
+// `pre`, `v` in decimal and `post`, in `out`.
+static char *num_path(char *out, const char *pre, i64 v, const char *post) {
+    char digits[20], *p = out;
+    int nd = 0;
+    while (*pre) *p++ = *pre++;
+    do digits[nd++] = (char)('0' + v % 10); while ((v /= 10) > 0);
+    while (nd) *p++ = digits[--nd];
+    while (*post) *p++ = *post++;
+    *p = 0;
+    return out;
+}
+
 // A number in a /proc file: after `tag` if there is one, or else the `nth` field
 // (from 0) of its first line.
 static char pbuf[4096] __attribute__((aligned(4096)));
@@ -315,16 +327,18 @@ int cmain(void) {
     check(sys(NR_newfstatat, -100, "/proc/thread-self/stat", pst, 0) == 0 && sys(NR_newfstatat, -100, "/proc/thread-self/maps", pst, 0) == -2 &&
           sys(NR_newfstatat, -100, "/proc/sys/kernel", pst, 0) == 0 && sys(NR_newfstatat, -100, "/proc/pressure/memory", pst, 0) == 0 &&
           sys(NR_newfstatat, -100, "/proc/meminfo", pst, 0) == 0, "a thread's directory, /proc/sys, /proc/pressure and /proc/meminfo are found");
+    char path[64];
+    i64 me = sys(NR_gettid);
+    check(sys(NR_newfstatat, -100, num_path(path, "/proc/self/task/", me, "/stat"), pst, 0) == 0 &&
+          sys(NR_newfstatat, -100, num_path(path, "/proc/self/task/0", me, "/stat"), pst, 0) == -2 &&
+          sys(NR_newfstatat, -100, "/proc/self/task/999999", pst, 0) == -2, "a thread's directory is found by its number, as readdir spells it");
+    i64 nfd = sys(NR_openat, -100, "/proc/self/stat", 0, 0);
+    check(sys(NR_newfstatat, -100, num_path(path, "/proc/self/fd/", nfd, ""), pst, 0x100 /* AT_SYMLINK_NOFOLLOW */) == 0 && (*(u32 *)(pst + 16) & 0170000) == 0120000 &&
+          sys(NR_close, nfd) == 0 && sys(NR_newfstatat, -100, path, pst, 0x100) == -2, "an open fd is a link in /proc/self/fd, and a closed one isn't there");
     pid = fork_();
     if (pid == 0) sys(NR_exit_group, 0);
     // A zombie keeps its directory until it is reaped.
-    char zpath[32], digits[12];
-    int nd = 0, zi = 0;
-    for (const char *t = "/proc/"; *t; t++) zpath[zi++] = *t;
-    for (i64 v = pid; v; v /= 10) digits[nd++] = (char)('0' + v % 10);
-    while (nd) zpath[zi++] = digits[--nd];
-    for (const char *t = "/stat"; *t; t++) zpath[zi++] = *t;
-    zpath[zi] = 0;
+    char *zpath = num_path(path, "/proc/", pid, "/stat");
     nap_ms(100);
     i64 zst = sys(NR_newfstatat, -100, zpath, pst, 0);
     check(reap(pid, 3000) == 0 && zst == 0 && sys(NR_newfstatat, -100, zpath, pst, 0) == -2, "a zombie's /proc directory is there until it is reaped");

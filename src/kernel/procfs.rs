@@ -867,6 +867,18 @@ impl FileSystem for ProcFs {
                 return Ok(fixed(&PID_DIR, pid, extra));
             }
             Some((K::Task, pid, extra)) => return Ok(fixed(&TASK_DIR, pid, extra)),
+            // A thread or an fd, by its number as readdir spells it: listing them made a
+            // name for each of a process's threads, or files, to find one.
+            Some((K::PTask, pid, _)) => {
+                let p = self.proc(pid)?;
+                let tid = name.parse::<i32>().ok().filter(|t| t.to_string() == name);
+                return Ok(tid.filter(|&t| p.threads.lock().unwrap().iter().any(|th| th.tid == t)).map(|t| mk(K::Task, pid, t as u64)));
+            }
+            Some((K::PFd, pid, _)) => {
+                let p = self.proc(pid)?;
+                let fd = name.parse::<i64>().ok().filter(|f| f.to_string() == name);
+                return Ok(fd.filter(|&f| p.files.lock().unwrap().get(f).is_ok()).map(|f| mk(K::PFdLink, pid, f as u64)));
+            }
             Some((K::Root, _, _)) => {
                 return Ok(match name {
                     "sys" => Some(mk(K::Sysctl, 0, Sysctl::root() as u64)),

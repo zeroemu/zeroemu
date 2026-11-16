@@ -12,7 +12,7 @@ use super::wait::EVENTS;
 use super::{ERESTARTSYS, IDLE, Thread};
 use crate::errno::*;
 use std::collections::VecDeque;
-use std::sync::{Arc, LazyLock, Mutex, OnceLock, Weak};
+use std::sync::{Arc, LazyLock, Mutex, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub const INPUT_MAJOR: u32 = 13;
@@ -142,18 +142,19 @@ pub fn open(devt: u64) -> Option<Arc<Client>> {
     Some(c)
 }
 
-/// CLOCK_MONOTONIC's zero. Event times must be on that clock: InputDispatcher drops
-/// anything it thinks is more than ten seconds old.
-static BOOT: OnceLock<Instant> = OnceLock::new();
-
-/// CLOCK_MONOTONIC's zero, fixed by whoever asks first: the kernel's clock, input
-/// events and the GPU's fence and flip times all count from it.
+/// CLOCK_MONOTONIC's zero, fixed by whoever asks first (hv::clock::zero), as the
+/// Instant deadlines count from.
 pub fn boot_instant() -> Instant {
-    *BOOT.get_or_init(Instant::now)
+    crate::hv::clock::zero().1
 }
 
+/// CLOCK_MONOTONIC now: the host counter's ticks since its zero, which is also what
+/// guest code reads from CNTVCT_EL0. Event times must be on that clock:
+/// InputDispatcher drops anything it thinks is more than ten seconds old. The
+/// kernel's clock and the GPU's fence and flip times count from it too.
 pub(crate) fn since_boot() -> Duration {
-    BOOT.get_or_init(Instant::now).elapsed()
+    use crate::hv::clock;
+    Duration::from_nanos(clock::to_ns(clock::now().wrapping_sub(clock::zero().0)))
 }
 
 impl Device {

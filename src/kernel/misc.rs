@@ -147,7 +147,7 @@ impl Kernel {
             }
             sysinfo => {
                 let mut b = [0u8; 112];
-                b[0..8].copy_from_slice(&self.boot.elapsed().as_secs().to_le_bytes());
+                b[0..8].copy_from_slice(&super::evdev::since_boot().as_secs().to_le_bytes());
                 b[32..40].copy_from_slice(&phys::ram().to_le_bytes()); // totalram
                 b[40..48].copy_from_slice(&phys::ram().saturating_sub(self.phys.frames_in_use() * phys::PAGE).to_le_bytes());
                 b[104..108].copy_from_slice(&1u32.to_le_bytes()); // mem_unit
@@ -244,7 +244,7 @@ impl Kernel {
     fn clock(&self, id: u64) -> (u64, u64) {
         let d = match id {
             0 | 5 | 8 | 11 => SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default(), // REALTIME(_COARSE), REALTIME_ALARM
-            _ => self.boot.elapsed(),
+            _ => super::evdev::since_boot(),
         };
         (d.as_secs(), d.subsec_nanos() as u64)
     }

@@ -3,6 +3,7 @@
 //! page, or is interrupted. Page tables, processes, and everything
 //! Linux-specific live above this line, in `mm` and `kernel`.
 
+pub mod clock;
 #[cfg(target_os = "macos")]
 mod hvf;
 #[cfg(target_os = "macos")]

@@ -114,3 +114,9 @@ pub fn check(what: &str, ret: hv_return_t) {
         panic!("{what} failed: hv_return_t = {ret:#x}");
     }
 }
+
+// The vCPU's virtual counter: CNTVCT_EL0 = mach_absolute_time() - vtimer_offset.
+#[link(name = "Hypervisor", kind = "framework")]
+unsafe extern "C" {
+    pub fn hv_vcpu_set_vtimer_offset(vcpu: hv_vcpu_t, offset: u64) -> hv_return_t;
+}

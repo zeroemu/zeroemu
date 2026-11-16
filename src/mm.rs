@@ -184,6 +184,25 @@ impl SharedObject {
         Ok(frame)
     }
 
+    /// For each (page, 0) of `pages`, the frame holding it if it is in memory now (and,
+    /// with a pager, mapped somewhere already), with a hold on it for a mapping, as
+    /// `map_frame` gives (`dirty` for a shared mapping that may write it); the others
+    /// stay 0. Nothing is read back or allocated.
+    fn resident_frames(&self, pages: &mut [(u64, u64)], dirty: bool) {
+        let mut slots = self.pages.lock().unwrap();
+        for (idx, frame) in pages {
+            let Some(slot) = usize::try_from(*idx).ok().and_then(|i| slots.get_mut(i)) else { continue };
+            // With a pager, a page nothing maps stays unmapped, so that it can still go.
+            if slot.frame != 0 && (self.pager.is_none() || !self.phys.is_sole_owner(slot.frame & !FLAGS)) {
+                if dirty {
+                    slot.frame |= DIRTY;
+                }
+                *frame = slot.frame & !FLAGS;
+                self.phys.share(*frame);
+            }
+        }
+    }
+
     /// For an object that holds all its pages in memory (no pager), so can't fail.
     pub fn read(&self, off: u64, buf: &mut [u8]) {
         if self.try_read(off, buf).is_err() {
@@ -359,6 +378,11 @@ impl PageSource for SharedObject {
         let mut v = vec![0; len];
         self.try_read(off, &mut v)?;
         Ok(v)
+    }
+
+    fn resident(&self, pages: &mut [(u64, u64)]) {
+        // A private mapping never writes the object's frames: it copies them first.
+        self.resident_frames(pages, false);
     }
 }
 
@@ -1212,7 +1236,77 @@ impl AddressSpace {
         let frame = self.populate(start, &vma, page, write).map_err(|_| SEGV_MAPERR)?;
         let shared = matches!(vma.backing, Backing::Shared { .. } | Backing::Dev { .. });
         self.phys.write_pte(slot, self.entry_for(frame, prot, shared));
+        self.fault_around(start, &vma, page, slot, write);
         Ok(())
+    }
+
+    /// Maps the neighbours of a page just faulted in that are in memory already, as
+    /// Linux's do_fault_around does (mm/memory.c, with filemap_map_pages in
+    /// mm/filemap.c), so that code and data many processes use cost one fault per
+    /// 64 KB rather than one per page. The window is the page cache's, in file pages,
+    /// cut to the mapping and to the page's own leaf table. Only entries not present yet
+    /// are filled, and no TLB holds one of those, so nothing needs flushing.
+    ///
+    /// Unlike Linux, only pages that something has mapped already: Linux can unmap a
+    /// page to reclaim it (it keeps reverse maps), and zeroemu can't, so a page mapped
+    /// here stays in memory as long as the mapping does. Mapping every page in memory
+    /// kept 490 MB more in guest memory after opening seven apps (2632 MB before); pages
+    /// mapped elsewhere are kept anyway, and gave 70% of the saving.
+    fn fault_around(&self, vma_start: u64, vma: &Vma, page: u64, slot: u64, write: bool) {
+        use crate::pagecache::WINDOW_PAGES;
+        const N: usize = WINDOW_PAGES as usize;
+        // Private file mappings only while they can't be written (code, read-only data,
+        // the vdex, oat and apk files ART maps): mapped from the cache now, a page there
+        // would later be copied on a fault of its own, and a TLB flush, rather than on its
+        // first touch. Shared memory with no pager, and device memory, whatever the
+        // access: their pages stay in memory anyway, and are mapped as they will be.
+        // A pager's pages only where the mapping can never write them: one that can marks
+        // them dirty, and each would be written out to leave memory.
+        let offset = match &vma.backing {
+            Backing::File { offset, .. } if !write && vma.prot & PROT_WRITE == 0 => *offset,
+            Backing::Shared { obj, offset } if obj.pager.is_none() || vma.max_prot & PROT_WRITE == 0 => *offset,
+            Backing::Dev { offset, .. } => *offset,
+            _ => return,
+        };
+        if vma.uffd().is_some() {
+            return;
+        }
+        let idx = (offset + (page - vma_start)) / PAGE;
+        let first = idx - idx % WINDOW_PAGES;
+        let at = paging::index(page, paging::levels() - 1) as u64;
+        let before = (idx - first).min((page - vma_start) / PAGE).min(at);
+        let after = (first + WINDOW_PAGES - 1 - idx).min((vma.end - page) / PAGE - 1).min(511 - at);
+        let table = slot - at * 8;
+        let mut want = [(0u64, 0u64); N];
+        let mut n = 0;
+        for i in at - before..=at + after {
+            if i != at && !paging::is_valid(self.phys.read_u64(table + i * 8)) {
+                want[n] = (idx + i - at, 0);
+                n += 1;
+            }
+        }
+        if n == 0 {
+            return;
+        }
+        let want = &mut want[..n];
+        match &vma.backing {
+            Backing::File { src, .. } => src.resident(want),
+            Backing::Shared { obj, .. } => obj.resident_frames(want, vma.max_prot & PROT_WRITE != 0),
+            Backing::Dev { mem, .. } => {
+                for (i, frame) in want.iter_mut() {
+                    if *i * PAGE < mem.len {
+                        *frame = mem.gpa + *i * PAGE;
+                    }
+                }
+            }
+            Backing::Anon => return,
+        }
+        let shared = !matches!(vma.backing, Backing::File { .. });
+        for &(i, frame) in want.iter() {
+            if frame != 0 {
+                self.phys.write_pte(table + (at + i - idx) * 8, self.entry_for(frame, vma.prot, shared));
+            }
+        }
     }
 
     /// Each page present, as (where its mapping starts, its mapping, its address, its

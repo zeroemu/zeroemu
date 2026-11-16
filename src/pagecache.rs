@@ -25,6 +25,12 @@ pub trait PageSource: Send + Sync {
     /// `len` bytes from `off`, or as many as there are (some sources read zeros
     /// past their end: they don't know where that is, and the caller does).
     fn read_bytes(&self, off: u64, len: usize) -> Result<Vec<u8>, i64>;
+    /// For each (page, 0) of `pages`, the frame holding that page if it is in memory
+    /// and mapped somewhere already, with a hold on it for the caller as `page` gives;
+    /// the others stay 0. It reads nothing and doesn't count as a use: it is for
+    /// mapping a fault's neighbours, which may never be touched (see
+    /// `AddressSpace::fault_around`).
+    fn resident(&self, _pages: &mut [(u64, u64)]) {}
 }
 
 /// Bytes outside guest memory (a generated file someone maps): each mapping gets
@@ -59,8 +65,8 @@ impl PageSource for Bytes {
 }
 
 /// How much a miss reads: a file is mostly read in runs, and decompressing is by
-/// the extent anyway.
-const WINDOW_PAGES: u64 = 16;
+/// the extent anyway. A fault maps the pages of its window that are in memory.
+pub const WINDOW_PAGES: u64 = 16;
 /// How many pages nothing has mapped may stay. Reading them again is quick (the
 /// host has the image file cached, and LZ4 is fast), so this needn't be much.
 const IDLE_LIMIT: u64 = (256 << 20) / PAGE;
@@ -515,6 +521,20 @@ impl PageSource for CachedFile {
     fn read_bytes(&self, off: u64, len: usize) -> Result<Vec<u8>, i64> {
         self.read(off, len)
     }
+
+    fn resident(&self, pages: &mut [(u64, u64)]) {
+        // Under the lock, as in `page`: `try_evict` can't take one between the look and the hold.
+        let st = self.state.lock().unwrap();
+        for (idx, frame) in pages {
+            if let Some(&entry) = u32::try_from(*idx).ok().and_then(|i| st.pages.get(&i)) {
+                // A page nothing maps stays unmapped, so that it can still go.
+                if !self.cache.phys.is_sole_owner(entry & !REFERENCED) {
+                    *frame = entry & !REFERENCED;
+                    self.cache.phys.share(*frame);
+                }
+            }
+        }
+    }
 }
 
 impl Drop for CachedFile {
@@ -546,7 +566,7 @@ impl ReadAt for CachedFile {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mm::{AddressSpace, Backing, KernelWindow, Placement};
+    use crate::mm::{AddressSpace, Backing, KernelWindow, Placement, SharedObject};
     use crate::paging::{PROT_READ, PROT_WRITE};
     use crate::vfs::{Dirent, Stat};
     use std::sync::atomic::AtomicUsize;
@@ -710,6 +730,96 @@ mod tests {
         a.write(at, &[2]).unwrap();
         assert_eq!(b.read_vec(at, 1).unwrap(), [1]);
         assert_eq!(file.read(0, 1).unwrap(), [0]);
+    }
+
+    /// A read fault also maps the pages of its window that another mapping has, as far
+    /// as its own mapping goes: still the cache's frames, so a write copies them. Pages
+    /// nothing maps stay unmapped, so that the cache can still let them go.
+    #[test]
+    fn a_read_fault_maps_the_neighbours_mapped_elsewhere() {
+        let (phys, cache, _fake, file) = fixture(PAGE * WINDOW_PAGES * 4);
+        let kernel = KernelWindow::new(&phys, &[]).unwrap();
+        let w = WINDOW_PAGES as usize;
+        // Another process has every other page of the first two windows mapped. Its own
+        // faults found nothing else mapped around them.
+        let mut b = AddressSpace::new(phys.clone(), &kernel, 2).unwrap();
+        let other = b.map(Placement::Fixed(1 << 30), PAGE * WINDOW_PAGES * 2, PROT_READ, Backing::File { src: file.clone(), offset: 0 }).unwrap();
+        for i in (0..WINDOW_PAGES * 2).step_by(2) {
+            b.fault(other + PAGE * i, false, false).unwrap();
+        }
+        let evens: Vec<u8> = (0..w * 2).map(|i| (i % 2 == 0) as u8).collect();
+        assert_eq!(b.residency(other, other + PAGE * WINDOW_PAGES * 2), evens);
+        // Three pages into the file, so its windows don't start where the mapping does,
+        // and ending before the second window does.
+        let mut a = AddressSpace::new(phys.clone(), &kernel, 1).unwrap();
+        let len = PAGE * (WINDOW_PAGES + 4);
+        let at = a.map(Placement::Fixed((1 << 30) + (2 << 20)), len, PROT_READ, Backing::File { src: file.clone(), offset: PAGE * 3 }).unwrap();
+        a.fault(at + PAGE * 2, false, false).unwrap();
+        // The page faulted, and the first window's even pages from the fourth on.
+        let mut want = vec![0u8; w + 4];
+        for p in [1, 2, 3, 5, 7, 9, 11] {
+            want[p] = 1;
+        }
+        assert_eq!(a.residency(at, at + len), want);
+        a.fault(at + PAGE * (WINDOW_PAGES - 2), false, false).unwrap();
+        for p in [13, 14, 15, 17, 19] {
+            want[p] = 1;
+        }
+        assert_eq!(a.residency(at, at + len), want, "the second window, as far as the mapping goes");
+        // Each mapped page holds its frame, and the frames are the cache's: b's 16 and
+        // the two a faulted itself.
+        assert_eq!(phys.cached_idle_frames(), phys.cached_frames() - 18);
+        a.protect(at, len, PROT_READ | PROT_WRITE).unwrap();
+        a.write(at + PAGE * 5 + 7, &[99]).unwrap();
+        assert_eq!(a.read_vec(at + PAGE * 5 + 7, 1).unwrap(), [99]);
+        assert_eq!(b.read_vec(other + PAGE * 8 + 7, 1).unwrap(), [7]);
+        assert_eq!(file.read(PAGE * 8 + 7, 1).unwrap(), [7]);
+        drop(a);
+        drop(b);
+        assert_eq!(phys.cached_idle_frames(), phys.cached_frames());
+        // Pages a fault mapped are not taken while mapped, and go once they aren't.
+        cache.limit_idle(0);
+        cache.balance();
+        cache.balance();
+        assert_eq!(phys.cached_frames(), 0);
+    }
+
+    /// A writable private mapping takes its pages one at a time: mapped read-only from the
+    /// cache, each would be copied on a second fault rather than the first.
+    #[test]
+    fn a_writable_private_mapping_maps_only_the_page_faulted() {
+        let (phys, _cache, _fake, file) = fixture(PAGE * WINDOW_PAGES);
+        let kernel = KernelWindow::new(&phys, &[]).unwrap();
+        let mut b = AddressSpace::new(phys.clone(), &kernel, 2).unwrap();
+        let other = b.map(Placement::Hint(0), PAGE * 4, PROT_READ, Backing::File { src: file.clone(), offset: 0 }).unwrap();
+        for i in 0..4 {
+            b.fault(other + PAGE * i, false, false).unwrap();
+        }
+        let mut a = AddressSpace::new(phys.clone(), &kernel, 1).unwrap();
+        let at = a.map(Placement::Hint(0), PAGE * 4, PROT_READ | PROT_WRITE, Backing::File { src: file, offset: 0 }).unwrap();
+        a.fault(at + PAGE, false, false).unwrap();
+        assert_eq!(a.residency(at, at + PAGE * 4), [0, 1, 0, 0]);
+    }
+
+    /// Shared memory maps what it has around a fault, written or not, with the mapping's
+    /// protection: the same frames everyone sees.
+    #[test]
+    fn shared_memory_maps_what_it_has_around_a_fault() {
+        let phys = PhysMem::new(Arc::new(crate::hv::NoHv));
+        let kernel = KernelWindow::new(&phys, &[]).unwrap();
+        let obj = SharedObject::new(phys.clone());
+        obj.write(PAGE, &[1; 3 * PAGE as usize]).unwrap();
+        let mut a = AddressSpace::new(phys.clone(), &kernel, 1).unwrap();
+        let at = a.map(Placement::Fixed(1 << 30), PAGE * 8, PROT_READ | PROT_WRITE, Backing::Shared { obj: obj.clone(), offset: 0 }).unwrap();
+        a.fault(at + PAGE * 2, true, false).unwrap();
+        // mincore counts a shared page in memory as resident: check the entries themselves.
+        let mut mapped = Vec::new();
+        a.each_resident(&mut |_, _, va, _| mapped.push((va - at) / PAGE));
+        assert_eq!(mapped, [1, 2, 3]);
+        a.write(at + PAGE * 3, &[7]).unwrap();
+        let mut b = [0u8; 1];
+        obj.read(PAGE * 3, &mut b);
+        assert_eq!(b, [7]);
     }
 
     /// Files as the image holds them, read through the cache, against what the

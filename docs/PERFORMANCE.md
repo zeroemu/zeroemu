@@ -37,9 +37,17 @@ guest memory twice. This is accounting: the page exists once either way.
 ## System calls
 
 A syscall round trip (guest → host → guest) is ~1.0 µs on an M1 Pro (1M
-`getpid` calls in 1.0 s), about 10x a native syscall. Planned mitigations:
+`getpid` calls in 1.0 s), about 10x a native syscall.
 
-- a vDSO page so `clock_gettime` / `gettimeofday` never exit the VM;
+arm64 programs get a vDSO, as on Linux, so `clock_gettime`, `gettimeofday` (and
+`time`) and `clock_getres` don't exit the VM: they read the virtual counter, which
+every vCPU sets to count from CLOCK_MONOTONIC's zero, and a read-only page of the
+kernel's offsets. A clock read takes about 25 ns that way, against 1.2 to 1.4 µs as a
+syscall (`guest/clocks.c` measures both). On a device idle after boot, clock calls
+were about half of all syscall exits, 1,350 a second; 36 a second are left, for what
+the vDSO passes on to the syscall, as Linux's does: the CPU-time clocks, mostly.
+`ZEROEMU_NO_VDSO=1` turns it off. Planned mitigations:
+
 - fewer register accesses per exit;
 - implementing binder transactions and futex wakeups without extra round trips.
 

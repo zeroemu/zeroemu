@@ -256,6 +256,24 @@ fn decode(ino: u64) -> Option<(K, i32, u64)> {
     Some((k, ((ino >> 16) & 0xffff_ffff) as i32, ino >> 48))
 }
 
+/// Whether a node of this kind is a directory, as `content` would make it. stat and
+/// readdir go by this rather than making the node, as Linux's procfs takes an inode's
+/// type from its tables of entries (fs/proc/base.c's pid_entry) and makes a file's text
+/// only when it is read (seq_file).
+fn is_dir(k: K, extra: u64) -> bool {
+    match k {
+        K::Root | K::Net | K::Pid | K::PFd | K::PTask | K::Task | K::PAttr | K::PNs | K::Pressure => true,
+        // /proc/sys: sysctl.rs numbers its files first and its directories after them.
+        K::Sysctl => extra as u16 >= Sysctl::root(),
+        _ => false,
+    }
+}
+
+/// Whether a node of this kind is a symbolic link, as `content` would make it.
+fn is_link(k: K) -> bool {
+    matches!(k, K::Self_ | K::ThreadSelf | K::PExe | K::PCwd | K::PFdLink | K::PNsLink)
+}
+
 enum Content {
     Dir(Vec<(String, u64)>),
     File(Vec<u8>),
@@ -298,6 +316,44 @@ impl ProcFs {
     /// Zombies included: a parent may read one's stat before reaping it.
     fn proc_or_zombie(&self, pid: i32) -> io::Result<Arc<Process>> {
         self.kernel()?.process(pid).ok_or_else(|| err(ENOENT))
+    }
+
+    /// Whether a node that isn't a link is there, by the checks `content` makes for it,
+    /// without making it. An open makes a file's text once, when it is first read: a
+    /// process's stat or status made at each step of the path walk and again at open
+    /// was most of what reading them cost.
+    fn check(&self, k: K, pid: i32, extra: u64) -> io::Result<()> {
+        let kernel = self.kernel()?;
+        match k {
+            K::Pid | K::PStatus | K::PStat | K::PStatm => {
+                self.proc_or_zombie(pid)?;
+            }
+            K::Mounts | K::PMounts | K::PMountinfo => {
+                if pid != 0 {
+                    self.proc(pid)?;
+                }
+                kernel.vfs.as_deref().ok_or_else(|| err(ENOENT))?;
+            }
+            K::Sysctl => {
+                kernel.sysctl.entry(extra as u16).ok_or_else(|| err(ENOENT))?;
+            }
+            K::PMaps => {
+                if self.proc(pid)?.mm.lock().unwrap().is_none() {
+                    return Err(err(ENOENT));
+                }
+            }
+            K::PTimerslack => {
+                thread_of(&*self.proc(pid)?, extra as i32).ok_or_else(|| err(ESRCH))?;
+            }
+            K::PCmdline | K::PComm | K::PFd | K::PTask | K::POom | K::POomAdj | K::POomScore | K::PNs | K::PCgroup => {
+                self.proc(pid)?;
+            }
+            K::AttrCurrent | K::AttrPrev | K::AttrExec | K::AttrFscreate | K::AttrKeycreate | K::AttrSockcreate => {
+                self.proc(pid)?;
+            }
+            _ => {}
+        }
+        Ok(())
     }
 
     fn content(&self, ino: u64) -> io::Result<Content> {
@@ -661,13 +717,22 @@ impl FileSystem for ProcFs {
     }
 
     fn stat(&self, ino: u64) -> io::Result<Stat> {
-        let (mode, size) = match self.content(ino)? {
-            Content::Dir(_) if matches!(decode(ino), Some((K::PNs, _, _))) => (S_IFDIR | 0o511, 0),
-            Content::Dir(_) => (S_IFDIR | 0o555, 0),
-            Content::Link(t) => (S_IFLNK | 0o777, t.len() as u64),
-            Content::File(_) if matches!(decode(ino), Some((K::PTimerslack, _, _))) => (S_IFREG | 0o666, 0),
-            Content::File(_) if self.write_ok(ino) => (S_IFREG | 0o644, 0),
-            Content::File(_) => (S_IFREG | 0o444, 0), // like Linux, procfs files report size 0
+        let (k, pid, extra) = decode(ino).ok_or_else(|| err(ENOENT))?;
+        let (mode, size) = if is_link(k) {
+            // A link's target is quick to make, and its length is its size.
+            match self.content(ino)? {
+                Content::Link(t) => (S_IFLNK | 0o777, t.len() as u64),
+                _ => return Err(err(EIO)),
+            }
+        } else {
+            self.check(k, pid, extra)?;
+            match k {
+                K::PNs => (S_IFDIR | 0o511, 0),
+                _ if is_dir(k, extra) => (S_IFDIR | 0o555, 0),
+                K::PTimerslack => (S_IFREG | 0o666, 0),
+                _ if self.write_ok(ino) => (S_IFREG | 0o644, 0),
+                _ => (S_IFREG | 0o444, 0), // like Linux, procfs files report size 0
+            }
         };
         let mtime = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
         // An nsfs inode's number is the namespace's id.
@@ -796,10 +861,12 @@ impl FileSystem for ProcFs {
     fn readdir(&self, dir: u64) -> io::Result<Vec<Dirent>> {
         let Content::Dir(entries) = self.content(dir)? else { return Err(err(ENOTDIR)) };
         let mut out = vec![Dirent { name: ".".into(), ino: dir, dtype: 4 }, Dirent { name: "..".into(), ino: ROOT, dtype: 4 }];
+        // Each entry's type by its kind: listing /proc made every process's directory, and
+        // listing one made its stat, status and maps.
         for (name, i) in entries {
-            let dtype = match self.content(i) {
-                Ok(Content::Dir(_)) => 4,
-                Ok(Content::Link(_)) => 10,
+            let dtype = match decode(i) {
+                Some((k, _, extra)) if is_dir(k, extra) => 4,
+                Some((k, _, _)) if is_link(k) => 10,
                 _ => 8,
             };
             out.push(Dirent { name, ino: i, dtype });

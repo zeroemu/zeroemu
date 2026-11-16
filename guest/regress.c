@@ -10,9 +10,11 @@ typedef unsigned int u32;
 #define NR_openat 56
 #define NR_close 57
 #define NR_pipe2 59
+#define NR_getdents64 61
 #define NR_read 63
 #define NR_write 64
 #define NR_pread64 67
+#define NR_newfstatat 79
 #define NR_fstat 80
 #define NR_utimensat 88
 #define NR_exit 93
@@ -66,6 +68,7 @@ static void check(int cond, const char *name) {
     puts_("\n");
     if (!cond) failures++;
 }
+static int streq(const char *a, const char *b) { while (*a && *a == *b) a++, b++; return *a == *b; }
 static void nap_ms(i64 ms) { i64 ts[2] = {ms / 1000, (ms % 1000) * 1000000}; sys(NR_nanosleep, ts, 0); }
 
 #define CLONE_THREAD_FLAGS (0x100 | 0x200 | 0x400 | 0x800 | 0x10000 | 0x40000 | 0x200000)
@@ -117,6 +120,14 @@ static i64 bw(int fd, void *w, u64 wn, void *r, u64 rn, u64 *got) {
     i64 ret = sys(NR_ioctl, fd, BINDER_WRITE_READ, &b);
     if (got) *got = b.rcons;
     return ret;
+}
+
+// The d_type getdents64 gave `name`, or -1.
+static int dtype_of(char *buf, i64 n, const char *name) {
+    for (i64 off = 0; off < n; off += *(unsigned short *)(buf + off + 16)) {
+        if (streq(buf + off + 19, name)) return *(unsigned char *)(buf + off + 18);
+    }
+    return -1;
 }
 
 // Whether `want` is among the commands the driver returns next.
@@ -260,6 +271,20 @@ int cmain(void) {
     }
     status = reap(pid, 3000);
     check(status == 0 && canary[0] == 0x1122334455667788, "binder refuses a fixup outside its parent buffer");
+
+    // --- /proc: what stat and readdir say of a file, which they find out without making it
+    char pst[128];
+    check(sys(NR_newfstatat, -100, "/proc/self/status", pst, 0) == 0 && *(u32 *)(pst + 16) == 0100444 && *(i64 *)(pst + 48) == 0,
+          "/proc/self/status is a read-only regular file of size 0");
+    check(sys(NR_newfstatat, -100, "/proc/self/oom_score_adj", pst, 0) == 0 && *(u32 *)(pst + 16) == 0100644, "/proc/self/oom_score_adj is writable");
+    check(sys(NR_newfstatat, -100, "/proc/self/fd", pst, 0) == 0 && *(u32 *)(pst + 16) == 040555, "/proc/self/fd is a directory");
+    check(sys(NR_newfstatat, -100, "/proc/999999/status", pst, 0) == -2, "a process that isn't there has no status");
+    static char dents[8192];
+    i64 pd = sys(NR_openat, -100, "/proc/self", 0, 0);
+    i64 dn = sys(NR_getdents64, pd, dents, sizeof dents);
+    check(dtype_of(dents, dn, "status") == 8 && dtype_of(dents, dn, "fd") == 4 && dtype_of(dents, dn, "exe") == 10 && dtype_of(dents, dn, "task") == 4,
+          "readdir of /proc/self gives each entry's type");
+    sys(NR_close, pd);
 
     puts_(failures ? "SOME CHECKS FAILED\n" : "all checks passed\n");
     return failures;

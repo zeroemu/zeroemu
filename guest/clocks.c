@@ -1,6 +1,7 @@
 // Freestanding arm64 test of the guest's clocks: the virtual counter (CNTVCT_EL0)
 // against CLOCK_MONOTONIC on every vCPU, the other clocks against it, and the vDSO,
-// found through AT_SYSINFO_EHDR as bionic finds it, against the syscalls.
+// found through AT_SYSINFO_EHDR as bionic finds it, against the syscalls. And
+// getcpu, which sched_getcpu makes.
 
 typedef unsigned long u64;
 typedef long i64;
@@ -17,10 +18,13 @@ typedef unsigned char u8;
 #define NR_futex 98
 #define NR_clock_gettime 113
 #define NR_clock_getres 114
+#define NR_sched_getaffinity 123
+#define NR_getcpu 168
 #define NR_gettimeofday 169
 #define NR_clone 220
 #define NR_wait4 260
 
+#define EFAULT 14
 #define EINVAL 22
 
 static i64 sys6(i64 n, i64 a, i64 b, i64 c, i64 d, i64 e, i64 f) {
@@ -342,6 +346,17 @@ static int run(u64 *sp) {
     u64 r1 = svc_ns(0);
     u64 us = (u64)tv.sec * 1000000 + (u64)tv.usec;
     check(tv.usec >= 0 && tv.usec < 1000000 && r0 / 1000 <= us && us <= r1 / 1000, "gettimeofday is CLOCK_REALTIME in microseconds");
+
+    // getcpu: a CPU below the count sched_getaffinity gives, on node 0, the same each time.
+    u64 mask = 0;
+    sys(NR_sched_getaffinity, 0, 8, &mask);
+    u32 ncpu = 0;
+    for (u64 m = mask; m; m >>= 1) ncpu += m & 1;
+    u32 cpu = 99, node = 99, cpu2 = 98;
+    check(sys(NR_getcpu, &cpu, &node, 0) == 0 && cpu < ncpu && node == 0, "getcpu: a CPU Android counts, node 0");
+    check(sys(NR_getcpu, &cpu2, 0, 0) == 0 && cpu2 == cpu, "getcpu: the same CPU again, no node wanted");
+    check(sys(NR_getcpu, 0, 0, 0) == 0, "getcpu with nothing wanted");
+    check(sys(NR_getcpu, 8, 0, 0) == -EFAULT, "getcpu to a bad address is EFAULT");
 
     // The vDSO.
     check(sysinfo_ehdr != 0 && sysinfo_ehdr % 4096 == 0, "AT_SYSINFO_EHDR is a page");

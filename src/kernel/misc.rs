@@ -128,7 +128,7 @@ impl Kernel {
             sched_getaffinity => {
                 // One CPU per vCPU slot would be truthful; report the host's
                 // core count so thread pools size themselves sensibly.
-                let cpus = std::thread::available_parallelism().map_or(1, |n| n.get()).min(64);
+                let cpus = cpus();
                 let mut mask = [0u8; 8];
                 for i in 0..cpus {
                     mask[i / 8] |= 1 << (i % 8);
@@ -136,6 +136,21 @@ impl Kernel {
                 let len = a[1].min(8) as usize;
                 t.proc.mm().write(a[2], &mask[..len])?;
                 Ok(len as i64)
+            }
+            getcpu => {
+                // Linux says which CPU the thread is on now, and its NUMA node
+                // (kernel/sys.c); it may be on another by the time it looks. Here no
+                // thread is on any CPU in particular, so each says the same one, picked
+                // by its tid: per-CPU data (sched_getcpu's callers) then spreads over
+                // the CPUs Android counts. There is one node.
+                let cpu = (t.tid as u32 % cpus() as u32).to_le_bytes();
+                if a[0] != 0 {
+                    t.proc.mm().write(a[0], &cpu)?;
+                }
+                if a[1] != 0 {
+                    t.proc.mm().write(a[1], &0u32.to_le_bytes())?;
+                }
+                Ok(0)
             }
             getrusage => {
                 const RUSAGE_SELF: i32 = 0;
@@ -252,6 +267,13 @@ impl Kernel {
         let ns = super::clock::now_ns(id as u32).unwrap_or_else(super::clock::monotonic_ns);
         (ns / 1_000_000_000, ns % 1_000_000_000)
     }
+}
+
+/// The CPUs Android sees: as many as the host has, up to 64 (sched_getaffinity,
+/// /proc/cpuinfo, /sys/devices/system/cpu).
+fn cpus() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::thread::available_parallelism().map_or(1, |n| n.get()).min(64))
 }
 
 /// struct rusage: ru_utime then ru_stime (timevals), then ru_maxrss in KB and the rest.

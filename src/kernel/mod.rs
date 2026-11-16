@@ -12,6 +12,7 @@ mod binder;
 mod block;
 mod bpf;
 mod cgroup;
+pub(crate) mod clock;
 mod control;
 mod creds;
 mod drm;

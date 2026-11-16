@@ -13,7 +13,7 @@ use super::{ERESTARTSYS, IDLE, Thread};
 use crate::errno::*;
 use std::collections::VecDeque;
 use std::sync::{Arc, LazyLock, Mutex, Weak};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 pub const INPUT_MAJOR: u32 = 13;
 const FIRST_MINOR: u32 = 64;
@@ -148,13 +148,10 @@ pub fn boot_instant() -> Instant {
     crate::hv::clock::zero().1
 }
 
-/// CLOCK_MONOTONIC now: the host counter's ticks since its zero, which is also what
-/// guest code reads from CNTVCT_EL0. Event times must be on that clock:
-/// InputDispatcher drops anything it thinks is more than ten seconds old. The
-/// kernel's clock and the GPU's fence and flip times count from it too.
+/// CLOCK_MONOTONIC now (kernel/clock.rs). Event times must be on that clock:
+/// InputDispatcher drops anything it thinks is more than ten seconds old.
 pub(crate) fn since_boot() -> Duration {
-    use crate::hv::clock;
-    Duration::from_nanos(clock::to_ns(clock::now().wrapping_sub(clock::zero().0)))
+    super::clock::monotonic()
 }
 
 impl Device {
@@ -430,8 +427,8 @@ impl Client {
         let t = if *self.clock.lock().unwrap() == CLOCK_MONOTONIC {
             at
         } else {
-            let ago = since_boot().saturating_sub(at);
-            SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().saturating_sub(ago)
+            // CLOCK_REALTIME, as the guest reads it (kernel/clock.rs).
+            Duration::from_nanos((at.as_nanos() as u64).wrapping_add(super::clock::realtime_offset()))
         };
         out.extend_from_slice(&t.as_secs().to_le_bytes());
         out.extend_from_slice(&(t.subsec_micros() as u64).to_le_bytes());

@@ -5,7 +5,7 @@ use crate::arch::{Arch, Sysno};
 use crate::errno::*;
 use crate::hv::Vcpu;
 use crate::phys;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 const ARCH_SET_FS: u64 = 0x1002;
 
@@ -56,6 +56,11 @@ impl Kernel {
                     b[..8].copy_from_slice(&s.to_le_bytes());
                     b[8..].copy_from_slice(&(ns / 1000).to_le_bytes());
                     t.proc.mm().write(a[0], &b)?;
+                }
+                // The time zone is Linux's sys_tz, zeros unless settimeofday set it
+                // (kernel/time/time.c), and settimeofday here sets nothing.
+                if a[1] != 0 {
+                    t.proc.mm().write(a[1], &[0u8; 8])?;
                 }
                 Ok(0)
             }
@@ -147,7 +152,7 @@ impl Kernel {
             }
             sysinfo => {
                 let mut b = [0u8; 112];
-                b[0..8].copy_from_slice(&super::evdev::since_boot().as_secs().to_le_bytes());
+                b[0..8].copy_from_slice(&super::clock::monotonic().as_secs().to_le_bytes());
                 b[32..40].copy_from_slice(&phys::ram().to_le_bytes()); // totalram
                 b[40..48].copy_from_slice(&phys::ram().saturating_sub(self.phys.frames_in_use() * phys::PAGE).to_le_bytes());
                 b[104..108].copy_from_slice(&1u32.to_le_bytes()); // mem_unit
@@ -241,12 +246,11 @@ impl Kernel {
         }
     }
 
+    /// A clock that isn't CPU time (clock.rs). clockid_t is an int. Ids Linux doesn't
+    /// have read as CLOCK_MONOTONIC, as they always have here.
     fn clock(&self, id: u64) -> (u64, u64) {
-        let d = match id {
-            0 | 5 | 8 | 11 => SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default(), // REALTIME(_COARSE), REALTIME_ALARM
-            _ => super::evdev::since_boot(),
-        };
-        (d.as_secs(), d.subsec_nanos() as u64)
+        let ns = super::clock::now_ns(id as u32).unwrap_or_else(super::clock::monotonic_ns);
+        (ns / 1_000_000_000, ns % 1_000_000_000)
     }
 }
 

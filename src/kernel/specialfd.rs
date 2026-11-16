@@ -7,7 +7,7 @@ use super::{ERESTARTSYS, POLL, Thread};
 use crate::errno::*;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 const EFD_SEMAPHORE: u64 = 1;
 const COUNTER_MAX: u64 = u64::MAX - 1;
@@ -118,7 +118,7 @@ pub(super) fn deadline_for(clock: u64, boot: Instant, value: Duration, abstime: 
     let delay = if !abstime {
         value
     } else if matches!(clock, 0 | 8 | 11) {
-        value.saturating_sub(SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default())
+        value.saturating_sub(super::clock::realtime())
     } else {
         value.saturating_sub(boot.elapsed())
     };

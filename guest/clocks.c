@@ -1,5 +1,5 @@
 // Freestanding arm64 test of the guest's clocks: the virtual counter (CNTVCT_EL0)
-// against CLOCK_MONOTONIC on every vCPU.
+// against CLOCK_MONOTONIC on every vCPU, and the other clocks against it.
 
 typedef unsigned long u64;
 typedef long i64;
@@ -12,6 +12,7 @@ typedef unsigned char u8;
 #define NR_exit_group 94
 #define NR_futex 98
 #define NR_clock_gettime 113
+#define NR_gettimeofday 169
 #define NR_clone 220
 #define NR_wait4 260
 
@@ -50,6 +51,7 @@ static void check(int cond, const char *name) {
 }
 
 struct timespec { i64 sec, nsec; };
+struct timeval { i64 sec, usec; };
 static u64 ns_of(struct timespec t) { return (u64)t.sec * 1000000000 + (u64)t.nsec; }
 static u64 svc_ns(int id) {
     struct timespec t;
@@ -180,6 +182,32 @@ static int run(u64 *sp) {
     int st = -1;
     sys(NR_wait4, pid, &st, 0, 0);
     check(st == 0, "and in a forked child");
+
+    // The other clocks are CLOCK_MONOTONIC plus an offset: BOOTTIME, MONOTONIC_RAW,
+    // MONOTONIC_COARSE and BOOTTIME_ALARM add nothing.
+    static const int mono_ids[] = {4, 6, 7, 9};
+    int between = 1;
+    for (u64 i = 0; i < sizeof mono_ids / sizeof mono_ids[0]; i++) {
+        u64 a = svc_ns(1), v = svc_ns(mono_ids[i]), b = svc_ns(1);
+        if (!(a <= v && v <= b)) between = 0;
+    }
+    check(between, "BOOTTIME, MONOTONIC_RAW, MONOTONIC_COARSE and BOOTTIME_ALARM are CLOCK_MONOTONIC");
+    // The wall clocks: REALTIME, REALTIME_COARSE, REALTIME_ALARM and TAI agree.
+    static const int wall_ids[] = {5, 8, 11};
+    int same = 1;
+    for (u64 i = 0; i < sizeof wall_ids / sizeof wall_ids[0]; i++) {
+        u64 a = svc_ns(0), v = svc_ns(wall_ids[i]), b = svc_ns(0);
+        if (!(a <= v && v <= b)) same = 0;
+    }
+    check(same, "REALTIME_COARSE, REALTIME_ALARM and TAI are CLOCK_REALTIME");
+    check(svc_ns(0) / 1000000000 > 1700000000, "CLOCK_REALTIME is the date");
+    struct timeval tv = {0, -1};
+    int tz[2] = {7, 7};
+    u64 r0 = svc_ns(0);
+    check(sys(NR_gettimeofday, &tv, tz) == 0 && tz[0] == 0 && tz[1] == 0, "gettimeofday zeroes the time zone");
+    u64 r1 = svc_ns(0);
+    u64 us = (u64)tv.sec * 1000000 + (u64)tv.usec;
+    check(tv.usec >= 0 && tv.usec < 1000000 && r0 / 1000 <= us && us <= r1 / 1000, "gettimeofday is CLOCK_REALTIME in microseconds");
 
     puts_(failures ? "SOME CHECKS FAILED\n" : "all checks passed\n");
     return failures;

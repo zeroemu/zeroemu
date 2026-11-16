@@ -35,6 +35,7 @@ pub fn start(k: &Arc<Kernel>) {
     let _ = std::thread::Builder::new().name("kswapd".into()).spawn(move || {
         while let Some(k) = k.upgrade() {
             check(&k);
+            k.tick_clocks();
             drop(k);
             std::thread::sleep(INTERVAL);
         }

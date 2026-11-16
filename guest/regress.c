@@ -28,6 +28,7 @@ typedef unsigned int u32;
 #define NR_setresgid 149
 #define NR_gettid 178
 #define NR_munmap 215
+#define NR_madvise 233
 #define NR_mremap 216
 #define NR_clone 220
 #define NR_mmap 222
@@ -111,12 +112,48 @@ static void spin_on(void *arg) {
     spin_done = 1;
 }
 
+// Reads a page in user code, with no syscall, until it is told the page was dropped.
+// Then whether it reads the zeros MADV_DONTNEED left (1) or the old value (2).
+static volatile int *watched;
+static volatile int watch_started, watch_dropped, watch_result;
+static void watch(void *arg) {
+    (void)arg;
+    watch_started = 1;
+    for (;;) {
+        int dropped = watch_dropped;
+        __asm__ volatile("dmb ish" ::: "memory");
+        int v = *watched;
+        if (dropped) {
+            watch_result = v == 0 ? 1 : 2;
+            return;
+        }
+    }
+}
+
 static int fa, fb;
 static volatile i64 w1_ret = 99, w2_ret = 99;
 static void waiter1(void *arg) { (void)arg; i64 ts[2] = {0, 300000000}; w1_ret = sys(NR_futex, &fa, 0 /* WAIT */, 0, ts); }
 static void waiter2(void *arg) { (void)arg; i64 ts[2] = {3, 0}; w2_ret = sys(NR_futex, &fb, 0 /* WAIT */, 0, ts); }
-static char stacks[3][16384] __attribute__((aligned(16)));
-static int ctid[3];
+static char stacks[5][16384] __attribute__((aligned(16)));
+static int ctid[5];
+
+// MADV_DONTNEED of `pages` pages, one of which another thread is reading in user code:
+// once madvise returns, that thread no longer reads the old page. Linux's
+// flush_tlb_page and flush_tlb_range (arch/arm64/include/asm/tlbflush.h) reach every
+// CPU and wait for them.
+static void dropped_everywhere(u64 pages, int n, const char *name) {
+    char *m = (char *)sys(NR_mmap, 0, 4 * 4096, 3, 0x22, -1, 0);
+    watched = (volatile int *)(m + 4096);
+    *watched = 1;
+    watch_started = watch_dropped = watch_result = 0;
+    spawn(stacks[n] + 16384, watch, 0, &ctid[n]);
+    for (int i = 0; i < 200 && !watch_started; i++) nap_ms(5);
+    nap_ms(20); // reading it through its TLB by now
+    sys(NR_madvise, (u64)watched, pages * 4096, 4 /* MADV_DONTNEED */);
+    watch_dropped = 1;
+    for (int i = 0; i < 200 && !watch_result; i++) nap_ms(5);
+    check(watch_result == 1, name);
+}
 
 struct bwr { u64 wsize, wcons, wbuf, rsize, rcons, rbuf; };
 // binder_buffer_object: a scatter-gather buffer, and where in its parent its address goes.
@@ -235,6 +272,10 @@ int cmain(void) {
     sys(NR_tkill, spin_tid, 12);
     for (int i = 0; i < 200 && !spin_done; i++) nap_ms(5);
     check(spin_done, "a signal interrupts a thread spinning in user code");
+
+    // --- pages dropped are gone for every thread when madvise returns
+    dropped_everywhere(1, 3, "another thread stops reading a page MADV_DONTNEED dropped");
+    dropped_everywhere(2, 4, "and one of two pages");
 
     // --- an exclusive load across a 16-byte boundary
     pid = fork_();

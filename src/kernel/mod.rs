@@ -1326,6 +1326,7 @@ impl Kernel {
             // The first dump has no start to divide by: it only starts the count.
             if since.is_none() {
                 FAULT_NS.store(0, Ordering::Relaxed);
+                crate::hv::TLB_FLUSHES.iter().chain(&crate::mm::TLB_CHANGES).for_each(|n| n.store(0, Ordering::Relaxed));
                 eprintln!("[exits] counting from now; the next dump gives the rates");
             } else {
                 eprintln!(
@@ -1341,6 +1342,12 @@ impl Kernel {
                 }
                 let mut by_nr: Vec<_> = by_nr.into_iter().collect();
                 by_nr.sort_by_key(|&(_, n)| std::cmp::Reverse(n));
+                let flushes: Vec<String> =
+                    crate::hv::TlbFlush::NAMES.iter().zip(&crate::hv::TLB_FLUSHES).map(|(name, n)| format!("{:.0}/s {name}", n.swap(0, Ordering::Relaxed) as f64 / secs)).collect();
+                eprintln!("[exits] TLB flushes: {}", flushes.join(", "));
+                let changes: Vec<String> =
+                    crate::mm::TlbChange::NAMES.iter().zip(&crate::mm::TLB_CHANGES).map(|(name, n)| format!("{:.0}/s {name}", n.swap(0, Ordering::Relaxed) as f64 / secs)).collect();
+                eprintln!("[exits] stale translations from: {}", changes.join(", "));
                 for (nr, n) in by_nr.into_iter().take(30) {
                     eprintln!("[exits] {:.0}/s {:?}", n as f64 / secs, self.arch.sysno(nr));
                 }
@@ -1580,8 +1587,12 @@ impl Kernel {
             if tlb.behind() {
                 let mut mm = t.proc.mm();
                 stale.absorb(mm.take_stale());
-                vcpu.flush_tlb();
-                flushing = Some(tlb.current());
+                let (generation, page) = mm.tlb_flush_scope();
+                match page {
+                    Some(va) => vcpu.flush_tlb_page(va),
+                    None => vcpu.flush_tlb(),
+                }
+                flushing = Some(generation);
             }
             let exit = vcpu.run();
             // The flush requested last time ran on entry; now frames are safe to

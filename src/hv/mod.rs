@@ -14,6 +14,32 @@ mod x86;
 
 use crate::arch::Arch;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
+
+/// TLB flushes run in the guest, by `TlbFlush`, for ZEROEMU_SYSCOUNT's thread dumps.
+pub static TLB_FLUSHES: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// What a TLB flush covered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub enum TlbFlush {
+    /// Translations the page tables no longer allow, anywhere in the address space,
+    /// on the way into the guest.
+    AddressSpace = 0,
+    /// As `AddressSpace`, for one page.
+    Page = 1,
+    /// As `AddressSpace`, before the kernel goes on (fork).
+    Now = 2,
+}
+
+impl TlbFlush {
+    pub const NAMES: [&str; 3] = ["address space", "page", "fork"];
+
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub fn count(self) {
+        TLB_FLUSHES[self as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
 
 #[derive(Debug)]
 // The arm64 Windows build has no vCPU, so nothing constructs these variants there.
@@ -164,10 +190,16 @@ pub trait Vcpu {
     fn state(&self) -> CpuState;
     fn set_state(&mut self, state: &CpuState);
     fn set_page_tables(&mut self, root: PageTableRoot);
-    /// Invalidates cached translations for every vCPU of the VM before this
-    /// one next enters the guest (after unmapping or downgrading pages).
+    /// Invalidates cached translations of the current address space for every
+    /// vCPU of the VM before this one next enters the guest (after unmapping or
+    /// downgrading pages). A backend may invalidate more.
     fn flush_tlb(&mut self);
-    /// Invalidates cached translations for every vCPU of the VM before returning.
+    /// As `flush_tlb`, for the page at `va` only (a backend may do more).
+    fn flush_tlb_page(&mut self, va: u64) {
+        let _ = va;
+        self.flush_tlb();
+    }
+    /// As `flush_tlb`, before returning.
     fn flush_tlb_now(&mut self);
     /// Makes sure there is a vCPU behind this object; false if the thread is dying.
     fn ready(&mut self) -> bool {

@@ -2,22 +2,28 @@
 //!
 //! The guest runs at EL0 under page tables built by `mm`. EL1 holds only the
 //! kernel window: a vector table whose every entry is `hvc #n`, so any
-//! exception from user code exits straight to us, and a TLB-flush trampoline.
+//! exception from user code exits straight to us, and TLB-flush trampolines.
 //! We resume the guest by restoring PC/CPSR from ELR_EL1/SPSR_EL1 ourselves,
-//! or, after page-table changes, by entering the trampoline, which runs
-//! `tlbi vmalle1is` (broadcast to every vCPU) and `eret`s to EL0.
+//! or, after page-table changes, by entering a trampoline, which invalidates the
+//! address space's translations (`tlbi aside1is`) or one page's (`tlbi vale1is`),
+//! broadcast to every vCPU, and `eret`s to EL0.
 
 use super::hvf_sys::*;
-use super::{Aarch64State, CpuState, Exit, Hypervisor, KernelPage, Kick, PageTableRoot, SyscallRegs, Vcpu};
+use super::{Aarch64State, CpuState, Exit, Hypervisor, KernelPage, Kick, PageTableRoot, SyscallRegs, TlbFlush, Vcpu};
 use crate::paging::KERNEL_WINDOW;
 use std::ptr;
 use std::sync::Arc;
 
 const VECTORS: u64 = KERNEL_WINDOW;
+/// Flushes the current address space (its ASID, from TTBR0_EL1).
 const TLB_FLUSH: u64 = KERNEL_WINDOW + 0x800;
-/// The same flush for the kernel's own use: comes back with `hvc` instead of
-/// going on to EL0.
-const TLB_FLUSH_NOW: u64 = KERNEL_WINDOW + 0x820;
+/// Flushes one page: the `tlbi` operand (ASID and page number) is in SP_EL1,
+/// which nothing else at EL1 uses.
+const TLB_FLUSH_PAGE: u64 = KERNEL_WINDOW + 0x840;
+/// TLB_FLUSH for the kernel's own use: comes back with `hvc` instead of going
+/// on to EL0.
+const TLB_FLUSH_NOW: u64 = KERNEL_WINDOW + 0x880;
+const TLB_FLUSH_END: u64 = KERNEL_WINDOW + 0x8c0;
 /// Past the entries of the vector table, whose only EL1 code is `hvc`.
 const VECTORS_END: u64 = KERNEL_WINDOW + 0x800;
 
@@ -131,18 +137,42 @@ impl Hypervisor for Hvf {
         for n in 0..16u32 {
             put(n as u64 * 0x80, 0xd400_0002 | (n << 5)); // hvc #n
         }
-        let flush = [
+        // Only the address space's own translations: every caller flushes for
+        // changes to its own page tables, and the kernel window's entries are
+        // global and never change. arm64 Linux's flush_tlb_mm and flush_tlb_page
+        // (arch/arm64/include/asm/tlbflush.h) do the same. Each uses x0, kept in
+        // TPIDR_EL1 meanwhile, where back_to_el0 finds it if a kick lands inside.
+        const SAVE_X0: u32 = 0xd518_d080; // msr tpidr_el1, x0
+        const RESTORE_X0: u32 = 0xd538_d080; // mrs x0, tpidr_el1
+        let asid = [
+            SAVE_X0,
+            0xd538_2000, // mrs x0, ttbr0_el1
+            0x9250_3c00, // and x0, x0, #0xffff000000000000 (the ASID)
             0xd503_3a9f, // dsb ishst
-            0xd508_831f, // tlbi vmalle1is
+            0xd508_8340, // tlbi aside1is, x0
             0xd503_3b9f, // dsb ish
             0xd503_3fdf, // isb
-            0xd69f_03e0, // eret
+            RESTORE_X0,
         ];
-        for (i, insn) in flush.iter().enumerate() {
-            put(TLB_FLUSH - KERNEL_WINDOW + i as u64 * 4, *insn);
-        }
-        for (i, insn) in flush[..4].iter().chain(&[0xd400_0002 | (16 << 5)]).enumerate() {
-            put(TLB_FLUSH_NOW - KERNEL_WINDOW + i as u64 * 4, *insn);
+        let page = [
+            SAVE_X0,
+            0x9100_03e0, // mov x0, sp (SP_EL1)
+            0xd503_3a9f, // dsb ishst
+            0xd508_83a0, // tlbi vale1is, x0
+            0xd503_3b9f, // dsb ish
+            0xd503_3fdf, // isb
+            RESTORE_X0,
+        ];
+        const ERET: u32 = 0xd69f_03e0;
+        let code: [(u64, &[u32]); 3] = [
+            (TLB_FLUSH, &[&asid[..], &[ERET]].concat()),
+            (TLB_FLUSH_PAGE, &[&page[..], &[ERET]].concat()),
+            (TLB_FLUSH_NOW, &[&asid[..], &[0xd400_0002 | (16 << 5)]].concat()), // hvc #16
+        ];
+        for (at, insns) in code {
+            for (i, insn) in insns.iter().enumerate() {
+                put(at - KERNEL_WINDOW + i as u64 * 4, *insn);
+            }
         }
         vec![KernelPage { va: KERNEL_WINDOW, gpa, exec: true }]
     }
@@ -154,7 +184,10 @@ impl Hypervisor for Hvf {
         if ret != HV_SUCCESS {
             return Err(format!("hv_vcpu_create failed ({ret:#x})"));
         }
-        let mut v = HvfVcpu { id, exit, flush_pending: true };
+        // No flush on the way in: what a TLB may still hold for its address space is
+        // the run loop's business (TlbGen), which makes a new address space flush
+        // before anything runs in it.
+        let mut v = HvfVcpu { id, exit, flush_pending: None, asid: 0 };
         if let Some(secs) = std::env::var("ZEROEMU_WATCHDOG").ok().and_then(|s| s.parse::<u64>().ok()) {
             // Debug aid: force an exit after `secs` so a guest stuck without
             // trapping (e.g. an EL1 exception loop) gets its state dumped.
@@ -203,8 +236,11 @@ impl Hypervisor for Hvf {
 struct HvfVcpu {
     id: hv_vcpu_t,
     exit: *const hv_vcpu_exit_t,
-    /// Enter through the TLB-flush trampoline on the next run.
-    flush_pending: bool,
+    /// Enter through a TLB-flush trampoline on the next run: AddressSpace or
+    /// Now for TLB_FLUSH, Page for TLB_FLUSH_PAGE with this `tlbi` operand.
+    flush_pending: Option<(TlbFlush, u64)>,
+    /// Its address space's id, as in TTBR0_EL1.
+    asid: u16,
 }
 
 struct HvfKick(hv_vcpu_t);
@@ -233,13 +269,18 @@ impl HvfVcpu {
         check("hv_vcpu_set_sys_reg", unsafe { hv_vcpu_set_sys_reg(self.id, r, v) });
     }
 
-    /// If an exit (a kick) caught the vCPU inside the EL1 trampoline, rewind
+    /// If an exit (a kick) caught the vCPU inside an EL1 trampoline, rewind
     /// to the EL0 resume point and redo the flush next time.
     fn back_to_el0(&mut self) {
         if self.reg(HV_REG_CPSR) & CPSR_MODE_MASK != 0 {
+            let pc = self.reg(HV_REG_PC);
+            // Past its first instruction, the guest's x0 is in TPIDR_EL1.
+            if (TLB_FLUSH..TLB_FLUSH_END).contains(&pc) && ![TLB_FLUSH, TLB_FLUSH_PAGE].contains(&pc) {
+                self.set_reg(HV_REG_X0, self.sys(HV_SYS_REG_TPIDR_EL1));
+            }
             self.set_reg(HV_REG_PC, self.sys(HV_SYS_REG_ELR_EL1));
             self.set_reg(HV_REG_CPSR, self.sys(HV_SYS_REG_SPSR_EL1));
-            self.flush_pending = true;
+            self.flush_tlb();
         }
     }
 }
@@ -247,12 +288,19 @@ impl HvfVcpu {
 impl Vcpu for HvfVcpu {
     fn run(&mut self) -> Exit {
         loop {
-            if self.flush_pending {
+            if let Some((why, operand)) = self.flush_pending.take() {
+                why.count();
                 self.set_sys(HV_SYS_REG_ELR_EL1, self.reg(HV_REG_PC));
                 self.set_sys(HV_SYS_REG_SPSR_EL1, self.reg(HV_REG_CPSR));
-                self.set_reg(HV_REG_PC, TLB_FLUSH);
+                let at = match why {
+                    TlbFlush::Page => {
+                        self.set_sys(HV_SYS_REG_SP_EL1, operand);
+                        TLB_FLUSH_PAGE
+                    }
+                    _ => TLB_FLUSH,
+                };
+                self.set_reg(HV_REG_PC, at);
                 self.set_reg(HV_REG_CPSR, CPSR_EL1H_MASKED);
-                self.flush_pending = false;
             }
             check("hv_vcpu_run", unsafe { hv_vcpu_run(self.id) });
             let exit = unsafe { *self.exit };
@@ -371,11 +419,14 @@ impl Vcpu for HvfVcpu {
     }
 
     fn set_page_tables(&mut self, root: PageTableRoot) {
+        // No flush: a new address space, or an ASID used before, starts behind on
+        // its flushes (mm::TlbGen).
         self.set_sys(HV_SYS_REG_TTBR0_EL1, root.root | (root.asid as u64) << 48);
-        self.flush_pending = true;
+        self.asid = root.asid;
     }
 
     fn flush_tlb_now(&mut self) {
+        TlbFlush::Now.count();
         let (pc, cpsr) = (self.reg(HV_REG_PC), self.reg(HV_REG_CPSR));
         self.set_reg(HV_REG_PC, TLB_FLUSH_NOW);
         self.set_reg(HV_REG_CPSR, CPSR_EL1H_MASKED);
@@ -392,7 +443,17 @@ impl Vcpu for HvfVcpu {
     }
 
     fn flush_tlb(&mut self) {
-        self.flush_pending = true;
+        self.flush_pending = Some((TlbFlush::AddressSpace, 0));
+    }
+
+    fn flush_tlb_page(&mut self, va: u64) {
+        // The operand of tlbi vale1is: ASID in bits 63:48, VA[55:12] in 43:0.
+        let operand = (self.asid as u64) << 48 | (va >> 12) & ((1 << 44) - 1);
+        self.flush_pending = match self.flush_pending {
+            None => Some((TlbFlush::Page, operand)),
+            Some((TlbFlush::Page, o)) if o == operand => Some((TlbFlush::Page, o)),
+            Some(_) => Some((TlbFlush::AddressSpace, 0)),
+        };
     }
 
     fn kicker(&self) -> Arc<dyn Kick> {

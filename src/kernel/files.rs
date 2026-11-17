@@ -2344,9 +2344,7 @@ impl Kernel {
                         Ok(f) => f,
                         Err(e) => break_with(e)?,
                     };
-                    if let Kind::Timer(tf) = &f.kind {
-                        timer = timer.into_iter().chain(tf.deadline()).min();
-                    }
+                    timer = timer.into_iter().chain(timer_deadline(&f)).min();
                     mask |= poll_mask(&f, t, 0);
                     let r = poll_ready(&f, t, 0);
                     for (i, mask) in [POLLIN | POLLHUP | POLLERR, POLLOUT | POLLERR, POLLPRI].iter().enumerate() {
@@ -2399,9 +2397,7 @@ impl Kernel {
                         let f = t.files().get(fd as i64);
                         match f {
                             Ok(f) => {
-                                if let Kind::Timer(tf) = &f.kind {
-                                    timer = timer.into_iter().chain(tf.deadline()).min();
-                                }
+                                timer = timer.into_iter().chain(timer_deadline(&f)).min();
                                 mask |= poll_mask(&f, t, 0);
                                 poll_ready(&f, t, 0) & (events | POLLERR | POLLHUP)
                             }
@@ -2480,6 +2476,19 @@ fn epoll_timespec_ms(t: &Thread, ts: u64) -> Result<i64, i64> {
         return Err(EINVAL);
     }
     Ok(sec.saturating_mul(1000).saturating_add((nsec + 999_999) / 1_000_000))
+}
+
+/// When a timerfd behind `f` next fires: its own, or the first of an epoll's, nested
+/// ones too. On Linux the timer's hrtimer wakes the pollers when it fires
+/// (timerfd_tmrproc in fs/timerfd.c), and through an epoll, ep_poll_callback in
+/// fs/eventpoll.c passes that on to those polling the epoll. Here nothing announces it
+/// (the timer counts when somebody looks), so a poller sleeps no later than this.
+fn timer_deadline(f: &File) -> Option<Instant> {
+    match &f.kind {
+        Kind::Timer(tf) => tf.deadline(),
+        Kind::Epoll(ep) => ep.deadline(),
+        _ => None,
+    }
 }
 
 /// How long a poller may sleep: until its deadline or the next timer. Changes,

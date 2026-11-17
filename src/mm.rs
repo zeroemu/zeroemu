@@ -828,10 +828,12 @@ pub struct AddressSpace {
     stale: Stale,
     /// User pages present in the tables, kept as entries come and go, as Linux keeps
     /// mm->rss_stat (include/linux/mm.h): /proc/<pid>/stat, statm, status and oom_score,
-    /// and getrusage, read it, where they used to walk every table. A new entry goes in
-    /// through `install`; fork, mremap and fault-around, which set many at once, count
-    /// their own; and `clear_pages` counts off what it clears. ZEROEMU_RSS_CHECK=1
-    /// compares it with a walk.
+    /// and getrusage, read it, where they used to walk every table. An entry is counted
+    /// where it is made present: by `install` (host_ptr's and userfaultfd's fills), by
+    /// `fault` for its page and the ones `fault_around` returns, and by fork for each
+    /// child entry; mremap's moved entries stay counted, and `clear_pages` counts off what
+    /// it clears. A new way of making entries present must count them too.
+    /// ZEROEMU_RSS_CHECK=1 compares it with a walk.
     resident: u64,
     /// Between a fault that answered FAULT_READ and its next try: what it wants read,
     /// then what was read. Never set while the address space is unlocked.
@@ -1164,8 +1166,8 @@ impl AddressSpace {
             cleared.push((va, paging::addr(e)));
         });
         let any = !cleared.is_empty();
-        // Saturating: were an entry ever made without `install`, the count would be low,
-        // and wrapping would make it the size of the address space.
+        // Saturating: were an entry ever made present without being counted, the count
+        // would be low, and wrapping would make it the size of the address space.
         self.resident = self.resident.saturating_sub(cleared.len() as u64);
         for (va, frame) in cleared {
             if !self.is_device(va) {

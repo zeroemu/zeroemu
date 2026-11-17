@@ -57,16 +57,18 @@ counts in single boots; what they add up to for a whole device is measured separ
 arm64 programs get a vDSO, as on Linux, so `clock_gettime`, `gettimeofday` (and
 `time`) and `clock_getres` don't exit the VM: they read the virtual counter, which
 every vCPU sets to count from CLOCK_MONOTONIC's zero, and a read-only page of the
-kernel's offsets. A clock read takes about 25 ns that way, against 1.2 to 1.4 µs as a
+kernel's offsets. A clock read takes about 25 ns that way, against about 0.95 µs as a
 syscall (`guest/clocks.c` measures both). On a device idle after boot, clock calls
 were about half of all syscall exits, 1,350 a second; 36 a second are left, for what
 the vDSO passes on to the syscall, as Linux's does: the CPU-time clocks, mostly.
 `ZEROEMU_NO_VDSO=1` turns it off.
 
-Page faults exit too. A read or exec fault on a file, shared memory or device memory
-also maps those of its 16 neighbouring pages that other mappings already have, as
-Linux's fault-around does; in one boot each, that took faults at idle from about 1,700
-a second to 1,100. A fault whose page has to be read from the system image or `/data`
+Page faults exit too. As Linux's fault-around does, a fault also maps the other pages
+of its 16-page window that are in memory already. In a file mapped read-only, that is
+on a read or exec fault, and only pages another mapping has already, since zeroemu
+can't take a page back from a mapping to reclaim it. In shared memory and device memory
+it is on any fault (for a `/data` file mapped shared, only where the mapping can't
+write). In one boot each, that took faults at idle from about 1,700 a second to 1,100. A fault whose page has to be read from the system image or `/data`
 reads it with the address space unlocked, as Linux does with `VM_FAULT_RETRY`, so the
 process's other threads don't wait for the read.
 

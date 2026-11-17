@@ -1522,7 +1522,6 @@ impl AddressSpace {
         }
     }
 
-    /// What was unmapped since the last flush; release it once that happened.
     /// exec: this address space replaces `old` for the same threads, whose run loops
     /// keep watching the flush state they started with.
     /// Its own ASID's translations are flushed before it runs, as for any new one.
@@ -1564,6 +1563,7 @@ impl AddressSpace {
         (self.tlb.current(), page)
     }
 
+    /// What was unmapped since the last flush; release it once that happened.
     pub fn take_stale(&mut self) -> Stale {
         std::mem::take(&mut self.stale)
     }
@@ -1577,8 +1577,11 @@ impl AddressSpace {
 
 impl Drop for AddressSpace {
     fn drop(&mut self) {
-        // Callers flush TLBs before dropping a space a vCPU may still cache
-        // (exec switches roots first; exited processes have no vCPUs left).
+        // No vCPU runs on it any more: exec switches roots first, once the other
+        // threads are gone, and an exited process has no vCPUs left. The TLBs may
+        // still hold its translations, under its ASID, but nothing runs under that
+        // ASID until it is given out again, and its next owner flushes it first
+        // (PhysMem::alloc_asid).
         let mut pages = Vec::new();
         self.visit(0, USER_TOP, &mut |_, _, va, e| pages.push((va, paging::addr(e))));
         for (va, frame) in pages {

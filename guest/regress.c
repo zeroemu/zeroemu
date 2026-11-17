@@ -130,6 +130,19 @@ static void watch(void *arg) {
     }
 }
 
+// The condition flags after a syscall (gettid) or a page fault (a write to `p`), set
+// to `in` just before.
+static u64 flags_through_syscall(u64 in) {
+    u64 out;
+    __asm__ volatile("msr nzcv, %1\n" "mov x8, #178\n" "svc #0\n" "mrs %0, nzcv\n" : "=&r"(out) : "r"(in) : "x0", "x8", "memory", "cc");
+    return out;
+}
+static u64 flags_through_fault(u64 in, volatile char *p) {
+    u64 out;
+    __asm__ volatile("msr nzcv, %1\n" "strb wzr, [%2]\n" "mrs %0, nzcv\n" : "=&r"(out) : "r"(in), "r"(p) : "memory", "cc");
+    return out;
+}
+
 static int fa, fb;
 static volatile i64 w1_ret = 99, w2_ret = 99;
 static void waiter1(void *arg) { (void)arg; i64 ts[2] = {0, 300000000}; w1_ret = sys(NR_futex, &fa, 0 /* WAIT */, 0, ts); }
@@ -272,6 +285,16 @@ int cmain(void) {
     sys(NR_tkill, spin_tid, 12);
     for (int i = 0; i < 200 && !spin_done; i++) nap_ms(5);
     check(spin_done, "a signal interrupts a thread spinning in user code");
+
+    // --- the condition flags come back from a syscall and a page fault as they went in:
+    // Linux's kernel_exit puts back the PSTATE the exception saved (arch/arm64/kernel/entry.S)
+    char *fresh = (char *)sys(NR_mmap, 0, 16 * 4096, 3, 0x22, -1, 0);
+    int flags_kept = 1;
+    for (u64 f = 0; f < 16; f++) {
+        flags_kept &= flags_through_syscall(f << 28) == f << 28;
+        flags_kept &= flags_through_fault(f << 28, fresh + f * 4096) == f << 28;
+    }
+    check(flags_kept, "the condition flags survive a syscall and a page fault");
 
     // --- pages dropped are gone for every thread when madvise returns
     dropped_everywhere(1, 3, "another thread stops reading a page MADV_DONTNEED dropped");

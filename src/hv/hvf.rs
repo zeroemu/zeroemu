@@ -1,10 +1,11 @@
 //! macOS backend: Hypervisor.framework on Apple Silicon.
 //!
 //! The guest runs at EL0 under page tables built by `mm`. EL1 holds only the
-//! kernel window: a vector table whose every entry is `hvc #n`, so any
-//! exception from user code exits straight to us, and TLB-flush trampolines.
-//! We resume the guest by restoring PC/CPSR from ELR_EL1/SPSR_EL1 ourselves,
-//! or, after page-table changes, by entering a trampoline, which invalidates the
+//! kernel window: a vector table whose every entry exits to us with `hvc`, and
+//! TLB-flush trampolines. The entry for exceptions from EL0 tells an svc from
+//! anything else and follows its hvc with an `eret`, so that a syscall's exit reads
+//! no EL1 register and the vCPU goes back to EL0 by itself when it next runs. After
+//! page-table changes it goes back through a trampoline instead, which invalidates the
 //! address space's translations (`tlbi aside1is`) or one page's (`tlbi vale1is`),
 //! broadcast to every vCPU, and `eret`s to EL0.
 
@@ -27,8 +28,14 @@ const TLB_FLUSH_END: u64 = KERNEL_WINDOW + 0x8c0;
 /// Past the entries of the vector table, whose only EL1 code is `hvc`.
 const VECTORS_END: u64 = KERNEL_WINDOW + 0x800;
 
-/// Vector index for "synchronous exception from lower EL, AArch64".
+/// Vector index for "synchronous exception from lower EL, AArch64", and the
+/// immediate of its hvc for anything but an svc.
 const VEC_LOWER_SYNC: u64 = 8;
+/// That vector's hvc immediate for an svc: its exception class.
+const HVC_SYSCALL: u64 = EC_SVC64;
+/// That vector's two `eret`s, one after each hvc. A vCPU stopped at one goes back
+/// to EL0 at ELR_EL1, with SPSR_EL1, when it next runs.
+const STUB_ERETS: [u64; 2] = [VECTORS + VEC_LOWER_SYNC * 0x80 + 7 * 4, VECTORS + VEC_LOWER_SYNC * 0x80 + 9 * 4];
 
 const EC_INSTR_ABORT_LOWER: u64 = 0x20;
 const EC_DATA_ABORT_LOWER: u64 = 0x24;
@@ -134,16 +141,38 @@ impl Hypervisor for Hvf {
     fn kernel_pages(&self, alloc: &mut dyn FnMut() -> (u64, *mut u8)) -> Vec<KernelPage> {
         let (gpa, host) = alloc();
         let put = |off: u64, insn: u32| unsafe { (host.add(off as usize) as *mut u32).write(insn) };
+        const HVC: u32 = 0xd400_0002; // hvc #0; the immediate goes in bits 20:5
+        const ERET: u32 = 0xd69f_03e0;
+        // EL1 code uses x0 alone, kept meanwhile in TPIDR_EL1 (which EL0 can't
+        // reach), where back_to_el0 finds it if a kick lands in a trampoline.
+        const SAVE_X0: u32 = 0xd518_d080; // msr tpidr_el1, x0
+        const RESTORE_X0: u32 = 0xd538_d080; // mrs x0, tpidr_el1
         for n in 0..16u32 {
-            put(n as u64 * 0x80, 0xd400_0002 | (n << 5)); // hvc #n
+            put(n as u64 * 0x80, HVC | n << 5); // hvc #n
+        }
+        // An exception from EL0. Reading an EL1 register after an exit, or writing
+        // PC and CPSR, costs about 20 ns each (measured on an M1 Pro, against about
+        // 0.9 us for the exit itself), and a syscall's exit needs none of them if the
+        // svc is sorted out here and its eret done here.
+        let lower_sync = [
+            SAVE_X0,
+            0xd538_5200, // mrs x0, esr_el1
+            0xd35a_fc00, // lsr x0, x0, #26 (the exception class)
+            0xf100_541f, // cmp x0, #0x15 (svc)
+            RESTORE_X0,
+            0x5400_0061, // b.ne +3
+            HVC | (HVC_SYSCALL as u32) << 5,
+            ERET,
+            HVC | (VEC_LOWER_SYNC as u32) << 5,
+            ERET,
+        ];
+        for (i, insn) in lower_sync.iter().enumerate() {
+            put(VEC_LOWER_SYNC * 0x80 + i as u64 * 4, *insn);
         }
         // Only the address space's own translations: every caller flushes for
         // changes to its own page tables, and the kernel window's entries are
         // global and never change. arm64 Linux's flush_tlb_mm and flush_tlb_page
-        // (arch/arm64/include/asm/tlbflush.h) do the same. Each uses x0, kept in
-        // TPIDR_EL1 meanwhile, where back_to_el0 finds it if a kick lands inside.
-        const SAVE_X0: u32 = 0xd518_d080; // msr tpidr_el1, x0
-        const RESTORE_X0: u32 = 0xd538_d080; // mrs x0, tpidr_el1
+        // (arch/arm64/include/asm/tlbflush.h) do the same.
         let asid = [
             SAVE_X0,
             0xd538_2000, // mrs x0, ttbr0_el1
@@ -163,11 +192,10 @@ impl Hypervisor for Hvf {
             0xd503_3fdf, // isb
             RESTORE_X0,
         ];
-        const ERET: u32 = 0xd69f_03e0;
         let code: [(u64, &[u32]); 3] = [
             (TLB_FLUSH, &[&asid[..], &[ERET]].concat()),
             (TLB_FLUSH_PAGE, &[&page[..], &[ERET]].concat()),
-            (TLB_FLUSH_NOW, &[&asid[..], &[0xd400_0002 | (16 << 5)]].concat()), // hvc #16
+            (TLB_FLUSH_NOW, &[&asid[..], &[HVC | 16 << 5]].concat()),
         ];
         for (at, insns) in code {
             for (i, insn) in insns.iter().enumerate() {
@@ -243,6 +271,16 @@ struct HvfVcpu {
     asid: u16,
 }
 
+/// Where a kick's exit found the vCPU.
+enum Kicked {
+    /// At EL0, or at a stub's eret: as good as EL0.
+    El0,
+    /// In a vector, before its hvc.
+    BeforeHvc,
+    /// In a TLB-flush trampoline.
+    Trampoline,
+}
+
 struct HvfKick(hv_vcpu_t);
 
 impl Kick for HvfKick {
@@ -269,19 +307,29 @@ impl HvfVcpu {
         check("hv_vcpu_set_sys_reg", unsafe { hv_vcpu_set_sys_reg(self.id, r, v) });
     }
 
-    /// If an exit (a kick) caught the vCPU inside an EL1 trampoline, rewind
-    /// to the EL0 resume point and redo the flush next time.
-    fn back_to_el0(&mut self) {
-        if self.reg(HV_REG_CPSR) & CPSR_MODE_MASK != 0 {
-            let pc = self.reg(HV_REG_PC);
-            // Past its first instruction, the guest's x0 is in TPIDR_EL1.
-            if (TLB_FLUSH..TLB_FLUSH_END).contains(&pc) && ![TLB_FLUSH, TLB_FLUSH_PAGE].contains(&pc) {
-                self.set_reg(HV_REG_X0, self.sys(HV_SYS_REG_TPIDR_EL1));
-            }
-            self.set_reg(HV_REG_PC, self.sys(HV_SYS_REG_ELR_EL1));
-            self.set_reg(HV_REG_CPSR, self.sys(HV_SYS_REG_SPSR_EL1));
-            self.flush_tlb();
+    /// Where a kick's exit found the vCPU.
+    fn kicked_at(&self) -> Kicked {
+        if self.reg(HV_REG_CPSR) & CPSR_MODE_MASK == 0 {
+            return Kicked::El0;
         }
+        match self.reg(HV_REG_PC) {
+            pc if STUB_ERETS.contains(&pc) => Kicked::El0,
+            pc if pc < VECTORS_END => Kicked::BeforeHvc,
+            _ => Kicked::Trampoline,
+        }
+    }
+
+    /// The kick caught the vCPU inside a TLB-flush trampoline: rewind to the EL0
+    /// resume point and redo the flush next time.
+    fn back_to_el0(&mut self) {
+        let pc = self.reg(HV_REG_PC);
+        // Past its first instruction, the guest's x0 is in TPIDR_EL1.
+        if (TLB_FLUSH..TLB_FLUSH_END).contains(&pc) && ![TLB_FLUSH, TLB_FLUSH_PAGE].contains(&pc) {
+            self.set_reg(HV_REG_X0, self.sys(HV_SYS_REG_TPIDR_EL1));
+        }
+        self.set_reg(HV_REG_PC, self.sys(HV_SYS_REG_ELR_EL1));
+        self.set_reg(HV_REG_CPSR, self.sys(HV_SYS_REG_SPSR_EL1));
+        self.flush_tlb();
     }
 }
 
@@ -290,8 +338,16 @@ impl Vcpu for HvfVcpu {
         loop {
             if let Some((why, operand)) = self.flush_pending.take() {
                 why.count();
-                self.set_sys(HV_SYS_REG_ELR_EL1, self.reg(HV_REG_PC));
-                self.set_sys(HV_SYS_REG_SPSR_EL1, self.reg(HV_REG_CPSR));
+                // Stopped at a stub's eret, ELR_EL1 and SPSR_EL1 already say where to
+                // go back to in EL0, as the trampoline's own eret wants. A vCPU at EL0
+                // (new, or given new registers) has them set here, which costs more:
+                // Hypervisor.framework loads EL1 registers written from the host on
+                // the next entry.
+                if self.reg(HV_REG_CPSR) & CPSR_MODE_MASK == 0 {
+                    self.set_sys(HV_SYS_REG_ELR_EL1, self.reg(HV_REG_PC));
+                    self.set_sys(HV_SYS_REG_SPSR_EL1, self.reg(HV_REG_CPSR));
+                    self.set_reg(HV_REG_CPSR, CPSR_EL1H_MASKED);
+                }
                 let at = match why {
                     TlbFlush::Page => {
                         self.set_sys(HV_SYS_REG_SP_EL1, operand);
@@ -300,7 +356,6 @@ impl Vcpu for HvfVcpu {
                     _ => TLB_FLUSH,
                 };
                 self.set_reg(HV_REG_PC, at);
-                self.set_reg(HV_REG_CPSR, CPSR_EL1H_MASKED);
             }
             check("hv_vcpu_run", unsafe { hv_vcpu_run(self.id) });
             let exit = unsafe { *self.exit };
@@ -320,16 +375,22 @@ impl Vcpu for HvfVcpu {
                         ),
                     };
                 }
-                // A kick can land after the guest took an exception and before the
-                // vector's hvc ran. ELR holds the instruction after an svc: going
-                // back to EL0 from here would drop the syscall, and the guest would
-                // see its first argument as the result. Let the hvc happen; the
-                // thread looks at its signals on the way back in anyway.
-                HV_EXIT_REASON_CANCELED if self.reg(HV_REG_CPSR) & CPSR_MODE_MASK != 0 && self.reg(HV_REG_PC) < VECTORS_END => continue,
-                HV_EXIT_REASON_CANCELED => {
-                    self.back_to_el0();
-                    return Exit::Interrupted;
-                }
+                HV_EXIT_REASON_CANCELED => match self.kicked_at() {
+                    // A kick can land after the guest took an exception and before the
+                    // vector's hvc ran. ELR holds the instruction after an svc: going
+                    // back to EL0 from here would drop the syscall, and the guest would
+                    // see its first argument as the result. Let the hvc happen; the
+                    // thread looks at its signals on the way back in anyway.
+                    Kicked::BeforeHvc => continue,
+                    // At EL0, or at a stub's eret on the way there: whatever the kick
+                    // was for (a signal, giving the vCPU up) is looked at before the
+                    // guest runs on.
+                    Kicked::El0 => return Exit::Interrupted,
+                    Kicked::Trampoline => {
+                        self.back_to_el0();
+                        return Exit::Interrupted;
+                    }
+                },
                 HV_EXIT_REASON_VTIMER_ACTIVATED => continue,
                 other => {
                     return Exit::Fault { pc: self.reg(HV_REG_PC), addr: 0, detail: format!("unexpected exit reason {other}") };
@@ -346,6 +407,9 @@ impl Vcpu for HvfVcpu {
             }
 
             let vector = syndrome & 0xffff;
+            if vector == HVC_SYSCALL {
+                return Exit::Syscall;
+            }
             let esr = self.sys(HV_SYS_REG_ESR_EL1);
             let elr = self.sys(HV_SYS_REG_ELR_EL1);
             if vector != VEC_LOWER_SYNC {
@@ -356,14 +420,10 @@ impl Vcpu for HvfVcpu {
                 };
             }
 
-            // Return to EL0 where the guest left off (for aborts, that
-            // re-executes the faulting instruction).
-            self.set_reg(HV_REG_PC, elr);
-            self.set_reg(HV_REG_CPSR, self.sys(HV_SYS_REG_SPSR_EL1));
-
+            // The stub's eret goes back to EL0 where the guest left off: for aborts,
+            // that re-executes the faulting instruction.
             let addr = || crate::arch::untag(self.sys(HV_SYS_REG_FAR_EL1));
             return match esr >> 26 {
-                EC_SVC64 => Exit::Syscall,
                 EC_DATA_ABORT_LOWER if DFSC_PAGING.contains(&(esr & ESR_DFSC)) => Exit::PageFault { pc: elr, addr: addr(), write: esr & ESR_WNR != 0 && esr & ESR_CM == 0, exec: false },
                 EC_DATA_ABORT_LOWER if esr & ESR_DFSC == DFSC_ALIGNMENT => Exit::Alignment { pc: elr, addr: addr() },
                 EC_INSTR_ABORT_LOWER => Exit::PageFault { pc: elr, addr: addr(), write: false, exec: true },
@@ -390,8 +450,10 @@ impl Vcpu for HvfVcpu {
             *x = self.reg(HV_REG_X0 + i as u32);
         }
         s.sp = self.sys(HV_SYS_REG_SP_EL0);
-        s.pc = self.reg(HV_REG_PC);
-        s.pstate = self.reg(HV_REG_CPSR);
+        // At EL1 the vCPU is stopped at a stub's eret (as after every exit but a
+        // kick at EL0), and the guest's PC and PSTATE are where the eret takes them from.
+        let cpsr = self.reg(HV_REG_CPSR);
+        (s.pc, s.pstate) = if cpsr & CPSR_MODE_MASK != 0 { (self.sys(HV_SYS_REG_ELR_EL1), self.sys(HV_SYS_REG_SPSR_EL1)) } else { (self.reg(HV_REG_PC), cpsr) };
         s.tpidr = self.sys(HV_SYS_REG_TPIDR_EL0);
         s.fpcr = self.reg(HV_REG_FPCR);
         s.fpsr = self.reg(HV_REG_FPSR);
@@ -407,6 +469,7 @@ impl Vcpu for HvfVcpu {
             self.set_reg(HV_REG_X0 + i as u32, x);
         }
         self.set_sys(HV_SYS_REG_SP_EL0, s.sp);
+        // Straight to EL0, past any stub's eret.
         self.set_reg(HV_REG_PC, s.pc);
         // Only user-mode flags; the mode field must say EL0t.
         self.set_reg(HV_REG_CPSR, s.pstate & !CPSR_MODE_MASK & 0xf000_0000);

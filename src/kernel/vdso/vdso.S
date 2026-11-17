@@ -17,7 +17,8 @@
 #define VVAR_SERVED	4
 #define VVAR_BASE	8
 #define VVAR_MULT	16
-#define VVAR_OFFSETS	64
+#define VVAR_TURN	24
+#define VVAR_CLOCKS	64
 
 #define NR_gettimeofday		169
 #define NR_clock_gettime	113
@@ -34,10 +35,11 @@
 .endm
 
 // x6 = nanoseconds on a clock: CLOCK_MONOTONIC from the counter, plus the clock's
-// offset, read from x4. In: x2, the [vvar] page. Uses x5-x12.
+// offset and what it has gained since the turn, from its 16 bytes at x4. In: x2, the
+// [vvar] page. Uses x5-x15.
 //
-// The host may change an offset at any time (CLOCK_REALTIME's follows the host's
-// wall clock), so the reads go inside a sequence count as Linux's do
+// The host may change a clock's numbers at any time (CLOCK_REALTIME's follow the
+// host's wall clock), so the reads go inside a sequence count as Linux's do
 // (include/vdso/helpers.h): an odd count means a change is under way, and a count
 // that moved means one happened while reading.
 .macro	clock_ns
@@ -49,7 +51,8 @@
 	mrs	x6, cntvct_el0
 	ldr	x7, [x2, #VVAR_BASE]
 	ldp	w9, w10, [x2, #VVAR_MULT]
-	ldr	x11, [x4]
+	ldp	x11, x13, [x4]
+	ldr	x14, [x2, #VVAR_TURN]
 	dmb	ishld
 	// The count is read again only once the counter has been: the address depends
 	// on the counter's value (arch_counter_enforce_ordering in Linux).
@@ -67,7 +70,16 @@
 	mul	x6, x6, x9
 	udiv	x6, x6, x10
 	add	x6, x6, x7
+	// A wall clock gains x13 / 2^32 ns on CLOCK_MONOTONIC for each ns since the turn,
+	// x14, or loses if x13 is negative: how zeroemu slews CLOCK_REALTIME toward the
+	// host's wall clock. The product is 128 bits, shifted right by 32 (rounded down).
+	// The other clocks have 0.
+	sub	x14, x6, x14
+	mul	x15, x14, x13
+	smulh	x14, x14, x13
+	extr	x14, x14, x15, #32
 	add	x6, x6, x11
+	add	x6, x6, x14
 .endm
 
 // x9 = x6 / 1e9, x10 = x6 % 1e9. Uses x7.
@@ -91,8 +103,8 @@ __kernel_clock_gettime:
 	ldr	w3, [x2, #VVAR_SERVED]
 	lsr	w3, w3, w0
 	tbz	w3, #0, 9f
-	add	x4, x2, #VVAR_OFFSETS
-	add	x4, x4, w0, uxtw #3
+	add	x4, x2, #VVAR_CLOCKS
+	add	x4, x4, w0, uxtw #4
 	clock_ns
 	split_seconds
 	stp	x9, x10, [x1]
@@ -114,7 +126,7 @@ __kernel_gettimeofday:
 	cbz	x0, 1f
 	ldr	w3, [x2, #VVAR_SERVED]
 	tbz	w3, #CLOCK_REALTIME, 9f
-	add	x4, x2, #VVAR_OFFSETS + CLOCK_REALTIME * 8
+	add	x4, x2, #VVAR_CLOCKS + CLOCK_REALTIME * 16
 	clock_ns
 	split_seconds
 	mov	x7, #1000

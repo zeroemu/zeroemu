@@ -38,8 +38,13 @@ const SERVED: usize = 4;
 const COUNTER_BASE: usize = 8;
 /// numer and denom: a tick is numer / denom nanoseconds.
 const MULT: usize = 16;
-/// For each clock id below 32, what it adds to CLOCK_MONOTONIC, in nanoseconds.
-const OFFSETS: usize = 64;
+/// The CLOCK_MONOTONIC time, in nanoseconds, the clocks' rates count from
+/// (clock::Line's base).
+const TURN: usize = 24;
+/// For each clock id below 32, 16 bytes: what it adds to CLOCK_MONOTONIC at TURN, in
+/// nanoseconds, and how fast it gains on it from there, in 2^-32 ns per ns (signed).
+/// The wall clocks have CLOCK_REALTIME's line (clock::Line); the others, zeros.
+const CLOCKS: usize = 64;
 
 /// Whether arm64 processes get the vDSO.
 pub fn enabled() -> bool {
@@ -102,7 +107,7 @@ impl Vdso {
             v.u64(COUNTER_BASE).store(0, Ordering::Relaxed);
             v.u32(MULT).store(numer, Ordering::Relaxed);
             v.u32(MULT + 4).store(denom, Ordering::Relaxed);
-            v.put_offsets();
+            v.put_line(clock::line());
             v.u32(SERVED).store(clock::SERVED, Ordering::Relaxed);
         });
         Ok(Some(v))
@@ -121,16 +126,18 @@ impl Vdso {
         Ok(())
     }
 
-    /// Hands the vDSO CLOCK_REALTIME's offset, after `clock::refresh` moved it.
-    pub(super) fn update(&self) {
-        self.write(|| self.put_offsets());
+    /// Hands the vDSO CLOCK_REALTIME's new line, which `line` works out once the
+    /// vDSO's readers can see it changing (clock.rs says why).
+    pub(super) fn update(&self, line: impl FnOnce() -> clock::Line) {
+        self.write(|| self.put_line(line()));
     }
 
-    fn put_offsets(&self) {
+    fn put_line(&self, line: clock::Line) {
+        self.u64(TURN).store(line.base, Ordering::Relaxed);
         for id in 0..32 {
-            if let Some(off) = clock::offset(id) {
-                self.u64(OFFSETS + id as usize * 8).store(off, Ordering::Relaxed);
-            }
+            let (offset, rate) = if clock::WALL >> id & 1 != 0 { (line.offset, line.rate) } else { (0, 0) };
+            self.u64(CLOCKS + id * 16).store(offset, Ordering::Relaxed);
+            self.u64(CLOCKS + id * 16 + 8).store(rate as u64, Ordering::Relaxed);
         }
     }
 

@@ -428,7 +428,7 @@ impl Client {
             at
         } else {
             // CLOCK_REALTIME, as the guest reads it (kernel/clock.rs).
-            Duration::from_nanos((at.as_nanos() as u64).wrapping_add(super::clock::realtime_offset()))
+            Duration::from_nanos(super::clock::realtime_at(at.as_nanos() as u64))
         };
         out.extend_from_slice(&t.as_secs().to_le_bytes());
         out.extend_from_slice(&(t.subsec_micros() as u64).to_le_bytes());

@@ -268,6 +268,22 @@ static int vdso_monotonic_against_svc(void) {
     return 1;
 }
 
+// CLOCK_REALTIME, read both ways in turn for 300 ms, across three of the host's
+// corrections of it (ten a second): each read at least the one before. zeroemu
+// slews it toward the host's wall clock as NTP slews Linux's, never stepping it
+// back for a correction.
+static int vdso_realtime_never_back(void) {
+    u64 last = 0, end = svc_ns(1) + 300000000;
+    while (svc_ns(1) < end) {
+        struct timespec t;
+        if (vdso_gettime(0, &t) != 0) return 0;
+        u64 v = ns_of(t), s = svc_ns(0);
+        if (v < last || s < v) return 0;
+        last = s;
+    }
+    return 1;
+}
+
 static void vdso_thread(void *arg) {
     thread_ok[(u64)arg] = vdso_monotonic_against_svc();
 }
@@ -407,10 +423,10 @@ static int run(u64 *sp) {
     check(vdso_sigreturn != 0 && handler_lr == vdso_sigreturn, "it returned to __kernel_rt_sigreturn");
 
     check(vdso_monotonic_against_svc(), "vDSO CLOCK_MONOTONIC and the syscall's agree, read in turn");
-    // Each clock it answers, between two syscalls on the same clock. CLOCK_REALTIME
-    // follows the host's wall clock ten times a second, which can move it a little.
+    // Each clock it answers, between two syscalls on the same clock: the wall clocks
+    // too, as both compute them from the same numbers.
     static const int ids[] = {0, 1, 4, 5, 6, 7, 8, 9, 11};
-    int in_turn = 1, real_close = 1;
+    int in_turn = 1;
     for (u64 i = 0; i < sizeof ids / sizeof ids[0]; i++) {
         int id = ids[i];
         u64 a = svc_ns(id);
@@ -419,12 +435,10 @@ static int run(u64 *sp) {
         u64 b = svc_ns(id);
         u64 v = ns_of(t);
         if (r != 0 || t.nsec < 0 || t.nsec >= 1000000000) in_turn = 0;
-        int wall = id == 0 || id == 5 || id == 8 || id == 11;
-        if (!wall && !(a <= v && v <= b)) in_turn = 0;
-        if (wall && !(v + 1000000 >= a && v <= b + 1000000)) real_close = 0;
+        if (!(a <= v && v <= b)) in_turn = 0;
     }
     check(in_turn, "every clock it answers, between two syscalls");
-    check(real_close, "CLOCK_REALTIME within a millisecond of the syscall's");
+    check(vdso_realtime_never_back(), "CLOCK_REALTIME never goes back, read both ways for 300 ms");
     struct timespec rt = {0, 0};
     vdso_gettime(0, &rt);
     check(rt.sec > 1700000000, "its CLOCK_REALTIME is the date");

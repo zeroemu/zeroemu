@@ -441,13 +441,19 @@ impl World {
         }
     }
 
-    /// After queueing work for process `id`: wakes as many of its idle threads as there
-    /// is work, the last to go to sleep first, as binder_select_thread_ilocked. That one
-    /// is likelier to still have its vCPU, and what it last touched in the caches.
+    /// After queueing a piece of work for process `id`: wakes one of its idle threads to
+    /// take it, the last to go to sleep, as binder_wakeup_proc_ilocked and
+    /// binder_select_thread_ilocked. That one is likelier to still have its vCPU, and
+    /// what it last touched in the caches. Only one: threads woken for earlier work are
+    /// off the list but may not have looked yet, so waking one per piece of work still
+    /// queued would wake them all over again, and a burst of k calls would wake about
+    /// k*k/2 threads. A thread that reads and leaves work behind wakes the next (in
+    /// binder_read), so work queued with one call to this, or skipped by the thread
+    /// woken for it, is still taken.
     fn wake_proc(&mut self, id: ProcId) {
         let Some(p) = self.procs.get_mut(&id) else { return };
         let single = p.threads.len() <= 1;
-        let mut want = p.todo.len();
+        let mut want = usize::from(!p.todo.is_empty());
         let mut i = p.idle.len();
         while want > 0 && i > 0 {
             i -= 1;
@@ -471,7 +477,8 @@ impl World {
         }
     }
 
-    /// Wakes every thread of `id` that has work, of its own or the process's.
+    /// Wakes every thread of `id` that has work of its own, and one to take the
+    /// process's work, if it has any.
     fn wake_all(&mut self, id: ProcId) {
         let Some(p) = self.procs.get(&id) else { return };
         let tids: Vec<i32> = p.threads.iter().filter(|(_, th)| th.parked && th.process_todo).map(|(&tid, _)| tid).collect();
@@ -1814,7 +1821,9 @@ impl Kernel {
                     }
                     w.thread(b.id, t.tid).note(format_args!("read: spawn looper"));
                 }
-                // This thread took one piece of process work; another may take the rest.
+                // This thread took one piece of process work, or none: another may take
+                // the rest. Every thread woken to take process work comes here before
+                // it returns or sleeps, so what it leaves always wakes someone.
                 if !w.procs[&b.id].todo.is_empty() {
                     w.wake_proc(b.id);
                 }
@@ -2001,5 +2010,75 @@ pub fn mmap_area(file: &File) -> Option<&BinderFile> {
     match &file.kind {
         Kind::Binder(b) => Some(b),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Process 1, with looper threads 1..=n asleep in binder_read with nothing to do,
+    /// the last to sleep last, as binder_read leaves them.
+    fn idle_loopers(n: i32) -> World {
+        let mut p = BProc {
+            ctx: 0,
+            pid: 1,
+            process: Weak::new(),
+            threads: IdMap::default(),
+            todo: VecDeque::new(),
+            idle: Vec::new(),
+            refs: BTreeMap::new(),
+            node_refs: IdMap::default(),
+            nodes: HashMap::new(),
+            area: None,
+            allocs: BTreeMap::new(),
+            max_threads: 0,
+            default_nice: 0,
+            requested: 0,
+            started: 0,
+            dead: false,
+            polled: false,
+            euid: 0,
+            sid: 0,
+            deaths_pending: HashMap::new(),
+        };
+        for tid in 1..=n {
+            p.threads.insert(tid, BThread { parked: true, looper: LOOPER_ENTERED, ..Default::default() });
+            p.idle.push(tid);
+        }
+        let mut w = World::default();
+        w.procs.insert(1, p);
+        w
+    }
+
+    #[test]
+    fn process_work_wakes_one_thread_per_piece() {
+        let mut w = idle_loopers(8);
+        w.wake_proc(1);
+        assert!(w.pending.wakes.is_empty(), "no work, nobody woken");
+        // Three calls before any woken thread runs: those woken for the first ones are
+        // still to look, and must not be counted as missing.
+        for txn in 1..=3 {
+            w.procs.get_mut(&1).unwrap().todo.push_back(Work::Txn(txn));
+            w.wake_proc(1);
+        }
+        assert_eq!(w.pending.wakes.len(), 3);
+        let p = &w.procs[&1];
+        assert_eq!(p.idle, [1, 2, 3, 4, 5], "the last to sleep is woken first");
+        assert!((6..=8).all(|tid| !p.threads[&tid].parked));
+    }
+
+    #[test]
+    fn process_work_skips_threads_that_cannot_take_it() {
+        let mut w = idle_loopers(2);
+        let p = w.procs.get_mut(&1).unwrap();
+        // Not a looper: it takes process work only as the process's only thread.
+        p.threads.get_mut(&2).unwrap().looper = 0;
+        p.todo.push_back(Work::Txn(1));
+        w.wake_proc(1);
+        assert_eq!(w.pending.wakes.len(), 1);
+        let p = &w.procs[&1];
+        assert_eq!(p.idle, [2]);
+        assert!(!p.threads[&1].parked && p.threads[&2].parked);
     }
 }

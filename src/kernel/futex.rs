@@ -409,8 +409,15 @@ impl Kernel {
             Ok(_) => EAGAIN,
             Err(e) => e,
         };
-        // A wake that took it off meanwhile was counted for it, and may have been
-        // the only one: it was woken.
-        if self.futex.remove(w) { -err } else { 0 }
+        if !self.futex.remove(w) {
+            // A wake took it off meanwhile and counted it. On Linux it would never have
+            // been queued, and that wake would have gone to the next waiter, which may
+            // have nothing else coming (a condition variable's next waiter, for one): so
+            // it is passed on. Waking one too many is allowed, as a futex waiter must
+            // check why it woke; missing one is not.
+            let key = *w.key.lock().unwrap();
+            self.futex.wake(key, 1, bitset);
+        }
+        -err
     }
 }

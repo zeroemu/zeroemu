@@ -36,6 +36,7 @@ typedef unsigned int u32;
 #define NR_clone 220
 #define NR_mmap 222
 #define NR_mprotect 226
+#define NR_mincore 232
 #define NR_madvise 233
 #define NR_wait4 260
 #define NR_socketpair 199
@@ -324,6 +325,20 @@ int cmain(void) {
     i64 pid = fork_();
     if (pid == 0) sys(NR_exit_group, sys(NR_mremap, m, -1L, 4096, 0, 0) == -14 ? 0 : 3);
     check(reap(pid, 3000) == 0, "mremap with an old length of (size_t)-1 is EFAULT, and unmaps nothing");
+
+    // --- prefaulting maps pages without touching them
+    unsigned char vec[4];
+    i64 pm = sys(NR_mmap, 0, 4 * 4096, 3, 0x22, -1, 0);
+    check(sys(NR_madvise, pm + 4096, 2 * 4096, 23 /* MADV_POPULATE_WRITE */) == 0 && sys(NR_mincore, pm, 4 * 4096, vec) == 0
+          && !vec[0] && vec[1] && vec[2] && !vec[3], "MADV_POPULATE_WRITE maps the pages it is given, and only those");
+    i64 pp = sys(NR_mmap, 0, 2 * 4096, 3, 0x8022 /* MAP_POPULATE */, -1, 0);
+    check(sys(NR_mincore, pp, 2 * 4096, vec) == 0 && vec[0] && vec[1], "MAP_POPULATE maps the pages at once");
+    i64 pn = sys(NR_mmap, 0, 2 * 4096, 3, 0x18022 /* MAP_POPULATE | MAP_NONBLOCK */, -1, 0);
+    check(sys(NR_mincore, pn, 2 * 4096, vec) == 0 && !vec[0] && !vec[1], "MAP_NONBLOCK cancels MAP_POPULATE");
+    sys(NR_mprotect, pm, 4096, 0);
+    check(sys(NR_madvise, pm, 4096, 22 /* MADV_POPULATE_READ */) == -22, "MADV_POPULATE_READ of PROT_NONE is EINVAL");
+    sys(NR_munmap, pm + 3 * 4096, 4096);
+    check(sys(NR_madvise, pm + 2 * 4096, 2 * 4096, 22) == -12, "MADV_POPULATE_READ over a hole is ENOMEM");
 
     // --- nanosleep's remaining time
     i64 act[4] = {(i64)handler, 0, 0, 0};

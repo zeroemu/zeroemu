@@ -6,7 +6,10 @@
 //!
 //! All binder state sits behind one lock (as Linux's binder once did);
 //! blocking waits release it. Lock order: binder → address spaces → fd
-//! tables.
+//! tables. Every binder user in the system queues on that lock, so what is
+//! done under it is kept short: guest memory is read and written outside it
+//! where it can be, threads it wakes are signalled once it is let go, and an
+//! ioctl keeps it from one command to the next rather than take it again.
 //!
 //! References follow Linux's driver. A node counts the references other
 //! processes hold and those held locally: by buffers in flight, and by its owner
@@ -20,7 +23,9 @@ use super::wait::EVENTS;
 use super::{Kernel, Process, Thread};
 use crate::errno::*;
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::sync::{Arc, Condvar, Mutex, Weak};
+use std::hash::{BuildHasherDefault, Hasher};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
+use std::time::Duration;
 
 // ioctls (_IOC(dir, 'b', nr, size)).
 const BINDER_WRITE_READ: u64 = 0xc030_6201;
@@ -97,6 +102,31 @@ pub const DEVICES: [(&str, u64); 3] = [("binder", 0xa36), ("hwbinder", 0xa37), (
 type ProcId = u64;
 type NodeId = u64;
 type TxnId = u64;
+
+/// Hashes the driver's own ids and the kernel's tids, which no guest chooses, so
+/// SipHash's defence against chosen keys buys nothing there. A transaction makes
+/// some thirty lookups with the lock held. (rustc's FxHasher.)
+#[derive(Default)]
+struct IdHasher(u64);
+
+impl Hasher for IdHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.write_u64(b as u64);
+        }
+    }
+    fn write_u64(&mut self, n: u64) {
+        self.0 = (self.0.rotate_left(5) ^ n).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+    fn write_i32(&mut self, n: i32) {
+        self.write_u64(n as u32 as u64);
+    }
+}
+
+type IdMap<K, V> = HashMap<K, V, BuildHasherDefault<IdHasher>>;
 
 enum Work {
     Txn(TxnId),
@@ -250,10 +280,15 @@ struct BProc {
     ctx: usize,
     pid: i32,
     process: Weak<Process>,
-    threads: HashMap<i32, BThread>,
+    threads: IdMap<i32, BThread>,
     todo: VecDeque<Work>,
+    /// Threads asleep in binder_read with nothing of their own to do, the last to
+    /// go to sleep last: those that can take this process's work. As Linux's
+    /// proc->waiting_threads, so that work wakes one of them without looking at
+    /// every thread that ever used binder here (hundreds in system_server).
+    idle: Vec<i32>,
     refs: BTreeMap<u32, Ref>,
-    node_refs: HashMap<NodeId, u32>,
+    node_refs: IdMap<NodeId, u32>,
     nodes: HashMap<u64, NodeId>,
     /// mmap'd receive area (user VA, size) and its allocations offset → (len, async node).
     area: Option<(u64, u64)>,
@@ -277,17 +312,49 @@ struct BProc {
 
 #[derive(Default)]
 struct World {
-    procs: HashMap<ProcId, BProc>,
-    nodes: HashMap<NodeId, Node>,
-    txns: HashMap<TxnId, Txn>,
+    procs: IdMap<ProcId, BProc>,
+    nodes: IdMap<NodeId, Node>,
+    txns: IdMap<TxnId, Txn>,
     next: u64,
     mgr: [Option<NodeId>; 3],
+    /// Who to tell once the lock is let go (see Guard).
+    pending: Pending,
+}
+
+/// Threads woken, and poll keys bumped, while the lock is held.
+#[derive(Default)]
+struct Pending {
+    wakes: Vec<Arc<Condvar>>,
+    keys: Vec<usize>,
+}
+
+impl Pending {
+    fn is_empty(&self) -> bool {
+        self.wakes.is_empty() && self.keys.is_empty()
+    }
+
+    fn tell(&mut self) {
+        for cv in self.wakes.drain(..) {
+            cv.notify_one();
+        }
+        for key in self.keys.drain(..) {
+            EVENTS.bump_key(key);
+        }
+    }
+}
+
+thread_local! {
+    /// The emptied lists of this thread's last unlock, for the next to fill: no
+    /// allocation per transaction.
+    static SPARE: std::cell::RefCell<Pending> = std::cell::RefCell::default();
 }
 
 /// Lock order: this lock, then address spaces and fd tables. A transaction copies
 /// into the receiver and installs descriptors in its table with this held, so
 /// nothing may hold either of those while taking it: poll_ready can take it, and
-/// the last reference to a BinderFile can go away anywhere (see its Drop).
+/// the last reference to a BinderFile can go away anywhere (see its Drop). A guest
+/// thread's own locks (its scheduling attributes, its signals, what it sleeps on)
+/// can be taken under it; none of those is held while taking it.
 static WORLD: Mutex<Option<World>> = Mutex::new(None);
 
 static WORLD_TAKER: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
@@ -297,11 +364,56 @@ pub(super) fn lock_taker() -> Option<i32> {
     WORLD.try_lock().is_err().then(|| WORLD_TAKER.load(std::sync::atomic::Ordering::Relaxed))
 }
 
-fn world() -> std::sync::MutexGuard<'static, Option<World>> {
+fn world() -> Guard {
     let mut w = WORLD.lock().unwrap();
     WORLD_TAKER.store(super::guest_tid(), std::sync::atomic::Ordering::Relaxed);
     w.get_or_insert_with(World::default);
-    w
+    Guard(Some(w))
+}
+
+/// The binder lock, held. The threads woken while it is held are signalled, and poll
+/// keys bumped, once it is let go: the first thing a woken thread does is take the
+/// lock, and on macOS signalling a condvar someone waits on is a system call, which
+/// every binder user in the system would otherwise wait behind. Nothing is lost: what
+/// a sleeper waits for is changed with the lock held, and it looks again before it
+/// sleeps, with the lock held until its wait begins.
+struct Guard(Option<MutexGuard<'static, Option<World>>>);
+
+impl std::ops::Deref for Guard {
+    type Target = Option<World>;
+    fn deref(&self) -> &Option<World> {
+        self.0.as_ref().unwrap()
+    }
+}
+
+impl std::ops::DerefMut for Guard {
+    fn deref_mut(&mut self) -> &mut Option<World> {
+        self.0.as_mut().unwrap()
+    }
+}
+
+impl Guard {
+    /// Thread::sleep with the lock let go meanwhile. Whoever this thread woke is
+    /// told first, since the lock comes back only when this thread wakes.
+    fn sleep(mut self, t: &Thread, cv: &Condvar, timeout: Duration) -> Guard {
+        let mut g = self.0.take().unwrap();
+        if let Some(w) = g.as_mut() {
+            w.pending.tell();
+        }
+        Guard(Some(t.sleep(cv, g, timeout)))
+    }
+}
+
+impl Drop for Guard {
+    fn drop(&mut self) {
+        let Some(mut g) = self.0.take() else { return };
+        let Some(w) = g.as_mut().filter(|w| !w.pending.is_empty()) else { return };
+        let mut pending = SPARE.try_with(|spare| std::mem::take(&mut *spare.borrow_mut())).unwrap_or_default();
+        std::mem::swap(&mut pending, &mut w.pending);
+        drop(g);
+        pending.tell();
+        let _ = SPARE.try_with(|spare| *spare.borrow_mut() = pending);
+    }
 }
 
 /// One open of a binder device (normally one per process).
@@ -310,28 +422,63 @@ pub struct BinderFile {
 }
 
 impl World {
-    /// After queueing work for process `id`: wakes threads that can take it.
-    /// A thread asleep in binder_read is woken by name; waking everything on
-    /// EVENTS would stampede every binder thread in the system per transaction.
-    /// Deferred work wakes no one: it goes back with whatever wakes the thread.
-    fn wake(&mut self, id: ProcId) {
+    /// Thread `tid` of process `id` has work of its own to read now: wakes it if it is
+    /// asleep in binder_read, as binder_wakeup_thread_ilocked. A thread asleep there is
+    /// woken by name; waking everything on EVENTS would stampede every binder thread in
+    /// the system per transaction. Deferred work wakes no one: it goes back with
+    /// whatever wakes the thread.
+    fn wake_thread(&mut self, id: ProcId, tid: i32) {
+        let Some(p) = self.procs.get_mut(&id) else { return };
+        if let Some(th) = p.threads.get_mut(&tid)
+            && th.parked
+        {
+            th.parked = false;
+            p.idle.retain(|&x| x != tid);
+            self.pending.wakes.push(th.cv.clone());
+        }
+        if p.polled && !self.pending.keys.contains(&poll_key(id)) {
+            self.pending.keys.push(poll_key(id));
+        }
+    }
+
+    /// After queueing work for process `id`: wakes as many of its idle threads as there
+    /// is work, the last to go to sleep first, as binder_select_thread_ilocked. That one
+    /// is likelier to still have its vCPU, and what it last touched in the caches.
+    fn wake_proc(&mut self, id: ProcId) {
         let Some(p) = self.procs.get_mut(&id) else { return };
         let single = p.threads.len() <= 1;
-        let mut process_work = p.todo.len();
-        for th in p.threads.values_mut().filter(|th| th.parked) {
-            let takes_process_work = process_work > 0 && th.stack.is_empty() && th.todo.is_empty() && (th.looper != 0 || single);
-            if !th.process_todo && !takes_process_work {
+        let mut want = p.todo.len();
+        let mut i = p.idle.len();
+        while want > 0 && i > 0 {
+            i -= 1;
+            let tid = p.idle[i];
+            let Some(th) = p.threads.get_mut(&tid).filter(|th| th.parked) else {
+                p.idle.remove(i);
+                continue;
+            };
+            // As binder_read's test. One that isn't a looper stays on the list: it
+            // takes the process's work once it is the only thread.
+            if !(th.stack.is_empty() && th.todo.is_empty() && (th.looper != 0 || single)) {
                 continue;
             }
-            if !th.process_todo {
-                process_work -= 1;
-            }
+            p.idle.remove(i);
             th.parked = false;
-            th.cv.notify_one();
+            self.pending.wakes.push(th.cv.clone());
+            want -= 1;
         }
-        if p.polled {
-            EVENTS.bump_key(poll_key(id));
+        if p.polled && !self.pending.keys.contains(&poll_key(id)) {
+            self.pending.keys.push(poll_key(id));
         }
+    }
+
+    /// Wakes every thread of `id` that has work, of its own or the process's.
+    fn wake_all(&mut self, id: ProcId) {
+        let Some(p) = self.procs.get(&id) else { return };
+        let tids: Vec<i32> = p.threads.iter().filter(|(_, th)| th.parked && th.process_todo).map(|(&tid, _)| tid).collect();
+        for tid in tids {
+            self.wake_thread(id, tid);
+        }
+        self.wake_proc(id);
     }
 }
 
@@ -348,7 +495,7 @@ impl Drop for BinderFile {
             // Callers and death watchers anywhere may have new work.
             let ids: Vec<ProcId> = w.procs.keys().copied().collect();
             for p in ids {
-                w.wake(p);
+                w.wake_all(p);
             }
             drop(g);
             EVENTS.bump();
@@ -368,10 +515,11 @@ pub fn open(t: &Thread, rdev: u64) -> Option<BinderFile> {
             ctx,
             pid: t.proc.pid,
             process: Arc::downgrade(&t.proc),
-            threads: HashMap::new(),
+            threads: IdMap::default(),
             todo: VecDeque::new(),
+            idle: Vec::new(),
             refs: BTreeMap::new(),
-            node_refs: HashMap::new(),
+            node_refs: IdMap::default(),
             nodes: HashMap::new(),
             area: None,
             allocs: BTreeMap::new(),
@@ -405,12 +553,14 @@ pub fn set_area(b: &BinderFile, start: u64, size: u64) -> Result<(), i64> {
 /// thread closing the driver under a main thread asleep in joinThreadPool.
 pub fn flush(b: &BinderFile) {
     let mut g = world();
-    let Some(p) = g.as_mut().unwrap().procs.get_mut(&b.id) else { return };
+    let w = g.as_mut().unwrap();
+    let Some(p) = w.procs.get_mut(&b.id) else { return };
+    p.idle.clear();
     for th in p.threads.values_mut() {
         th.need_return = true;
         if th.parked {
             th.parked = false;
-            th.cv.notify_one();
+            w.pending.wakes.push(th.cv.clone());
         }
     }
 }
@@ -486,14 +636,15 @@ impl World {
                 th.note(format_args!("failed reply queued: answer to {call} couldn't be delivered"));
                 th.stack.retain(|&x| x != call);
                 th.push(Work::FailedReply);
+                self.wake_thread(to, caller);
             }
             _ => {
+                // For this thread, which reads it before it sleeps.
                 let th = self.thread(me, tid);
                 th.note(format_args!("failed reply queued: couldn't send"));
                 th.push(Work::FailedReply);
             }
         }
-        self.wake(to);
     }
 
     /// As binder_send_failed_reply: `call` will never be answered. Its caller is told,
@@ -512,7 +663,7 @@ impl World {
                 th.note(format_args!("dead reply queued for {call}"));
                 th.stack.retain(|&x| x != call);
                 th.push(Work::DeadReply);
-                self.wake(p);
+                self.wake_thread(p, tid);
                 return;
             }
             let Some(next) = txn.from_parent else { return };
@@ -753,7 +904,7 @@ impl World {
         if let Some(p) = self.procs.get_mut(&owner) {
             p.todo.push_back(Work::Node(node));
         }
-        self.wake(owner);
+        self.wake_proc(owner);
     }
 
     fn remove_node(&mut self, node: NodeId) {
@@ -935,9 +1086,33 @@ impl Kernel {
         let (wsize, wcons, wbuf) = (u64_at(&bwr, 0), u64_at(&bwr, 8), u64_at(&bwr, 16));
         let (rsize, rcons, rbuf) = (u64_at(&bwr, 24), u64_at(&bwr, 32), u64_at(&bwr, 40));
 
+        // The binder lock, kept from one command to the next and into the read.
+        let mut held: Option<Guard> = None;
         let mut consumed = wcons;
         if wsize > wcons {
             let cmds = t.proc.mm().read_vec(wbuf + wcons, (wsize - wcons).min(1 << 20) as usize)?;
+            // What the transactions send is read from the sender first, so that the lock,
+            // once taken, can be kept to the end. The commands before one whose contents
+            // can't be read still run, as when each was read in its turn.
+            let mut sends = Vec::new();
+            let mut off = 0usize;
+            while off + 4 <= cmds.len() {
+                let cmd = u32_at(&cmds, off);
+                let size = ((cmd >> 16) & 0x3fff) as usize;
+                if off + 4 + size > cmds.len() {
+                    break;
+                }
+                if let BC_TRANSACTION | BC_REPLY | BC_TRANSACTION_SG | BC_REPLY_SG = cmd {
+                    let out = self.read_outgoing(t, cmd == BC_REPLY || cmd == BC_REPLY_SG, &cmds[off + 4..off + 4 + size], cmd == BC_TRANSACTION_SG || cmd == BC_REPLY_SG);
+                    let failed = out.is_err();
+                    sends.push(out);
+                    if failed {
+                        break;
+                    }
+                }
+                off += 4 + size;
+            }
+            let mut sends = sends.into_iter();
             let mut off = 0usize;
             while off + 4 <= cmds.len() {
                 let cmd = u32_at(&cmds, off);
@@ -946,9 +1121,10 @@ impl Kernel {
                     break;
                 }
                 let args = &cmds[off + 4..off + 4 + size];
-                if let Err(e) = self.binder_command(t, b, cmd, args) {
+                if let Err(e) = self.binder_command(t, b, cmd, args, &mut held, &mut sends) {
                     if ring_on() {
-                        if let Some(th) = world().as_mut().and_then(|w| w.procs.get_mut(&b.id)).and_then(|p| p.threads.get_mut(&t.tid)) {
+                        let mut g = held.take().unwrap_or_else(world);
+                        if let Some(th) = g.as_mut().and_then(|w| w.procs.get_mut(&b.id)).and_then(|p| p.threads.get_mut(&t.tid)) {
                             th.note(format_args!("command {cmd:#x} failed: {e}"));
                         }
                     }
@@ -957,11 +1133,15 @@ impl Kernel {
                 off += 4 + size;
                 consumed = wcons + off as u64;
             }
-            t.proc.mm().write_u64(arg + 8, consumed)?;
         }
 
+        // What was consumed is written back after the read, with the lock let go, and
+        // also when the read fails: libbinder retries an ioctl that was interrupted, and
+        // must not send the commands again (binder_ioctl_write_read copies the whole
+        // binder_write_read back either way).
+        let wrote = |consumed| if wsize > wcons { t.proc.mm().write_u64(arg + 8, consumed) } else { Ok(()) };
         if rsize > rcons {
-            let out = match self.binder_read(t, file, b, (rsize - rcons) as usize, rcons == 0) {
+            let out = match self.binder_read(t, file, b, (rsize - rcons) as usize, rcons == 0, held.take().unwrap_or_else(world)) {
                 Ok(out) => out,
                 Err(e) => {
                     if ring_on() && e != EINTR {
@@ -969,24 +1149,31 @@ impl Kernel {
                             th.note(format_args!("read failed: {e}"));
                         }
                     }
+                    wrote(consumed)?;
                     return Err(e);
                 }
             };
+            wrote(consumed)?;
             t.proc.mm().write(rbuf + rcons, &out)?;
             t.proc.mm().write_u64(arg + 32, rcons + out.len() as u64)?;
+        } else {
+            drop(held);
+            wrote(consumed)?;
         }
         Ok(0)
     }
 
-    fn binder_command(&self, t: &Arc<Thread>, b: &BinderFile, cmd: u32, a: &[u8]) -> Result<(), i64> {
+    /// One command. `held` is the binder lock if this ioctl holds it: commands take
+    /// it there and leave it for the next, and let it go to touch guest memory.
+    /// `sends` has what each transaction sends, read beforehand.
+    fn binder_command(&self, t: &Arc<Thread>, b: &BinderFile, cmd: u32, a: &[u8], held: &mut Option<Guard>, sends: &mut std::vec::IntoIter<Result<Outgoing, i64>>) -> Result<(), i64> {
         match cmd {
             BC_TRANSACTION | BC_REPLY | BC_TRANSACTION_SG | BC_REPLY_SG => {
-                let sg = cmd == BC_TRANSACTION_SG || cmd == BC_REPLY_SG;
-                let out = self.read_outgoing(t, cmd == BC_REPLY || cmd == BC_REPLY_SG, a, sg)?;
-                self.binder_transact(t, b, out);
+                let out = sends.next().ok_or(EFAULT)??;
+                self.binder_transact(t, b, out, held);
             }
             BC_FREE_BUFFER => {
-                let mut g = world();
+                let g = held.get_or_insert_with(world);
                 let w = g.as_mut().unwrap();
                 if let Some(alloc) = w.free(b.id, u64_at(a, 0)) {
                     // An async transaction finished: start the node's next one.
@@ -998,24 +1185,25 @@ impl Kernel {
                             if let Some(p) = w.procs.get_mut(&owner) {
                                 p.todo.push_back(Work::Txn(next));
                             }
-                            w.wake(owner);
+                            w.wake_proc(owner);
                         }
                     }
                     w.release_held(b.id, alloc.held);
                     if let Some(target) = alloc.target {
                         w.dec_node(target, true, false);
                     }
-                    drop(g);
-                    let mut files = t.files();
-                    for fd in alloc.fda_fds {
-                        files.close(fd as i64);
+                    if !alloc.fda_fds.is_empty() {
+                        *held = None;
+                        let mut files = t.files();
+                        for fd in alloc.fda_fds {
+                            files.close(fd as i64);
+                        }
                     }
                 }
             }
             BC_INCREFS | BC_ACQUIRE | BC_RELEASE | BC_DECREFS => {
                 let handle = u32_at(a, 0);
-                let mut g = world();
-                let w = g.as_mut().unwrap();
+                let w = held.get_or_insert_with(world).as_mut().unwrap();
                 let ctx = w.procs.get(&b.id).ok_or(EBADF)?.ctx;
                 if handle == 0 && !w.procs[&b.id].refs.contains_key(&0) {
                     // First use of the context manager's handle.
@@ -1037,25 +1225,22 @@ impl Kernel {
                 // The owner has taken the reference it was told about, so the one
                 // standing in for it until now can go.
                 let ptr = u64_at(a, 0);
-                let mut g = world();
-                let w = g.as_mut().unwrap();
+                let w = held.get_or_insert_with(world).as_mut().unwrap();
                 if let Some(&n) = w.procs.get(&b.id).and_then(|p| p.nodes.get(&ptr)) {
                     w.dec_node(n, cmd == BC_ACQUIRE_DONE, false);
                 }
             }
             BC_DEAD_BINDER_DONE => {
                 let cookie = u64_at(a, 0);
-                let mut g = world();
-                let w = g.as_mut().unwrap();
+                let w = held.get_or_insert_with(world).as_mut().unwrap();
                 let cleared = w.procs.get_mut(&b.id).and_then(|p| p.deaths_pending.remove(&cookie));
                 if cleared == Some(true) {
                     w.thread(b.id, t.tid).push(Work::ClearDeathDone(cookie));
-                    w.wake(b.id);
+                    w.wake_thread(b.id, t.tid);
                 }
             }
             BC_REGISTER_LOOPER | BC_ENTER_LOOPER | BC_EXIT_LOOPER => {
-                let mut g = world();
-                let w = g.as_mut().unwrap();
+                let w = held.get_or_insert_with(world).as_mut().unwrap();
                 let th = w.thread(b.id, t.tid);
                 match cmd {
                     BC_REGISTER_LOOPER => th.looper |= LOOPER_REGISTERED,
@@ -1070,8 +1255,7 @@ impl Kernel {
             }
             BC_REQUEST_DEATH_NOTIFICATION | BC_CLEAR_DEATH_NOTIFICATION => {
                 let (handle, cookie) = (u32_at(a, 0), u64_at(a, 4));
-                let mut g = world();
-                let w = g.as_mut().unwrap();
+                let w = held.get_or_insert_with(world).as_mut().unwrap();
                 let Some(node) = w.procs.get(&b.id).and_then(|p| p.refs.get(&handle)).map(|r| r.node) else { return Ok(()) };
                 let n = w.nodes.get_mut(&node).unwrap();
                 if cmd == BC_REQUEST_DEATH_NOTIFICATION {
@@ -1097,8 +1281,7 @@ impl Kernel {
                         }
                     }
                 }
-                w.wake(b.id);
-                drop(g);
+                w.wake_proc(b.id);
             }
             _ => {
                 if super::verbose() {
@@ -1143,9 +1326,9 @@ impl Kernel {
         Ok(Outgoing { reply, target, code, flags, data, offsets, sg: sgmap, sg_size, too_big: false })
     }
 
-    fn binder_transact(&self, t: &Arc<Thread>, b: &BinderFile, mut out: Outgoing) {
-        let mut g = world();
-        let w = g.as_mut().unwrap();
+    /// Takes the binder lock into `held`, and leaves it there.
+    fn binder_transact(&self, t: &Arc<Thread>, b: &BinderFile, mut out: Outgoing, held: &mut Option<Guard>) {
+        let w = held.get_or_insert_with(world).as_mut().unwrap();
         let me = b.id;
         let ctx = w.procs[&me].ctx;
 
@@ -1206,7 +1389,6 @@ impl Kernel {
                 }
                 w.thread(me, t.tid).note(format_args!("call to dead handle {handle}: dead reply queued"));
                 w.thread(me, t.tid).push(Work::DeadReply);
-                drop(g);
                 return;
             };
             let owner = w.nodes[&node].owner;
@@ -1250,7 +1432,6 @@ impl Kernel {
                 eprintln!("[zeroemu] binder: no receive buffer space in pid {}", w.procs[&to].pid);
             }
             w.transaction_failed(me, t.tid, answering, to, to_thread);
-            drop(g);
             return;
         };
 
@@ -1371,7 +1552,6 @@ impl Kernel {
                 w.free(to, buffer);
                 w.release_held(to, held);
                 w.transaction_failed(me, t.tid, answering, to, to_thread);
-                drop(g);
                 return;
             }
         };
@@ -1452,7 +1632,6 @@ impl Kernel {
             w.free(to, buffer);
             w.release_held(to, held);
             w.transaction_failed(me, t.tid, answering, to, to_thread);
-            drop(g);
             return;
         }
 
@@ -1536,6 +1715,7 @@ impl Kernel {
             caller.note(format_args!("reply {txn} queued, for {answering:?}"));
             caller.stack.retain(|&x| Some(x) != answering);
             caller.push(Work::Reply(txn));
+            w.wake_thread(to, to_thread.unwrap());
         } else if oneway {
             // One async call per node at a time; BC_FREE_BUFFER of this
             // buffer starts the next.
@@ -1549,28 +1729,33 @@ impl Kernel {
             } else {
                 n.async_busy = true;
                 w.procs.get_mut(&to).unwrap().todo.push_back(Work::Txn(txn));
+                w.wake_proc(to);
             }
         } else {
             w.thread(me, t.tid).stack.push(txn);
             match to_thread {
-                Some(th) => w.thread(to, th).push(Work::Txn(txn)),
-                None => w.procs.get_mut(&to).unwrap().todo.push_back(Work::Txn(txn)),
+                Some(th) => {
+                    w.thread(to, th).push(Work::Txn(txn));
+                    w.wake_thread(to, th);
+                }
+                None => {
+                    w.procs.get_mut(&to).unwrap().todo.push_back(Work::Txn(txn));
+                    w.wake_proc(to);
+                }
             }
         }
-        w.wake(to);
-        drop(g);
     }
 
-    /// Fills the read buffer, blocking until there is something to say.
-    fn binder_read(&self, t: &Arc<Thread>, file: &File, b: &BinderFile, max: usize, at_start: bool) -> Result<Vec<u8>, i64> {
-        let mut out = Vec::new();
+    /// Fills the read buffer, blocking until there is something to say. Starts with
+    /// the binder lock held, and keeps it but to sleep.
+    fn binder_read(&self, t: &Arc<Thread>, file: &File, b: &BinderFile, max: usize, at_start: bool, mut g: Guard) -> Result<Vec<u8>, i64> {
+        let mut out = Vec::with_capacity(max.min(256));
         if at_start {
             put32(&mut out, BR_NOOP);
         }
         let mut yielded = false;
         let mut asked_for_looper = false;
         loop {
-            let mut g = world();
             {
                 let w = g.as_mut().unwrap();
                 if !w.procs.contains_key(&b.id) {
@@ -1625,7 +1810,7 @@ impl Kernel {
                 }
                 // This thread took one piece of process work; another may take the rest.
                 if !w.procs[&b.id].todo.is_empty() {
-                    w.wake(b.id);
+                    w.wake_proc(b.id);
                 }
             }
             if asked_for_looper || out.len() > if at_start { 4 } else { 0 } {
@@ -1646,14 +1831,23 @@ impl Kernel {
                 yielded = true;
                 drop(g);
                 super::vcpus::blocking();
+                g = world();
                 continue;
             }
-            let th = g.as_mut().unwrap().thread(b.id, t.tid);
+            let w = g.as_mut().unwrap();
+            let th = w.thread(b.id, t.tid);
             th.parked = true;
             let cv = th.cv.clone();
-            let mut g = t.sleep(&cv, g, super::IDLE);
-            if let Some(th) = g.as_mut().unwrap().procs.get_mut(&b.id).and_then(|p| p.threads.get_mut(&t.tid)) {
-                th.parked = false;
+            if th.stack.is_empty() && th.todo.is_empty() {
+                w.procs.get_mut(&b.id).unwrap().idle.push(t.tid);
+            }
+            g = g.sleep(t, &cv, super::IDLE);
+            // Whoever woke it took it off the idle list; a timeout or a kick didn't.
+            if let Some(p) = g.as_mut().unwrap().procs.get_mut(&b.id)
+                && let Some(th) = p.threads.get_mut(&t.tid)
+                && std::mem::take(&mut th.parked)
+            {
+                p.idle.retain(|&x| x != t.tid);
             }
             yielded = false; // others may be waiting for a vCPU by now
         }

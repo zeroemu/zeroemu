@@ -1685,38 +1685,51 @@ impl AddressSpace {
         child.start_stack = self.start_stack;
         (child.arg_start, child.arg_end) = (self.arg_start, self.arg_end);
         child.brk = self.brk;
-        let mut pages = Vec::new();
-        self.visit(0, USER_TOP, &mut |_, slot, va, e| pages.push((slot, va, e)));
+        // A mapping at a time, as Linux's dup_mmap does (kernel/fork.c), deciding once for
+        // each what its pages get, and finding the child's leaf table once for each of the
+        // parent's: zygote has tens of thousands of pages present, and every app launch
+        // waits for its fork.
+        let (owner, leaf) = (child.owner(), paging::levels() - 1);
         let mut downgraded = false;
         let mut failed = None;
-        for (slot, va, e) in pages {
-            if self.find(va).is_some_and(|(_, v)| v.on_fork != OnFork::Copy) {
+        for (&start, vma) in &self.vmas {
+            if vma.on_fork != OnFork::Copy {
                 continue;
             }
-            // Before anything else, since this can fail, and nothing later can.
-            let owner = child.owner();
-            let child_slot = match walk(&self.phys, owner, &mut child.tables, child.root.root, 0, va, true) {
-                Ok(s) => s.unwrap(),
-                Err(e) => {
-                    failed = Some(e);
-                    break;
+            let device = matches!(vma.backing, Backing::Dev { .. });
+            let shared = device || matches!(vma.backing, Backing::Shared { .. });
+            // The leaf table this was last for (by the address it starts at), and the child's.
+            let mut tables = (u64::MAX, 0);
+            self.visit(start, vma.end, &mut |phys, slot, va, e| {
+                if failed.is_some() {
+                    return;
                 }
-            };
-            let mut entry = e;
-            if !self.is_device(va) {
-                self.phys.share(paging::addr(e));
-            }
-            if !self.is_shared(va) {
-                let frame = paging::addr(e);
-                if paging::permits(e, true, false) {
+                let at = paging::index(va, leaf) as u64 * 8;
+                if tables.0 != va - at / 8 * PAGE {
+                    // Before anything else, since this can fail, and nothing later can.
+                    match walk(phys, owner, &mut child.tables, child.root.root, 0, va, true) {
+                        Ok(s) => tables = (va - at / 8 * PAGE, s.unwrap() - at),
+                        Err(e) => {
+                            failed = Some(e);
+                            return;
+                        }
+                    }
+                }
+                let mut entry = e;
+                if !device {
+                    phys.share(paging::addr(e));
+                }
+                if !shared && paging::permits(e, true, false) {
                     // Both copies read-only: the parent's entry changes under its threads.
-                    let prot = self.find(va).map_or(0, |(_, v)| v.prot);
-                    entry = paging::user_page(frame, read_only(prot));
-                    self.phys.write_u64(slot, entry);
+                    entry = paging::user_page(paging::addr(e), read_only(vma.prot));
+                    phys.write_u64(slot, entry);
                     downgraded = true;
                 }
+                phys.write_u64(tables.1 + at, entry);
+            });
+            if failed.is_some() {
+                break;
             }
-            self.phys.write_u64(child_slot, entry);
         }
         // Entries already changed are changed, whether or not the rest followed.
         if downgraded {
@@ -1744,13 +1757,18 @@ impl Drop for AddressSpace {
     fn drop(&mut self) {
         // Callers flush TLBs before dropping a space a vCPU may still cache
         // (exec switches roots first; exited processes have no vCPUs left).
-        let mut pages = Vec::new();
-        self.visit(0, USER_TOP, &mut |_, _, va, e| pages.push((va, paging::addr(e))));
-        for (va, frame) in pages {
-            if !self.is_device(va) {
-                self.phys.free(frame);
+        // Device pages hold nothing. Pages come in address order: one look at the
+        // mappings for each device mapping, not for each page.
+        let devices: Vec<(u64, u64)> = self.vmas.iter().filter(|(_, v)| matches!(v.backing, Backing::Dev { .. })).map(|(&s, v)| (s, v.end)).collect();
+        let mut next = 0;
+        self.visit(0, USER_TOP, &mut |phys, _, va, e| {
+            while devices.get(next).is_some_and(|d| d.1 <= va) {
+                next += 1;
             }
-        }
+            if !devices.get(next).is_some_and(|d| d.0 <= va) {
+                phys.free(paging::addr(e));
+            }
+        });
         let phys = self.phys.clone();
         self.stale.release(&phys);
         self.forget_read();
@@ -1830,6 +1848,43 @@ mod tests {
         cache.reclaim(1 << 20);
         b.fault_reading(at, false, false).unwrap();
         assert_eq!(b.read_vec(at, 1).unwrap(), [5]);
+    }
+
+    /// What a child gets of each mapping, across leaf tables: private pages shared until
+    /// written, shared ones the same, none of a MADV_DONTFORK one, zeros in a
+    /// MADV_WIPEONFORK one.
+    #[test]
+    fn a_child_gets_each_mapping_as_its_policy_says() {
+        let phys = PhysMem::new(Arc::new(crate::hv::NoHv));
+        let kernel = KernelWindow::new(&phys, &[]).unwrap();
+        let mut a = AddressSpace::new(phys.clone(), &kernel, 1).unwrap();
+        let base = 1u64 << 30;
+        // Across a leaf table's end.
+        let private = a.map(Placement::Fixed(base + (2 << 20) - PAGE * 2), PAGE * 4, PROT_READ | PROT_WRITE, Backing::Anon).unwrap();
+        let obj = SharedObject::new(phys.clone());
+        let shared = a.map(Placement::Fixed(base + (8 << 20)), PAGE * 2, PROT_READ | PROT_WRITE, Backing::Shared { obj, offset: 0 }).unwrap();
+        let dropped = a.map(Placement::Fixed(base + (16 << 20)), PAGE, PROT_READ | PROT_WRITE, Backing::Anon).unwrap();
+        let wiped = a.map(Placement::Fixed(base + (24 << 20)), PAGE, PROT_READ | PROT_WRITE, Backing::Anon).unwrap();
+        for (i, at) in [private, private + PAGE * 3, shared, dropped, wiped].into_iter().enumerate() {
+            a.write(at, &[i as u8 + 1]).unwrap();
+        }
+        a.set_on_fork(dropped, PAGE, OnFork::Drop).unwrap();
+        a.set_on_fork(wiped, PAGE, OnFork::Wipe).unwrap();
+        let used = phys.frames_in_use();
+        let before = a.tlb_gen;
+        let mut b = a.fork(&kernel, 2).unwrap();
+        assert!(a.tlb_gen > before, "the parent's writable entries became read-only");
+        assert_eq!(b.read_vec(private, 1).unwrap(), [1]);
+        assert_eq!(b.read_vec(private + PAGE * 3, 1).unwrap(), [2]);
+        assert_eq!(b.read_vec(shared, 1).unwrap(), [3]);
+        assert_eq!(b.read_vec(dropped, 1), Err(EFAULT));
+        assert_eq!(b.read_vec(wiped, 1).unwrap(), [0]);
+        b.write(private + PAGE * 3, &[9]).unwrap();
+        b.write(shared, &[8]).unwrap();
+        assert_eq!(a.read_vec(private + PAGE * 3, 1).unwrap(), [2], "a copy for the writer");
+        assert_eq!(a.read_vec(shared, 1).unwrap(), [8], "one page for both");
+        drop(b);
+        assert_eq!(phys.frames_in_use(), used, "the child's holds and tables all went");
     }
 
     /// mremap's tables come first, so its failing can't lose what was mapped. (Nothing

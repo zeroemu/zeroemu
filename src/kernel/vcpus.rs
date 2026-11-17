@@ -30,7 +30,7 @@ use crate::hv::{CpuState, Exit, Hypervisor, Kick, PageTableRoot, SyscallRegs, Ur
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering, fence};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -161,7 +161,8 @@ impl Pool {
 
     /// Asks up to `n` holders asleep in the kernel for at least `min`, longest asleep
     /// first, to give their places back: woken, each finds nothing to do and gives its
-    /// vCPU up as it goes back to sleep (`blocking`). Returns how many it asked.
+    /// vCPU up as it goes back to sleep (`blocking`). Returns how many it asked: one
+    /// found awake by then isn't.
     /// `again`: those already asked count too, and are woken again, in case the last
     /// wakeup came before they slept.
     fn reclaim(&self, st: &PoolState, n: usize, min: Duration, again: bool) -> usize {
@@ -180,11 +181,22 @@ impl Pool {
             .collect();
         sleepers.sort_unstable_by_key(|(asleep, _)| *asleep);
         sleepers.truncate(n);
+        let mut asked = 0;
         for (_, h) in &sleepers {
             h.thread.give_back.store(true, Ordering::Relaxed);
+            // It may have woken since it was read asleep: `running` clears the ask, but
+            // it may have done so before this set it, and then the thread would give
+            // its vCPU up at its next sleep for no reason. With the fence in `running`,
+            // either this sees it awake and takes the ask back, or `running` clears it.
+            fence(Ordering::SeqCst);
+            if h.asleep.load(Ordering::Relaxed) == 0 {
+                h.thread.give_back.store(false, Ordering::Relaxed);
+                continue;
+            }
             nudge(&h.thread);
+            asked += 1;
         }
-        sleepers.len()
+        asked
     }
 
     /// After a place was taken: keeps an eighth of the places free, so a thread that
@@ -416,6 +428,8 @@ impl Slot {
         {
             h.asleep.store(0, Ordering::Relaxed);
             h.run_since.store(self.pool.now_ns(), Ordering::Relaxed);
+            // Pairs with the one in `reclaim`.
+            fence(Ordering::SeqCst);
             self.thread.give_back.store(false, Ordering::Relaxed);
         }
     }
@@ -426,6 +440,11 @@ impl Slot {
         i.state = v.state();
         if let Some((id, _)) = i.held.take() {
             self.pool.st.lock().unwrap().holders.remove(&id);
+            // Its place is given back, so any ask is answered. One can come in as it
+            // leaves (`reclaim` read it asleep in an earlier sleep of this syscall), but
+            // only under the pool's lock, which the removal waited for; none can come
+            // now. Left set, it would make the next vCPU's first sleep give it up too.
+            self.thread.give_back.store(false, Ordering::Relaxed);
         }
         let gated = i.gated.take();
         if let Some(id) = gated {

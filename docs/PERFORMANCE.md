@@ -115,8 +115,8 @@ the app list included): the median frame went from 29 ms to 18 ms and janky fram
 
 What's left is mostly the first time something is drawn: a shader compiled, or icons
 uploaded, can cost 50 to 150 ms. The work under System calls and CPU left this as it
-was: in the runs under "Before and after", janky frames were 0.2 to 0.4% either way
-(one run before it was 2.4%), and the 99th percentile 11 to 20 ms.
+was: in the runs under "Before and after", janky frames were 0.2 to 0.6% either way,
+and the 99th percentile 17 to 22 ms.
 
 The graphics path is the Android Emulator's: GL calls go through the same gfxstream pipe
 to the same renderer. What differs is the kernel. zeroemu has no guest kernel and no
@@ -134,7 +134,7 @@ CPU, as macOS counts zeroemu's threads (Activity Monitor's figure), a settled de
 | Flinging the app list | 270-320% | 95% |
 
 The "Now" column was measured before the changes under System calls and before the
-vCPU and 2-second wakeup items below.
+vCPU and 2-second wakeup items below; "Before and after" has what they changed.
 
 - Threads asleep in poll, epoll and the like are woken by keys their files hash onto.
   There were 63 keys for well over a thousand sleeping threads, so every event woke
@@ -173,29 +173,30 @@ as it doesn't.
 
 The changes under System calls, the vCPU, wakeup and fault items under CPU, and the GPU
 calls taken off the renderer's thread, on a whole device: an M1 Pro in ordinary use
-(an editor and a browser open, nothing heavy running), no network, and a `/data` that
-starts empty, so each run is a first boot and Android is still setting itself up in
-the background while it is measured. zeroemu's own CPU time as `ps` counts it. The
-build before is the one the changes started from. Each is the median of three runs,
-before and after run in turn (before, after, after, before, before, after):
+(an editor and a browser open, nothing heavy running), no network, zeroemu's own CPU
+time as `ps` counts it. The build before is the one the changes started from. Each
+figure is the median of three runs, before and after run in turn (before, after,
+after, before, before, after), each from a copy of the same settled `/data`:
 
 | | Before | After |
 |---|---|---|
-| Boot, to `sys.boot_completed` | 16.0 s | 13.0 s |
-| Idle, a minute from 2.5 minutes after boot | 18.5% of a core | 14.0% |
-| Opening 13 apps, scrolling each, then flinging the launcher (about 145 s) | 88% of a core | 67% |
-| Syscall exits a second, idle | 1,630 | 890 |
-| Syscall exits a second, opening the apps | 27,300 | 14,800 |
-| Page faults a second, opening the apps | 6,270 | 4,950 |
-| Memory after opening the apps (`top`) | 4.67 GB | 4.43 GB |
-| App launch, `am start -W` TotalTime, sum of ten apps' medians | 4.7 s | 3.6 s |
-| Launcher fling: janky frames, 99th percentile | 0.2%, 12 ms | 0.4%, 18 ms |
+| Idle, a minute from 2.5 minutes after boot | 18.8% of a core | 13.7% |
+| Opening 13 apps, scrolling each, then flinging the launcher (about 145 s) | 73.6% of a core | 58.4% |
+| Syscall exits a second, idle | 1,640 | 900 |
+| Syscall exits a second, opening the apps | 22,200 | 12,550 |
+| Page faults a second, opening the apps | 4,610 | 3,500 |
+| Memory idle, and after opening the apps (`top`) | 3.03, 4.46 GB | 2.95, 4.26 GB |
+| App launch, `am start -W` TotalTime, sum of 12 apps' medians | 4.15 s | 3.30 s |
+| Launcher fling: janky frames, 99th percentile | 0.2%, 20 ms | 0.4%, 18 ms |
+| Boot, to `sys.boot_completed` | 10.9 s | 10.8 s |
 
-Launch times went down for every app but Calendar (about the same): Maps from 1,042 to
-656 ms, Chrome from 320 to 202 ms, Settings from 282 to 198 ms. The first run of the
-new build booted in 18.3 s, the other two in 13.0 s; the median is the latter. Memory
-at idle didn't change (3.09 against 3.05 GB). The runs' scripts and logs aren't in the
-repository; `ZEROEMU_SYSCOUNT=1` with `kill -USR1` gives the exit counts.
+Every app but Calendar (about the same) opened faster: Chrome in 215 ms rather than
+324, Maps in 381 rather than 505, the Play Store in 168 rather than 249. A first boot
+gains more than a settled one: in the same runs from an empty `/data`, boot went from
+16.0 s to 13.0 s, CPU while opening the apps from 88% to 67% of a core, and idle from
+18.5% to 14.0%, while Android was still setting itself up. Frame statistics didn't
+change either way. The runs' scripts aren't in the repository; `ZEROEMU_SYSCOUNT=1`
+with `kill -USR1` gives the exit counts.
 
 ## Measuring
 

@@ -39,7 +39,8 @@ guest memory twice. This is accounting: the page exists once either way.
 A syscall round trip (guest → host → guest) is about 0.92 µs on an M1 Pro: 1M `getpid`
 calls (`guest/bench_aarch64.S`) took 0.92 s, against 1.04 s before the changes below, the
 two run in turn on a busy machine. The figures here come from microbenchmarks and from
-counts in single boots; what they add up to for a whole device is measured separately.
+counts in single boots; what they add up to for a whole device is under "Before and
+after", below.
 
 - A syscall exit makes 9 calls into Hypervisor.framework rather than 14. The EL0 vector
   goes back to EL0 through its own `eret`, so zeroemu reads no EL1 register and writes
@@ -68,9 +69,10 @@ of its 16-page window that are in memory already. In a file mapped read-only, th
 on a read or exec fault, and only pages another mapping has already, since zeroemu
 can't take a page back from a mapping to reclaim it. In shared memory and device memory
 it is on any fault (for a `/data` file mapped shared, only where the mapping can't
-write). In one boot each, that took faults at idle from about 1,700 a second to 1,100. A fault whose page has to be read from the system image or `/data`
-reads it with the address space unlocked, as Linux does with `VM_FAULT_RETRY`, so the
-process's other threads don't wait for the read.
+write). In one boot each, that took faults at idle from about 1,700 a second to 1,100.
+A fault whose page has to be read from the system image or `/data` reads it with the
+address space unlocked, as Linux does with `VM_FAULT_RETRY`, so the process's other
+threads don't wait for the read.
 
 Planned:
 
@@ -112,7 +114,9 @@ the app list included): the median frame went from 29 ms to 18 ms and janky fram
   and SurfaceFlinger's vsync model was fed times it couldn't use.
 
 What's left is mostly the first time something is drawn: a shader compiled, or icons
-uploaded, can cost 50 to 150 ms.
+uploaded, can cost 50 to 150 ms. The work under System calls and CPU left this as it
+was: in the runs under "Before and after", janky frames were 0.2 to 0.4% either way
+(one run before it was 2.4%), and the 99th percentile 11 to 20 ms.
 
 The graphics path is the Android Emulator's: GL calls go through the same gfxstream pipe
 to the same renderer. What differs is the kernel. zeroemu has no guest kernel and no
@@ -164,6 +168,34 @@ What idle CPU is left is mostly Android's: the composer calls SurfaceFlinger wit
 vsync 60 times a second whatever is on screen, as the emulator's images tell
 SurfaceFlinger not to trust present fences, and it keeps hardware vsync on for as long
 as it doesn't.
+
+## Before and after
+
+The changes under System calls, the vCPU, wakeup and fault items under CPU, and the GPU
+calls taken off the renderer's thread, on a whole device: an M1 Pro in ordinary use
+(an editor and a browser open, nothing heavy running), no network, and a `/data` that
+starts empty, so each run is a first boot and Android is still setting itself up in
+the background while it is measured. zeroemu's own CPU time as `ps` counts it. The
+build before is the one the changes started from. Each is the median of three runs,
+before and after run in turn (before, after, after, before, before, after):
+
+| | Before | After |
+|---|---|---|
+| Boot, to `sys.boot_completed` | 16.0 s | 13.0 s |
+| Idle, a minute from 2.5 minutes after boot | 18.5% of a core | 14.0% |
+| Opening 13 apps, scrolling each, then flinging the launcher (about 145 s) | 88% of a core | 67% |
+| Syscall exits a second, idle | 1,630 | 890 |
+| Syscall exits a second, opening the apps | 27,300 | 14,800 |
+| Page faults a second, opening the apps | 6,270 | 4,950 |
+| Memory after opening the apps (`top`) | 4.67 GB | 4.43 GB |
+| App launch, `am start -W` TotalTime, sum of ten apps' medians | 4.7 s | 3.6 s |
+| Launcher fling: janky frames, 99th percentile | 0.2%, 12 ms | 0.4%, 18 ms |
+
+Launch times went down for every app but Calendar (about the same): Maps from 1,042 to
+656 ms, Chrome from 320 to 202 ms, Settings from 282 to 198 ms. The first run of the
+new build booted in 18.3 s, the other two in 13.0 s; the median is the latter. Memory
+at idle didn't change (3.09 against 3.05 GB). The runs' scripts and logs aren't in the
+repository; `ZEROEMU_SYSCOUNT=1` with `kill -USR1` gives the exit counts.
 
 ## Measuring
 

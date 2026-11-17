@@ -1290,37 +1290,46 @@ impl AddressSpace {
     /// of [dst, dst+len). What was done, and if that is not everything, why not.
     pub fn uffd_fill(&mut self, ctx: &Arc<UffdCtx>, dst: u64, len: u64, src: Option<u64>) -> (u64, Option<i64>) {
         let mut done = 0;
-        let mut page = [0u8; PAGE as usize];
+        // Where the registered mapping of the last page ends, and its protection: ART's
+        // compacting GC copies runs of pages into one mapping, and the pages come in order.
+        let mut within = (0, 0);
         while done < len {
-            let at = dst + done;
-            let filled = (|| {
-                let (_, vma) = self.find(at).ok_or(ENOENT)?;
-                if !vma.uffd().is_some_and(|c| Arc::ptr_eq(c, ctx)) {
-                    return Err(ENOENT);
-                }
-                let prot = vma.prot;
-                let slot = walk(&self.phys, self.owner(), &mut self.tables, self.root.root, 0, at, true)?.unwrap();
-                if paging::is_valid(self.phys.read_u64(slot)) {
-                    return Err(EEXIST);
-                }
-                if let Some(src) = src {
-                    self.read(src + done, &mut page)?;
-                }
-                let frame = self.phys.alloc_for(self.owner())?;
-                if src.is_some() {
-                    unsafe { std::ptr::copy_nonoverlapping(page.as_ptr(), self.phys.host(frame), page.len()) };
-                }
-                self.sync_for_exec(frame, prot);
-                // It wasn't valid before, so no TLB holds it.
-                self.phys.write_pte(slot, paging::user_page(frame, prot));
-                Ok(())
-            })();
-            if let Err(e) = filled {
+            if let Err(e) = self.uffd_fill_page(ctx, dst + done, src.map(|s| s + done), &mut within) {
                 return (done, Some(e));
             }
             done += PAGE;
         }
         (done, None)
+    }
+
+    fn uffd_fill_page(&mut self, ctx: &Arc<UffdCtx>, at: u64, src: Option<u64>, within: &mut (u64, u32)) -> Result<(), i64> {
+        if at >= within.0 {
+            let (_, vma) = self.find(at).ok_or(ENOENT)?;
+            if !vma.uffd().is_some_and(|c| Arc::ptr_eq(c, ctx)) {
+                return Err(ENOENT);
+            }
+            *within = (vma.end, vma.prot);
+        }
+        let (owner, prot) = (self.owner(), within.1);
+        let slot = walk(&self.phys, owner, &mut self.tables, self.root.root, 0, at, true)?.unwrap();
+        if paging::is_valid(self.phys.read_u64(slot)) {
+            return Err(EEXIST);
+        }
+        let frame = match src {
+            // From the source's frame straight into the new one, which needn't be zeroed
+            // first: each page is copied once.
+            Some(src) => {
+                let from = self.host_ptr(src, false, false)?;
+                let frame = self.phys.alloc_for_overwrite(owner)?;
+                unsafe { std::ptr::copy_nonoverlapping(from, self.phys.host(frame), PAGE as usize) };
+                frame
+            }
+            None => self.phys.alloc_for(owner)?,
+        };
+        self.sync_for_exec(frame, prot);
+        // It wasn't valid before, so no TLB holds it.
+        self.phys.write_pte(slot, paging::user_page(frame, prot));
+        Ok(())
     }
 
     pub fn set_brk(&mut self, want: u64) -> u64 {

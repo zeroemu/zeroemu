@@ -1434,14 +1434,15 @@ impl AddressSpace {
     /// mm/filemap.c), so that code and data many processes use cost one fault per
     /// 64 KB rather than one per page. The window is the page cache's, in file pages,
     /// cut to the mapping and to the page's own leaf table. Only entries not present yet
-    /// are filled, and no TLB holds one of those, so nothing needs flushing.
+    /// are filled, and no TLB holds one of those, so nothing needs flushing. Returns how
+    /// many it filled.
     ///
     /// Unlike Linux, only pages that something has mapped already: Linux can unmap a
     /// page to reclaim it (it keeps reverse maps), and zeroemu can't, so a page mapped
     /// here stays in memory as long as the mapping does. Mapping every page in memory
     /// kept 490 MB more in guest memory after opening seven apps (2632 MB before); pages
     /// mapped elsewhere are kept anyway, and gave 70% of the saving.
-    fn fault_around(&self, vma_start: u64, vma: &Vma, page: u64, slot: u64, write: bool) {
+    fn fault_around(&self, vma_start: u64, vma: &Vma, page: u64, slot: u64, write: bool) -> usize {
         use crate::pagecache::WINDOW_PAGES;
         const N: usize = WINDOW_PAGES as usize;
         // Private file mappings only while they can't be written (code, read-only data,
@@ -1455,10 +1456,10 @@ impl AddressSpace {
             Backing::File { offset, .. } if !write && vma.prot & PROT_WRITE == 0 => *offset,
             Backing::Shared { obj, offset } if obj.pager.is_none() || vma.max_prot & PROT_WRITE == 0 => *offset,
             Backing::Dev { offset, .. } => *offset,
-            _ => return,
+            _ => return 0,
         };
         if vma.uffd().is_some() {
-            return;
+            return 0;
         }
         let idx = (offset + (page - vma_start)) / PAGE;
         let first = idx - idx % WINDOW_PAGES;
@@ -1475,7 +1476,7 @@ impl AddressSpace {
             }
         }
         if n == 0 {
-            return;
+            return 0;
         }
         let want = &mut want[..n];
         match &vma.backing {
@@ -1488,14 +1489,17 @@ impl AddressSpace {
                     }
                 }
             }
-            Backing::Anon => return,
+            Backing::Anon => return 0,
         }
         let shared = !matches!(vma.backing, Backing::File { .. });
+        let mut filled = 0;
         for &(i, frame) in want.iter() {
             if frame != 0 {
                 self.phys.write_pte(table + (at + i - idx) * 8, self.entry_for(frame, vma.prot, shared));
+                filled += 1;
             }
         }
+        filled
     }
 
     /// Each page present, as (where its mapping starts, its mapping, its address, its
@@ -1858,6 +1862,25 @@ mod tests {
         cache.reclaim(1 << 20);
         b.fault_reading(at, false, false).unwrap();
         assert_eq!(b.read_vec(at, 1).unwrap(), [5]);
+    }
+
+    /// Fault-around says how many entries it filled: each one a page now present, which
+    /// a count of resident pages (/proc's RSS) must add to the fault's own.
+    #[test]
+    fn fault_around_counts_what_it_maps() {
+        let phys = PhysMem::new(Arc::new(crate::hv::NoHv));
+        let kernel = KernelWindow::new(&phys, &[]).unwrap();
+        let obj = SharedObject::new(phys.clone());
+        obj.write(PAGE, &[1; 3 * PAGE as usize]).unwrap();
+        let mut a = AddressSpace::new(phys.clone(), &kernel, 1).unwrap();
+        let at = a.map(Placement::Fixed(1 << 30), PAGE * 8, PROT_READ, Backing::Shared { obj, offset: 0 }).unwrap();
+        let page = at + PAGE * 2;
+        let slot = walk(&a.phys, a.owner(), &mut a.tables, a.root.root, 0, page, true).unwrap().unwrap();
+        let (start, vma) = a.find(page).map(|(s, v)| (s, v.clone())).unwrap();
+        let filled = a.fault_around(start, &vma, page, slot, false);
+        let mut present = 0;
+        a.each_resident(&mut |_, _, _, _| present += 1);
+        assert_eq!((filled, present), (2, 2), "pages 1 and 3: 2 is the fault's own");
     }
 
     /// What a child gets of each mapping, across leaf tables: private pages shared until

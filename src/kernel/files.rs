@@ -407,6 +407,7 @@ impl Drop for PipeEnd {
 impl Pipe {
     fn read(&self, t: &Thread, max: usize, nonblock: bool) -> Result<Vec<u8>, i64> {
         let mut st = self.st.lock().unwrap();
+        let mut yielded = false;
         loop {
             if !st.buf.is_empty() {
                 let n = max.min(st.buf.len());
@@ -425,14 +426,28 @@ impl Pipe {
             if t.interrupted() {
                 return Err(ERESTARTSYS);
             }
-            super::vcpus::blocking();
+            if !yielded {
+                st = self.yield_vcpu(st);
+                yielded = true;
+                continue;
+            }
             st = t.sleep(&self.cv, st, super::IDLE);
+            yielded = false;
         }
+    }
+
+    /// vcpus::blocking() without the pipe's lock, which the other end wants, as giving
+    /// the vCPU back can take a while. The caller looks again before it sleeps.
+    fn yield_vcpu<'a>(&'a self, st: std::sync::MutexGuard<'a, PipeState>) -> std::sync::MutexGuard<'a, PipeState> {
+        drop(st);
+        super::vcpus::blocking();
+        self.st.lock().unwrap()
     }
 
     fn write(&self, t: &Thread, data: &[u8], nonblock: bool) -> Result<usize, i64> {
         let mut st = self.st.lock().unwrap();
         let mut done = 0;
+        let mut yielded = false;
         loop {
             if st.readers == 0 {
                 return Err(EPIPE);
@@ -454,8 +469,13 @@ impl Pipe {
             if t.interrupted() {
                 return if done > 0 { Ok(done) } else { Err(ERESTARTSYS) };
             }
-            super::vcpus::blocking();
+            if !yielded {
+                st = self.yield_vcpu(st);
+                yielded = true;
+                continue;
+            }
             st = t.sleep(&self.cv, st, super::IDLE);
+            yielded = false;
         }
     }
 }

@@ -590,6 +590,8 @@ pub struct Thread {
     host: std::sync::OnceLock<crate::hv::HostThread>,
     /// Asked to give its vCPU back the next time it blocks (vcpus::Pool::reclaim).
     give_back: AtomicBool,
+    /// Its place on the futex queues.
+    futex: Arc<futex::Waiter>,
     /// A descriptor table of its own: cloned without CLONE_FILES. Bionic's
     /// crash handler makes such a thread and closes everything in it.
     own_files: Option<Arc<Mutex<FdTable>>>,
@@ -829,6 +831,7 @@ impl Thread {
             in_syscall: Mutex::new(None),
             host: std::sync::OnceLock::new(),
             give_back: AtomicBool::new(false),
+            futex: futex::Waiter::new(),
         })
     }
 

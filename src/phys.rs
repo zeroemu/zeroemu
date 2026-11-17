@@ -432,7 +432,8 @@ impl PhysMem {
     /// A cached frame the host has written for the last time: it stays as it is until the
     /// page cache lets go of it.
     pub fn freeze(&self, gpa: u64) {
-        self.extra_refs[(gpa / PAGE) as usize].fetch_or(FROZEN, Ordering::AcqRel);
+        // Not synced yet, whatever the frame's last owner left in its count.
+        let _ = self.extra_refs[(gpa / PAGE) as usize].fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| Some(n & !SYNCED | FROZEN));
     }
 
     /// The page cache lets go of a frame, which lives on if something has it mapped. Its
@@ -476,8 +477,9 @@ impl PhysMem {
             #[cfg(test)]
             self.icache_syncs.fetch_add(1, Ordering::Relaxed);
             if frozen == FROZEN {
-                // After the invalidate, which reaches every core's instruction cache.
-                flags.fetch_or(SYNCED, Ordering::Release);
+                // After the invalidate, which reaches every core's instruction cache. Not if
+                // the page cache let go of the frame meanwhile: the mark would outlive it.
+                let _ = flags.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| (n & FROZEN != 0).then_some(n | SYNCED));
             }
         }
     }

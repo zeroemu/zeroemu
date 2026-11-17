@@ -302,6 +302,11 @@ impl Sysctl {
         table().len() as u16
     }
 
+    /// Whether `idx` names a file or directory, without making its text or listing.
+    pub fn exists(idx: u16) -> bool {
+        (idx as usize) < table().len() + dirs().len()
+    }
+
     pub fn entry(&self, idx: u16) -> Option<Entry> {
         let i = idx as usize;
         if let Some((path, _, _)) = table().get(i) {

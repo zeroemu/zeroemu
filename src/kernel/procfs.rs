@@ -383,7 +383,9 @@ impl ProcFs {
                 kernel.vfs.as_deref().ok_or_else(|| err(ENOENT))?;
             }
             K::Sysctl => {
-                kernel.sysctl.entry(extra as u16).ok_or_else(|| err(ENOENT))?;
+                if !Sysctl::exists(extra as u16) {
+                    return Err(err(ENOENT));
+                }
             }
             K::PMaps => {
                 if self.proc(pid)?.mm.lock().unwrap().is_none() {
@@ -850,16 +852,22 @@ impl FileSystem for ProcFs {
                 _ => ROOT,
             }));
         }
-        // Any thread has a /proc/<tid>, though readdir lists only group leaders.
-        if dir == ROOT
-            && let Ok(tid) = name.parse::<i32>()
-            && let Some(th) = self.kernel()?.task(tid)
-        {
-            let pid = th.proc.pid;
-            return Ok(Some(mk(K::Pid, pid, if tid == pid { 0 } else { tid as u64 })));
+        // Any thread has a /proc/<tid>, though readdir lists only group leaders. A
+        // process's own number, live or a zombie, is one map lookup; only another thread's
+        // number needs every process's threads searched.
+        if dir == ROOT && let Ok(tid) = name.parse::<i32>() {
+            let kernel = self.kernel()?;
+            if let Some(p) = kernel.process(tid).filter(|p| p.pid.to_string() == name) {
+                return Ok(Some(mk(K::Pid, p.pid, 0)));
+            }
+            if let Some(th) = kernel.task(tid) {
+                let pid = th.proc.pid;
+                return Ok(Some(mk(K::Pid, pid, if tid == pid { 0 } else { tid as u64 })));
+            }
         }
         // /proc and the fixed directories are looked in without being listed: every open
         // of a process's file looks names up in both, and a list of /proc names every process.
+        // Linux looks them up the same way (fs/proc/base.c: proc_pident_lookup, proc_pid_lookup).
         let fixed = |table: &[(&str, K)], pid: i32, extra: u64| table.iter().find(|(n, _)| *n == name).map(|(_, k)| mk(*k, pid, extra));
         match decode(dir) {
             Some((K::Pid, pid, extra)) => {
@@ -867,8 +875,9 @@ impl FileSystem for ProcFs {
                 return Ok(fixed(&PID_DIR, pid, extra));
             }
             Some((K::Task, pid, extra)) => return Ok(fixed(&TASK_DIR, pid, extra)),
-            // A thread or an fd, by its number as readdir spells it: listing them made a
-            // name for each of a process's threads, or files, to find one.
+            // A thread or an fd, by its number as readdir spells it (fs/proc/base.c's
+            // name_to_int, which proc_task_lookup and fs/proc/fd.c's proc_lookupfd_common
+            // use): listing them made a name for each of a process's threads, or files, to find one.
             Some((K::PTask, pid, _)) => {
                 let p = self.proc(pid)?;
                 let tid = name.parse::<i32>().ok().filter(|t| t.to_string() == name);

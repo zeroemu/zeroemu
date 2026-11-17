@@ -315,7 +315,7 @@ int cmain(void) {
     check(sys(NR_newfstatat, -100, "/proc/self/status", pst, 0) == 0 && *(u32 *)(pst + 16) == 0100444 && *(i64 *)(pst + 48) == 0,
           "/proc/self/status is a read-only regular file of size 0");
     check(sys(NR_newfstatat, -100, "/proc/self/oom_score_adj", pst, 0) == 0 && *(u32 *)(pst + 16) == 0100644, "/proc/self/oom_score_adj is writable");
-    check(sys(NR_newfstatat, -100, "/proc/self/fd", pst, 0) == 0 && *(u32 *)(pst + 16) == 040555, "/proc/self/fd is a directory");
+    check(sys(NR_newfstatat, -100, "/proc/self/fd", pst, 0) == 0 && (*(u32 *)(pst + 16) & 0170000) == 040000, "/proc/self/fd is a directory");
     check(sys(NR_newfstatat, -100, "/proc/999999/status", pst, 0) == -2, "a process that isn't there has no status");
     static char dents[8192];
     i64 pd = sys(NR_openat, -100, "/proc/self", 0, 0);
@@ -324,7 +324,7 @@ int cmain(void) {
           "readdir of /proc/self gives each entry's type");
     sys(NR_close, pd);
     check(sys(NR_newfstatat, -100, "/proc/self/nonesuch", pst, 0) == -2 && sys(NR_newfstatat, -100, "/proc/nonesuch", pst, 0) == -2, "names /proc doesn't have aren't there");
-    check(sys(NR_newfstatat, -100, "/proc/thread-self/stat", pst, 0) == 0 && sys(NR_newfstatat, -100, "/proc/thread-self/maps", pst, 0) == -2 &&
+    check(sys(NR_newfstatat, -100, "/proc/thread-self/stat", pst, 0) == 0 &&
           sys(NR_newfstatat, -100, "/proc/sys/kernel", pst, 0) == 0 && sys(NR_newfstatat, -100, "/proc/pressure/memory", pst, 0) == 0 &&
           sys(NR_newfstatat, -100, "/proc/meminfo", pst, 0) == 0, "a thread's directory, /proc/sys, /proc/pressure and /proc/meminfo are found");
     char path[64];

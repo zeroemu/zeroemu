@@ -10,7 +10,7 @@ use crate::errno::*;
 use crate::hv::{CpuState, SyscallRegs, Vcpu};
 use std::collections::HashMap;
 use std::ops::{Deref, DerefMut};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering, fence};
 use std::sync::{Arc, LockResult, Mutex, MutexGuard, PoisonError};
 
 pub const SIGILL: u32 = 4;
@@ -84,7 +84,8 @@ impl Pending {
     }
 
     /// The numbers pending, without the lock. A signal sent after this is read
-    /// kicks the thread it is for, which makes it look again.
+    /// kicks the thread it is for, which makes it look again (for a process's
+    /// signal, a thread whose mask lets it in: see Thread::set_mask).
     pub fn bits(&self) -> u64 {
         self.bits.load(Ordering::Acquire)
     }
@@ -293,8 +294,26 @@ fn ignored(act: &SigAction, sig: u32, init: bool) -> bool {
 }
 
 impl Thread {
+    /// Sets its signal mask (only the thread itself does); the old one. Linux changes
+    /// the mask and looks at what is pending under the siglock, which a sender also
+    /// holds while it queues a process's signal and picks the thread to wake by its
+    /// mask (__set_current_blocked, complete_signal, kernel/signal.c). Here neither
+    /// takes a lock: the thread reads the pending bits on its way back into the guest
+    /// without one, and send_process_signal reads the masks without one. Each stores,
+    /// then reads what the other stored, and without a full fence on both sides both
+    /// can read the old value: the thread runs on without the signal while the sender,
+    /// finding it blocked, wakes no one. With the fences one of them sees the other's
+    /// store. Only a mask that lets a signal in needs it.
+    pub(super) fn set_mask(&self, mask: u64) -> u64 {
+        let old = self.mask.swap(mask, Ordering::Relaxed);
+        if old & !mask != 0 {
+            fence(Ordering::SeqCst);
+        }
+        old
+    }
+
     /// Whether a signal it doesn't block is pending, ignored or not: what
-    /// deliver_signals would act on. Read without a lock.
+    /// deliver_signals would act on. Read without a lock (see set_mask).
     fn unblocked_pending(&self) -> bool {
         let mask = self.mask.load(Ordering::Relaxed) & !UNBLOCKABLE;
         (self.pending.bits() | self.proc.pending.bits()) & !mask != 0
@@ -386,6 +405,9 @@ impl Kernel {
             return;
         }
         proc.pending.lock().unwrap().insert(sig, info);
+        // Pairs with the one in Thread::set_mask: a thread letting `sig` in just now
+        // either sees it pending or has its new mask seen here.
+        fence(Ordering::SeqCst);
         if blocked {
             super::wait::EVENTS.bump_key(Arc::as_ptr(proc) as usize); // a signalfd reader may be polling for it
         }
@@ -494,7 +516,7 @@ impl Kernel {
                     if act.flags & SA_NODEFER == 0 {
                         mask |= bit(sig);
                     }
-                    t.mask.store(mask & !UNBLOCKABLE, Ordering::Relaxed);
+                    t.set_mask(mask & !UNBLOCKABLE);
                     if act.flags & SA_RESETHAND != 0 {
                         t.proc.sig.lock().unwrap().0[sig as usize] = SigAction::default();
                     }
@@ -517,8 +539,15 @@ impl Kernel {
             rewind(&mut state, &regs);
             vcpu.set_state(&state);
         }
+        // A sigsuspend, ppoll, pselect or epoll_pwait woke without a handler: its mask
+        // goes back. A signal it lets in is taken now, before the guest runs, as Linux
+        // looks again after restore_saved_sigmask (exit_to_user_mode_loop,
+        // kernel/entry/common.c).
         if let Some(m) = t.saved_mask.take() {
-            t.mask.store(m, Ordering::Relaxed); // sigsuspend woke without a handler
+            t.set_mask(m);
+            if t.unblocked_pending() {
+                self.deliver_signals(t, vcpu, None);
+            }
         }
     }
 
@@ -586,7 +615,7 @@ impl Kernel {
             2 => s,        // SIG_SETMASK
             _ => return -EINVAL,
         };
-        t.mask.store(new & !UNBLOCKABLE, Ordering::Relaxed);
+        t.set_mask(new & !UNBLOCKABLE);
         0
     }
 
@@ -595,7 +624,7 @@ impl Kernel {
             Ok(m) => m,
             Err(e) => return -e,
         };
-        let old = t.mask.swap(mask & !UNBLOCKABLE, Ordering::Relaxed);
+        let old = t.set_mask(mask & !UNBLOCKABLE);
         t.saved_mask.put(old);
         while !t.interrupted() {
             super::vcpus::blocking();
@@ -815,7 +844,7 @@ impl Kernel {
                 s.v[i as usize] = u128::from_le_bytes(b[o..o + 16].try_into().unwrap());
             }
         }
-        t.mask.store(r(UC + 40) & !UNBLOCKABLE, Ordering::Relaxed);
+        t.set_mask(r(UC + 40) & !UNBLOCKABLE);
         vcpu.set_state(&state);
         Ret::NoReturn
     }
@@ -924,8 +953,7 @@ impl Kernel {
                 Err(_) => return self.bad_sigframe(t, frame),
             }
         }
-        t.mask
-            .store(r(X64_SIGMASK) & !UNBLOCKABLE, Ordering::Relaxed);
+        t.set_mask(r(X64_SIGMASK) & !UNBLOCKABLE);
         vcpu.set_state(state);
         Ret::NoReturn
     }

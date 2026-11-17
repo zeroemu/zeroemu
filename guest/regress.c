@@ -26,6 +26,7 @@ typedef unsigned int u32;
 #define NR_rt_sigprocmask 135
 #define NR_setresuid 147
 #define NR_setresgid 149
+#define NR_getpid 172
 #define NR_gettid 178
 #define NR_munmap 215
 #define NR_madvise 233
@@ -112,6 +113,34 @@ static void spin_on(void *arg) {
     spin_done = 1;
 }
 
+// Round after round, lets in with sigprocmask a SIGUSR1 that the main thread sends to
+// the whole process at about the same time, while no other thread lets it in. Then
+// it spins in user code until the handler has run: Linux delivers it on the way back
+// from sigprocmask, or wakes this thread for it (complete_signal, kernel/signal.c).
+// A round where it is still waiting after that long counts as missed.
+#define RACE_ROUNDS 2000
+static volatile int race_round, race_done, race_seen, race_missed;
+static void race_handler(int s) { (void)s; race_seen++; }
+static void race_on(void *arg) {
+    (void)arg;
+    u64 usr1 = 1UL << 9;
+    for (int i = 1; i <= RACE_ROUNDS; i++) {
+        while (race_round != i) {
+            if (race_round < 0) return;
+        }
+        // A different moment each round, against the main thread's kill.
+        for (int n = (i * 37) % 2000; n > 0; n--) __asm__ volatile("" ::: "memory");
+        sys(NR_rt_sigprocmask, 1 /* SIG_UNBLOCK */, &usr1, 0, 8);
+        for (long n = 0; race_seen != i && n < 50000000; n++) {}
+        if (race_seen != i) {
+            race_missed++;
+            sys(NR_getpid); // takes it on the way back
+        }
+        sys(NR_rt_sigprocmask, 0 /* SIG_BLOCK */, &usr1, 0, 8);
+        race_done = i;
+    }
+}
+
 // Reads a page in user code, with no syscall, until it is told the page was dropped.
 // Then whether it reads the zeros MADV_DONTNEED left (1) or the old value (2).
 static volatile int *watched;
@@ -147,8 +176,8 @@ static int fa, fb;
 static volatile i64 w1_ret = 99, w2_ret = 99;
 static void waiter1(void *arg) { (void)arg; i64 ts[2] = {0, 300000000}; w1_ret = sys(NR_futex, &fa, 0 /* WAIT */, 0, ts); }
 static void waiter2(void *arg) { (void)arg; i64 ts[2] = {3, 0}; w2_ret = sys(NR_futex, &fb, 0 /* WAIT */, 0, ts); }
-static char stacks[5][16384] __attribute__((aligned(16)));
-static int ctid[5];
+static char stacks[6][16384] __attribute__((aligned(16)));
+static int ctid[6];
 
 // MADV_DONTNEED of `pages` pages, one of which another thread is reading in user code:
 // once madvise returns, that thread no longer reads the old page. Linux's
@@ -285,6 +314,24 @@ int cmain(void) {
     sys(NR_tkill, spin_tid, 12);
     for (int i = 0; i < 200 && !spin_done; i++) nap_ms(5);
     check(spin_done, "a signal interrupts a thread spinning in user code");
+
+    // --- a signal sent to the process reaches the one thread that lets it in, even as
+    // it does so: Linux changes a mask, and picks a thread for a process's signal by
+    // its mask, under the same lock (kernel/signal.c)
+    i64 race_act[4] = {(i64)race_handler, 0, 0, 0};
+    sys(NR_rt_sigaction, 10 /* SIGUSR1 */, race_act, 0, 8);
+    u64 race_old = 0;
+    sys(NR_rt_sigprocmask, 0 /* SIG_BLOCK */, &block, &race_old, 8); // the new thread's too
+    spawn(stacks[5] + 16384, race_on, 0, &ctid[5]);
+    i64 me = sys(NR_getpid);
+    for (int i = 1; i <= RACE_ROUNDS && race_missed < 4; i++) {
+        race_round = i;
+        sys(NR_kill, me, 10);
+        while (race_done != i) {}
+    }
+    race_round = -1;
+    sys(NR_rt_sigprocmask, 2 /* SIG_SETMASK */, &race_old, 0, 8);
+    check(race_missed == 0 && race_seen == RACE_ROUNDS, "a process's signal reaches the thread letting it in as it is sent");
 
     // --- the condition flags come back from a syscall and a page fault as they went in:
     // Linux's kernel_exit puts back the PSTATE the exception saved (arch/arm64/kernel/entry.S)

@@ -238,12 +238,16 @@ impl SyncFile {
 struct Resource {
     id: u32,
     size: u64,
-    #[allow(dead_code)]
-    stride: u32,
     blob_mem: u32,
-    guest: Option<Arc<crate::mm::SharedObject>>,
+    /// Its guest pages, which the renderer has as its backing. A buffer made with
+    /// RESOURCE_CREATE gets them only when first mapped or transferred (`lazy`).
+    guest: Mutex<Option<Arc<crate::mm::SharedObject>>>,
+    /// Its guest pages are made on first use (see `guest_pages`).
+    lazy: bool,
     mapped: Mutex<Weak<DevMem>>,
     mapped_once: AtomicBool,
+    /// The context the renderer attached it to last, 0 if none (see `attach`).
+    last_ctx: Mutex<u32>,
     gpu: Arc<dyn GpuBackend>,
     phys: Arc<PhysMem>,
 }
@@ -253,17 +257,33 @@ impl Drop for Resource {
         // Pages (and any GPA map) are still alive: field drops run after this,
         // and a VMA may still hold the shared object. Unmap the renderer
         // view before the resource itself goes.
-        if self.mapped_once.load(Ordering::Acquire) {
-            self.gpu.resource_unmap(self.id);
-        }
-        if self.guest.is_some() {
-            self.gpu.detach_iov(self.id);
-        }
-        self.gpu.resource_unref(self.id);
+        let backed = self.guest.get_mut().unwrap_or_else(|p| p.into_inner()).is_some();
+        self.gpu.resource_unref(self.id, self.mapped_once.load(Ordering::Acquire), backed);
     }
 }
 
 impl Resource {
+    /// Attaches it to a context, as Linux does whenever a file gets a handle to it
+    /// (virtio_gpu_gem_object_open, drivers/gpu/drm/virtio/virtgpu_gem.c): the composer
+    /// imports the buffer it is about to show every frame. The renderer
+    /// (VirtioGpuContext::AttachResource) adds it to two sets and points it at the
+    /// context's pipe, letting go of the pipe it pointed at before. Only a pipe resource
+    /// reads that, but the reference keeps a destroyed context's pipe and render thread
+    /// alive (VirtioGpuFrontend::destroyContext detaches nothing) until another context
+    /// attaches the resource or it is freed. zeroemu never detaches, so a repeat by the
+    /// context that attached it last is the only attach that changes nothing.
+    fn attach(&self, ctx: u32) {
+        if ctx == 0 {
+            return;
+        }
+        // Held across the call, so that the renderer's last attach is the one recorded.
+        let mut last = self.last_ctx.lock().unwrap();
+        if *last != ctx {
+            self.gpu.ctx_attach_resource(ctx, self.id);
+            *last = ctx;
+        }
+    }
+
     fn host_mem(self: &Arc<Self>) -> Result<Arc<DevMem>, i64> {
         if let Some(m) = self.mapped.lock().unwrap().upgrade() {
             return Ok(m);
@@ -297,8 +317,31 @@ impl Resource {
             let mem = self.host_mem()?;
             return Ok(Backing::Dev { mem, offset: delta });
         }
-        let obj = self.guest.clone().ok_or(ENODEV)?;
+        let obj = self.guest_pages()?;
         Ok(Backing::Shared { obj, offset: delta })
+    }
+
+    /// Its guest pages, made and attached as the renderer's backing first if this is
+    /// their first use. Linux backs every buffer at once (virtio_gpu_object_create,
+    /// drivers/gpu/drm/virtio/virtgpu_object.c), but most of what gralloc makes are
+    /// buffers only the GPU touches: windows, SurfaceFlinger's targets, hardware
+    /// bitmaps. Backing a full-screen one costs 10 MB of guest pages, plus as much again
+    /// for the renderer's copy of them (VirtioGpuResource::AttachIov), that nothing
+    /// ever reads. The guest can't tell: it sees the same size, and the contents are
+    /// zeros until it writes them either way.
+    fn guest_pages(&self) -> Result<Arc<crate::mm::SharedObject>, i64> {
+        // Held while the backing is made, so that a transfer racing this one waits for it.
+        let mut g = self.guest.lock().unwrap();
+        if let Some(obj) = g.as_ref() {
+            return Ok(obj.clone());
+        }
+        if !self.lazy {
+            return Err(ENODEV);
+        }
+        let (obj, iov) = guest_backing(&self.phys, self.size)?;
+        self.gpu.attach_iov(self.id, iov)?;
+        *g = Some(obj.clone());
+        Ok(obj)
     }
 }
 
@@ -822,9 +865,7 @@ fn prime_fd_to_handle(o: &Open, arg: u64, io: &mut dyn Io) -> Result<i64, i64> {
     let mut b = io.read_mem(arg, 12)?;
     let dma = io.dma_of(ru32(&b, 8) as i32 as i64)?;
     let ctx = o.st.lock().unwrap().ctx;
-    if ctx != 0 {
-        o.dev.gpu.ctx_attach_resource(ctx, dma.gem.res.id);
-    }
+    dma.gem.res.attach(ctx);
     let (handle, _) = o.gems.lock().unwrap().insert(dma.gem.res.clone());
     wu32(&mut b, 0, handle);
     store(io, arg, &b)?;
@@ -935,27 +976,46 @@ fn virt_context_init(o: &Open, arg: u64, io: &mut dyn Io) -> Result<i64, i64> {
 fn guest_backing(phys: &Arc<PhysMem>, size: u64) -> Result<(Arc<crate::mm::SharedObject>, gpu::Iov), i64> {
     let obj = crate::mm::SharedObject::new(phys.clone());
     let pages = size.div_ceil(phys::PAGE) as usize;
-    let mut iov = Vec::with_capacity(pages);
+    let mut iov: gpu::Iov = Vec::new();
     for i in 0..pages {
         let gpa = obj.frame(i)?;
         let n = (phys::PAGE as usize).min(size as usize - i * phys::PAGE as usize);
-        iov.push((phys.host(gpa), n));
+        let host = phys.host(gpa);
+        // Frames come in blocks that are contiguous on the host too: one entry for each
+        // run rather than each page, as the renderer walks the list from the start on
+        // every transfer (VirtioGpuResource::TransferWithIov).
+        match iov.last_mut() {
+            Some((p, len)) if p.wrapping_add(*len) == host => *len += n,
+            _ => iov.push((host, n)),
+        }
     }
     Ok((obj, iov))
 }
 
-fn new_res(dev: &Device, id: u32, size: u64, stride: u32, blob_mem: u32, guest: Option<Arc<crate::mm::SharedObject>>) -> Arc<Resource> {
+/// `ctx` is the context it was created attached to, if any.
+/// A resource with neither guest pages nor host memory gets its guest pages on first use.
+fn new_res(dev: &Device, id: u32, size: u64, blob_mem: u32, guest: Option<Arc<crate::mm::SharedObject>>, ctx: u32) -> Arc<Resource> {
     Arc::new(Resource {
         id,
         size,
-        stride,
         blob_mem,
-        guest,
+        lazy: guest.is_none() && blob_mem == 0,
+        guest: Mutex::new(guest),
         mapped: Mutex::new(Weak::new()),
         mapped_once: AtomicBool::new(false),
+        last_ctx: Mutex::new(ctx),
         gpu: dev.gpu.clone(),
         phys: dev.phys.clone(),
     })
+}
+
+/// A resource that is a context's pipe to its render thread, which carries the guest's
+/// GLES stream, as the renderer tells them apart (GetResourceType): a PIPE_BUFFER bound
+/// VIRGL_BIND_CUSTOM.
+fn is_pipe(args: &Resource3d) -> bool {
+    const PIPE_BUFFER: u32 = 0;
+    const VIRGL_BIND_CUSTOM: u32 = 1 << 17;
+    args.target == PIPE_BUFFER && args.bind == VIRGL_BIND_CUSTOM
 }
 
 fn virt_res_create(o: &Open, arg: u64, io: &mut dyn Io) -> Result<i64, i64> {
@@ -971,7 +1031,6 @@ fn virt_res_create(o: &Open, arg: u64, io: &mut dyn Io) -> Result<i64, i64> {
     if size == 0 || size > (1 << 32) {
         return Err(EINVAL);
     }
-    let (guest, iov) = guest_backing(&o.dev.phys, size)?;
     let id = o.dev.alloc_res();
     let args = Resource3d {
         handle: id,
@@ -986,13 +1045,19 @@ fn virt_res_create(o: &Open, arg: u64, io: &mut dyn Io) -> Result<i64, i64> {
         nr_samples: ru32(&b, 32),
         flags: ru32(&b, 36),
     };
-    o.dev.gpu.resource_create(&args, iov)?;
+    // A pipe is written from the start. Anything else gets its guest pages when first
+    // mapped or transferred (Resource::guest_pages).
+    let pipe = is_pipe(&args);
+    let (guest, iov) = if pipe {
+        let (g, iov) = guest_backing(&o.dev.phys, size)?;
+        (Some(g), iov)
+    } else {
+        (None, Vec::new())
+    };
     // Opening a handle attaches the object to the file's context (drm_gem_handle_create).
     let ctx = o.st.lock().unwrap().ctx;
-    if ctx != 0 {
-        o.dev.gpu.ctx_attach_resource(ctx, id);
-    }
-    let res = new_res(&o.dev, id, size, stride, 0, Some(guest));
+    o.dev.gpu.resource_create(&args, iov, ctx)?;
+    let res = new_res(&o.dev, id, size, 0, guest, ctx);
     o.dev.track_res(&res);
     let (handle, _) = o.gems.lock().unwrap().insert(res);
     wu32(&mut b, 40, handle);
@@ -1021,27 +1086,20 @@ fn virt_create_blob(o: &Open, arg: u64, io: &mut dyn Io) -> Result<i64, i64> {
         (Some(g), iov)
     };
     let ctx = o.st.lock().unwrap().ctx;
-    if cmd_size > 0 {
+    let cmd = if cmd_size > 0 {
         if ctx == 0 {
             return Err(EINVAL);
         }
-        let cmd = io.read_mem(cmd_ptr, cmd_size.min(16 << 20))?;
-        o.dev.gpu.submit(ctx, &cmd, &[])?;
-    }
+        io.read_mem(cmd_ptr, cmd_size.min(16 << 20))?
+    } else {
+        Vec::new()
+    };
     let id = o.dev.alloc_res();
     let blob = Blob { blob_mem: mem, blob_flags: flags, blob_id, size };
-    // This gfxstream build's create_blob wrapper ignores the iov, so a guest
-    // blob is attached again explicitly. Host blobs have no guest pages.
-    o.dev.gpu.resource_create_blob(ctx, id, &blob, iov.clone())?;
-    if !iov.is_empty() && let Err(e) = o.dev.gpu.attach_iov(id, iov) {
-        o.dev.gpu.resource_unref(id);
-        return Err(e);
-    }
-    let res = new_res(&o.dev, id, size, 0, mem, guest);
+    // Host blobs have no guest pages.
+    o.dev.gpu.resource_create_blob(ctx, id, &blob, iov, &cmd)?;
+    let res = new_res(&o.dev, id, size, mem, guest, ctx);
     o.dev.track_res(&res);
-    if ctx != 0 {
-        o.dev.gpu.ctx_attach_resource(ctx, id);
-    }
     let (handle, _) = o.gems.lock().unwrap().insert(res);
     wu32(&mut b, 8, handle);
     wu32(&mut b, 12, id);
@@ -1084,6 +1142,9 @@ fn virt_transfer(o: &Open, cmd: u64, arg: u64, io: &mut dyn Io) -> Result<i64, i
     if trace() {
         let dir = if ioc_nr(cmd) == 0x46 { "FROM_HOST" } else { "TO_HOST" };
         eprintln!("[drm] {} xfer {dir} res {} {}x{} at {},{} off {} size {}", io.comm(), gem.res.id, t.bx.w, t.bx.h, t.bx.x, t.bx.y, t.offset, gem.res.size);
+    }
+    if gem.res.lazy {
+        gem.res.guest_pages()?;
     }
     let xfer = if ioc_nr(cmd) == 0x46 { o.dev.gpu.transfer_read(gem.res.id, &t) } else { o.dev.gpu.transfer_write(gem.res.id, &t) };
     if let Err(e) = xfer {
@@ -1136,8 +1197,7 @@ fn virt_exec(o: &Open, cmd: u64, arg: u64, io: &mut dyn Io) -> Result<i64, i64> 
     if nbo > 0 {
         let raw = io.read_mem(bos, nbo * 4)?;
         for i in 0..nbo {
-            let gem = o.gem(ru32(&raw, i * 4))?;
-            o.dev.gpu.ctx_attach_resource(ctx, gem.res.id);
+            o.gem(ru32(&raw, i * 4))?.res.attach(ctx);
         }
     }
     o.dev.gpu.submit(ctx, &cmd, &in_fences)?;
@@ -1464,7 +1524,8 @@ fn mode_rmfb(o: &Open, arg: u64, io: &mut dyn Io) -> Result<i64, i64> {
 fn present(o: &Open, fb: u32, user: u64, event: bool) -> Result<(), i64> {
     // Debugging: ZEROEMU_DUMP_RES=<dir> saves, on every 40th flip, each
     // display-sized resource as the host renderer sees it.
-    if let Ok(dir) = std::env::var("ZEROEMU_DUMP_RES") {
+    static DUMP: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    if let Some(dir) = DUMP.get_or_init(|| std::env::var("ZEROEMU_DUMP_RES").ok()) {
         static FLIPS: AtomicU64 = AtomicU64::new(0);
         let n = FLIPS.fetch_add(1, Ordering::Relaxed);
         if n % 40 == 20 && n < 400 {
@@ -1544,8 +1605,8 @@ fn mode_create_dumb(o: &Open, arg: u64, io: &mut dyn Io) -> Result<i64, i64> {
         nr_samples: 0,
         flags: 0,
     };
-    o.dev.gpu.resource_create(&args, iov)?;
-    let res = new_res(&o.dev, id, size, stride, 0, Some(guest));
+    o.dev.gpu.resource_create(&args, iov, 0)?;
+    let res = new_res(&o.dev, id, size, 0, Some(guest), 0);
     o.dev.track_res(&res);
     let (handle, _) = o.gems.lock().unwrap().insert(res);
     wu32(&mut b, 16, handle);
@@ -1882,6 +1943,20 @@ mod tests {
         assert_eq!(&m.buf[0x100 + 32..0x100 + 42], b"virtio_gpu");
         assert_eq!(ru32(&m.buf, 0x100 + 64), 1, "first fence signaled");
         assert_eq!(ru32(&m.buf, 0x150 + 64), 0, "second pending");
+    }
+
+    #[test]
+    fn attach_again_when_another_context_attached_last() {
+        let fake = gpu::fake::Fake::new();
+        let dev = Device::new(fake.clone(), PhysMem::new(Arc::new(NoHv)));
+        // Made attached to context 1, then imported by 2 every frame, once by 3 (which
+        // then dies), and again by 2. The renderer must see 2 attach it after 3 did, or
+        // it keeps 3's pipe alive.
+        let res = new_res(&dev, 5, 4096, 0, None, 1);
+        for ctx in [1, 2, 2, 2, 3, 2, 2, 0] {
+            res.attach(ctx);
+        }
+        assert_eq!(fake.attaches(), vec![(2, 5), (3, 5), (2, 5)]);
     }
 
     #[test]

@@ -33,6 +33,8 @@ struct State {
     ctx: HashMap<u32, u32>,
     handler: Option<Arc<dyn Fn(Fence) + Send + Sync>>,
     pub flushed: Vec<u32>,
+    /// (context, resource) of each attach, in order.
+    attaches: Vec<(u32, u32)>,
 }
 
 pub struct Fake {
@@ -42,13 +44,18 @@ pub struct Fake {
 impl Fake {
     pub fn new() -> Arc<Fake> {
         Arc::new(Fake {
-            st: Mutex::new(State { res: HashMap::new(), ctx: HashMap::new(), handler: None, flushed: Vec::new() }),
+            st: Mutex::new(State { res: HashMap::new(), ctx: HashMap::new(), handler: None, flushed: Vec::new(), attaches: Vec::new() }),
         })
     }
 
     #[cfg(test)]
     pub fn flushed(&self) -> Vec<u32> {
         self.st.lock().unwrap().flushed.clone()
+    }
+
+    #[cfg(test)]
+    pub fn attaches(&self) -> Vec<(u32, u32)> {
+        self.st.lock().unwrap().attaches.clone()
     }
 }
 
@@ -108,14 +115,17 @@ impl GpuBackend for Fake {
         Ok(())
     }
 
-    fn resource_create(&self, args: &Resource3d, _iov: Iov) -> Result<(), i64> {
+    fn resource_create(&self, args: &Resource3d, _iov: Iov, _ctx_id: u32) -> Result<(), i64> {
         let size = (args.width as u64) * (args.height.max(1) as u64) * 4 * (args.depth.max(1) as u64) * (args.array_size.max(1) as u64);
         let info = ResourceInfo { virgl_format: args.format, width: args.width, height: args.height, depth: args.depth.max(1), flags: args.flags, stride: args.width.saturating_mul(4), drm_fourcc: 0 };
         self.st.lock().unwrap().res.insert(args.handle, Res { info, host: None, size });
         Ok(())
     }
 
-    fn resource_create_blob(&self, _ctx_id: u32, handle: u32, blob: &Blob, _iov: Iov) -> Result<(), i64> {
+    fn resource_create_blob(&self, ctx_id: u32, handle: u32, blob: &Blob, _iov: Iov, cmd: &[u8]) -> Result<(), i64> {
+        if !cmd.is_empty() {
+            self.submit(ctx_id, cmd, &[])?;
+        }
         if !matches!(blob.blob_mem, BLOB_MEM_GUEST | BLOB_MEM_HOST3D | BLOB_MEM_HOST3D_GUEST) || blob.size == 0 {
             return Err(22);
         }
@@ -125,7 +135,7 @@ impl GpuBackend for Fake {
         Ok(())
     }
 
-    fn resource_unref(&self, handle: u32) {
+    fn resource_unref(&self, handle: u32, _unmap: bool, _detach: bool) {
         self.st.lock().unwrap().res.remove(&handle);
     }
 
@@ -135,7 +145,9 @@ impl GpuBackend for Fake {
 
     fn detach_iov(&self, _handle: u32) {}
 
-    fn ctx_attach_resource(&self, _ctx_id: u32, _handle: u32) {}
+    fn ctx_attach_resource(&self, ctx_id: u32, handle: u32) {
+        self.st.lock().unwrap().attaches.push((ctx_id, handle));
+    }
 
     fn ctx_detach_resource(&self, _ctx_id: u32, _handle: u32) {}
 

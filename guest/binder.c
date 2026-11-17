@@ -143,15 +143,54 @@ int cmain(void) {
         d.obj = (struct flat){ TYPE_BINDER, 0, 0x1234, 0x5678 };
         d.fdo = (struct flat){ TYPE_FD, 0, (u64)pp[1], 0 };
         u64 offs[2] = { 8, 32 };
-        send_txn(fd, BC_TRANSACTION, 0, 7, 0x10 /* TF_ACCEPT_FDS */, &d, sizeof d, offs, sizeof offs);
-        int acquired = 0;
-        struct txn *r = (struct txn *)expect(fd, BR_REPLY, &acquired);
-        int ok = r && r->data_size == 4 && seq((char *)r->buffer, "pong", 4);
-        // A one-way call: no reply comes back, only TRANSACTION_COMPLETE.
-        send_txn(fd, BC_TRANSACTION, 0, 9, TF_ONE_WAY, "async", 5, 0, 0);
-        ok = ok && expect(fd, BR_TRANSACTION_COMPLETE, &acquired) != 0;
+        // As libbinder makes a call: sent, and its answer read, in one BINDER_WRITE_READ.
+        struct { u32 cmd; struct txn t; } __attribute__((packed)) w;
+        memset(&w, 0, sizeof w);
+        w.cmd = BC_TRANSACTION;
+        w.t.code = 7;
+        w.t.flags = 0x10; // TF_ACCEPT_FDS
+        w.t.data_size = sizeof d;
+        w.t.offsets_size = sizeof offs;
+        w.t.buffer = (u64)&d;
+        w.t.offsets = (u64)offs;
+        u64 got = 0;
+        bw(fd, &w, sizeof w, rbuf, sizeof rbuf, &got);
+        // As on Linux, BR_TRANSACTION_COMPLETE waits for the reply and comes with it in
+        // that read, so a call takes one ioctl.
+        int bad = 0, acquired = 0;
+        struct txn *r = 0;
+        u32 last = 0;
+        for (char *p = (char *)rbuf, *end = p + got; p < end;) {
+            u32 cmd = *(u32 *)p;
+            if (cmd == BR_ACQUIRE) acquired = 1;
+            if (cmd == BR_REPLY && last == BR_TRANSACTION_COMPLETE) r = (struct txn *)(p + 4);
+            last = cmd;
+            p += 4 + ((cmd >> 16) & 0x3fff);
+        }
+        if (!r) {
+            bad |= 4;
+            r = (struct txn *)expect(fd, BR_REPLY, &acquired);
+        }
+        if (!(r && r->data_size == 4 && seq((char *)r->buffer, "pong", 4))) bad |= 1;
+        // Two one-way calls in one write: no reply comes back, only TRANSACTION_COMPLETE,
+        // at once. The driver reads the first call's data before it takes its lock and
+        // the second's in its turn, so both ways are tried.
+        struct { u32 c1; struct txn t1; u32 c2; struct txn t2; } __attribute__((packed)) two;
+        memset(&two, 0, sizeof two);
+        two.c1 = two.c2 = BC_TRANSACTION;
+        two.t1.code = 9;
+        two.t1.flags = TF_ONE_WAY;
+        two.t1.data_size = 5;
+        two.t1.buffer = (u64)"async";
+        two.t2.code = 10;
+        two.t2.flags = TF_ONE_WAY;
+        two.t2.data_size = 5;
+        two.t2.buffer = (u64)"again";
+        bw(fd, &two, sizeof two, 0, 0, 0);
+        if (!expect(fd, BR_TRANSACTION_COMPLETE, &acquired)) bad |= 1;
         if (!acquired) expect(fd, BR_ACQUIRE, &acquired); // the manager now holds our object
-        sys(NR_exit_group, ok ? (acquired ? 0 : 3) : 2);
+        if (!acquired) bad |= 2;
+        sys(NR_exit_group, bad);
     }
     sys(NR_close, pp[1]);
 
@@ -179,22 +218,32 @@ int cmain(void) {
         struct { u32 cmd; u64 ptr; } __attribute__((packed)) fb = { BC_FREE_BUFFER, t->buffer };
         bw(mgr, &fb, sizeof fb, 0, 0, 0);
 
-        // Watch the child's object die with it.
-        struct { u32 cmd; u32 handle; u64 cookie; } __attribute__((packed)) dn = { BC_REQUEST_DEATH_NOTIFICATION, handle, 0xdead };
-        bw(mgr, &dn, sizeof dn, 0, 0, 0);
-
         struct txn *a = (struct txn *)expect(mgr, BR_TRANSACTION, 0);
         check(a && a->code == 9 && (a->flags & TF_ONE_WAY) && seq((char *)a->buffer, "async", 5), "one-way transaction delivered");
+        // One one-way call per object at a time: freeing the first starts the second.
         if (a) {
             struct { u32 cmd; u64 ptr; } __attribute__((packed)) fb2 = { BC_FREE_BUFFER, a->buffer };
             bw(mgr, &fb2, sizeof fb2, 0, 0, 0);
+            a = (struct txn *)expect(mgr, BR_TRANSACTION, 0);
+            check(a && a->code == 10 && (a->flags & TF_ONE_WAY) && seq((char *)a->buffer, "again", 5), "second call of a write delivered");
         }
+        if (a) {
+            struct { u32 cmd; u64 ptr; } __attribute__((packed)) fb3 = { BC_FREE_BUFFER, a->buffer };
+            bw(mgr, &fb3, sizeof fb3, 0, 0, 0);
+        }
+
+        // Watch the child's object die with it. Asked only now, so that its obituary
+        // can't come before the second call; if it is dead already, it comes at once.
+        struct { u32 cmd; u32 handle; u64 cookie; } __attribute__((packed)) dn = { BC_REQUEST_DEATH_NOTIFICATION, handle, 0xdead };
+        bw(mgr, &dn, sizeof dn, 0, 0, 0);
     }
     char buf[32];
     check(sys(NR_read, pp[0], buf, 32) == 13 && seq(buf, "via binder fd", 13), "child's pipe received the write");
     int st = -1;
     sys(NR_wait4, pid, &st, 0, 0);
-    check(st == 0, "child got BR_REPLY, one-way completion, and BR_ACQUIRE");
+    int code = st == -1 || (st & 0x7f) ? 255 : (st >> 8) & 0xff;
+    check((code & ~4) == 0, "child got BR_REPLY, one-way completion, and BR_ACQUIRE");
+    check((code & 4) == 0, "a sync call's BR_TRANSACTION_COMPLETE comes with its reply, in the read that sent it");
     u64 *cookie = (u64 *)expect(mgr, BR_DEAD_BINDER, 0);
     check(cookie && *cookie == 0xdead, "death notification when the child exits");
 

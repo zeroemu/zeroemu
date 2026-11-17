@@ -1082,6 +1082,21 @@ impl AddressSpace {
         cur >= end
     }
 
+    /// For MADV_POPULATE_READ/WRITE and MAP_POPULATE: whether the page at `va` has to be
+    /// faulted in for the access, or why it can't be, as Linux answers (madvise_populate in
+    /// mm/madvise.c, check_vma_flags in mm/gup.c): ENOMEM where nothing is mapped, EINVAL
+    /// where the mapping doesn't allow the access, or is device memory.
+    pub fn needs_populate(&mut self, va: u64, write: bool) -> Result<bool, i64> {
+        let owner = self.owner();
+        let (_, vma) = find_in(&self.vmas, va).ok_or(ENOMEM)?;
+        if vma.prot & if write { PROT_WRITE } else { PROT_READ } == 0 || matches!(vma.backing, Backing::Dev { .. }) {
+            return Err(EINVAL);
+        }
+        let Some(slot) = walk(&self.phys, owner, &mut self.tables, self.root.root, 0, va, false)? else { return Ok(true) };
+        let e = self.phys.read_u64(slot);
+        Ok(!paging::is_valid(e) || !paging::permits(e, write, false))
+    }
+
     /// mincore: one byte per page of [start, end), 1 for one in memory.
     pub fn residency(&self, start: u64, end: u64) -> Vec<u8> {
         let mut out = vec![0u8; ((end - start) / PAGE) as usize];

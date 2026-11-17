@@ -52,6 +52,9 @@ struct WaitState {
     woken: bool,
     /// Its thread sleeps on `cv` now, so a wake or a kick has to tell it.
     asleep: bool,
+    /// The bitset of the wake that took it, for a waiter that should never have been
+    /// queued to pass that wake on with (Futexes::unqueue_stale).
+    by: u32,
 }
 
 impl Waiter {
@@ -116,10 +119,11 @@ struct ToWake {
 impl ToWake {
     /// Marks `w` woken, under its shard's lock, so that a waiter giving up meanwhile
     /// finds itself both off the queue and woken. One not asleep yet needs no telling:
-    /// it looks before it sleeps.
-    fn take(&mut self, w: Arc<Waiter>) {
+    /// it looks before it sleeps. `by`: the waker's bitset.
+    fn take(&mut self, w: Arc<Waiter>, by: u32) {
         let mut st = w.st.lock().unwrap();
         st.woken = true;
+        st.by = by;
         if st.asleep {
             drop(st);
             self.asleep.push(w);
@@ -155,7 +159,7 @@ impl Futexes {
             while i < list.len() && wake.n < n as usize {
                 let e = &list[i];
                 if e.key == key && e.bitset & bitset != 0 && e.tid == 0 {
-                    wake.take(list.remove(i).w);
+                    wake.take(list.remove(i).w, bitset);
                 } else {
                     i += 1;
                 }
@@ -179,6 +183,21 @@ impl Futexes {
                 return false;
             }
             // Requeued since its key was read: look where it went.
+        }
+    }
+
+    /// Takes off its queue a waiter whose word turned out not to hold the value it
+    /// waits for. On Linux it would never have been queued: futex_wait_setup
+    /// (kernel/futex/waitwake.c) reads the word with the bucket locked. So a wake that
+    /// took it off meanwhile, and counted it, goes on to the waiter that wake would
+    /// have reached next, which may have nothing else coming (a condition variable's
+    /// next waiter, for one). Waking one too many is allowed, as a futex waiter must
+    /// check why it woke; missing one is not.
+    fn unqueue_stale(&self, w: &Arc<Waiter>) {
+        if !self.remove(w) {
+            let key = *w.key.lock().unwrap();
+            let by = w.st.lock().unwrap().by;
+            self.wake(key, 1, by);
         }
     }
 
@@ -216,7 +235,7 @@ impl Futexes {
                 }
                 let mut e = src.remove(i);
                 if wake.n < wake_n {
-                    wake.take(e.w);
+                    wake.take(e.w, u32::MAX);
                 } else {
                     e.key = key2;
                     *e.w.key.lock().unwrap() = key2;
@@ -427,7 +446,7 @@ impl Kernel {
             match res {
                 Ok((_, true)) => {
                     if let Some(i) = next {
-                        wake.take(list.remove(i).w);
+                        wake.take(list.remove(i).w, u32::MAX);
                     }
                     0
                 }
@@ -453,15 +472,34 @@ impl Kernel {
             Ok(_) => EAGAIN,
             Err(e) => e,
         };
-        if !self.futex.remove(w) {
-            // A wake took it off meanwhile and counted it. On Linux it would never have
-            // been queued, and that wake would have gone to the next waiter, which may
-            // have nothing else coming (a condition variable's next waiter, for one): so
-            // it is passed on. Waking one too many is allowed, as a futex waiter must
-            // check why it woke; missing one is not.
-            let key = *w.key.lock().unwrap();
-            self.futex.wake(key, 1, bitset);
-        }
+        self.futex.unqueue_stale(w);
         -err
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_wake_taken_by_a_stale_waiter_goes_on_to_the_next() {
+        let f = Futexes::default();
+        let key = (1, 0x1000);
+        let (stale, next) = (Waiter::new(), Waiter::new());
+        queue(&mut f.shard(key).lock().unwrap(), &stale, key, 0b01, 0);
+        queue(&mut f.shard(key).lock().unwrap(), &next, key, 0b10, 0);
+        // FUTEX_WAKE_BITSET(1, 0b11) takes the first, whose word then reads changed. On
+        // Linux the first would not have been queued and the wake would reach the other,
+        // although its bitset isn't the first one's.
+        assert_eq!(f.wake(key, 1, 0b11), 1);
+        f.unqueue_stale(&stale);
+        assert!(next.st.lock().unwrap().woken, "passed on, with the waker's bitset");
+        assert!(!f.remove(&next), "and taken off the queue");
+        // One that leaves before any wake takes it wakes nobody.
+        queue(&mut f.shard(key).lock().unwrap(), &stale, key, u32::MAX, 0);
+        queue(&mut f.shard(key).lock().unwrap(), &next, key, u32::MAX, 0);
+        f.unqueue_stale(&stale);
+        assert!(!next.st.lock().unwrap().woken);
+        assert!(f.remove(&next));
     }
 }

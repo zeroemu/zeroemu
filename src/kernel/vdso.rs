@@ -5,6 +5,7 @@
 //! clocks from the virtual counter and a read-only page of the kernel's numbers,
 //! [vvar], and never leave the VM, where each syscall is a VM exit. Android reads
 //! the clocks thousands of times a second: every Looper message, frame and log line.
+//! Signal handlers return to its __kernel_rt_sigreturn, as on Linux.
 //!
 //! The image is vdso/vdso.S, built into vdso/vdso.so by scripts/build-vdso.sh and
 //! checked in. As on Linux (arch/arm64/kernel/vdso.c), every process maps the same
@@ -23,7 +24,8 @@ use std::sync::{Arc, LazyLock, Mutex};
 static IMAGE: &[u8] = include_bytes!("vdso/vdso.so");
 
 /// Where [vvar] is, with the image above it. The same in every process, as fork
-/// keeps them where bionic found them; below the signal page.
+/// keeps them where bionic found them; below where the signal page is in processes
+/// without them.
 pub const VVAR: u64 = USER_TOP - 8 * PAGE;
 pub const BASE: u64 = VVAR + PAGE;
 
@@ -48,6 +50,30 @@ pub fn enabled() -> bool {
 /// AT_SYSINFO_EHDR for a new program: where the image is, if processes have one.
 pub fn base() -> Option<u64> {
     enabled().then_some(BASE)
+}
+
+/// Where signal handlers return to, if processes have a vDSO: its
+/// __kernel_rt_sigreturn.
+pub fn sigreturn() -> Option<u64> {
+    static AT: LazyLock<Option<u64>> = LazyLock::new(|| symbol("__kernel_rt_sigreturn").map(|v| BASE + v));
+    if enabled() { *AT } else { None }
+}
+
+/// The value of a symbol the image exports, found through its section headers.
+fn symbol(name: &str) -> Option<u64> {
+    let b = IMAGE;
+    let u16_at = |o: usize| u16::from_le_bytes(b[o..o + 2].try_into().unwrap()) as usize;
+    let u32_at = |o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap()) as usize;
+    let u64_at = |o: usize| u64::from_le_bytes(b[o..o + 8].try_into().unwrap()) as usize;
+    let (shoff, shnum) = (u64_at(40), u16_at(60));
+    let dynsym = (0..shnum).map(|i| shoff + i * 64).find(|&s| u32_at(s + 4) == 11)?;
+    let (symtab, size, strtab) = (u64_at(dynsym + 24), u64_at(dynsym + 32), u32_at(dynsym + 40));
+    let strtab = u64_at(shoff + strtab * 64 + 24);
+    (0..size / 24).map(|i| symtab + i * 24).find_map(|s| {
+        let n = strtab + u32_at(s);
+        let end = n + b[n..].iter().position(|&c| c == 0)?;
+        (b[n..end] == *name.as_bytes()).then(|| u64_at(s + 8) as u64)
+    })
 }
 
 pub struct Vdso {
@@ -239,6 +265,50 @@ mod tests {
             }
         }
         found.sort();
-        assert_eq!(found, ["__kernel_clock_getres", "__kernel_clock_gettime", "__kernel_gettimeofday"]);
+        assert_eq!(found, ["__kernel_clock_getres", "__kernel_clock_gettime", "__kernel_gettimeofday", "__kernel_rt_sigreturn"]);
+    }
+
+    /// Unwinders recognise a signal frame's return address by these instructions,
+    /// and some look one instruction back from it.
+    #[test]
+    fn sigreturn_is_what_unwinders_look_for() {
+        let at = symbol("__kernel_rt_sigreturn").unwrap() as usize;
+        assert_eq!(u32_at(IMAGE, at - 4), 0xd503201f, "a nop before it");
+        assert_eq!(u32_at(IMAGE, at), 0xd2801168, "mov x8, #139");
+        assert_eq!(u32_at(IMAGE, at + 4), 0xd4000001, "svc #0");
+        assert!(symbol("__kernel_clock_gettime").is_some());
+        assert_eq!(symbol("nothing"), None);
+    }
+
+    /// The clock functions have unwind information, so a profiler's sample in one
+    /// unwinds to its caller; the signal return has none, so that LLVM's libunwind
+    /// and libgcc unwind out of a handler from the signal frame (vdso.S says why).
+    /// Read from .eh_frame_hdr's table, as both find it.
+    #[test]
+    fn unwind_information_covers_the_clocks_not_sigreturn() {
+        let b = IMAGE;
+        let (phoff, phnum) = (u64_at(b, 32) as usize, u16_at(b, 56) as usize);
+        let hdr = (0..phnum).map(|i| phoff + i * 56).find(|&p| u32_at(b, p) == 0x6474_e550).map(|p| u64_at(b, p + 8) as usize).expect("PT_GNU_EH_FRAME");
+        // version 1; eh_frame_ptr pc-relative, the count a u32, the table of pairs
+        // relative to the header, all 4 bytes signed (DW_EH_PE_*).
+        assert_eq!(&b[hdr..hdr + 4], [1, 0x1b, 0x03, 0x3b]);
+        let count = u32_at(b, hdr + 8) as usize;
+        let mut covered = Vec::new();
+        for i in 0..count {
+            let e = hdr + 12 + i * 8;
+            let start = (hdr as i64 + u32_at(b, e) as i32 as i64) as usize;
+            let fde = (hdr as i64 + u32_at(b, e + 4) as i32 as i64) as usize;
+            // The FDE's own start, pc-relative, agrees with the table; its length follows.
+            assert_eq!((fde as i64 + 8 + u32_at(b, fde + 8) as i32 as i64) as usize, start);
+            covered.push(start..start + u32_at(b, fde + 12) as usize);
+        }
+        let covers = |at: u64| covered.iter().any(|r| r.contains(&(at as usize)));
+        for f in ["__kernel_clock_gettime", "__kernel_gettimeofday", "__kernel_clock_getres"] {
+            assert!(covers(symbol(f).unwrap()), "{f} has unwind information");
+        }
+        let at = symbol("__kernel_rt_sigreturn").unwrap();
+        for a in [at - 4, at, at + 4] {
+            assert!(!covers(a), "nothing covers the signal return at {a:#x}");
+        }
     }
 }

@@ -1,8 +1,9 @@
 // zeroemu's vDSO for arm64 guests: clock_gettime, gettimeofday and clock_getres
 // without leaving the VM, as Linux's arm64 vDSO answers them (arch/arm64/kernel/vdso,
-// lib/vdso/gettimeofday.c). Built by scripts/build-vdso.sh into vdso.so, which
-// src/kernel/vdso.rs maps into every arm64 process; see that file for the layout of
-// the [vvar] page these read, which is mapped just below this image.
+// lib/vdso/gettimeofday.c), and where signal handlers return to. Built by
+// scripts/build-vdso.sh into vdso.so, which src/kernel/vdso.rs maps into every arm64
+// process; see that file for the layout of the [vvar] page these read, which is
+// mapped just below this image.
 //
 // Each function answers what it can from the guest's virtual counter, CNTVCT_EL0,
 // and the [vvar] page, and makes the syscall for everything else (the CPU-time
@@ -21,6 +22,7 @@
 #define NR_gettimeofday		169
 #define NR_clock_gettime	113
 #define NR_clock_getres		114
+#define NR_rt_sigreturn		139
 #define CLOCK_REALTIME		0
 
 	.text
@@ -154,3 +156,25 @@ __kernel_clock_getres:
 	ret
 	.cfi_endproc
 	.size	__kernel_clock_getres, . - __kernel_clock_getres
+
+// void __kernel_rt_sigreturn(void): where a signal handler returns to (the x30 it is
+// entered with) unless sigaction gave a restorer, which bionic on arm64 doesn't. It
+// is in the vDSO, as on Linux (arch/arm64/kernel/vdso/sigreturn.S), so that
+// unwinders find an ELF image here: libunwindstack, which debuggerd and ART's stack
+// dumps use, gives up on a return address in a mapping without one.
+//
+// Unwinders recognise these two instructions and read the interrupted context, every
+// register, from the signal frame at sp. It has no unwind information (no
+// .cfi_startproc), as Linux's has none: DWARF can only say where the frame record
+// is, not the interrupted pc and sp, and LLVM's libunwind and libgcc use whatever
+// unwind information they find before they look at the instructions, so with it they
+// would step out of a handler to the wrong frame. The nop is for unwinders that look
+// one instruction back from a return address to find the function it is in.
+	.p2align 4
+	nop
+	.globl	__kernel_rt_sigreturn
+	.type	__kernel_rt_sigreturn, %function
+__kernel_rt_sigreturn:
+	mov	x8, #NR_rt_sigreturn
+	svc	#0
+	.size	__kernel_rt_sigreturn, . - __kernel_rt_sigreturn

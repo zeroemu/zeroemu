@@ -167,7 +167,8 @@ pub struct Kernel {
     live_threads: AtomicUsize,
     persist: Option<Persist>,
     pub(crate) pressure: pressure::Pressure,
-    /// Where signal handlers return to: one page, the same in every process.
+    /// Where signal handlers return to without a vDSO: one page, the same in every
+    /// process.
     sigpage: Arc<crate::mm::SharedObject>,
     /// The vDSO and its [vvar] page, the same in every process (arm64 only).
     vdso: Option<vdso::Vdso>,
@@ -1141,11 +1142,12 @@ impl Kernel {
     pub fn new_address_space(&self) -> Result<AddressSpace, i64> {
         let asid = self.phys.alloc_asid()?;
         let mut mm = AddressSpace::new(self.phys.clone(), &self.kwin, asid).inspect_err(|_| self.phys.free_asid(asid))?;
-        // Where signal handlers return to (Linux puts this in the vDSO).
-        mm.map(Placement::Fixed(signal::SIGRETURN_TRAMPOLINE), PAGE, PROT_READ | PROT_EXEC, Backing::File { src: self.sigpage.clone(), offset: 0 })?;
-        mm.set_name(signal::SIGRETURN_TRAMPOLINE, PAGE, "[sigpage]");
+        // Where signal handlers return to: the vDSO, as on Linux, or a page of its own.
         if let Some(v) = &self.vdso {
             v.map(&mut mm)?;
+        } else {
+            mm.map(Placement::Fixed(signal::SIGRETURN_TRAMPOLINE), PAGE, PROT_READ | PROT_EXEC, Backing::File { src: self.sigpage.clone(), offset: 0 })?;
+            mm.set_name(signal::SIGRETURN_TRAMPOLINE, PAGE, "[sigpage]");
         }
         Ok(mm)
     }

@@ -1,7 +1,7 @@
 // Freestanding arm64 test of the guest's clocks: the virtual counter (CNTVCT_EL0)
 // against CLOCK_MONOTONIC on every vCPU, the other clocks against it, and the vDSO,
-// found through AT_SYSINFO_EHDR as bionic finds it, against the syscalls. And
-// getcpu, which sched_getcpu makes.
+// found through AT_SYSINFO_EHDR as bionic finds it, against the syscalls, and
+// signal handlers returning through it. And getcpu, which sched_getcpu makes.
 
 typedef unsigned long u64;
 typedef long i64;
@@ -21,6 +21,10 @@ typedef unsigned char u8;
 #define NR_sched_getaffinity 123
 #define NR_getcpu 168
 #define NR_gettimeofday 169
+#define NR_tgkill 131
+#define NR_rt_sigaction 134
+#define NR_getpid 172
+#define NR_gettid 178
 #define NR_clone 220
 #define NR_wait4 260
 
@@ -181,6 +185,7 @@ typedef int (*clock_getres_fn)(int, struct timespec *);
 static clock_gettime_fn vdso_gettime;
 static gettimeofday_fn vdso_gettimeofday;
 static clock_getres_fn vdso_getres;
+static u64 vdso_sigreturn;
 static int versioned;
 
 struct ehdr { u8 ident[16]; u16 type, machine; u32 version; u64 entry, phoff, shoff; u32 flags; u16 ehsize, phentsize, phnum, shentsize, shnum, shstrndx; };
@@ -234,6 +239,7 @@ static int find_vdso(u64 base) {
         if (seq(n, "__kernel_clock_gettime")) vdso_gettime = (clock_gettime_fn)fn;
         if (seq(n, "__kernel_gettimeofday")) vdso_gettimeofday = (gettimeofday_fn)fn;
         if (seq(n, "__kernel_clock_getres")) vdso_getres = (clock_getres_fn)fn;
+        if (seq(n, "__kernel_rt_sigreturn")) vdso_sigreturn = (u64)fn;
     }
     return vdso_gettime && vdso_gettimeofday && vdso_getres;
 }
@@ -275,6 +281,16 @@ static int line_has(const char *text, const char *name, const char *what) {
         l = *e ? e + 1 : e;
     }
     return 0;
+}
+
+// A handler installed as bionic installs them on arm64, without SA_RESTORER: it
+// returns to wherever the kernel put in x30.
+struct sigaction_k { void (*handler)(int); u64 flags; void *restorer; u64 mask; };
+static volatile u64 handler_lr;
+static volatile int handled;
+static void on_usr1(int sig) {
+    handler_lr = (u64)__builtin_return_address(0);
+    handled = sig;
 }
 
 static u64 now_ns(void) {
@@ -380,6 +396,15 @@ static int run(u64 *sp) {
     want[w++] = '-';
     want[w] = 0;
     check(line_has(buf, "[vdso]", want), "[vdso] starts at AT_SYSINFO_EHDR");
+    check(!contains(buf, n, "[sigpage]"), "no [sigpage]: handlers return through the vDSO");
+
+    // Signal handlers return to __kernel_rt_sigreturn, and from there to where the
+    // signal came in.
+    struct sigaction_k sa = {on_usr1, 0x10000000 /* SA_RESTART */, 0, 0};
+    check(sys(NR_rt_sigaction, 10 /* SIGUSR1 */, &sa, 0, 8) == 0, "a SIGUSR1 handler, no restorer");
+    sys(NR_tgkill, sys(NR_getpid), sys(NR_gettid), 10);
+    check(handled == 10, "the handler ran and came back");
+    check(vdso_sigreturn != 0 && handler_lr == vdso_sigreturn, "it returned to __kernel_rt_sigreturn");
 
     check(vdso_monotonic_against_svc(), "vDSO CLOCK_MONOTONIC and the syscall's agree, read in turn");
     // Each clock it answers, between two syscalls on the same clock. CLOCK_REALTIME

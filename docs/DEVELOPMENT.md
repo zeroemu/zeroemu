@@ -161,7 +161,8 @@ Graphics:
   asks for (by default `Minigbm:enabled`, as the guest's gralloc is minigbm).
 - `ZEROEMU_GPU_STATS=1` prints the display's frame rate every five seconds (and black
   frames, when frames are read back); the line also says how many sleeping threads
-  events woke and how many vCPUs were made each second.
+  events woke and how many vCPUs were made each second, and how many calls waited
+  for the renderer's one thread (`virtio-gpu`).
 - `ZEROEMU_DRM_TRACE=1` logs GPU ioctls, transfers and fences.
 - `ZEROEMU_GPU_LOG=<S|E|W|I|D>` sets how much of the renderer's own log shows, from
   nothing (`S`) to everything (`D`). By default its errors show during a boot.

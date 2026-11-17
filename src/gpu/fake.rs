@@ -108,14 +108,17 @@ impl GpuBackend for Fake {
         Ok(())
     }
 
-    fn resource_create(&self, args: &Resource3d, _iov: Iov) -> Result<(), i64> {
+    fn resource_create(&self, args: &Resource3d, _iov: Iov, _ctx_id: u32) -> Result<(), i64> {
         let size = (args.width as u64) * (args.height.max(1) as u64) * 4 * (args.depth.max(1) as u64) * (args.array_size.max(1) as u64);
         let info = ResourceInfo { virgl_format: args.format, width: args.width, height: args.height, depth: args.depth.max(1), flags: args.flags, stride: args.width.saturating_mul(4), drm_fourcc: 0 };
         self.st.lock().unwrap().res.insert(args.handle, Res { info, host: None, size });
         Ok(())
     }
 
-    fn resource_create_blob(&self, _ctx_id: u32, handle: u32, blob: &Blob, _iov: Iov) -> Result<(), i64> {
+    fn resource_create_blob(&self, ctx_id: u32, handle: u32, blob: &Blob, _iov: Iov, cmd: &[u8]) -> Result<(), i64> {
+        if !cmd.is_empty() {
+            self.submit(ctx_id, cmd, &[])?;
+        }
         if !matches!(blob.blob_mem, BLOB_MEM_GUEST | BLOB_MEM_HOST3D | BLOB_MEM_HOST3D_GUEST) || blob.size == 0 {
             return Err(22);
         }
@@ -125,7 +128,7 @@ impl GpuBackend for Fake {
         Ok(())
     }
 
-    fn resource_unref(&self, handle: u32) {
+    fn resource_unref(&self, handle: u32, _unmap: bool, _detach: bool) {
         self.st.lock().unwrap().res.remove(&handle);
     }
 

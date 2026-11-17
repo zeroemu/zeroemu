@@ -171,9 +171,16 @@ pub trait GpuBackend: Send + Sync {
     fn submit(&self, ctx_id: u32, cmds: &[u8], in_fences: &[u64]) -> Result<(), i64>;
     fn create_fence(&self, fence: Fence) -> Result<(), i64>;
 
-    fn resource_create(&self, args: &Resource3d, iov: Iov) -> Result<(), i64>;
-    fn resource_create_blob(&self, ctx_id: u32, handle: u32, blob: &Blob, iov: Iov) -> Result<(), i64>;
-    fn resource_unref(&self, handle: u32);
+    /// Creates a resource backed by `iov` and, unless `ctx_id` is 0, attaches it to that
+    /// context, in one call: the kernel does both for every buffer it creates.
+    fn resource_create(&self, args: &Resource3d, iov: Iov, ctx_id: u32) -> Result<(), i64>;
+    /// Submits `cmd` to the context first when there is one (gfxstream's guest describes
+    /// the blob it is about to create that way), then creates the blob, backs it with
+    /// `iov`, and attaches it to the context unless `ctx_id` is 0.
+    fn resource_create_blob(&self, ctx_id: u32, handle: u32, blob: &Blob, iov: Iov, cmd: &[u8]) -> Result<(), i64>;
+    /// Frees a resource, unmapping its host memory first when it was mapped (`unmap`)
+    /// and detaching its guest backing when it has one (`detach`).
+    fn resource_unref(&self, handle: u32, unmap: bool, detach: bool);
     fn attach_iov(&self, handle: u32, iov: Iov) -> Result<(), i64>;
     fn detach_iov(&self, handle: u32);
     fn ctx_attach_resource(&self, ctx_id: u32, handle: u32);
@@ -301,7 +308,7 @@ fn exercise(gpu: &dyn GpuBackend) -> Result<String, String> {
         nr_samples: 0,
         flags: 0,
     };
-    gpu.resource_create(&args, iov).map_err(|e| format!("resource_create errno {e}"))?;
+    gpu.resource_create(&args, iov, 0).map_err(|e| format!("resource_create errno {e}"))?;
     if let Some(info) = gpu.resource_info(1) {
         lines.push(format!(
             "resource info format {} {}x{} stride {} fourcc {:#x}",
@@ -330,7 +337,7 @@ fn probe_blob(gpu: &dyn GpuBackend) -> String {
         return format!("blob: context_create errno {e}");
     }
     let blob = Blob { blob_mem: BLOB_MEM_HOST3D, blob_flags: BLOB_FLAG_USE_MAPPABLE, blob_id: 0, size: 65536 };
-    if let Err(e) = gpu.resource_create_blob(1, 2, &blob, Vec::new()) {
+    if let Err(e) = gpu.resource_create_blob(1, 2, &blob, Vec::new(), &[]) {
         return format!("blob: create errno {e}");
     }
     match gpu.resource_map(2) {

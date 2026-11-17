@@ -29,6 +29,13 @@ const SLOTS: usize = 16384;
 /// What keys hash onto. Bucket 0 is for plain `bump`s, which every watcher watches.
 const BUCKETS: usize = 4096;
 const WORDS: usize = BUCKETS / 64;
+/// Slots per group: a group's watchers of one bucket are one cache line of bits.
+const GROUP: usize = 512;
+const GROUPS: usize = SLOTS / GROUP;
+
+/// Bit i of word k: slot k * 64 + i of the group watches the bucket.
+#[repr(align(64))]
+struct Line([AtomicU64; GROUP / 64]);
 
 /// What a waiting thread watches: a set of buckets that keys hash onto. An event wakes
 /// only the threads whose sets have its bucket. Android has a thousand threads or more
@@ -38,6 +45,8 @@ const WORDS: usize = BUCKETS / 64;
 pub struct Mask([u64; WORDS]);
 
 impl Mask {
+    const NONE: Mask = Mask([0; WORDS]);
+
     /// Nothing but plain bumps.
     pub const fn plain() -> Mask {
         let mut w = [0; WORDS];
@@ -101,9 +110,12 @@ struct Slot {
 /// Whoever changes something bumps after the change, and whoever waits watches
 /// before checking, so no wakeup can be lost: each is sure to see the other.
 pub struct Events {
-    /// masks[w][slot]: word w of each slot's mask, so that an event looks at one
-    /// contiguous row, a word per thread, as cheaply as before buckets were many.
-    masks: [[AtomicU64; SLOTS]; WORDS],
+    /// watchers[g][b]: the slots of group g that watch bucket b, a bit each. An event
+    /// reads one cache line per group in use, a few for thousands of threads, where a
+    /// word per slot ever used cost microseconds at every event. A thread's bits change
+    /// only where what it watches does, so a Looper going back to the same epoll set
+    /// writes nothing.
+    watchers: [[Line; BUCKETS]; GROUPS],
     slots: [Slot; SLOTS],
     /// Slots at or above this have never been used.
     high: AtomicUsize,
@@ -113,29 +125,20 @@ pub struct Events {
 }
 
 pub static EVENTS: Events = Events {
-    masks: [const { [const { AtomicU64::new(0) }; SLOTS] }; WORDS],
+    watchers: [const { [const { Line([const { AtomicU64::new(0) }; GROUP / 64]) }; BUCKETS] }; GROUPS],
     announced: [const { AtomicU64::new(0) }; BUCKETS],
     slots: [const { Slot { seq: Mutex::new(0), cv: Condvar::new(), asleep: std::sync::atomic::AtomicBool::new(false) } }; SLOTS],
     high: AtomicUsize::new(0),
     free: Mutex::new(Vec::new()),
 };
 
-/// This thread's slot, for as long as it lives, and which words of its mask aren't zero.
-struct MySlot(usize, std::cell::Cell<u64>);
+/// This thread's slot, for as long as it lives, and the mask its bits in `watchers` say.
+struct MySlot(usize, std::cell::Cell<Mask>);
 
 impl Drop for MySlot {
     fn drop(&mut self) {
-        clear_words(self.0, self.1.get());
+        EVENTS.register(self.0, &self.1.get(), &Mask::NONE);
         EVENTS.free.lock().unwrap().push(self.0);
-    }
-}
-
-fn clear_words(slot: usize, words: u64) {
-    let mut words = words;
-    while words != 0 {
-        let w = words.trailing_zeros() as usize;
-        words &= words - 1;
-        EVENTS.masks[w][slot].store(0, Ordering::Relaxed);
     }
 }
 
@@ -147,7 +150,7 @@ thread_local! {
             assert!(i < SLOTS, "more threads than event slots");
             i
         })
-    }, std::cell::Cell::new(0));
+    }, std::cell::Cell::new(Mask::NONE));
 }
 
 fn my_slot() -> usize {
@@ -193,24 +196,64 @@ pub fn top_wakers(n: usize) -> Vec<(usize, u64, u64)> {
 impl Events {
     fn wake(&self, i: usize) {
         let slot = &self.slots[i];
-        *slot.seq.lock().unwrap() += 1;
-        if slot.asleep.load(Ordering::Relaxed) {
+        let asleep = {
+            let mut seq = slot.seq.lock().unwrap();
+            *seq += 1;
+            // Its thread says it sleeps under this lock, which the condvar lets go of
+            // only once it does: one that isn't asleep yet sees the new count first.
+            slot.asleep.load(Ordering::Relaxed)
+        };
+        if asleep {
             WAKES.fetch_add(1, Ordering::Relaxed);
+            slot.cv.notify_one();
         }
-        slot.cv.notify_one();
+    }
+
+    /// Bit `slot` of bucket `b`'s watchers: its word, and the bit in it.
+    fn bit(&self, slot: usize, b: usize) -> (&AtomicU64, u64) {
+        let i = slot % GROUP;
+        (&self.watchers[slot / GROUP][b].0[i / 64], 1 << (i % 64))
+    }
+
+    /// Moves `slot`'s bits from the buckets of `old` to those of `new`, touching only
+    /// the buckets that differ.
+    fn register(&self, slot: usize, old: &Mask, new: &Mask) {
+        for (w, (&o, &n)) in old.0.iter().zip(&new.0).enumerate() {
+            let mut changed = o ^ n;
+            while changed != 0 {
+                let b = w * 64 + changed.trailing_zeros() as usize;
+                changed &= changed - 1;
+                let (word, me) = self.bit(slot, b);
+                if n & 1 << (b % 64) != 0 {
+                    word.fetch_or(me, Ordering::Relaxed);
+                } else {
+                    word.fetch_and(!me, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+
+    /// Calls `f` with each slot that watches bucket `b`.
+    fn each_watcher(&self, b: usize, mut f: impl FnMut(usize)) {
+        let groups = self.high.load(Ordering::Acquire).min(SLOTS).div_ceil(GROUP);
+        for (g, lines) in self.watchers[..groups].iter().enumerate() {
+            for (k, word) in lines[b].0.iter().enumerate() {
+                let mut bits = word.load(Ordering::Relaxed);
+                while bits != 0 {
+                    f(g * GROUP + k * 64 + bits.trailing_zeros() as usize);
+                    bits &= bits - 1;
+                }
+            }
+        }
     }
 
     fn wake_bucket(&self, b: usize) -> u64 {
         fence(Ordering::SeqCst);
-        let (w, bit) = (b / 64, 1u64 << (b % 64));
-        let row = &self.masks[w];
         let mut woken = 0;
-        for i in 0..self.high.load(Ordering::Acquire).min(SLOTS) {
-            if row[i].load(Ordering::Relaxed) & bit != 0 {
-                self.wake(i);
-                woken += 1;
-            }
-        }
+        self.each_watcher(b, |i| {
+            self.wake(i);
+            woken += 1;
+        });
         woken
     }
 
@@ -236,12 +279,9 @@ impl Events {
             static SHOWN: Mutex<Vec<usize>> = Mutex::new(Vec::new());
             if woken > 100 && !SHOWN.lock().unwrap().contains(&key) {
                 SHOWN.lock().unwrap().push(key);
-                let (w, bit) = (b / 64, 1u64 << (b % 64));
-                let tids: Vec<i32> = (0..self.high.load(Ordering::Acquire).min(SLOTS))
-                    .filter(|&i| self.masks[w][i].load(Ordering::Relaxed) & bit != 0)
-                    .map(|i| SLOT_TIDS[i].load(Ordering::Relaxed))
-                    .take(40)
-                    .collect();
+                let mut tids: Vec<i32> = Vec::new();
+                self.each_watcher(b, |i| tids.push(SLOT_TIDS[i].load(Ordering::Relaxed)));
+                tids.truncate(40);
                 eprintln!("zeroemu: key {key:#x} woke {woken} threads ({tids:?}), from:\n{}", std::backtrace::Backtrace::force_capture());
             }
         }
@@ -261,14 +301,11 @@ impl Events {
         let mask = *mask | Mask::plain();
         MY_SLOT.with(|s| {
             let i = s.0;
-            let now = mask.0.iter().enumerate().filter(|(_, w)| **w != 0).fold(0u64, |m, (w, _)| m | 1 << w);
-            let mut touch = now | s.1.get();
-            while touch != 0 {
-                let w = touch.trailing_zeros() as usize;
-                touch &= touch - 1;
-                self.masks[w][i].store(mask.0[w], Ordering::Relaxed);
+            let old = s.1.get();
+            if old != mask {
+                self.register(i, &old, &mask);
+                s.1.set(mask);
             }
-            s.1.set(now);
             fence(Ordering::SeqCst);
             *self.slots[i].seq.lock().unwrap()
         })
@@ -355,6 +392,31 @@ mod tests {
         EVENTS.bump();
         assert_eq!(a.recv_timeout(Duration::from_secs(5)), Ok(false));
         assert_eq!(b.recv_timeout(Duration::from_secs(5)), Ok(false), "a plain bump reaches everyone");
+    }
+
+    #[test]
+    fn a_thread_watches_only_what_it_watched_last() {
+        // Keys on buckets no other test uses, as tests share EVENTS.
+        let others = [0x1000_0040usize, 0x2000_0000, 0x3000_0000].map(bucket_of);
+        let mut keys = (0..).map(|i| 0x6000_0000usize + i * 64).filter(|&k| !others.contains(&bucket_of(k)));
+        let k1 = keys.next().unwrap();
+        let k2 = keys.find(|&k| bucket_of(k) != bucket_of(k1)).unwrap();
+        let watching = |slot: usize, b: usize| {
+            let (word, me) = EVENTS.bit(slot, b);
+            word.load(Ordering::Relaxed) & me != 0
+        };
+        let slot = std::thread::spawn(move || {
+            let slot = my_slot();
+            let _ = EVENTS.watch_key(k1);
+            assert!(watching(slot, bucket_of(k1)) && watching(slot, 0));
+            let _ = EVENTS.watch_key(k2);
+            assert!(watching(slot, bucket_of(k2)) && !watching(slot, bucket_of(k1)), "only the key it watches now");
+            assert!(watching(slot, 0), "and plain bumps");
+            slot
+        })
+        .join()
+        .unwrap();
+        assert!(!watching(slot, bucket_of(k2)), "nothing once its thread is gone");
     }
 
     #[test]

@@ -109,8 +109,10 @@ CPU, as macOS counts zeroemu's threads (Activity Monitor's figure), a settled de
 - A vCPU belongs to its host thread, and the hypervisor allows 64. Threads that went to
   sleep holding one kept it for as long as they slept, which kept the pool short, so
   every thread that blocked for a moment gave its own up and made a new one when it
-  woke: 150 a second at idle. Now threads asleep in the kernel for a second give theirs
-  back when places run short.
+  woke: 150 a second at idle. Now a thread keeps its vCPU while it sleeps, and an eighth
+  of the places are kept free by asking the threads that have slept longest for theirs;
+  only when that falls behind does a thread give its own up as it blocks. Opening seven
+  apps made 2,300 vCPUs a second before this and 960 after.
 - The emulated sensors sent all nine sensors' readings every 10 ms, the fastest rate
   anything had asked for, each reading waking the sensors HAL. The HAL makes Android's
   events itself, at each sensor's rate, from the last reading it got, so zeroemu now

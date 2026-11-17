@@ -181,6 +181,9 @@ static int fa, fb;
 static volatile i64 w1_ret = 99, w2_ret = 99;
 static void waiter1(void *arg) { (void)arg; i64 ts[2] = {0, 300000000}; w1_ret = sys(NR_futex, &fa, 0 /* WAIT */, 0, ts); }
 static void waiter2(void *arg) { (void)arg; i64 ts[2] = {3, 0}; w2_ret = sys(NR_futex, &fb, 0 /* WAIT */, 0, ts); }
+static int fc;
+static volatile i64 w3_ret = 99;
+static void waiter3(void *arg) { (void)arg; w3_ret = sys(NR_futex, &fc, 9 /* WAIT_BITSET */, 0, 0, 0, 1); }
 static char stacks[6][16384] __attribute__((aligned(16)));
 static int ctid[6];
 
@@ -419,6 +422,16 @@ int cmain(void) {
     nap_ms(300);
     check(w1_ret == -110 && woke == 1 && w2_ret == 0, "a requeued waiter that timed out doesn't take a later wake");
     sys(NR_futex, &fb, 1, 10);
+    nap_ms(50);
+
+    // --- FUTEX_WAKE_BITSET wakes only the waiters it shares a bit with
+    spawn(stacks[0] + 16384, waiter3, 0, &ctid[0]);
+    nap_ms(60);
+    i64 none = sys(NR_futex, &fc, 10 /* WAKE_BITSET */, 1, 0, 0, 2);
+    i64 one = sys(NR_futex, &fc, 10, 1, 0, 0, 3);
+    nap_ms(100);
+    check(none == 0 && one == 1 && w3_ret == 0, "FUTEX_WAKE_BITSET wakes only waiters with a bit in common");
+    sys(NR_futex, &fc, 1, 10);
     nap_ms(50);
 
     // --- binder: a buffer's pointer goes inside its parent, not wherever the sender says

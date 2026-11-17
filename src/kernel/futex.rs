@@ -1,11 +1,16 @@
 //! Futexes, keyed by (process, address), or by guest-physical address for those in
 //! memory that processes share.
 //!
-//! Lock order: the waiter table, then the address space (to read the word).
+//! Waiters are kept in shards by key, as Linux keeps them in hash buckets
+//! (kernel/futex/core.c), so futexes that hash apart never wait for each other.
+//!
+//! Lock order: a shard (for FUTEX_REQUEUE two, the lower first), then the address
+//! space. Only the PI calls and FUTEX_CMP_REQUEUE read the word under a shard; a
+//! plain wait reads it after it queues, holding none (futex_wait).
 
-use super::{ERESTARTSYS, IDLE, Kernel, Thread};
+use super::{BACKSTOP, ERESTARTSYS, Kernel, Thread};
 use crate::errno::*;
-use std::collections::HashMap;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 
@@ -30,56 +35,216 @@ const FUTEX_TID_MASK: u32 = 0x3fff_ffff;
 /// Key "pid" for futexes in shared memory, keyed by guest-physical address.
 pub const SHARED: i32 = -1;
 
-struct Waiter {
-    woken: Mutex<bool>,
+/// A thread's place on the queues (Thread::futex), made with the thread and used for
+/// each of its waits, as a thread waits on one futex at a time: a wait allocates nothing.
+pub(super) struct Waiter {
+    st: Mutex<WaitState>,
     cv: Condvar,
-    bitset: u32,
-    /// A PI lock waiter's tid: unlock hands it the lock.
-    tid: i32,
-    /// The queue it is on now: FUTEX_REQUEUE moves waiters, and one that gives up
-    /// (a timeout, a signal) must leave the queue it was moved to. Written under the
-    /// table's lock.
+    /// The key it is queued under now: FUTEX_REQUEUE moves waiters, and one that gives
+    /// up (a timeout, a signal) must leave the queue it was moved to. Written under the
+    /// locks of the shards it moves between.
     key: Mutex<(i32, u64)>,
 }
 
-/// (pid, address) -> threads waiting there, in arrival order.
-type WaitQueues = HashMap<(i32, u64), Vec<Arc<Waiter>>>;
-
 #[derive(Default)]
+struct WaitState {
+    /// Set, under the lock of its shard, by whoever takes it off its queue to wake it.
+    woken: bool,
+    /// Its thread sleeps on `cv` now, so a wake or a kick has to tell it.
+    asleep: bool,
+    /// The bitset of the wake that took it, for a waiter that should never have been
+    /// queued to pass that wake on with (Futexes::unqueue_stale).
+    by: u32,
+}
+
+impl Waiter {
+    pub(super) fn new() -> Arc<Waiter> {
+        Arc::new(Waiter { st: Mutex::default(), cv: Condvar::new(), key: Mutex::new((0, 0)) })
+    }
+
+    /// For Thread::kick, once what the thread is to look at is set: wakes it if it
+    /// sleeps here. Under the lock it looks and sleeps under, so the kick can't come
+    /// between the two and be lost, as one through Thread::sleeping_on can; that is
+    /// what lets a futex wait sleep for as long as it waits.
+    pub(super) fn kick(&self) {
+        if self.st.lock().unwrap().asleep {
+            self.cv.notify_one();
+        }
+    }
+}
+
+/// A waiter on one key's queue.
+struct Entry {
+    key: (i32, u64),
+    w: Arc<Waiter>,
+    bitset: u32,
+    /// A PI lock waiter's tid: unlock hands it the lock. 0 for others.
+    tid: i32,
+}
+
+const SHARDS: usize = 256;
+
+/// The waiters of the keys that hash here, each key's in arrival order. There are a
+/// few, so one list, which keeps its room, where a list per key would be allocated
+/// and freed as waits come and go.
+#[repr(align(64))]
+#[derive(Default)]
+struct Shard(Mutex<Vec<Entry>>);
+
 pub struct Futexes {
-    waiters: Mutex<WaitQueues>,
+    shards: [Shard; SHARDS],
+}
+
+impl Default for Futexes {
+    fn default() -> Futexes {
+        Futexes { shards: std::array::from_fn(|_| Shard::default()) }
+    }
+}
+
+fn shard_of(key: (i32, u64)) -> usize {
+    // Words are 4-byte aligned, and an object's few of them close together; multiplying
+    // by 2^64/phi spreads the address into the top bits.
+    let h = ((key.1 >> 2) ^ (key.0 as u32 as u64) << 40).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    (h >> (64 - SHARDS.trailing_zeros())) as usize
+}
+
+/// Waiters taken off their queues, to be told once the shard's lock is let go: telling
+/// one is a host system call, which other threads should not wait on for the lock.
+#[derive(Default)]
+struct ToWake {
+    asleep: Vec<Arc<Waiter>>,
+    n: usize,
+}
+
+impl ToWake {
+    /// Marks `w` woken, under its shard's lock, so that a waiter giving up meanwhile
+    /// finds itself both off the queue and woken. One not asleep yet needs no telling:
+    /// it looks before it sleeps. `by`: the waker's bitset.
+    fn take(&mut self, w: Arc<Waiter>, by: u32) {
+        let mut st = w.st.lock().unwrap();
+        st.woken = true;
+        st.by = by;
+        if st.asleep {
+            drop(st);
+            self.asleep.push(w);
+        }
+        self.n += 1;
+    }
+
+    fn tell(self) -> usize {
+        for w in &self.asleep {
+            w.cv.notify_one();
+        }
+        self.n
+    }
+}
+
+/// Puts a thread's waiter on `key`'s queue, not woken.
+fn queue(list: &mut Vec<Entry>, w: &Arc<Waiter>, key: (i32, u64), bitset: u32, tid: i32) {
+    w.st.lock().unwrap().woken = false;
+    *w.key.lock().unwrap() = key;
+    list.push(Entry { key, w: w.clone(), bitset, tid });
 }
 
 impl Futexes {
-    pub fn wake(&self, key: (i32, u64), n: u32, bitset: u32) -> i64 {
-        let mut map = self.waiters.lock().unwrap();
-        let Some(list) = map.get_mut(&key) else { return 0 };
-        let mut woken = 0;
-        list.retain(|w| {
-            if woken < n && w.bitset & bitset != 0 && w.tid == 0 {
-                *w.woken.lock().unwrap() = true;
-                w.cv.notify_one();
-                woken += 1;
-                false
-            } else {
-                true
-            }
-        });
-        if list.is_empty() {
-            map.remove(&key);
-        }
-        woken as i64
+    fn shard(&self, key: (i32, u64)) -> &Mutex<Vec<Entry>> {
+        &self.shards[shard_of(key)].0
     }
 
-    fn remove(&self, w: &Arc<Waiter>) {
-        let mut map = self.waiters.lock().unwrap();
-        let key = *w.key.lock().unwrap();
-        if let Some(list) = map.get_mut(&key) {
-            list.retain(|x| !Arc::ptr_eq(x, w));
-            if list.is_empty() {
-                map.remove(&key);
+    pub fn wake(&self, key: (i32, u64), n: u32, bitset: u32) -> i64 {
+        let mut wake = ToWake::default();
+        {
+            let mut list = self.shard(key).lock().unwrap();
+            let mut i = 0;
+            while i < list.len() && wake.n < n as usize {
+                let e = &list[i];
+                if e.key == key && e.bitset & bitset != 0 && e.tid == 0 {
+                    wake.take(list.remove(i).w, bitset);
+                } else {
+                    i += 1;
+                }
             }
         }
+        wake.tell() as i64
+    }
+
+    /// Takes a waiter that gives up off its queue. False if a wake took it off first:
+    /// it was woken, as Linux's futex_unqueue (kernel/futex/core.c) has it, and the
+    /// wake was counted for it.
+    fn remove(&self, w: &Arc<Waiter>) -> bool {
+        loop {
+            let key = *w.key.lock().unwrap();
+            let mut list = self.shard(key).lock().unwrap();
+            if let Some(i) = list.iter().position(|e| Arc::ptr_eq(&e.w, w)) {
+                list.remove(i);
+                return true;
+            }
+            if *w.key.lock().unwrap() == key {
+                return false;
+            }
+            // Requeued since its key was read: look where it went.
+        }
+    }
+
+    /// Takes off its queue a waiter whose word turned out not to hold the value it
+    /// waits for. On Linux it would never have been queued: futex_wait_setup
+    /// (kernel/futex/waitwake.c) reads the word with the bucket locked. So a wake that
+    /// took it off meanwhile, and counted it, goes on to the waiter that wake would
+    /// have reached next, which may have nothing else coming (a condition variable's
+    /// next waiter, for one). Waking one too many is allowed, as a futex waiter must
+    /// check why it woke; missing one is not.
+    fn unqueue_stale(&self, w: &Arc<Waiter>) {
+        if !self.remove(w) {
+            let key = *w.key.lock().unwrap();
+            let by = w.st.lock().unwrap().by;
+            self.wake(key, 1, by);
+        }
+    }
+
+    /// FUTEX_REQUEUE: wakes up to `wake_n` waiters on `key`, and moves up to `move_n`
+    /// of the rest to `key2`, behind those already there; FUTEX_CMP_REQUEUE first checks
+    /// the word at `addr` is still `cmp`, under both shards' locks as Linux does
+    /// (futex_requeue in kernel/futex/requeue.c).
+    #[allow(clippy::too_many_arguments)]
+    fn requeue(&self, t: &Thread, key: (i32, u64), key2: (i32, u64), addr: u64, cmp: Option<u32>, wake_n: usize, move_n: usize) -> i64 {
+        let (a, b) = (shard_of(key), shard_of(key2));
+        let (lo, hi) = (a.min(b), a.max(b));
+        let mut wake = ToWake::default();
+        {
+            let mut lo_g = self.shards[lo].0.lock().unwrap();
+            let mut hi_g = (hi != lo).then(|| self.shards[hi].0.lock().unwrap());
+            if let Some(cmp) = cmp {
+                let cur = t.proc.mm().read_u32(addr);
+                match cur {
+                    Ok(cur) if cur == cmp => {}
+                    Ok(_) => return -EAGAIN,
+                    Err(e) => return -e,
+                }
+            }
+            let (src, dst) = match hi_g.as_mut() {
+                None => (&mut *lo_g, None),
+                Some(h) if a == lo => (&mut *lo_g, Some(&mut **h)),
+                Some(h) => (&mut **h, Some(&mut *lo_g)),
+            };
+            let mut moved = Vec::new();
+            let mut i = 0;
+            while i < src.len() && wake.n + moved.len() < wake_n.saturating_add(move_n) {
+                if src[i].key != key {
+                    i += 1;
+                    continue;
+                }
+                let mut e = src.remove(i);
+                if wake.n < wake_n {
+                    wake.take(e.w, u32::MAX);
+                } else {
+                    e.key = key2;
+                    *e.w.key.lock().unwrap() = key2;
+                    moved.push(e);
+                }
+            }
+            dst.unwrap_or(src).extend(moved);
+        }
+        wake.tell() as i64
     }
 }
 
@@ -133,32 +298,9 @@ impl Kernel {
             FUTEX_WAKE_BITSET => self.futex.wake(key, val, val3),
             FUTEX_REQUEUE | FUTEX_CMP_REQUEUE => {
                 let key2 = self.futex_key(t, uaddr2, private);
-                let mut map = self.futex.waiters.lock().unwrap();
-                if op & FUTEX_CMD_MASK == FUTEX_CMP_REQUEUE {
-                    match t.proc.mm().read_u32(addr) {
-                        Ok(cur) if cur == val3 => {}
-                        Ok(_) => return -EAGAIN,
-                        Err(e) => return -e,
-                    }
-                }
-                let Some(mut list) = map.remove(&key) else { return 0 };
-                let wake_n = (val as usize).min(list.len());
-                for w in list.drain(..wake_n) {
-                    *w.woken.lock().unwrap() = true;
-                    w.cv.notify_one();
-                }
-                let move_n = (timeout as usize).min(list.len()); // val2 travels in the timeout slot
-                let moved: Vec<_> = list.drain(..move_n).collect();
-                for w in &moved {
-                    *w.key.lock().unwrap() = key2;
-                }
-                if !list.is_empty() {
-                    map.insert(key, list);
-                }
-                if !moved.is_empty() {
-                    map.entry(key2).or_default().extend(moved);
-                }
-                wake_n as i64
+                let cmp = (op & FUTEX_CMD_MASK == FUTEX_CMP_REQUEUE).then_some(val3);
+                // val2 travels in the timeout slot.
+                self.futex.requeue(t, key, key2, addr, cmp, val as usize, timeout as usize)
             }
             FUTEX_LOCK_PI | FUTEX_LOCK_PI2 | FUTEX_TRYLOCK_PI => {
                 let cmd = op & FUTEX_CMD_MASK;
@@ -191,6 +333,51 @@ impl Kernel {
         }
     }
 
+    /// Sleeps until this thread's waiter is woken, the deadline passes (`timed_out`)
+    /// or a signal comes (`interrupted`); a waiter that gives up leaves its queue.
+    fn futex_sleep(&self, t: &Thread, w: &Arc<Waiter>, deadline: Option<Instant>, timed_out: i64, interrupted: i64) -> i64 {
+        let mut fell_back = false;
+        loop {
+            if w.st.lock().unwrap().woken {
+                return 0;
+            }
+            let give_up = if deadline.is_some_and(|d| Instant::now() >= d) {
+                Some(timed_out)
+            } else if t.interrupted() {
+                Some(interrupted)
+            } else {
+                None
+            };
+            if std::mem::take(&mut fell_back) && (give_up.is_some() || t.give_back.load(Ordering::Relaxed)) {
+                let what = if give_up.is_some() { "a signal or exit" } else { "an ask for its vCPU" };
+                eprintln!("[zeroemu] late wake: tid {} futex: only the fallback timeout noticed {what}", t.tid);
+            }
+            if let Some(err) = give_up {
+                return if self.futex.remove(w) { err } else { 0 };
+            }
+            // Wakes and kicks both reach it under its lock (Waiter::kick): the limit
+            // is only a backstop.
+            let nap = deadline.map_or(BACKSTOP, |d| d.saturating_duration_since(Instant::now()).min(BACKSTOP));
+            // Before the waiter's lock is taken: giving the vCPU back can take a while,
+            // and a waker takes that lock while it holds the shard's.
+            super::vcpus::blocking();
+            let mut st = w.st.lock().unwrap();
+            if !st.woken {
+                // Asked for its vCPU since blocking() looked: the ask's kick found it
+                // not asleep yet, and Thread::sleep looks only for signals and exits.
+                // blocking() gives the vCPU up, the next time round.
+                if t.give_back.load(Ordering::Relaxed) {
+                    continue;
+                }
+                st.asleep = true;
+                let start = super::files::late_wake_log().then(Instant::now);
+                st = t.sleep(&w.cv, st, nap);
+                st.asleep = false;
+                fell_back = nap == BACKSTOP && start.is_some_and(|s| s.elapsed() >= nap);
+            }
+        }
+    }
+
     /// Takes a priority-inheritance lock (without the priority boost: host
     /// threads have no guest priorities to lend). The word holds the owner's
     /// tid; waiters queue here until unlock hands one of them the lock.
@@ -204,10 +391,10 @@ impl Kernel {
         if owner != 0 && owner != me && self.task(owner as i32).is_none() {
             return -ESRCH;
         }
-        let w = Arc::new(Waiter { woken: Mutex::new(false), cv: Condvar::new(), bitset: u32::MAX, tid: t.tid, key: Mutex::new(key) });
+        let w = &t.futex;
         {
-            let mut map = self.futex.waiters.lock().unwrap();
-            let queued = map.get(&key).is_some_and(|l| !l.is_empty());
+            let mut list = self.futex.shard(key).lock().unwrap();
+            let queued = list.iter().any(|e| e.key == key);
             let mut taken = false;
             let res = t.proc.mm().update_u32(addr, |cur| {
                 let owner = cur & FUTEX_TID_MASK;
@@ -233,95 +420,84 @@ impl Kernel {
             if try_only {
                 return -EAGAIN;
             }
-            map.entry(key).or_default().push(w.clone());
+            queue(&mut list, w, key, u32::MAX, t.tid);
         }
-        let mut woken = w.woken.lock().unwrap();
-        loop {
-            if *woken {
-                return 0; // the unlocker wrote our tid
-            }
-            let give_up = if deadline.is_some_and(|d| Instant::now() >= d) {
-                Some(-ETIMEDOUT)
-            } else if t.interrupted() {
-                Some(-ERESTARTSYS)
-            } else {
-                None
-            };
-            if let Some(err) = give_up {
-                drop(woken);
-                self.futex.remove(&w);
-                return if *w.woken.lock().unwrap() { 0 } else { err };
-            }
-            let nap = deadline.map_or(IDLE, |d| d.saturating_duration_since(Instant::now()).min(IDLE));
-            super::vcpus::blocking();
-            woken = t.sleep(&w.cv, woken, nap);
-        }
+        // Woken: the unlocker wrote our tid.
+        self.futex_sleep(t, w, deadline, -ETIMEDOUT, -ERESTARTSYS)
     }
 
     /// Releases a PI lock the caller owns: to the first waiter, or free.
     fn futex_unlock_pi(&self, t: &Thread, key: (i32, u64), addr: u64) -> i64 {
         let me = t.tid as u32;
-        let mut map = self.futex.waiters.lock().unwrap();
-        let next = map.get_mut(&key).and_then(|l| {
-            let i = l.iter().position(|w| w.tid != 0)?;
-            Some(l.remove(i))
-        });
-        let more = map.get(&key).is_some_and(|l| l.iter().any(|w| w.tid != 0));
-        if map.get(&key).is_some_and(|l| l.is_empty()) {
-            map.remove(&key);
-        }
-        let new = match &next {
-            Some(w) => w.tid as u32 | if more { FUTEX_WAITERS } else { 0 },
-            None => 0,
+        let mut wake = ToWake::default();
+        let ret = {
+            let mut list = self.futex.shard(key).lock().unwrap();
+            let next = list.iter().position(|e| e.key == key && e.tid != 0);
+            let new = match next {
+                Some(i) => {
+                    let more = list[i + 1..].iter().any(|e| e.key == key && e.tid != 0);
+                    list[i].tid as u32 | if more { FUTEX_WAITERS } else { 0 }
+                }
+                None => 0,
+            };
+            let res = t.proc.mm().update_u32(addr, |cur| (cur & FUTEX_TID_MASK == me).then_some(new));
+            match res {
+                Ok((_, true)) => {
+                    if let Some(i) = next {
+                        wake.take(list.remove(i).w, u32::MAX);
+                    }
+                    0
+                }
+                Ok((_, false)) => -EPERM, // not ours to give
+                Err(e) => -e,
+            }
         };
-        let res = t.proc.mm().update_u32(addr, |cur| (cur & FUTEX_TID_MASK == me).then_some(new));
-        match res {
-            Ok((_, true)) => {
-                if let Some(w) = next {
-                    *w.woken.lock().unwrap() = true;
-                    w.cv.notify_one();
-                }
-                0
-            }
-            Ok((_, false)) => {
-                if let Some(w) = next {
-                    map.entry(key).or_default().insert(0, w); // not ours to give
-                }
-                -EPERM
-            }
-            Err(e) => -e,
-        }
+        wake.tell();
+        ret
     }
 
     fn futex_wait(&self, t: &Thread, key: (i32, u64), addr: u64, val: u32, deadline: Option<Instant>, bitset: u32) -> i64 {
-        let w = Arc::new(Waiter { woken: Mutex::new(false), cv: Condvar::new(), bitset, tid: 0, key: Mutex::new(key) });
-        {
-            let mut map = self.futex.waiters.lock().unwrap();
-            match t.proc.mm().read_u32(addr) {
-                Ok(cur) if cur == val => {}
-                Ok(_) => return -EAGAIN,
-                Err(e) => return -e,
-            }
-            map.entry(key).or_default().push(w.clone());
-        }
-        let mut woken = w.woken.lock().unwrap();
-        loop {
-            if *woken {
-                return 0;
-            }
-            if deadline.is_some_and(|d| Instant::now() >= d) {
-                drop(woken);
-                self.futex.remove(&w);
-                return if *w.woken.lock().unwrap() { 0 } else { -ETIMEDOUT };
-            }
-            if t.interrupted() {
-                drop(woken);
-                self.futex.remove(&w);
-                return if *w.woken.lock().unwrap() { 0 } else { -EINTR };
-            }
-            let nap = deadline.map_or(IDLE, |d| d.saturating_duration_since(Instant::now()).min(IDLE));
-            super::vcpus::blocking();
-            woken = t.sleep(&w.cv, woken, nap);
-        }
+        let w = &t.futex;
+        // Queued before the word is read. Linux reads it with the bucket locked
+        // (futex_wait_setup in kernel/futex/waitwake.c), so a FUTEX_WAKE after the
+        // change being waited for finds the waiter; queueing first does the same,
+        // and keeps the address space's lock, which a page fault may hold for a
+        // while, from being waited for under the shard's.
+        queue(&mut self.futex.shard(key).lock().unwrap(), w, key, bitset, 0);
+        let cur = t.proc.mm().read_u32(addr); // the address space's lock let go here
+        let err = match cur {
+            Ok(cur) if cur == val => return self.futex_sleep(t, w, deadline, -ETIMEDOUT, -EINTR),
+            Ok(_) => EAGAIN,
+            Err(e) => e,
+        };
+        self.futex.unqueue_stale(w);
+        -err
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_wake_taken_by_a_stale_waiter_goes_on_to_the_next() {
+        let f = Futexes::default();
+        let key = (1, 0x1000);
+        let (stale, next) = (Waiter::new(), Waiter::new());
+        queue(&mut f.shard(key).lock().unwrap(), &stale, key, 0b01, 0);
+        queue(&mut f.shard(key).lock().unwrap(), &next, key, 0b10, 0);
+        // FUTEX_WAKE_BITSET(1, 0b11) takes the first, whose word then reads changed. On
+        // Linux the first would not have been queued and the wake would reach the other,
+        // although its bitset isn't the first one's.
+        assert_eq!(f.wake(key, 1, 0b11), 1);
+        f.unqueue_stale(&stale);
+        assert!(next.st.lock().unwrap().woken, "passed on, with the waker's bitset");
+        assert!(!f.remove(&next), "and taken off the queue");
+        // One that leaves before any wake takes it wakes nobody.
+        queue(&mut f.shard(key).lock().unwrap(), &stale, key, u32::MAX, 0);
+        queue(&mut f.shard(key).lock().unwrap(), &next, key, u32::MAX, 0);
+        f.unqueue_stale(&stale);
+        assert!(!next.st.lock().unwrap().woken);
+        assert!(f.remove(&next));
     }
 }

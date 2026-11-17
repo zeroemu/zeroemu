@@ -133,6 +133,11 @@ pub(super) const POLL: Duration = Duration::from_millis(200);
 /// For sleeps every wakeup reaches directly (Thread::sleep): only a kick lost
 /// in the instant before the sleep starts ever waits this long.
 pub(super) const IDLE: Duration = Duration::from_secs(2);
+/// For sleeps that every wakeup, kicks included, reaches under the lock they look and
+/// sleep under (futex waits, and the EVENTS waits of poll, select and epoll): nothing
+/// can be lost, and this only bounds what a bug would cost. IDLE, two seconds, woke a
+/// thousand sleeping threads a second for nothing.
+pub(super) const BACKSTOP: Duration = Duration::from_secs(30);
 /// Guest threads at once (each is a host thread; vCPUs are shared).
 const MAX_THREADS: usize = 16384;
 
@@ -593,8 +598,10 @@ pub struct Thread {
     in_syscall: InSyscall,
     /// The host thread it runs on, once it does, for its CPU time.
     host: std::sync::OnceLock<crate::hv::HostThread>,
-    /// Asked to give its vCPU back the next time it blocks (vcpus::reclaim_sleepers).
+    /// Asked to give its vCPU back the next time it blocks (vcpus::Pool::reclaim).
     give_back: AtomicBool,
+    /// Its place on the futex queues, where a kick finds it asleep in a futex wait.
+    futex: Arc<futex::Waiter>,
     /// A descriptor table of its own: cloned without CLONE_FILES. Bionic's
     /// crash handler makes such a thread and closes everything in it.
     own_files: Option<Arc<Mutex<FdTable>>>,
@@ -627,7 +634,7 @@ struct SyscallSnap {
 }
 
 /// The syscall a thread is in, written by the thread on every syscall and read by
-/// others only for thread dumps, /proc and handing back vCPUs. A sequence count
+/// others only for thread dumps and /proc. A sequence count
 /// rather than a lock, as Linux's seqcount_t (include/linux/seqlock.h), so the
 /// thread itself never waits or takes a lock for it: `seq` is a multiple of 4 while
 /// the thread is out of syscalls, one more while it writes the fields, and two more
@@ -718,9 +725,14 @@ pub fn wakeup_stats(over: Duration) -> String {
     );
     *last = (plain, keyed, wakes);
     static MADE_LAST: AtomicU64 = AtomicU64::new(0);
-    let made = vcpus::MADE.load(Ordering::Relaxed);
-    let (used, max) = vcpus::MAIN.get().and_then(|p| p.upgrade()).map_or((0, 0), |p| p.usage());
-    let s = format!("{s}, {:.0} vCPUs made/s, {used} of {max} in use", (made - MADE_LAST.swap(made, Ordering::Relaxed)) as f64 / secs);
+    static WAITED_LAST: AtomicU64 = AtomicU64::new(0);
+    let (made, waited) = (vcpus::MADE.load(Ordering::Relaxed), vcpus::WAITED.load(Ordering::Relaxed));
+    let (used, asleep, max) = vcpus::MAIN.get().and_then(|p| p.upgrade()).map_or((0, 0, 0), |p| p.usage());
+    let s = format!(
+        "{s}, {:.0} vCPUs made/s, {used} of {max} in use ({asleep} asleep), {:.0} waits for one/s",
+        (made - MADE_LAST.swap(made, Ordering::Relaxed)) as f64 / secs,
+        (waited - WAITED_LAST.swap(waited, Ordering::Relaxed)) as f64 / secs
+    );
     let top = wait::top_wakers(4);
     if top.is_empty() {
         return s;
@@ -890,18 +902,13 @@ impl Thread {
             in_syscall: Default::default(),
             host: std::sync::OnceLock::new(),
             give_back: AtomicBool::new(false),
+            futex: futex::Waiter::new(),
         })
     }
 
     /// Whether it is in a syscall now (a thread dump's view of it).
     pub fn in_syscall(&self) -> bool {
         self.in_syscall.read().is_ok_and(|s| s.is_some())
-    }
-
-    /// How long it has been in the syscall it is in, if it is in one.
-    pub(super) fn in_syscall_for(&self) -> Option<Duration> {
-        let since = self.in_syscall.read().ok()??.since;
-        Some(Duration::from_nanos(monotonic_ns().saturating_sub(since)))
     }
 
     /// CPU time it has used, in ns.
@@ -998,6 +1005,7 @@ impl Thread {
         if let Some(cv) = &*self.sleeping_on.lock().unwrap() {
             unsafe { (*cv.0).notify_all() };
         }
+        self.futex.kick();
     }
 
     /// Sleeps on `cv` until it is notified, the thread is kicked, or `timeout`

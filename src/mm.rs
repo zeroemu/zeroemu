@@ -1661,7 +1661,8 @@ impl AddressSpace {
     }
 
     /// A NUL-terminated string of at most 4 KiB (PATH_MAX). Looked for a page at a time,
-    /// as strncpy_from_user does, so a page after the NUL needn't be mapped.
+    /// as strncpy_from_user does (lib/strncpy_from_user.c), so a page after the NUL
+    /// needn't be mapped.
     pub fn read_cstr(&mut self, va: u64) -> Result<String, i64> {
         const MAX: usize = 4096;
         let mut out = Vec::new();

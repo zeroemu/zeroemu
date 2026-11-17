@@ -55,6 +55,12 @@ const DFSC_ALIGNMENT: u64 = 0b100001;
 const CPSR_EL1H_MASKED: u64 = 0x3c5;
 const CPSR_MODE_MASK: u64 = 0xf;
 
+/// ZEROEMU_WATCHDOG=<secs>, read once: every kick's exit and every new vCPU look.
+fn watchdog() -> Option<u64> {
+    static SECS: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *SECS.get_or_init(|| std::env::var("ZEROEMU_WATCHDOG").ok().and_then(|s| s.parse().ok()))
+}
+
 pub struct Hvf;
 
 impl Hvf {
@@ -216,7 +222,7 @@ impl Hypervisor for Hvf {
         // the run loop's business (TlbGen), which makes a new address space flush
         // before anything runs in it.
         let mut v = HvfVcpu { id, exit, flush_pending: None, asid: 0 };
-        if let Some(secs) = std::env::var("ZEROEMU_WATCHDOG").ok().and_then(|s| s.parse::<u64>().ok()) {
+        if let Some(secs) = watchdog() {
             // Debug aid: force an exit after `secs` so a guest stuck without
             // trapping (e.g. an EL1 exception loop) gets its state dumped.
             std::thread::spawn(move || {
@@ -361,7 +367,7 @@ impl Vcpu for HvfVcpu {
             let exit = unsafe { *self.exit };
             match exit.reason {
                 HV_EXIT_REASON_EXCEPTION => {}
-                HV_EXIT_REASON_CANCELED if std::env::var_os("ZEROEMU_WATCHDOG").is_some() => {
+                HV_EXIT_REASON_CANCELED if watchdog().is_some() => {
                     return Exit::Fault {
                         pc: self.reg(HV_REG_PC),
                         addr: self.sys(HV_SYS_REG_FAR_EL1),

@@ -244,6 +244,13 @@ impl Hypervisor for Hvf {
         // EL0 may read the virtual counter and frequency (bionic's clock
         // fast path).
         v.set_sys(HV_SYS_REG_CNTKCTL_EL1, 1 << 1);
+        // Every vCPU's virtual counter counts from CLOCK_MONOTONIC's zero, so guest
+        // code (the vDSO, and anything reading CNTVCT_EL0 itself) reads that clock,
+        // whichever vCPU it runs on and however late that was made: threads make and
+        // give up vCPUs as they come and go. Hypervisor.framework's default offset is
+        // undocumented (0 on macOS 26, the host's own count); QEMU's hvf backend sets
+        // one for the whole VM the same way.
+        check("hv_vcpu_set_vtimer_offset", unsafe { hv_vcpu_set_vtimer_offset(id, super::clock::zero().0) });
         let sctlr_res1 = (1 << 11) | (1 << 20) | (1 << 22) | (1 << 23) | (1 << 28) | (1 << 29);
         let sctlr = sctlr_res1
             | (1 << 0)   // M: MMU on

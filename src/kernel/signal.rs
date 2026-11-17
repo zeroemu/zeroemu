@@ -23,9 +23,10 @@ pub const SIGCONT: u32 = 18;
 pub const SIGSTOP: u32 = 19;
 pub const SS_ONSTACK: i32 = 1;
 
-/// A user page holding `rt_sigreturn`, mapped in every address space just
-/// below the top of user space; handlers return there unless SA_RESTORER
-/// gives another address (arm64 bionic relies on the kernel's).
+/// A user page holding `rt_sigreturn`, mapped in every address space without a
+/// vDSO just below the top of user space; handlers return there unless
+/// SA_RESTORER gives another address (arm64 bionic relies on the kernel's). With
+/// a vDSO they return to its __kernel_rt_sigreturn, as on Linux.
 pub const SIGRETURN_TRAMPOLINE: u64 = crate::paging::USER_TOP - crate::phys::PAGE;
 
 pub fn trampoline_page() -> Arc<[u8]> {
@@ -794,7 +795,7 @@ impl Kernel {
         s.x[30] = if act.flags & SA_RESTORER != 0 && act.restorer != 0 {
             act.restorer
         } else {
-            SIGRETURN_TRAMPOLINE
+            super::vdso::sigreturn().unwrap_or(SIGRETURN_TRAMPOLINE)
         };
         s.sp = frame;
         s.pc = act.handler;

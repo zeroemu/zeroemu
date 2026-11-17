@@ -7,7 +7,7 @@ use super::{ERESTARTSYS, IDLE, Kernel, Thread};
 use crate::errno::*;
 use std::collections::HashMap;
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::Instant;
 
 const FUTEX_WAIT: u32 = 0;
 const FUTEX_WAKE: u32 = 1;
@@ -122,8 +122,7 @@ impl Kernel {
                     Some(if op & FUTEX_CMD_MASK == FUTEX_WAIT {
                         super::wait::instant_after(d) // relative
                     } else if op & FUTEX_CLOCK_REALTIME != 0 {
-                        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
-                        super::wait::instant_after(d.saturating_sub(now))
+                        super::wait::instant_after(d.saturating_sub(super::clock::realtime()))
                     } else {
                         self.boot + d.min(super::wait::CENTURY) // absolute CLOCK_MONOTONIC
                     })
@@ -180,8 +179,7 @@ impl Kernel {
                     // Absolute: LOCK_PI on CLOCK_REALTIME, LOCK_PI2 on
                     // CLOCK_MONOTONIC unless asked otherwise.
                     Some(if cmd == FUTEX_LOCK_PI || op & FUTEX_CLOCK_REALTIME != 0 {
-                        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
-                        super::wait::instant_after(d.saturating_sub(now))
+                        super::wait::instant_after(d.saturating_sub(super::clock::realtime()))
                     } else {
                         self.boot + d.min(super::wait::CENTURY)
                     })

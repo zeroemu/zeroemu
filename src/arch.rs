@@ -174,6 +174,7 @@ syscalls! {
     getrusage = 165, 98;
     umask = 166, 95;
     prctl = 167, 157;
+    getcpu = 168, 309;
     gettimeofday = 169, 96;
     getpid = 172, 39;
     getppid = 173, 110;

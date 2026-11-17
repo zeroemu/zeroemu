@@ -20,7 +20,11 @@
 //!   into the offset as a rate instead: CLOCK_REALTIME gains or loses on
 //!   CLOCK_MONOTONIC, at most as fast as NTP slews Linux's clock, until it agrees with
 //!   the host's again. Only a gap a slew would take minutes to close, which setting
-//!   the host's clock or its sleep makes, is stepped.
+//!   the host's clock or its sleep makes, is stepped: within a tick of the clock
+//!   being set, and as soon as the host wakes. Linux steps it on resume before any
+//!   task runs again (timekeeping_resume in kernel/time/timekeeping.c); here a guest
+//!   thread that was running when the host went to sleep can read the old time for
+//!   the moment before kswapd's tick.
 //!
 //! Input event times, GPU fence and flip times and trace times are CLOCK_MONOTONIC
 //! too (`monotonic`), and absolute CLOCK_REALTIME deadlines count from `realtime`, so
@@ -212,7 +216,7 @@ fn next(old: Line, wall: u64, at: u64, now: u64) -> Line {
 
 impl super::Kernel {
     /// Keeps CLOCK_REALTIME with the host's wall clock, the vDSO's too: called ten
-    /// times a second.
+    /// times a second, and as soon as the host wakes (pressure.rs).
     pub(super) fn tick_clocks(&self) {
         first();
         let (width, wall, at) = sample();

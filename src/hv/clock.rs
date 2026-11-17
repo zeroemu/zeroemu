@@ -3,10 +3,11 @@
 //! the vCPU's vtimer offset (hv_vcpu.h), and hvf.rs sets that offset to `zero().0` on
 //! every vCPU it makes: guest code then reads the ticks since CLOCK_MONOTONIC's zero,
 //! the same on every vCPU, however late it was made. The kernel's CLOCK_MONOTONIC
-//! (kernel/clock.rs) and the vDSO count from that zero in the same ticks.
+//! (kernel/clock.rs) and the vDSO count from that zero in the same ticks. And a wait
+//! that counts the host's sleep, which the counter doesn't.
 
 use std::sync::OnceLock;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Whether guest code reads this counter, from `zero().0`: CNTVCT_EL0 under
 /// Hypervisor.framework. The vDSO needs it.
@@ -85,6 +86,63 @@ pub fn zero() -> (u64, Instant) {
     })
 }
 
+/// Waits for `d`, counting the time the host spends asleep. std::thread::sleep
+/// doesn't on macOS: it waits on mach_absolute_time, which stops while the Mac
+/// sleeps, so a thread that started waiting just before is woken up to `d` after the
+/// host wakes. kswapd waits with this, so that its tick, which steps CLOCK_REALTIME
+/// over the time the host slept (kernel/clock.rs), comes as soon as the host wakes:
+/// Linux injects the sleep before it thaws any task (timekeeping_resume in
+/// kernel/time/timekeeping.c), and guest threads here run again at once.
+pub fn sleep(d: Duration) {
+    #[cfg(target_os = "macos")]
+    {
+        // A kqueue interval timer with NOTE_MACH_CONTINUOUS_TIME goes on ticking across
+        // the host's sleep (sys/event.h). One kqueue for each thread that waits.
+        struct Kq(i32);
+        impl Drop for Kq {
+            fn drop(&mut self) {
+                if self.0 >= 0 {
+                    unsafe { libc::close(self.0) };
+                }
+            }
+        }
+        thread_local! {
+            static KQ: Kq = Kq(unsafe { libc::kqueue() });
+        }
+        let waited = KQ.with(|kq| {
+            if kq.0 < 0 {
+                return false;
+            }
+            let timer = libc::kevent {
+                ident: 1,
+                filter: libc::EVFILT_TIMER,
+                flags: libc::EV_ADD | libc::EV_ONESHOT,
+                fflags: libc::NOTE_NSECONDS | libc::NOTE_MACH_CONTINUOUS_TIME,
+                data: d.as_nanos().min(isize::MAX as u128) as isize,
+                udata: std::ptr::null_mut(),
+            };
+            let mut event: libc::kevent = unsafe { std::mem::zeroed() };
+            let mut change: *const libc::kevent = &timer;
+            loop {
+                let n = unsafe { libc::kevent(kq.0, change, (!change.is_null()) as i32, &mut event, 1, std::ptr::null()) };
+                if n == 1 {
+                    // A timer it refused comes back as an event with EV_ERROR set.
+                    return event.flags & libc::EV_ERROR == 0;
+                }
+                if n < 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+                    return false;
+                }
+                // Interrupted: the timer is set, so wait on without setting it again.
+                change = std::ptr::null();
+            }
+        });
+        if waited {
+            return;
+        }
+    }
+    std::thread::sleep(d);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -94,6 +152,18 @@ mod tests {
         let (n, d) = timebase();
         for t in [0u64, 1, 2, 3, 23, 24_000_000, 1 << 40, 123_456_789_012_345] {
             assert_eq!(to_ns(t) as u128, t as u128 * n as u128 / d as u128, "{t} ticks");
+        }
+    }
+
+    /// The timer's numbers are nanoseconds: neither ticks (24 times as long) nor
+    /// microseconds.
+    #[test]
+    fn sleep_waits_as_long_as_asked() {
+        for _ in 0..3 {
+            let t = Instant::now();
+            sleep(Duration::from_millis(20));
+            let took = t.elapsed();
+            assert!(took >= Duration::from_millis(20) && took < Duration::from_millis(400), "{took:?}");
         }
     }
 

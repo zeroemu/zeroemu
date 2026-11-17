@@ -34,10 +34,12 @@ pub fn start(k: &Arc<Kernel>) {
     let k = Arc::downgrade(k);
     let _ = std::thread::Builder::new().name("kswapd".into()).spawn(move || {
         while let Some(k) = k.upgrade() {
-            check(&k);
+            // The clocks first: after the host's sleep, CLOCK_REALTIME is behind by
+            // all of it until they tick, and reclaiming can take a while.
             k.tick_clocks();
+            check(&k);
             drop(k);
-            std::thread::sleep(INTERVAL);
+            crate::hv::clock::sleep(INTERVAL);
         }
     });
 }

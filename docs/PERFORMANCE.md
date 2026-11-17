@@ -36,8 +36,23 @@ guest memory twice. This is accounting: the page exists once either way.
 
 ## System calls
 
-A syscall round trip (guest → host → guest) is ~1.0 µs on an M1 Pro (1M
-`getpid` calls in 1.0 s), about 10x a native syscall.
+A syscall round trip (guest → host → guest) is about 0.92 µs on an M1 Pro: 1M `getpid`
+calls (`guest/bench_aarch64.S`) took 0.92 s, against 1.04 s before the changes below, the
+two run in turn on a busy machine. The figures here come from microbenchmarks and from
+counts in single boots; what they add up to for a whole device is measured separately.
+
+- A syscall exit makes 9 calls into Hypervisor.framework rather than 14. The EL0 vector
+  goes back to EL0 through its own `eret`, so zeroemu reads no EL1 register and writes
+  neither PC nor PSTATE for a syscall; a page fault reads ESR, ELR and FAR only.
+- On the way back into the guest a thread takes no lock unless a signal is pending or a
+  TLB flush is due: pending signals keep a bitmask beside them, and the address space's
+  TLB generations are atomics.
+- A TLB flush invalidates only the address space's ASID, or the one page that changed,
+  as arm64 Linux's `flush_tlb_mm` and `flush_tlb_page` do, and a new vCPU no longer
+  flushes. At idle after boot, flushes of the whole VM went from about 730 a second to
+  none; about 390 a second now flush one ASID and 130 one page.
+- A synchronous binder call's `BR_TRANSACTION_COMPLETE` comes with its reply, as Linux
+  defers it, so a call and its reply take 4 exits rather than 5.
 
 arm64 programs get a vDSO, as on Linux, so `clock_gettime`, `gettimeofday` (and
 `time`) and `clock_getres` don't exit the VM: they read the virtual counter, which
@@ -46,10 +61,21 @@ kernel's offsets. A clock read takes about 25 ns that way, against 1.2 to 1.4 µ
 syscall (`guest/clocks.c` measures both). On a device idle after boot, clock calls
 were about half of all syscall exits, 1,350 a second; 36 a second are left, for what
 the vDSO passes on to the syscall, as Linux's does: the CPU-time clocks, mostly.
-`ZEROEMU_NO_VDSO=1` turns it off. Planned mitigations:
+`ZEROEMU_NO_VDSO=1` turns it off.
 
-- fewer register accesses per exit;
-- implementing binder transactions and futex wakeups without extra round trips.
+Page faults exit too. A read or exec fault on a file, shared memory or device memory
+also maps those of its 16 neighbouring pages that other mappings already have, as
+Linux's fault-around does; in one boot each, that took faults at idle from about 1,700
+a second to 1,100. A fault whose page has to be read from the system image or `/data`
+reads it with the address space unlocked, as Linux does with `VM_FAULT_RETRY`, so the
+process's other threads don't wait for the read.
+
+Planned:
+
+- a save slot per vCPU at EL1, so that a syscall exit is one `hv_vcpu_run` and one
+  register write: an exit alone measures 0.88 µs, against 0.95 µs with the register
+  accesses still made;
+- futex wakeups without extra round trips.
 
 ## Smoothness
 
@@ -101,6 +127,9 @@ CPU, as macOS counts zeroemu's threads (Activity Monitor's figure), a settled de
 | Idle at the home screen | 51% of a core | 16% |
 | Flinging the app list | 270-320% | 95% |
 
+The "Now" column was measured before the changes under System calls and before the
+vCPU and 2-second wakeup items below.
+
 - Threads asleep in poll, epoll and the like are woken by keys their files hash onto.
   There were 63 keys for well over a thousand sleeping threads, so every event woke
   dozens of threads that had nothing to do, and that was most of the idle CPU. There
@@ -113,6 +142,10 @@ CPU, as macOS counts zeroemu's threads (Activity Monitor's figure), a settled de
   of the places are kept free by asking the threads that have slept longest for theirs;
   only when that falls behind does a thread give its own up as it blocks. Opening seven
   apps made 2,300 vCPUs a second before this and 960 after.
+- Threads asleep in a futex, poll, select or epoll woke every 2 seconds, in case a
+  wakeup had been lost. Every wakeup now reaches them under the lock they sleep under,
+  so they sleep until woken, with a 30-second backstop. With 300 such sleepers,
+  zeroemu's host context switches over 10 seconds went from about 1,700 to 120.
 - The emulated sensors sent all nine sensors' readings every 10 ms, the fastest rate
   anything had asked for, each reading waking the sensors HAL. The HAL makes Android's
   events itself, at each sensor's rate, from the last reading it got, so zeroemu now

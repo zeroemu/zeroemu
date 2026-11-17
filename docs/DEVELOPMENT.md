@@ -132,6 +132,10 @@ Stuck or busy guests:
   the last dump, by kind (syscalls, page faults, kicks) and by syscall, and the share of
   a core that page faults took.
 - `ZEROEMU_MEMSTAT=1` adds to each thread dump where memory has gone, by kind and by file.
+- `ZEROEMU_RSS_CHECK=1` checks each process's count of resident pages, which
+  `/proc/<pid>/stat`, `statm`, `status` and `oom_score` and `getrusage` report, against a
+  walk of its page tables, at each read of it and when the address space goes. It prints
+  any difference, and at the first check and every thousandth how many differed.
 - `ZEROEMU_WAKE_STATS=1` adds the keys that woke the most to `ZEROEMU_GPU_STATS=1`'s
   line, and prints where a key that wakes over a hundred threads at once is announced
   from.

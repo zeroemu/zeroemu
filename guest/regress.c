@@ -10,9 +10,11 @@ typedef unsigned int u32;
 #define NR_openat 56
 #define NR_close 57
 #define NR_pipe2 59
+#define NR_getdents64 61
 #define NR_read 63
 #define NR_write 64
 #define NR_pread64 67
+#define NR_newfstatat 79
 #define NR_fstat 80
 #define NR_utimensat 88
 #define NR_exit 93
@@ -31,6 +33,7 @@ typedef unsigned int u32;
 #define NR_clone 220
 #define NR_mmap 222
 #define NR_mprotect 226
+#define NR_madvise 233
 #define NR_wait4 260
 #define NR_socketpair 199
 
@@ -66,6 +69,8 @@ static void check(int cond, const char *name) {
     puts_("\n");
     if (!cond) failures++;
 }
+static int seq(const char *a, const char *b, u64 n) { while (n--) if (*a++ != *b++) return 0; return 1; }
+static int streq(const char *a, const char *b) { while (*a && *a == *b) a++, b++; return *a == *b; }
 static void nap_ms(i64 ms) { i64 ts[2] = {ms / 1000, (ms % 1000) * 1000000}; sys(NR_nanosleep, ts, 0); }
 
 #define CLONE_THREAD_FLAGS (0x100 | 0x200 | 0x400 | 0x800 | 0x10000 | 0x40000 | 0x200000)
@@ -118,6 +123,50 @@ static i64 bw(int fd, void *w, u64 wn, void *r, u64 rn, u64 *got) {
     if (got) *got = b.rcons;
     return ret;
 }
+
+// The d_type getdents64 gave `name`, or -1.
+static int dtype_of(char *buf, i64 n, const char *name) {
+    for (i64 off = 0; off < n; off += *(unsigned short *)(buf + off + 16)) {
+        if (streq(buf + off + 19, name)) return *(unsigned char *)(buf + off + 18);
+    }
+    return -1;
+}
+
+// `pre`, `v` in decimal and `post`, in `out`.
+static char *num_path(char *out, const char *pre, i64 v, const char *post) {
+    char digits[20], *p = out;
+    int nd = 0;
+    while (*pre) *p++ = *pre++;
+    do digits[nd++] = (char)('0' + v % 10); while ((v /= 10) > 0);
+    while (nd) *p++ = digits[--nd];
+    while (*post) *p++ = *post++;
+    *p = 0;
+    return out;
+}
+
+// A number in a /proc file: after `tag` if there is one, or else the `nth` field
+// (from 0) of its first line.
+static char pbuf[4096] __attribute__((aligned(4096)));
+static i64 proc_num(const char *path, const char *tag, int nth) {
+    i64 fd = sys(NR_openat, -100, path, 0, 0);
+    i64 n = fd < 0 ? -1 : sys(NR_read, fd, pbuf, sizeof pbuf - 1);
+    sys(NR_close, fd);
+    if (n <= 0) return -1;
+    pbuf[n] = 0;
+    char *p = pbuf;
+    if (tag) {
+        for (u64 len = slen(tag); *p && !(*p == *tag && seq(p, tag, len)); p++) {}
+        if (!*p) return -1;
+        p += slen(tag);
+    } else {
+        for (; nth > 0 && *p; p++) if (*p == ' ') nth--;
+    }
+    while (*p == ' ' || *p == '\t') p++;
+    i64 v = 0;
+    for (; *p >= '0' && *p <= '9'; p++) v = v * 10 + (*p - '0');
+    return v;
+}
+static i64 resident(void) { return proc_num("/proc/self/statm", 0, 1); }
 
 // Whether `want` is among the commands the driver returns next.
 static u32 rbuf[256];
@@ -260,6 +309,62 @@ int cmain(void) {
     }
     status = reap(pid, 3000);
     check(status == 0 && canary[0] == 0x1122334455667788, "binder refuses a fixup outside its parent buffer");
+
+    // --- /proc: what stat and readdir say of a file, which they find out without making it
+    char pst[128];
+    check(sys(NR_newfstatat, -100, "/proc/self/status", pst, 0) == 0 && *(u32 *)(pst + 16) == 0100444 && *(i64 *)(pst + 48) == 0,
+          "/proc/self/status is a read-only regular file of size 0");
+    check(sys(NR_newfstatat, -100, "/proc/self/oom_score_adj", pst, 0) == 0 && *(u32 *)(pst + 16) == 0100644, "/proc/self/oom_score_adj is writable");
+    check(sys(NR_newfstatat, -100, "/proc/self/fd", pst, 0) == 0 && (*(u32 *)(pst + 16) & 0170000) == 040000, "/proc/self/fd is a directory");
+    check(sys(NR_newfstatat, -100, "/proc/999999/status", pst, 0) == -2, "a process that isn't there has no status");
+    static char dents[8192];
+    i64 pd = sys(NR_openat, -100, "/proc/self", 0, 0);
+    i64 dn = sys(NR_getdents64, pd, dents, sizeof dents);
+    check(dtype_of(dents, dn, "status") == 8 && dtype_of(dents, dn, "fd") == 4 && dtype_of(dents, dn, "exe") == 10 && dtype_of(dents, dn, "task") == 4,
+          "readdir of /proc/self gives each entry's type");
+    sys(NR_close, pd);
+    check(sys(NR_newfstatat, -100, "/proc/self/nonesuch", pst, 0) == -2 && sys(NR_newfstatat, -100, "/proc/nonesuch", pst, 0) == -2, "names /proc doesn't have aren't there");
+    check(sys(NR_newfstatat, -100, "/proc/thread-self/stat", pst, 0) == 0 &&
+          sys(NR_newfstatat, -100, "/proc/sys/kernel", pst, 0) == 0 && sys(NR_newfstatat, -100, "/proc/pressure/memory", pst, 0) == 0 &&
+          sys(NR_newfstatat, -100, "/proc/meminfo", pst, 0) == 0, "a thread's directory, /proc/sys, /proc/pressure and /proc/meminfo are found");
+    char path[64];
+    i64 me = sys(NR_gettid);
+    check(sys(NR_newfstatat, -100, num_path(path, "/proc/self/task/", me, "/stat"), pst, 0) == 0 &&
+          sys(NR_newfstatat, -100, num_path(path, "/proc/self/task/0", me, "/stat"), pst, 0) == -2 &&
+          sys(NR_newfstatat, -100, "/proc/self/task/999999", pst, 0) == -2, "a thread's directory is found by its number, as readdir spells it");
+    i64 nfd = sys(NR_openat, -100, "/proc/self/stat", 0, 0);
+    check(sys(NR_newfstatat, -100, num_path(path, "/proc/self/fd/", nfd, ""), pst, 0x100 /* AT_SYMLINK_NOFOLLOW */) == 0 && (*(u32 *)(pst + 16) & 0170000) == 0120000 &&
+          sys(NR_close, nfd) == 0 && sys(NR_newfstatat, -100, path, pst, 0x100) == -2, "an open fd is a link in /proc/self/fd, and a closed one isn't there");
+    pid = fork_();
+    if (pid == 0) sys(NR_exit_group, 0);
+    // A zombie keeps its directory until it is reaped.
+    char *zpath = num_path(path, "/proc/", pid, "/stat");
+    nap_ms(100);
+    i64 zst = sys(NR_newfstatat, -100, zpath, pst, 0);
+    check(reap(pid, 3000) == 0 && zst == 0 && sys(NR_newfstatat, -100, zpath, pst, 0) == -2, "a zombie's /proc directory is there until it is reaped");
+
+    // --- RSS: pages counted as they come and go, as Linux's mm counters count them
+    memset(pbuf, 0, sizeof pbuf);
+    i64 r0 = resident();
+    char *mem = (char *)sys(NR_mmap, 0, 64 * 4096, 3, 0x22, -1, 0);
+    for (int i = 0; i < 64; i++) mem[i * 4096] = 1;
+    i64 r1 = resident();
+    sys(NR_madvise, mem, 16 * 4096, 4 /* MADV_DONTNEED */);
+    i64 r2 = resident();
+    char *grown = (char *)sys(NR_mremap, mem, 64 * 4096, 4096 * 4096, 1 /* MREMAP_MAYMOVE */);
+    i64 r3 = resident();
+    check(r1 - r0 == 64 && r1 - r2 == 16 && r3 == r2, "statm's resident pages follow touching, MADV_DONTNEED and mremap");
+    check(proc_num("/proc/self/status", "VmRSS:", 0) == r3 * 4 && proc_num("/proc/self/stat", 0, 23) == r3, "status's VmRSS and stat's rss say the same");
+    pid = fork_();
+    if (pid == 0) {
+        i64 c0 = resident();
+        char *more = (char *)sys(NR_mmap, 0, 8 * 4096, 3, 0x22, -1, 0);
+        for (int i = 0; i < 8; i++) more[i * 4096] = 1;
+        sys(NR_exit_group, c0 > 48 && resident() - c0 == 8 ? 0 : 3);
+    }
+    check(reap(pid, 3000) == 0, "a forked child has the pages it shares, and counts its own");
+    sys(NR_munmap, grown, 4096 * 4096);
+    check(resident() == r0, "munmap gives them back");
 
     puts_(failures ? "SOME CHECKS FAILED\n" : "all checks passed\n");
     return failures;

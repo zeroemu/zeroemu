@@ -18,6 +18,12 @@ pub const STACK_SIZE: u64 = 8 << 20;
 /// mmap allocates top-down from here (leaving room for the stack to grow).
 const MMAP_BASE: u64 = STACK_TOP - (1 << 30);
 
+/// ZEROEMU_RSS_CHECK=1: an address space's RSS count is checked against a walk of its tables.
+fn rss_check() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var("ZEROEMU_RSS_CHECK").as_deref() == Ok("1"));
+    *ON
+}
+
 pub fn page_down(v: u64) -> u64 {
     v & !(PAGE - 1)
 }
@@ -535,6 +541,12 @@ pub struct AddressSpace {
     pub tlb_gen: u64,
     pub flushed_gen: u64,
     stale: Stale,
+    /// User pages present in the tables, kept as entries come and go, as Linux keeps
+    /// mm->rss_stat (include/linux/mm.h): /proc/<pid>/stat, statm, status and oom_score,
+    /// and getrusage, read it, where they used to walk every table. A new entry goes in
+    /// through `install`; fork and mremap, which set many at once, count their own; and
+    /// `clear_pages` counts off what it clears. ZEROEMU_RSS_CHECK=1 compares it with a walk.
+    resident: u64,
 }
 
 impl AddressSpace {
@@ -563,6 +575,7 @@ impl AddressSpace {
             tlb_gen: 0,
             flushed_gen: 0,
             stale: Stale::default(),
+            resident: 0,
         })
     }
 
@@ -766,9 +779,29 @@ impl AddressSpace {
     /// Bytes of address space mapped, and bytes actually resident.
     pub fn usage(&self) -> (u64, u64) {
         let virt = self.vmas.iter().map(|(&s, v)| v.end - s).sum();
-        let mut resident = 0;
-        self.visit(0, USER_TOP, &mut |_, _, _, _| resident += PAGE);
-        (virt, resident)
+        if rss_check() {
+            self.check_resident();
+        }
+        (virt, self.resident * PAGE)
+    }
+
+    /// ZEROEMU_RSS_CHECK=1: counts the pages in the tables, as `usage` did before it kept
+    /// a count, and says when the two differ, and at the first check and every 1000th
+    /// how many did. Each read of the count is checked, and each address space as it goes.
+    fn check_resident(&self) {
+        use std::sync::atomic::AtomicU64;
+        static CHECKS: AtomicU64 = AtomicU64::new(0);
+        static DIFFERED: AtomicU64 = AtomicU64::new(0);
+        let mut walked = 0;
+        self.visit(0, USER_TOP, &mut |_, _, _, _| walked += 1);
+        if walked != self.resident {
+            DIFFERED.fetch_add(1, Ordering::Relaxed);
+            eprintln!("[zeroemu] RSS check: address space {} counts {} pages, its tables hold {walked}", self.root.asid, self.resident);
+        }
+        let n = CHECKS.fetch_add(1, Ordering::Relaxed) + 1;
+        if n == 1 || n.is_multiple_of(1000) {
+            eprintln!("[zeroemu] RSS check: {n} reads, {} differed from the tables", DIFFERED.load(Ordering::Relaxed));
+        }
     }
 
     pub fn unmap(&mut self, start: u64, len: u64) -> Result<(), i64> {
@@ -840,6 +873,9 @@ impl AddressSpace {
             cleared.push((va, paging::addr(e)));
         });
         let any = !cleared.is_empty();
+        // Saturating: were an entry ever made without `install`, the count would be low,
+        // and wrapping would make it the size of the address space.
+        self.resident = self.resident.saturating_sub(cleared.len() as u64);
         for (va, frame) in cleared {
             if !self.is_device(va) {
                 self.stale.frames.push(frame);
@@ -1020,6 +1056,8 @@ impl AddressSpace {
         for off in &present {
             walk(&self.phys, owner, &mut self.tables, self.root.root, 0, dst + off, true)?;
         }
+        // The moved entries stay counted in `resident`: they are cleared here and all set
+        // again at the destination below.
         let mut moves = Vec::new();
         self.visit(old, old + keep, &mut |phys, slot, va, e| {
             phys.write_u64(slot, 0);
@@ -1112,7 +1150,7 @@ impl AddressSpace {
                 }
                 self.sync_for_exec(frame, prot);
                 // It wasn't valid before, so no TLB holds it.
-                self.phys.write_pte(slot, paging::user_page(frame, prot));
+                self.install(slot, paging::user_page(frame, prot));
                 Ok(())
             })();
             if let Err(e) = filled {
@@ -1211,8 +1249,15 @@ impl AddressSpace {
         }
         let frame = self.populate(start, &vma, page, write).map_err(|_| SEGV_MAPERR)?;
         let shared = matches!(vma.backing, Backing::Shared { .. } | Backing::Dev { .. });
-        self.phys.write_pte(slot, self.entry_for(frame, prot, shared));
+        let e = self.entry_for(frame, prot, shared);
+        self.install(slot, e);
         Ok(())
+    }
+
+    /// Makes the empty entry at `slot` present, and counts the page (`resident`).
+    fn install(&mut self, slot: u64, e: u64) {
+        self.phys.write_pte(slot, e);
+        self.resident += 1;
     }
 
     /// Each page present, as (where its mapping starts, its mapping, its address, its
@@ -1286,7 +1331,7 @@ impl AddressSpace {
             }
             let frame = self.populate(start, &vma, page, write)?;
             e = self.entry_for(frame, vma.prot, matches!(vma.backing, Backing::Shared { .. } | Backing::Dev { .. }));
-            self.phys.write_pte(slot, e);
+            self.install(slot, e);
         } else if write && !matches!(vma.backing, Backing::Shared { .. } | Backing::Dev { .. }) && !self.phys.is_sole_owner(paging::addr(e)) {
             // The kernel writes past the page tables: it must not reach a frame
             // another process still shares.
@@ -1429,6 +1474,7 @@ impl AddressSpace {
                 }
             }
             self.phys.write_u64(child_slot, entry);
+            child.resident += 1;
         }
         // Entries already changed are changed, whether or not the rest followed.
         if downgraded {
@@ -1454,6 +1500,9 @@ impl AddressSpace {
 
 impl Drop for AddressSpace {
     fn drop(&mut self) {
+        if rss_check() {
+            self.check_resident();
+        }
         // Callers flush TLBs before dropping a space a vCPU may still cache
         // (exec switches roots first; exited processes have no vCPUs left).
         let mut pages = Vec::new();
@@ -1531,5 +1580,87 @@ mod tests {
         drop(b);
         // Only the tables' fixed part of the kernel window's stays.
         assert!(phys.frames_in_use() < 16, "{} left", phys.frames_in_use());
+    }
+
+    /// The pages a walk of the tables finds, as `usage` counted them before it kept a count.
+    fn walked(a: &AddressSpace) -> u64 {
+        let mut n = 0;
+        a.visit(0, USER_TOP, &mut |_, _, _, _| n += 1);
+        n
+    }
+
+    /// The RSS count follows every way an entry comes and goes: faults, the kernel's own
+    /// reads and writes, MADV_DONTNEED, munmap, mremap (moving, shrinking, onto another
+    /// mapping, and MREMAP_DONTUNMAP), mprotect, fork with each of its policies, copy on
+    /// write and userfaultfd, for anonymous, shared and file memory alike.
+    #[test]
+    fn the_rss_count_agrees_with_the_tables() {
+        let phys = PhysMem::new(Arc::new(crate::hv::NoHv));
+        let kernel = KernelWindow::new(&phys, &[]).unwrap();
+        let mut a = AddressSpace::new(phys.clone(), &kernel, 1).unwrap();
+        let rw = PROT_READ | PROT_WRITE;
+        let anon = a.map(Placement::Hint(0), PAGE * 16, rw, Backing::Anon).unwrap();
+        for i in 0..8 {
+            a.fault(anon + i * PAGE, i % 2 == 0, false).unwrap();
+        }
+        a.write(anon + 10 * PAGE, &[1; 3 * PAGE as usize]).unwrap();
+        assert_eq!((a.resident, walked(&a)), (11, 11));
+        a.fault(anon, true, false).unwrap(); // present already: nothing new
+        a.discard(anon + 2 * PAGE, 3 * PAGE).unwrap();
+        assert_eq!((a.resident, walked(&a)), (8, 8));
+        a.protect(anon, 4 * PAGE, PROT_READ).unwrap();
+        a.protect(anon, 4 * PAGE, rw).unwrap();
+        assert_eq!(a.resident, walked(&a));
+
+        let obj = SharedObject::new(phys.clone());
+        obj.write(0, &[2; 4 * PAGE as usize]).unwrap();
+        let shared = a.map(Placement::Hint(0), PAGE * 4, rw, Backing::Shared { obj: obj.clone(), offset: 0 }).unwrap();
+        a.read_vec(shared, 2 * PAGE as usize).unwrap();
+        a.fault(shared + 3 * PAGE, true, false).unwrap();
+        let file = a.map(Placement::Hint(0), PAGE * 4, rw, Backing::File { src: obj.clone(), offset: 0 }).unwrap();
+        a.fault(file, false, false).unwrap();
+        a.fault(file, true, false).unwrap(); // copy on write: the same one page
+        a.fault(file + PAGE, true, false).unwrap();
+        assert_eq!((a.resident, walked(&a)), (13, 13));
+
+        // Moved whole, shrunk, moved onto another mapping, and moved leaving the mapping.
+        let moved = a.remap(anon, PAGE * 16, PAGE * 16, true, Some(anon + (1 << 30)), false).unwrap();
+        assert_eq!((a.resident, walked(&a)), (13, 13));
+        let shrunk = a.remap(moved, PAGE * 16, PAGE * 4, true, None, false).unwrap();
+        assert_eq!(shrunk, moved);
+        assert_eq!(a.resident, walked(&a));
+        let onto = a.remap(shrunk, PAGE * 4, PAGE * 4, true, Some(shared), false).unwrap();
+        assert_eq!(onto, shared);
+        assert_eq!(a.resident, walked(&a));
+        let kept = a.remap(onto, PAGE * 2, PAGE * 2, true, None, true).unwrap(); // MREMAP_DONTUNMAP
+        a.fault(onto, true, false).unwrap();
+        assert_eq!(a.resident, walked(&a));
+
+        // fork: copied, dropped and wiped mappings, then a write that copies a page.
+        let wiped = a.map(Placement::Hint(0), PAGE * 2, rw, Backing::Anon).unwrap();
+        a.write(wiped, &[3; 2 * PAGE as usize]).unwrap();
+        a.set_on_fork(wiped, PAGE, OnFork::Wipe).unwrap();
+        a.set_on_fork(kept, PAGE * 2, OnFork::Drop).unwrap();
+        let mut b = a.fork(&kernel, 2).unwrap();
+        assert_eq!(b.resident, walked(&b));
+        assert!(b.resident > 0 && b.resident < a.resident);
+        b.write(file + 2 * PAGE, &[4]).unwrap();
+        b.write(wiped + PAGE, &[4]).unwrap();
+        assert_eq!(a.resident, walked(&a));
+        assert_eq!(b.resident, walked(&b));
+
+        // userfaultfd fills only what is missing.
+        let ctx = Arc::new(UffdCtx::default());
+        ctx.open.store(true, Ordering::Relaxed);
+        let area = a.map(Placement::Hint(0), PAGE * 4, rw, Backing::Anon).unwrap();
+        a.uffd_register(&ctx, area, PAGE * 4).unwrap();
+        a.uffd_fill(&ctx, area, PAGE * 2, None);
+        assert_eq!(a.uffd_fill(&ctx, area + PAGE, PAGE * 2, None).1, Some(EEXIST));
+        assert_eq!(a.resident, walked(&a));
+
+        a.unmap(0, USER_TOP).unwrap();
+        assert_eq!((a.resident, walked(&a)), (0, 0));
+        b.unmap(MIN_ADDR, USER_TOP - MIN_ADDR).unwrap();
+        assert_eq!((b.resident, walked(&b)), (0, 0));
     }
 }

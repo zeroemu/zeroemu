@@ -10,7 +10,7 @@ use super::{Blob, Box3, Fence, GpuBackend, Iov, Resource3d, ResourceInfo, Transf
 use std::ffi::{CStr, CString, c_void};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, mpsc};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, mpsc};
 use std::time::{Duration, Instant};
 
 // This build's get_cap_set wrapper discards max_ver and only writes max_size
@@ -283,8 +283,9 @@ pub struct Gfxstream {
     pipe_ctx: Mutex<std::collections::HashMap<u32, Arc<Mutex<()>>>>,
     /// The renderer's resource and context maps have no lock of their own. Calls
     /// that insert or erase entries hold this exclusively, on the worker; pipe
-    /// transfers, which only look entries up, share it.
-    maps: std::sync::RwLock<()>,
+    /// transfers and calls made on the calling thread, which only look entries up,
+    /// share it.
+    maps: MapsLock,
     /// The renderer's subwindow is (or was) up: teardown must remove it first.
     subwindow: AtomicBool,
     // Kept mapped for the process lifetime. dlclose races the renderer's threads.
@@ -493,7 +494,7 @@ pub fn open(width: u32, height: u32) -> Result<Arc<dyn GpuBackend>, String> {
         scanout: AtomicU32::new(0),
         pipes: Mutex::new(std::collections::HashMap::new()),
         pipe_ctx: Mutex::new(std::collections::HashMap::new()),
-        maps: std::sync::RwLock::new(()),
+        maps: MapsLock::default(),
         subwindow: AtomicBool::new(false),
         _lib: lib,
     });
@@ -900,7 +901,7 @@ impl Gfxstream {
             Some(p) if p.connected && !p.shared && p.ctx != 0 && p.ctx == t.ctx_id => {
                 let one = self.pipe_ctx.lock().unwrap_or_else(|p| p.into_inner()).entry(p.ctx).or_default().clone();
                 let _one = one.lock().unwrap_or_else(|p| p.into_inner());
-                let _shared = self.maps.read().unwrap_or_else(|p| p.into_inner());
+                let _shared = self.maps.read();
                 ck(call())
             }
             // The first write is the guest's connect, which makes the renderer create the
@@ -929,7 +930,7 @@ impl Gfxstream {
         if !*live {
             return Err(19); // ENODEV
         }
-        let _shared = self.maps.read().unwrap_or_else(|p| p.into_inner());
+        let _shared = self.maps.read();
         ck(f())
     }
 
@@ -947,9 +948,79 @@ impl Gfxstream {
     /// worker, with no pipe transfer looking at them.
     fn exclusive<R>(&self, f: impl FnOnce() -> R) -> R {
         self.worker.run(|| {
-            let _only = self.maps.write().unwrap_or_else(|p| p.into_inner());
+            let _only = self.maps.write();
             f()
         })
+    }
+}
+
+/// The lock on the renderer's maps. Unlike std's RwLock, a reader doesn't queue behind a
+/// writer that is only waiting for the readers to finish. A pipe read waits for its
+/// render thread to reply, which for the sync object HWUI makes each frame means the
+/// whole frame decoded, and a resource create queued behind one would otherwise stop
+/// every GL thread in the system, SurfaceFlinger's included, until it is through. A
+/// writer that has waited PATIENCE does make new readers wait, so a steady stream of
+/// transfers can't keep it out for long.
+#[derive(Default)]
+struct MapsLock {
+    st: Mutex<MapsState>,
+    cv: Condvar,
+}
+
+#[derive(Default)]
+struct MapsState {
+    readers: u32,
+    writer: bool,
+    /// Since when a writer has waited for the readers to finish.
+    waiting: Option<Instant>,
+}
+
+const PATIENCE: Duration = Duration::from_millis(4);
+
+struct MapsRead<'a>(&'a MapsLock);
+struct MapsWrite<'a>(&'a MapsLock);
+
+impl MapsLock {
+    fn state(&self) -> MutexGuard<'_, MapsState> {
+        self.st.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn read(&self) -> MapsRead<'_> {
+        let mut st = self.state();
+        while st.writer || st.waiting.is_some_and(|t| t.elapsed() >= PATIENCE) {
+            st = self.cv.wait(st).unwrap_or_else(|p| p.into_inner());
+        }
+        st.readers += 1;
+        MapsRead(self)
+    }
+
+    fn write(&self) -> MapsWrite<'_> {
+        let mut st = self.state();
+        let since = Instant::now();
+        while st.writer || st.readers > 0 {
+            st.waiting.get_or_insert(since);
+            st = self.cv.wait(st).unwrap_or_else(|p| p.into_inner());
+        }
+        st.waiting = None;
+        st.writer = true;
+        MapsWrite(self)
+    }
+}
+
+impl Drop for MapsRead<'_> {
+    fn drop(&mut self) {
+        let mut st = self.0.state();
+        st.readers -= 1;
+        if st.readers == 0 && st.waiting.is_some() {
+            self.0.cv.notify_all();
+        }
+    }
+}
+
+impl Drop for MapsWrite<'_> {
+    fn drop(&mut self) {
+        self.0.state().writer = false;
+        self.0.cv.notify_all();
     }
 }
 

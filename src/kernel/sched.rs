@@ -10,6 +10,7 @@ use crate::arch::Sysno;
 use crate::errno::*;
 use crate::hv::Urgency;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 const SCHED_OTHER: u32 = 0;
 const SCHED_FIFO: u32 = 1;
@@ -78,6 +79,35 @@ pub fn urgency(policy: u32, nice: i32, group: CpuGroup) -> Urgency {
         Urgency::Foreground
     } else {
         Urgency::Normal
+    }
+}
+
+/// Binder lends a thread the priority of each call it handles, and gives it back with
+/// the reply (binder_transaction_priority, binder_restore_priority), as Linux does with
+/// the nice Android sees. The host hears of a priority at the thread's next guest entry,
+/// and each change is a system call; a priority that drops into Background parks the
+/// vCPU to queue for a background place. A pool thread answering calls from a more
+/// urgent thread would pay for both twice per call, to go back to sleep each time
+/// straight after its reply. So the host is told of a rise at once and of a fall only
+/// when the thread next sleeps in binder or takes another call: that is when it either
+/// stops running or runs at what the next call lends it.
+impl Thread {
+    /// The thread's own nice back after a call. Android sees it at once; the host only
+    /// if that makes the thread more urgent.
+    pub(super) fn restore_nice(&self, nice: i32) {
+        let mut attrs = self.attrs.lock().unwrap();
+        attrs.sched.nice = nice;
+        let group = CpuGroup::from_u8(self.cpu_group.load(Ordering::Relaxed));
+        let u = urgency(attrs.sched.policy, nice, group);
+        if (u as u8) < self.urgency.load(Ordering::Relaxed) {
+            self.update_urgency(&attrs);
+        }
+    }
+
+    /// The host urgency from the thread's priority as it is now, after restore_nice
+    /// left it higher.
+    pub(super) fn settle_urgency(&self) {
+        self.update_urgency(&self.attrs.lock().unwrap());
     }
 }
 

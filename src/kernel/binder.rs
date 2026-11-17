@@ -1350,7 +1350,7 @@ impl Kernel {
             w.thread(me, t.tid).stack.pop();
             answering = Some(txn);
             if let Some(x) = w.txns.get(&txn) {
-                t.set_nice(x.saved_nice);
+                t.restore_nice(x.saved_nice);
             }
             match w.txns.get(&txn).and_then(|x| x.from).filter(|(fp, _)| w.procs.contains_key(fp)) {
                 Some((fp, ft)) => {
@@ -1771,7 +1771,7 @@ impl Kernel {
                 // Waiting for the process's work, a thread is at the process's priority:
                 // a one-way call leaves its mark, with no reply to put it back.
                 if idle && looper {
-                    t.set_nice(w.procs[&b.id].default_nice);
+                    t.restore_nice(w.procs[&b.id].default_nice);
                 }
                 while out.len() + 80 <= max {
                     // What is deferred waits for something to wake the thread, and
@@ -1826,10 +1826,12 @@ impl Kernel {
             if t.interrupted() {
                 return Err(EINTR);
             }
-            // Give up the vCPU without the binder lock, then look once more.
+            // Give up the vCPU without the binder lock, then look once more. Asleep, the
+            // thread needs no more urgency than its own (see Thread::restore_nice).
             if !yielded {
                 yielded = true;
                 drop(g);
+                t.settle_urgency();
                 super::vcpus::blocking();
                 g = world();
                 continue;
@@ -1966,6 +1968,8 @@ impl Kernel {
                 } else if !oneway || saved > min {
                     t.set_nice(min);
                 }
+                // The call runs at what it lends, not at what the last one left.
+                t.settle_urgency();
                 if oneway {
                     w.txns.remove(&id);
                 } else {

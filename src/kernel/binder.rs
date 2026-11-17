@@ -1091,10 +1091,15 @@ impl Kernel {
         let mut consumed = wcons;
         if wsize > wcons {
             let cmds = t.proc.mm().read_vec(wbuf + wcons, (wsize - wcons).min(1 << 20) as usize)?;
-            // What the transactions send is read from the sender first, so that the lock,
-            // once taken, can be kept to the end. The commands before one whose contents
-            // can't be read still run, as when each was read in its turn.
-            let mut sends = Vec::new();
+            // What the first transaction sends is read from the sender before the lock is
+            // taken, so that the lock, once taken, can be kept to the end: libbinder sends
+            // one transaction per write. Any later one is read in its turn, with the lock
+            // let go. Each can be 12 MiB of this process's memory to hold (data, offsets
+            // and scatter-gather buffers, MAX_AREA each), and a write buffer has room for
+            // thousands, so only one is held at a time; Linux's binder_transaction copies
+            // each straight into its receiver in its turn. The commands before one whose
+            // contents can't be read still run.
+            let mut first = None;
             let mut off = 0usize;
             while off + 4 <= cmds.len() {
                 let cmd = u32_at(&cmds, off);
@@ -1103,16 +1108,11 @@ impl Kernel {
                     break;
                 }
                 if let BC_TRANSACTION | BC_REPLY | BC_TRANSACTION_SG | BC_REPLY_SG = cmd {
-                    let out = self.read_outgoing(t, cmd == BC_REPLY || cmd == BC_REPLY_SG, &cmds[off + 4..off + 4 + size], cmd == BC_TRANSACTION_SG || cmd == BC_REPLY_SG);
-                    let failed = out.is_err();
-                    sends.push(out);
-                    if failed {
-                        break;
-                    }
+                    first = Some(self.read_outgoing(t, cmd == BC_REPLY || cmd == BC_REPLY_SG, &cmds[off + 4..off + 4 + size], cmd == BC_TRANSACTION_SG || cmd == BC_REPLY_SG));
+                    break;
                 }
                 off += 4 + size;
             }
-            let mut sends = sends.into_iter();
             let mut off = 0usize;
             while off + 4 <= cmds.len() {
                 let cmd = u32_at(&cmds, off);
@@ -1121,7 +1121,7 @@ impl Kernel {
                     break;
                 }
                 let args = &cmds[off + 4..off + 4 + size];
-                if let Err(e) = self.binder_command(t, b, cmd, args, &mut held, &mut sends) {
+                if let Err(e) = self.binder_command(t, b, cmd, args, &mut held, &mut first) {
                     if ring_on() {
                         let mut g = held.take().unwrap_or_else(world);
                         if let Some(th) = g.as_mut().and_then(|w| w.procs.get_mut(&b.id)).and_then(|p| p.threads.get_mut(&t.tid)) {
@@ -1165,11 +1165,17 @@ impl Kernel {
 
     /// One command. `held` is the binder lock if this ioctl holds it: commands take
     /// it there and leave it for the next, and let it go to touch guest memory.
-    /// `sends` has what each transaction sends, read beforehand.
-    fn binder_command(&self, t: &Arc<Thread>, b: &BinderFile, cmd: u32, a: &[u8], held: &mut Option<Guard>, sends: &mut std::vec::IntoIter<Result<Outgoing, i64>>) -> Result<(), i64> {
+    /// `first` has what the write's first transaction sends, read beforehand.
+    fn binder_command(&self, t: &Arc<Thread>, b: &BinderFile, cmd: u32, a: &[u8], held: &mut Option<Guard>, first: &mut Option<Result<Outgoing, i64>>) -> Result<(), i64> {
         match cmd {
             BC_TRANSACTION | BC_REPLY | BC_TRANSACTION_SG | BC_REPLY_SG => {
-                let out = sends.next().ok_or(EFAULT)??;
+                let out = match first.take() {
+                    Some(out) => out?,
+                    None => {
+                        *held = None;
+                        self.read_outgoing(t, cmd == BC_REPLY || cmd == BC_REPLY_SG, a, cmd == BC_TRANSACTION_SG || cmd == BC_REPLY_SG)?
+                    }
+                };
                 self.binder_transact(t, b, out, held);
             }
             BC_FREE_BUFFER => {

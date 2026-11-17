@@ -172,8 +172,21 @@ int cmain(void) {
             r = (struct txn *)expect(fd, BR_REPLY, &acquired);
         }
         if (!(r && r->data_size == 4 && seq((char *)r->buffer, "pong", 4))) bad |= 1;
-        // A one-way call: no reply comes back, only TRANSACTION_COMPLETE, at once.
-        send_txn(fd, BC_TRANSACTION, 0, 9, TF_ONE_WAY, "async", 5, 0, 0);
+        // Two one-way calls in one write: no reply comes back, only TRANSACTION_COMPLETE,
+        // at once. The driver reads the first call's data before it takes its lock and
+        // the second's in its turn, so both ways are tried.
+        struct { u32 c1; struct txn t1; u32 c2; struct txn t2; } __attribute__((packed)) two;
+        memset(&two, 0, sizeof two);
+        two.c1 = two.c2 = BC_TRANSACTION;
+        two.t1.code = 9;
+        two.t1.flags = TF_ONE_WAY;
+        two.t1.data_size = 5;
+        two.t1.buffer = (u64)"async";
+        two.t2.code = 10;
+        two.t2.flags = TF_ONE_WAY;
+        two.t2.data_size = 5;
+        two.t2.buffer = (u64)"again";
+        bw(fd, &two, sizeof two, 0, 0, 0);
         if (!expect(fd, BR_TRANSACTION_COMPLETE, &acquired)) bad |= 1;
         if (!acquired) expect(fd, BR_ACQUIRE, &acquired); // the manager now holds our object
         if (!acquired) bad |= 2;
@@ -205,16 +218,24 @@ int cmain(void) {
         struct { u32 cmd; u64 ptr; } __attribute__((packed)) fb = { BC_FREE_BUFFER, t->buffer };
         bw(mgr, &fb, sizeof fb, 0, 0, 0);
 
-        // Watch the child's object die with it.
-        struct { u32 cmd; u32 handle; u64 cookie; } __attribute__((packed)) dn = { BC_REQUEST_DEATH_NOTIFICATION, handle, 0xdead };
-        bw(mgr, &dn, sizeof dn, 0, 0, 0);
-
         struct txn *a = (struct txn *)expect(mgr, BR_TRANSACTION, 0);
         check(a && a->code == 9 && (a->flags & TF_ONE_WAY) && seq((char *)a->buffer, "async", 5), "one-way transaction delivered");
+        // One one-way call per object at a time: freeing the first starts the second.
         if (a) {
             struct { u32 cmd; u64 ptr; } __attribute__((packed)) fb2 = { BC_FREE_BUFFER, a->buffer };
             bw(mgr, &fb2, sizeof fb2, 0, 0, 0);
+            a = (struct txn *)expect(mgr, BR_TRANSACTION, 0);
+            check(a && a->code == 10 && (a->flags & TF_ONE_WAY) && seq((char *)a->buffer, "again", 5), "second call of a write delivered");
         }
+        if (a) {
+            struct { u32 cmd; u64 ptr; } __attribute__((packed)) fb3 = { BC_FREE_BUFFER, a->buffer };
+            bw(mgr, &fb3, sizeof fb3, 0, 0, 0);
+        }
+
+        // Watch the child's object die with it. Asked only now, so that its obituary
+        // can't come before the second call; if it is dead already, it comes at once.
+        struct { u32 cmd; u32 handle; u64 cookie; } __attribute__((packed)) dn = { BC_REQUEST_DEATH_NOTIFICATION, handle, 0xdead };
+        bw(mgr, &dn, sizeof dn, 0, 0, 0);
     }
     char buf[32];
     check(sys(NR_read, pp[0], buf, 32) == 13 && seq(buf, "via binder fd", 13), "child's pipe received the write");

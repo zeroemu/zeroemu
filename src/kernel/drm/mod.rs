@@ -246,10 +246,8 @@ struct Resource {
     lazy: bool,
     mapped: Mutex<Weak<DevMem>>,
     mapped_once: AtomicBool,
-    /// A context's pipe to its render thread (see `is_pipe`).
-    pipe: bool,
-    /// The contexts it is attached to.
-    attached: Mutex<Vec<u32>>,
+    /// The context the renderer attached it to last, 0 if none (see `attach`).
+    last_ctx: Mutex<u32>,
     gpu: Arc<dyn GpuBackend>,
     phys: Arc<PhysMem>,
 }
@@ -266,25 +264,23 @@ impl Drop for Resource {
 
 impl Resource {
     /// Attaches it to a context, as Linux does whenever a file gets a handle to it
-    /// (virtio_gpu_gem_object_open, drivers/gpu/drm/virtio/virtgpu_gem.c): gralloc
-    /// imports the buffer it is about to show every frame. Linux detaches it again when
-    /// the handle closes; zeroemu never does, so a context it is attached to stays so,
-    /// and attaching it again changes nothing in the renderer
-    /// (VirtioGpuContext::AttachResource adds to two sets, and points the resource at
-    /// the context's pipe, which only a pipe reads). A pipe is attached every time: the
-    /// renderer moves it onto the pipe of the context it was attached to last.
+    /// (virtio_gpu_gem_object_open, drivers/gpu/drm/virtio/virtgpu_gem.c): the composer
+    /// imports the buffer it is about to show every frame. The renderer
+    /// (VirtioGpuContext::AttachResource) adds it to two sets and points it at the
+    /// context's pipe, letting go of the pipe it pointed at before. Only a pipe resource
+    /// reads that, but the reference keeps a destroyed context's pipe and render thread
+    /// alive (VirtioGpuFrontend::destroyContext detaches nothing) until another context
+    /// attaches the resource or it is freed. zeroemu never detaches, so a repeat by the
+    /// context that attached it last is the only attach that changes nothing.
     fn attach(&self, ctx: u32) {
         if ctx == 0 {
             return;
         }
-        if self.pipe {
+        // Held across the call, so that the renderer's last attach is the one recorded.
+        let mut last = self.last_ctx.lock().unwrap();
+        if *last != ctx {
             self.gpu.ctx_attach_resource(ctx, self.id);
-            return;
-        }
-        let mut attached = self.attached.lock().unwrap();
-        if !attached.contains(&ctx) {
-            self.gpu.ctx_attach_resource(ctx, self.id);
-            attached.push(ctx);
+            *last = ctx;
         }
     }
 
@@ -998,7 +994,7 @@ fn guest_backing(phys: &Arc<PhysMem>, size: u64) -> Result<(Arc<crate::mm::Share
 
 /// `ctx` is the context it was created attached to, if any.
 /// A resource with neither guest pages nor host memory gets its guest pages on first use.
-fn new_res(dev: &Device, id: u32, size: u64, blob_mem: u32, guest: Option<Arc<crate::mm::SharedObject>>, pipe: bool, ctx: u32) -> Arc<Resource> {
+fn new_res(dev: &Device, id: u32, size: u64, blob_mem: u32, guest: Option<Arc<crate::mm::SharedObject>>, ctx: u32) -> Arc<Resource> {
     Arc::new(Resource {
         id,
         size,
@@ -1007,8 +1003,7 @@ fn new_res(dev: &Device, id: u32, size: u64, blob_mem: u32, guest: Option<Arc<cr
         guest: Mutex::new(guest),
         mapped: Mutex::new(Weak::new()),
         mapped_once: AtomicBool::new(false),
-        pipe,
-        attached: Mutex::new(if ctx == 0 { Vec::new() } else { vec![ctx] }),
+        last_ctx: Mutex::new(ctx),
         gpu: dev.gpu.clone(),
         phys: dev.phys.clone(),
     })
@@ -1062,7 +1057,7 @@ fn virt_res_create(o: &Open, arg: u64, io: &mut dyn Io) -> Result<i64, i64> {
     // Opening a handle attaches the object to the file's context (drm_gem_handle_create).
     let ctx = o.st.lock().unwrap().ctx;
     o.dev.gpu.resource_create(&args, iov, ctx)?;
-    let res = new_res(&o.dev, id, size, 0, guest, pipe, ctx);
+    let res = new_res(&o.dev, id, size, 0, guest, ctx);
     o.dev.track_res(&res);
     let (handle, _) = o.gems.lock().unwrap().insert(res);
     wu32(&mut b, 40, handle);
@@ -1103,7 +1098,7 @@ fn virt_create_blob(o: &Open, arg: u64, io: &mut dyn Io) -> Result<i64, i64> {
     let blob = Blob { blob_mem: mem, blob_flags: flags, blob_id, size };
     // Host blobs have no guest pages.
     o.dev.gpu.resource_create_blob(ctx, id, &blob, iov, &cmd)?;
-    let res = new_res(&o.dev, id, size, mem, guest, false, ctx);
+    let res = new_res(&o.dev, id, size, mem, guest, ctx);
     o.dev.track_res(&res);
     let (handle, _) = o.gems.lock().unwrap().insert(res);
     wu32(&mut b, 8, handle);
@@ -1611,7 +1606,7 @@ fn mode_create_dumb(o: &Open, arg: u64, io: &mut dyn Io) -> Result<i64, i64> {
         flags: 0,
     };
     o.dev.gpu.resource_create(&args, iov, 0)?;
-    let res = new_res(&o.dev, id, size, 0, Some(guest), false, 0);
+    let res = new_res(&o.dev, id, size, 0, Some(guest), 0);
     o.dev.track_res(&res);
     let (handle, _) = o.gems.lock().unwrap().insert(res);
     wu32(&mut b, 16, handle);
@@ -1948,6 +1943,20 @@ mod tests {
         assert_eq!(&m.buf[0x100 + 32..0x100 + 42], b"virtio_gpu");
         assert_eq!(ru32(&m.buf, 0x100 + 64), 1, "first fence signaled");
         assert_eq!(ru32(&m.buf, 0x150 + 64), 0, "second pending");
+    }
+
+    #[test]
+    fn attach_again_when_another_context_attached_last() {
+        let fake = gpu::fake::Fake::new();
+        let dev = Device::new(fake.clone(), PhysMem::new(Arc::new(NoHv)));
+        // Made attached to context 1, then imported by 2 every frame, once by 3 (which
+        // then dies), and again by 2. The renderer must see 2 attach it after 3 did, or
+        // it keeps 3's pipe alive.
+        let res = new_res(&dev, 5, 4096, 0, None, 1);
+        for ctx in [1, 2, 2, 2, 3, 2, 2, 0] {
+            res.attach(ctx);
+        }
+        assert_eq!(fake.attaches(), vec![(2, 5), (3, 5), (2, 5)]);
     }
 
     #[test]

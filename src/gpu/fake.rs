@@ -33,6 +33,8 @@ struct State {
     ctx: HashMap<u32, u32>,
     handler: Option<Arc<dyn Fn(Fence) + Send + Sync>>,
     pub flushed: Vec<u32>,
+    /// (context, resource) of each attach, in order.
+    attaches: Vec<(u32, u32)>,
 }
 
 pub struct Fake {
@@ -42,13 +44,18 @@ pub struct Fake {
 impl Fake {
     pub fn new() -> Arc<Fake> {
         Arc::new(Fake {
-            st: Mutex::new(State { res: HashMap::new(), ctx: HashMap::new(), handler: None, flushed: Vec::new() }),
+            st: Mutex::new(State { res: HashMap::new(), ctx: HashMap::new(), handler: None, flushed: Vec::new(), attaches: Vec::new() }),
         })
     }
 
     #[cfg(test)]
     pub fn flushed(&self) -> Vec<u32> {
         self.st.lock().unwrap().flushed.clone()
+    }
+
+    #[cfg(test)]
+    pub fn attaches(&self) -> Vec<(u32, u32)> {
+        self.st.lock().unwrap().attaches.clone()
     }
 }
 
@@ -138,7 +145,9 @@ impl GpuBackend for Fake {
 
     fn detach_iov(&self, _handle: u32) {}
 
-    fn ctx_attach_resource(&self, _ctx_id: u32, _handle: u32) {}
+    fn ctx_attach_resource(&self, ctx_id: u32, handle: u32) {
+        self.st.lock().unwrap().attaches.push((ctx_id, handle));
+    }
 
     fn ctx_detach_resource(&self, _ctx_id: u32, _handle: u32) {}
 

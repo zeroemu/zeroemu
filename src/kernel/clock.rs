@@ -45,7 +45,12 @@ const STEP: u64 = 20_000;
 
 /// Nanoseconds since CLOCK_MONOTONIC's zero.
 pub fn monotonic_ns() -> u64 {
-    counter::to_ns(counter::now().wrapping_sub(counter::zero().0))
+    // The zero first: the first caller in the process fixes it from a counter reading
+    // of its own, which a reading taken before it could precede. And a thread that
+    // read the counter while another was fixing the zero reads 0, not a wrapped
+    // difference centuries long.
+    let zero = counter::zero().0;
+    counter::to_ns(counter::now().saturating_sub(zero))
 }
 
 /// CLOCK_MONOTONIC, as a Duration.

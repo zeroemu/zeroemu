@@ -412,6 +412,8 @@ fn flush_stats(took: Duration, frame: Option<&[u8]>) {
         black: u32,
         total: Duration,
         worst: Duration,
+        /// WORKER_CALLS when it started.
+        calls: u64,
     }
     static ON: OnceLock<bool> = OnceLock::new();
     static STATS: Mutex<Option<Window>> = Mutex::new(None);
@@ -419,7 +421,14 @@ fn flush_stats(took: Duration, frame: Option<&[u8]>) {
         return;
     }
     let mut g = STATS.lock().unwrap_or_else(|p| p.into_inner());
-    let w = g.get_or_insert_with(|| Window { since: Instant::now(), frames: 0, black: 0, total: Duration::ZERO, worst: Duration::ZERO });
+    let w = g.get_or_insert_with(|| Window {
+        since: Instant::now(),
+        frames: 0,
+        black: 0,
+        total: Duration::ZERO,
+        worst: Duration::ZERO,
+        calls: WORKER_CALLS.load(Ordering::Relaxed),
+    });
     w.frames += 1;
     // A sample is plenty, as a frame is either wholly black or it isn't. Alpha aside.
     if frame.is_some_and(|f| f.chunks_exact(4).step_by(1009).all(|p| p[..3] == [0, 0, 0] || p[1..] == [0, 0, 0])) {
@@ -429,9 +438,7 @@ fn flush_stats(took: Duration, frame: Option<&[u8]>) {
     w.worst = w.worst.max(took);
     let elapsed = w.since.elapsed();
     if elapsed >= Duration::from_secs(5) {
-        static CALLS_BEFORE: AtomicU64 = AtomicU64::new(0);
-        let calls = WORKER_CALLS.load(Ordering::Relaxed);
-        let calls = calls - CALLS_BEFORE.swap(calls, Ordering::Relaxed);
+        let calls = WORKER_CALLS.load(Ordering::Relaxed) - w.calls;
         eprintln!(
             "zeroemu: display {:.1} fps, {} black, {} avg {:.1} ms, worst {:.1} ms, window {}; virtio-gpu thread {:.0} calls/s; {}",
             w.frames as f64 / elapsed.as_secs_f64(),

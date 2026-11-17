@@ -588,7 +588,7 @@ pub struct Thread {
     in_syscall: Mutex<Option<SyscallSnap>>,
     /// The host thread it runs on, once it does, for its CPU time.
     host: std::sync::OnceLock<crate::hv::HostThread>,
-    /// Asked to give its vCPU back the next time it blocks (vcpus::reclaim_sleepers).
+    /// Asked to give its vCPU back the next time it blocks (vcpus::Pool::reclaim).
     give_back: AtomicBool,
     /// A descriptor table of its own: cloned without CLONE_FILES. Bionic's
     /// crash handler makes such a thread and closes everything in it.
@@ -652,9 +652,14 @@ pub fn wakeup_stats(over: Duration) -> String {
     );
     *last = (plain, keyed, wakes);
     static MADE_LAST: AtomicU64 = AtomicU64::new(0);
-    let made = vcpus::MADE.load(Ordering::Relaxed);
-    let (used, max) = vcpus::MAIN.get().and_then(|p| p.upgrade()).map_or((0, 0), |p| p.usage());
-    let s = format!("{s}, {:.0} vCPUs made/s, {used} of {max} in use", (made - MADE_LAST.swap(made, Ordering::Relaxed)) as f64 / secs);
+    static WAITED_LAST: AtomicU64 = AtomicU64::new(0);
+    let (made, waited) = (vcpus::MADE.load(Ordering::Relaxed), vcpus::WAITED.load(Ordering::Relaxed));
+    let (used, asleep, max) = vcpus::MAIN.get().and_then(|p| p.upgrade()).map_or((0, 0, 0), |p| p.usage());
+    let s = format!(
+        "{s}, {:.0} vCPUs made/s, {used} of {max} in use ({asleep} asleep), {:.0} waits for one/s",
+        (made - MADE_LAST.swap(made, Ordering::Relaxed)) as f64 / secs,
+        (waited - WAITED_LAST.swap(waited, Ordering::Relaxed)) as f64 / secs
+    );
     let top = wait::top_wakers(4);
     if top.is_empty() {
         return s;
@@ -830,11 +835,6 @@ impl Thread {
     /// Whether it is in a syscall now (a thread dump's view of it).
     pub fn in_syscall(&self) -> bool {
         self.in_syscall.try_lock().is_ok_and(|s| s.is_some())
-    }
-
-    /// How long it has been in the syscall it is in, if it is in one.
-    pub(super) fn in_syscall_for(&self) -> Option<Duration> {
-        self.in_syscall.try_lock().ok().and_then(|s| s.as_ref().map(|s| s.since.elapsed()))
     }
 
     /// CPU time it has used, in ns.

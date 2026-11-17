@@ -8,8 +8,9 @@
 //! space. Only the PI calls and FUTEX_CMP_REQUEUE read the word under a shard; a
 //! plain wait reads it after it queues, holding none (futex_wait).
 
-use super::{ERESTARTSYS, IDLE, Kernel, Thread};
+use super::{BACKSTOP, ERESTARTSYS, Kernel, Thread};
 use crate::errno::*;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -37,8 +38,7 @@ pub const SHARED: i32 = -1;
 /// A thread's place on the queues (Thread::futex), made with the thread and used for
 /// each of its waits, as a thread waits on one futex at a time: a wait allocates nothing.
 pub(super) struct Waiter {
-    /// Set, under the lock of its shard, by whoever takes it off its queue to wake it.
-    woken: Mutex<bool>,
+    st: Mutex<WaitState>,
     cv: Condvar,
     /// The key it is queued under now: FUTEX_REQUEUE moves waiters, and one that gives
     /// up (a timeout, a signal) must leave the queue it was moved to. Written under the
@@ -46,9 +46,27 @@ pub(super) struct Waiter {
     key: Mutex<(i32, u64)>,
 }
 
+#[derive(Default)]
+struct WaitState {
+    /// Set, under the lock of its shard, by whoever takes it off its queue to wake it.
+    woken: bool,
+    /// Its thread sleeps on `cv` now, so a wake or a kick has to tell it.
+    asleep: bool,
+}
+
 impl Waiter {
     pub(super) fn new() -> Arc<Waiter> {
-        Arc::new(Waiter { woken: Mutex::new(false), cv: Condvar::new(), key: Mutex::new((0, 0)) })
+        Arc::new(Waiter { st: Mutex::default(), cv: Condvar::new(), key: Mutex::new((0, 0)) })
+    }
+
+    /// For Thread::kick, once what the thread is to look at is set: wakes it if it
+    /// sleeps here. Under the lock it looks and sleeps under, so the kick can't come
+    /// between the two and be lost, as one through Thread::sleeping_on can; that is
+    /// what lets a futex wait sleep for as long as it waits.
+    pub(super) fn kick(&self) {
+        if self.st.lock().unwrap().asleep {
+            self.cv.notify_one();
+        }
     }
 }
 
@@ -90,27 +108,36 @@ fn shard_of(key: (i32, u64)) -> usize {
 /// Waiters taken off their queues, to be told once the shard's lock is let go: telling
 /// one is a host system call, which other threads should not wait on for the lock.
 #[derive(Default)]
-struct ToWake(Vec<Arc<Waiter>>);
+struct ToWake {
+    asleep: Vec<Arc<Waiter>>,
+    n: usize,
+}
 
 impl ToWake {
     /// Marks `w` woken, under its shard's lock, so that a waiter giving up meanwhile
-    /// finds itself both off the queue and woken.
+    /// finds itself both off the queue and woken. One not asleep yet needs no telling:
+    /// it looks before it sleeps.
     fn take(&mut self, w: Arc<Waiter>) {
-        *w.woken.lock().unwrap() = true;
-        self.0.push(w);
+        let mut st = w.st.lock().unwrap();
+        st.woken = true;
+        if st.asleep {
+            drop(st);
+            self.asleep.push(w);
+        }
+        self.n += 1;
     }
 
     fn tell(self) -> usize {
-        for w in &self.0 {
+        for w in &self.asleep {
             w.cv.notify_one();
         }
-        self.0.len()
+        self.n
     }
 }
 
 /// Puts a thread's waiter on `key`'s queue, not woken.
 fn queue(list: &mut Vec<Entry>, w: &Arc<Waiter>, key: (i32, u64), bitset: u32, tid: i32) {
-    *w.woken.lock().unwrap() = false;
+    w.st.lock().unwrap().woken = false;
     *w.key.lock().unwrap() = key;
     list.push(Entry { key, w: w.clone(), bitset, tid });
 }
@@ -125,7 +152,7 @@ impl Futexes {
         {
             let mut list = self.shard(key).lock().unwrap();
             let mut i = 0;
-            while i < list.len() && wake.0.len() < n as usize {
+            while i < list.len() && wake.n < n as usize {
                 let e = &list[i];
                 if e.key == key && e.bitset & bitset != 0 && e.tid == 0 {
                     wake.take(list.remove(i).w);
@@ -182,13 +209,13 @@ impl Futexes {
             };
             let mut moved = Vec::new();
             let mut i = 0;
-            while i < src.len() && wake.0.len() + moved.len() < wake_n.saturating_add(move_n) {
+            while i < src.len() && wake.n + moved.len() < wake_n.saturating_add(move_n) {
                 if src[i].key != key {
                     i += 1;
                     continue;
                 }
                 let mut e = src.remove(i);
-                if wake.0.len() < wake_n {
+                if wake.n < wake_n {
                     wake.take(e.w);
                 } else {
                     e.key = key2;
@@ -292,8 +319,9 @@ impl Kernel {
     /// Sleeps until this thread's waiter is woken, the deadline passes (`timed_out`)
     /// or a signal comes (`interrupted`); a waiter that gives up leaves its queue.
     fn futex_sleep(&self, t: &Thread, w: &Arc<Waiter>, deadline: Option<Instant>, timed_out: i64, interrupted: i64) -> i64 {
+        let mut fell_back = false;
         loop {
-            if *w.woken.lock().unwrap() {
+            if w.st.lock().unwrap().woken {
                 return 0;
             }
             let give_up = if deadline.is_some_and(|d| Instant::now() >= d) {
@@ -303,16 +331,32 @@ impl Kernel {
             } else {
                 None
             };
+            if std::mem::take(&mut fell_back) && (give_up.is_some() || t.give_back.load(Ordering::Relaxed)) {
+                let what = if give_up.is_some() { "a signal or exit" } else { "an ask for its vCPU" };
+                eprintln!("[zeroemu] late wake: tid {} futex: only the fallback timeout noticed {what}", t.tid);
+            }
             if let Some(err) = give_up {
                 return if self.futex.remove(w) { err } else { 0 };
             }
-            let nap = deadline.map_or(IDLE, |d| d.saturating_duration_since(Instant::now()).min(IDLE));
+            // Wakes and kicks both reach it under its lock (Waiter::kick): the limit
+            // is only a backstop.
+            let nap = deadline.map_or(BACKSTOP, |d| d.saturating_duration_since(Instant::now()).min(BACKSTOP));
             // Before the waiter's lock is taken: giving the vCPU back can take a while,
             // and a waker takes that lock while it holds the shard's.
             super::vcpus::blocking();
-            let woken = w.woken.lock().unwrap();
-            if !*woken {
-                drop(t.sleep(&w.cv, woken, nap));
+            let mut st = w.st.lock().unwrap();
+            if !st.woken {
+                // Asked for its vCPU since blocking() looked: the ask's kick found it
+                // not asleep yet, and Thread::sleep looks only for signals and exits.
+                // blocking() gives the vCPU up, the next time round.
+                if t.give_back.load(Ordering::Relaxed) {
+                    continue;
+                }
+                st.asleep = true;
+                let start = super::files::late_wake_log().then(Instant::now);
+                st = t.sleep(&w.cv, st, nap);
+                st.asleep = false;
+                fell_back = nap == BACKSTOP && start.is_some_and(|s| s.elapsed() >= nap);
             }
         }
     }

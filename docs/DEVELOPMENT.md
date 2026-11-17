@@ -110,8 +110,9 @@ Tracing:
   sticky directory, owner only, a missing capability).
 - `ZEROEMU_FAULTLOG=1` reports every fault that raises a signal, handled or not
   (`ZEROEMU_FAULTLOG=0x<address>`: only faults at that address).
-- `ZEROEMU_LATEWAKE=1` reports readiness that no wakeup announced. Such files work,
-  but only as fast as the fallback timeout.
+- `ZEROEMU_LATEWAKE=1` reports a poll, select, epoll or futex wait that only its
+  fallback timeout (30 s) ended: readiness, a signal or an ask for the thread's vCPU
+  that no wakeup announced. Such waits work, but only as fast as that timeout.
 - `ZEROEMU_TRACE=<file>` writes Android's own trace markers to a host file, each with the
   guest's monotonic time, pid and tid, with zeroemu's GPU ioctls on the guest thread that made
   them; turn Android's tags on with `ZEROEMU_PROPS=debug.atrace.tags.enableflags=0x86e`

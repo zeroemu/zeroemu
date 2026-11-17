@@ -11,7 +11,7 @@ use super::wait::EVENTS;
 use std::sync::OnceLock;
 use super::inet;
 use super::inotify;
-use super::{ERESTARTSYS, IDLE, Kernel, Thread, int};
+use super::{BACKSTOP, ERESTARTSYS, Kernel, Thread, int};
 use crate::arch::Sysno;
 use crate::errno::*;
 use crate::mm::SharedObject;
@@ -2324,6 +2324,7 @@ impl Kernel {
         let wanted = |fd: usize, s: &Vec<u64>| !s.is_empty() && s[fd / 64] & 1 << (fd % 64) != 0;
         let old = self.swap_mask(t, sigmask)?;
         let mut watching = super::wait::Mask::plain();
+        let mut fell_back = false;
         let r = loop {
             // As the last pass found them. A descriptor closed and reopened since is
             // a surprise this finds out about from its timeout.
@@ -2355,6 +2356,9 @@ impl Kernel {
                     }
                 }
             }
+            if count > 0 && fell_back && late_wake_log() {
+                eprintln!("[zeroemu] late wake: tid {} select: only the fallback timeout noticed {count} ready descriptors", t.tid);
+            }
             if count > 0 || deadline.is_some_and(|d| Instant::now() >= d) {
                 let mut mm = t.proc.mm();
                 for (i, &p) in [a[1], a[2], a[3]].iter().enumerate() {
@@ -2373,7 +2377,8 @@ impl Kernel {
                 watching = mask;
                 continue;
             }
-            EVENTS.wait(seen, nap(deadline, timer));
+            let nap = nap(deadline, timer);
+            fell_back = EVENTS.wait(seen, nap) && nap == BACKSTOP;
         };
         self.restore_mask(t, old, &r);
         r
@@ -2381,6 +2386,7 @@ impl Kernel {
 
     fn ppoll_wait(&self, t: &Thread, fds: u64, mut raw: Vec<u8>, deadline: Option<Instant>) -> Result<i64, i64> {
         let mut watching = super::wait::Mask::plain();
+        let mut fell_back = false;
         loop {
             let seen = EVENTS.watch(&watching);
             let mut ready = 0;
@@ -2410,6 +2416,9 @@ impl Kernel {
                     }
                 }
             }
+            if ready > 0 && fell_back && late_wake_log() {
+                eprintln!("[zeroemu] late wake: tid {} ppoll: only the fallback timeout noticed {ready} ready descriptors", t.tid);
+            }
             if ready > 0 || deadline.is_some_and(|d| Instant::now() >= d) {
                 t.proc.mm().write(fds, &raw)?;
                 return Ok(ready);
@@ -2421,7 +2430,8 @@ impl Kernel {
                 watching = mask;
                 continue;
             }
-            EVENTS.wait(seen, nap(deadline, timer));
+            let nap = nap(deadline, timer);
+            fell_back = EVENTS.wait(seen, nap) && nap == BACKSTOP;
         }
     }
 
@@ -2456,7 +2466,7 @@ impl Kernel {
                 break Err(EINTR);
             }
             let nap = nap(deadline, ep.deadline());
-            fell_back = EVENTS.wait(seen, nap) && nap == IDLE;
+            fell_back = EVENTS.wait(seen, nap) && nap == BACKSTOP;
         };
         self.restore_mask(t, old, &r);
         r
@@ -2492,16 +2502,17 @@ fn timer_deadline(f: &File) -> Option<Instant> {
 }
 
 /// How long a poller may sleep: until its deadline or the next timer. Changes,
-/// signals and exits all wake it, so the limit is only a backstop, and at hundreds of
-/// threads in epoll it had better be a long one.
+/// signals and exits all wake it, each under the lock of its EVENTS slot, so the limit
+/// is only a backstop, and at hundreds of threads in epoll it had better be a long one.
 fn nap(deadline: Option<Instant>, timer: Option<Instant>) -> Duration {
     let until = deadline.into_iter().chain(timer).min();
-    until.map_or(IDLE, |d| d.saturating_duration_since(Instant::now()).min(IDLE)).max(Duration::from_micros(50))
+    until.map_or(BACKSTOP, |d| d.saturating_duration_since(Instant::now()).min(BACKSTOP)).max(Duration::from_micros(50))
 }
 
-/// ZEROEMU_LATEWAKE=1: reports readiness nothing announced with EVENTS.bump.
-/// Those files work, but only as fast as the fallback timeout.
-fn late_wake_log() -> bool {
+/// ZEROEMU_LATEWAKE=1: reports readiness nothing announced with EVENTS.bump, and
+/// futex waits that only the fallback timeout ended. Those work, but only as fast as
+/// that timeout.
+pub(super) fn late_wake_log() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("ZEROEMU_LATEWAKE").is_some())
 }

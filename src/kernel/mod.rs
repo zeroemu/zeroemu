@@ -131,6 +131,11 @@ pub(super) const POLL: Duration = Duration::from_millis(200);
 /// For sleeps every wakeup reaches directly (Thread::sleep): only a kick lost
 /// in the instant before the sleep starts ever waits this long.
 pub(super) const IDLE: Duration = Duration::from_secs(2);
+/// For sleeps that every wakeup, kicks included, reaches under the lock they look and
+/// sleep under (futex waits, and the EVENTS waits of poll, select and epoll): nothing
+/// can be lost, and this only bounds what a bug would cost. IDLE, two seconds, woke a
+/// thousand sleeping threads a second for nothing.
+pub(super) const BACKSTOP: Duration = Duration::from_secs(30);
 /// Guest threads at once (each is a host thread; vCPUs are shared).
 const MAX_THREADS: usize = 16384;
 
@@ -590,7 +595,7 @@ pub struct Thread {
     host: std::sync::OnceLock<crate::hv::HostThread>,
     /// Asked to give its vCPU back the next time it blocks (vcpus::Pool::reclaim).
     give_back: AtomicBool,
-    /// Its place on the futex queues.
+    /// Its place on the futex queues, where a kick finds it asleep in a futex wait.
     futex: Arc<futex::Waiter>,
     /// A descriptor table of its own: cloned without CLONE_FILES. Bionic's
     /// crash handler makes such a thread and closes everything in it.
@@ -934,6 +939,7 @@ impl Thread {
         if let Some(cv) = &*self.sleeping_on.lock().unwrap() {
             unsafe { (*cv.0).notify_all() };
         }
+        self.futex.kick();
     }
 
     /// Sleeps on `cv` until it is notified, the thread is kicked, or `timeout`

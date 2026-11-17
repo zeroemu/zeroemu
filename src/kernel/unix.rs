@@ -731,6 +731,12 @@ impl Socket {
                         let n = out.len();
                         return Ok((out, fds, from, cred, n));
                     }
+                    if consumed && !peek {
+                        // MSG_WAITALL waits for more, but what it took made room, and a
+                        // writer may be waiting for that: with no bump, only its fallback
+                        // timeout would see it.
+                        EVENTS.bump_key(self.key());
+                    }
                 }
                 if q.write_closed || gone || shut_rd {
                     let n = out.len();

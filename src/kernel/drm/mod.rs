@@ -980,11 +980,18 @@ fn virt_context_init(o: &Open, arg: u64, io: &mut dyn Io) -> Result<i64, i64> {
 fn guest_backing(phys: &Arc<PhysMem>, size: u64) -> Result<(Arc<crate::mm::SharedObject>, gpu::Iov), i64> {
     let obj = crate::mm::SharedObject::new(phys.clone());
     let pages = size.div_ceil(phys::PAGE) as usize;
-    let mut iov = Vec::with_capacity(pages);
+    let mut iov: gpu::Iov = Vec::new();
     for i in 0..pages {
         let gpa = obj.frame(i)?;
         let n = (phys::PAGE as usize).min(size as usize - i * phys::PAGE as usize);
-        iov.push((phys.host(gpa), n));
+        let host = phys.host(gpa);
+        // Frames come in blocks that are contiguous on the host too: one entry for each
+        // run rather than each page, as the renderer walks the list from the start on
+        // every transfer (VirtioGpuResource::TransferWithIov).
+        match iov.last_mut() {
+            Some((p, len)) if p.wrapping_add(*len) == host => *len += n,
+            _ => iov.push((host, n)),
+        }
     }
     Ok((obj, iov))
 }
@@ -1522,7 +1529,8 @@ fn mode_rmfb(o: &Open, arg: u64, io: &mut dyn Io) -> Result<i64, i64> {
 fn present(o: &Open, fb: u32, user: u64, event: bool) -> Result<(), i64> {
     // Debugging: ZEROEMU_DUMP_RES=<dir> saves, on every 40th flip, each
     // display-sized resource as the host renderer sees it.
-    if let Ok(dir) = std::env::var("ZEROEMU_DUMP_RES") {
+    static DUMP: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    if let Some(dir) = DUMP.get_or_init(|| std::env::var("ZEROEMU_DUMP_RES").ok()) {
         static FLIPS: AtomicU64 = AtomicU64::new(0);
         let n = FLIPS.fetch_add(1, Ordering::Relaxed);
         if n % 40 == 20 && n < 400 {

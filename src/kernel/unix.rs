@@ -6,7 +6,7 @@
 
 use super::files::{File, Kind};
 use super::signal::{SIGPIPE, SigInfo};
-use super::wait::EVENTS;
+use super::wait::{EVENTS, Mask, key_mask};
 use super::{ERESTARTSYS, IDLE, Kernel, Thread, int, logd, netlink};
 use crate::arch::Sysno;
 use crate::errno::*;
@@ -213,6 +213,19 @@ pub(super) fn sockopt_bytes(t: &Thread, val: u64, len: u64) -> Result<Vec<u8>, i
 /// When a blocking call with this SO_RCVTIMEO / SO_SNDTIMEO gives up.
 pub(super) fn deadline(timeout: Option<Duration>) -> Option<Instant> {
     timeout.map(super::wait::instant_after)
+}
+
+/// For a loop that tried, found nothing, and will try again: the first time watches
+/// `mask`, for the loop to look once more before it sleeps, as a watch must come before
+/// the look a sleep follows; the next time sleeps, or gives up (wait_or_give_up).
+fn watch_or_wait(t: &Thread, seen: &mut Option<u64>, mask: &Mask, until: Option<Instant>) -> Result<(), i64> {
+    match seen.take() {
+        None => {
+            *seen = Some(EVENTS.watch(mask));
+            Ok(())
+        }
+        Some(s) => wait_or_give_up(t, s, until),
+    }
 }
 
 /// One sleep of a blocking socket call. A timeout ran out: EAGAIN. Signals
@@ -523,8 +536,11 @@ impl Socket {
     /// Queues a message for `target` (the peer, or a bound datagram socket).
     fn deliver(&self, t: &Thread, target: &Arc<Socket>, msg: Msg, nonblock: bool) -> Result<(), i64> {
         let until = deadline(self.st.lock().unwrap().opts.sndtimeo);
+        // Watched only when the queue is full: the sender would otherwise move its place
+        // in EVENTS to the target's key and back, and stay among the key's watchers until
+        // it does.
+        let mut seen = None;
         loop {
-            let seen = EVENTS.watch_key(target.key());
             {
                 let mut q = target.rx.lock().unwrap();
                 if q.bytes + msg.data.len() <= QUEUE_LIMIT || q.bytes == 0 {
@@ -539,7 +555,7 @@ impl Socket {
             if nonblock {
                 return Err(EAGAIN);
             }
-            wait_or_give_up(t, seen, until)?;
+            watch_or_wait(t, &mut seen, &key_mask(target.key()), until)?;
         }
     }
 
@@ -602,8 +618,8 @@ impl Socket {
         let cred = Cred::of(t);
         let mut done = 0;
         let stop = |done: usize, e: i64| if done > 0 { Ok(done) } else { Err(e) };
+        let mut seen = None;
         loop {
-            let seen = EVENTS.watch_key(target.key());
             let room = {
                 let mut q = target.rx.lock().unwrap();
                 let room = QUEUE_LIMIT.saturating_sub(q.bytes).min(data.len() - done);
@@ -630,7 +646,7 @@ impl Socket {
             if nonblock {
                 return stop(done, EAGAIN);
             }
-            if let Err(e) = wait_or_give_up(t, seen, until) {
+            if let Err(e) = watch_or_wait(t, &mut seen, &key_mask(target.key()), until) {
                 return stop(done, e);
             }
         }
@@ -644,8 +660,10 @@ impl Socket {
         let mut fds = Vec::new();
         let (mut from, mut cred) = (Vec::new(), Cred::default());
         let until = deadline(self.st.lock().unwrap().opts.rcvtimeo);
+        // Watched only once there is nothing (more) to take: most receives follow a
+        // poll that said there was.
+        let mut seen = None;
         loop {
-            let seen = EVENTS.watch(&self.mask());
             let (connected, shut_rd, gone) = {
                 let st = self.st.lock().unwrap();
                 if st.backlog.is_some() {
@@ -723,7 +741,7 @@ impl Socket {
                 let n = out.len();
                 return if n == 0 { Err(EAGAIN) } else { Ok((out, fds, from, cred, n)) };
             }
-            if let Err(e) = wait_or_give_up(t, seen, until) {
+            if let Err(e) = watch_or_wait(t, &mut seen, &self.mask(), until) {
                 let n = out.len();
                 return if n == 0 { Err(e) } else { Ok((out, fds, from, cred, n)) };
             }

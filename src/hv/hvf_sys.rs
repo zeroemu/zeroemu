@@ -57,6 +57,7 @@ pub const HV_SYS_REG_MAIR_EL1: u16 = 0xc510;
 pub const HV_SYS_REG_VBAR_EL1: u16 = 0xc600;
 pub const HV_SYS_REG_TPIDR_EL0: u16 = 0xde82;
 pub const HV_SYS_REG_SP_EL1: u16 = 0xe208;
+pub const HV_SYS_REG_TPIDR_EL1: u16 = 0xc684;
 pub const HV_SYS_REG_CNTKCTL_EL1: u16 = 0xc708;
 pub const HV_SYS_REG_TPIDRRO_EL0: u16 = 0xde83;
 

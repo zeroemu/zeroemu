@@ -189,8 +189,11 @@ struct Inner {
     /// What the host was last told about this thread.
     told: Option<Urgency>,
     /// A TLB flush asked for with no vCPU to ask: the next one does it. A new vCPU
-    /// flushing for itself isn't enough, since others hold translations too.
+    /// doesn't flush otherwise.
     flush_wanted: bool,
+    /// A flush asked of the live vCPU that it may not have run yet: if it is
+    /// destroyed first, the next one does it.
+    flush_asked: bool,
 }
 
 /// One guest thread's vCPU, made and destroyed on its own host thread.
@@ -239,6 +242,7 @@ impl Slot {
         };
         if std::mem::take(&mut i.flush_wanted) {
             v.flush_tlb();
+            i.flush_asked = true;
         }
         let id = self.pool.add_holder(&self.thread);
         i.gated = gate.map(|g| g.add_holder(&self.thread));
@@ -284,6 +288,7 @@ impl Slot {
         let mut i = self.inner.borrow_mut();
         let Some(v) = i.vcpu.take() else { return };
         i.state = v.state();
+        i.flush_wanted |= std::mem::take(&mut i.flush_asked);
         if let Some((id, _)) = i.held.take() {
             self.pool.st.lock().unwrap().holders.remove(&id);
         }
@@ -322,7 +327,7 @@ pub struct LazyVcpu(Rc<Slot>);
 
 impl LazyVcpu {
     pub fn new(hv: Arc<dyn Hypervisor>, pool: Arc<Pool>, thread: Arc<Thread>, root: PageTableRoot, state: CpuState) -> LazyVcpu {
-        let slot = Rc::new(Slot { hv, pool, thread, inner: RefCell::new(Inner { vcpu: None, state, root, held: None, gated: None, told: None, flush_wanted: false }) });
+        let slot = Rc::new(Slot { hv, pool, thread, inner: RefCell::new(Inner { vcpu: None, state, root, held: None, gated: None, told: None, flush_wanted: false, flush_asked: false }) });
         CURRENT.with(|c| *c.borrow_mut() = Some(slot.clone()));
         LazyVcpu(slot)
     }
@@ -372,7 +377,15 @@ impl Vcpu for LazyVcpu {
             }
             Ok(false) => {}
         }
-        let exit = self.0.inner.borrow_mut().vcpu.as_mut().unwrap().run();
+        let exit = {
+            let mut i = self.0.inner.borrow_mut();
+            let exit = i.vcpu.as_mut().unwrap().run();
+            // It went in, and through any flush asked for.
+            if !matches!(exit, Exit::Interrupted) {
+                i.flush_asked = false;
+            }
+            exit
+        };
         self.0.maybe_yield();
         exit
     }
@@ -420,16 +433,32 @@ impl Vcpu for LazyVcpu {
     fn flush_tlb(&mut self) {
         let mut i = self.0.inner.borrow_mut();
         match &mut i.vcpu {
-            Some(v) => v.flush_tlb(),
+            Some(v) => {
+                v.flush_tlb();
+                i.flush_asked = true;
+            }
+            None => i.flush_wanted = true,
+        }
+    }
+
+    fn flush_tlb_page(&mut self, va: u64) {
+        let mut i = self.0.inner.borrow_mut();
+        match &mut i.vcpu {
+            Some(v) => {
+                v.flush_tlb_page(va);
+                i.flush_asked = true;
+            }
             None => i.flush_wanted = true,
         }
     }
 
     fn flush_tlb_now(&mut self) {
-        // ready() came first, but keep to what a parked thread can do: a new
+        // ready() came first, but keep to what a parked thread can do: the next
         // vCPU flushes on its first entry, and nothing else here is on the way.
-        if let Some(v) = &mut self.0.inner.borrow_mut().vcpu {
-            v.flush_tlb_now();
+        let mut i = self.0.inner.borrow_mut();
+        match &mut i.vcpu {
+            Some(v) => v.flush_tlb_now(),
+            None => i.flush_wanted = true,
         }
     }
 

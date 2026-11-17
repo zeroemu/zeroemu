@@ -11,7 +11,6 @@ use crate::hv::{CpuState, Vcpu};
 use crate::mm::AddressSpace;
 use crate::phys::PAGE;
 use crate::vfs::{Node, S_IFMT, S_IFREG};
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
@@ -155,7 +154,7 @@ impl Kernel {
             child_cv: Condvar::new(),
             status: Mutex::new(None),
             exiting: Mutex::new(None),
-            pending: Mutex::new(HashMap::new()),
+            pending: Default::default(),
             knobs: Mutex::new(parent.knobs.lock().unwrap().clone()),
             creds: Mutex::new(parent.creds.lock().unwrap().clone()),
             attrs: Mutex::new(parent.attrs.lock().unwrap().fork(t.tid)),
@@ -233,10 +232,7 @@ impl Kernel {
         vcpu.set_page_tables(mm.root);
         vcpu.set_state(&state);
         // A flush this thread already asked for counts against these numbers.
-        {
-            let current = t.proc.mm();
-            (mm.tlb_gen, mm.flushed_gen) = (current.tlb_gen, current.flushed_gen);
-        }
+        mm.replace_tlb(&t.proc.mm());
         let old = t.proc.mm.lock().unwrap().replace(mm);
         drop(old);
         Ret::NoReturn

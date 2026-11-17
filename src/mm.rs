@@ -8,7 +8,7 @@ use crate::pagecache::{PageCache, PageSource};
 use crate::paging::{self, KERNEL_WINDOW, PROT_EXEC, PROT_READ, PROT_WRITE, USER_TOP};
 use crate::phys::{PAGE, PhysMem};
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 /// Lowest mappable address (Linux's mmap_min_addr on Android).
@@ -379,6 +379,76 @@ impl Drop for SharedObject {
     }
 }
 
+/// Where an address space's TLB flushes stand. Every thread compares the two on
+/// every way into the guest, so they are kept apart from the address space's lock:
+/// `changed` changes only under that lock, and a thread takes it only when it is behind.
+#[derive(Default)]
+pub struct TlbGen {
+    /// Bumped when entries are removed or downgraded.
+    changed: AtomicU64,
+    /// Every flush asked for up to this generation has run in the guest.
+    flushed: AtomicU64,
+}
+
+impl TlbGen {
+    /// For a new address space: behind by one, so that its first thread flushes its
+    /// ASID before anything runs. An ASID is used again once its address space has
+    /// gone, and nothing flushed what the TLBs held for it then.
+    fn fresh() -> TlbGen {
+        TlbGen { changed: AtomicU64::new(1), flushed: AtomicU64::new(0) }
+    }
+
+    /// Whether translations the page tables no longer allow may still be cached.
+    /// A bump that lands just after this is read is as one that came just after the
+    /// lock was let go: the thread that bumped flushes before it next runs guest code.
+    pub fn behind(&self) -> bool {
+        self.flushed.load(Ordering::Acquire) < self.changed.load(Ordering::Acquire)
+    }
+
+    pub fn current(&self) -> u64 {
+        self.changed.load(Ordering::Acquire)
+    }
+
+    /// A flush asked for at generation `g` has run.
+    pub fn flushed_to(&self, g: u64) {
+        self.flushed.fetch_max(g, Ordering::Release);
+    }
+
+    /// Under the address space's lock, after the entries changed and with what they
+    /// pointed at already in `stale`. The new generation.
+    fn bump(&self) -> u64 {
+        self.changed.fetch_add(1, Ordering::Release) + 1
+    }
+}
+
+/// Why translations went stale, for ZEROEMU_SYSCOUNT's thread dumps. Spurious
+/// counts the faults that needed no flush.
+#[derive(Clone, Copy)]
+pub enum TlbChange {
+    Unmap,
+    Discard,
+    Protect,
+    Remap,
+    Fork,
+    CopyOnWrite,
+    WriteAllowed,
+    Spurious,
+    NewSpace,
+}
+
+pub static TLB_CHANGES: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
+
+impl TlbChange {
+    pub const NAMES: [&str; 9] = ["munmap", "madvise", "mprotect", "mremap", "fork", "copy on write", "write allowed", "spurious fault (none)", "new address space"];
+
+    fn count(self) {
+        TLB_CHANGES[self as usize].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// In `AddressSpace::tlb_pages`: a change to more than one page.
+const WHOLE: u64 = u64::MAX;
+
 /// What an unmap left behind: frames and shared objects that must outlive the
 /// next TLB flush.
 #[derive(Default)]
@@ -533,13 +603,15 @@ pub struct AddressSpace {
     pub arg_start: u64,
     pub arg_end: u64,
     pub brk: u64,
-    /// Bumped when entries are removed or downgraded. `flushed_gen` catches up
-    /// once a TLB flush has run in the guest. A thread behind on this flushes
-    /// before re-entering, even if another thread has asked for a flush too:
-    /// that one may be preempted, and this thread must not run on old entries.
-    /// `stale` frames may be freed only after the flush.
-    pub tlb_gen: u64,
-    pub flushed_gen: u64,
+    /// Bumped when entries are removed or downgraded; `flushed` catches up once a
+    /// TLB flush has run in the guest. A thread behind on this flushes before
+    /// re-entering, even if another thread has asked for a flush too: that one may
+    /// be preempted, and this thread must not run on old entries. `stale` frames may
+    /// be freed only after the flush. Shared with the run loops of the process's
+    /// threads, and carried over by exec to the address space that replaces this one.
+    pub tlb: Arc<TlbGen>,
+    /// The generations not yet flushed, each with the one page it changed or WHOLE.
+    tlb_pages: Vec<(u64, u64)>,
     stale: Stale,
     /// User pages present in the tables, kept as entries come and go, as Linux keeps
     /// mm->rss_stat (include/linux/mm.h): /proc/<pid>/stat, statm, status and oom_score,
@@ -562,6 +634,7 @@ impl AddressSpace {
             table = t;
         }
         phys.write_u64(table + paging::index(KERNEL_WINDOW, paging::gib_level()) as u64 * 8, paging::table(kernel.table));
+        TlbChange::NewSpace.count();
         Ok(AddressSpace {
             phys,
             root: PageTableRoot { root, asid },
@@ -572,8 +645,8 @@ impl AddressSpace {
             arg_start: 0,
             arg_end: 0,
             brk: 0,
-            tlb_gen: 0,
-            flushed_gen: 0,
+            tlb: Arc::new(TlbGen::fresh()),
+            tlb_pages: vec![(1, WHOLE)],
             stale: Stale::default(),
             resident: 0,
         })
@@ -824,7 +897,7 @@ impl AddressSpace {
             }
         }
         if freed {
-            self.tlb_gen += 1;
+            self.tlb_changed(TlbChange::Unmap, (end - start == PAGE).then_some(start));
         }
         Ok(())
     }
@@ -835,8 +908,9 @@ impl AddressSpace {
         if !start.is_multiple_of(PAGE) {
             return Err(EINVAL);
         }
-        if self.clear_pages(start, start.saturating_add(page_up(len))) {
-            self.tlb_gen += 1;
+        let end = start.saturating_add(page_up(len));
+        if self.clear_pages(start, end) {
+            self.tlb_changed(TlbChange::Discard, (end - start == PAGE).then_some(start));
         }
         Ok(())
     }
@@ -936,7 +1010,7 @@ impl AddressSpace {
     }
 
     /// Replaces a private frame still shared with other owners by a private copy.
-    fn break_cow(&mut self, slot: u64, frame: u64, prot: u32) -> Result<u64, i64> {
+    fn break_cow(&mut self, page: u64, slot: u64, frame: u64, prot: u32) -> Result<u64, i64> {
         let copy = self.phys.alloc_for(self.owner())?;
         unsafe { std::ptr::copy_nonoverlapping(self.phys.host(frame), self.phys.host(copy), PAGE as usize) };
         self.sync_for_exec(copy, prot);
@@ -944,7 +1018,7 @@ impl AddressSpace {
         self.phys.write_pte(slot, e);
         // Sibling threads may read it through old entries until the flush.
         self.stale.frames.push(frame);
-        self.tlb_gen += 1;
+        self.tlb_changed(TlbChange::CopyOnWrite, Some(page));
         Ok(e)
     }
 
@@ -995,7 +1069,7 @@ impl AddressSpace {
             changed = true;
         });
         if changed {
-            self.tlb_gen += 1;
+            self.tlb_changed(TlbChange::Protect, (end - start == PAGE).then_some(start));
         }
         Ok(())
     }
@@ -1075,7 +1149,7 @@ impl AddressSpace {
             let slot = walk(&self.phys, owner, &mut self.tables, self.root.root, 0, dst + off, true)?.unwrap();
             self.phys.write_u64(slot, e);
         }
-        self.tlb_gen += 1;
+        self.tlb_changed(TlbChange::Remap, None);
         Ok(dst)
     }
 
@@ -1238,13 +1312,21 @@ impl AddressSpace {
                 if write && !shared && !self.phys.is_sole_owner(frame) {
                     // No thread can still write the old frame: fork flushed
                     // before it let go of the address space.
-                    self.break_cow(slot, frame, prot).map_err(|_| SEGV_MAPERR)?;
+                    self.break_cow(page, slot, frame, prot).map_err(|_| SEGV_MAPERR)?;
                     return Ok(());
                 }
                 self.phys.write_u64(slot, self.entry_for(frame, prot, shared));
+                self.tlb_changed(TlbChange::WriteAllowed, Some(page));
+                return Ok(());
             }
-            // Either way the entry now allows it; a stale TLB entry caused the fault.
-            self.tlb_gen += 1;
+            // The entry allows the access already: another thread changed it after
+            // this one walked. If the fault was for translation, the entry was invalid
+            // then, and no TLB holds an invalid entry. If it was for permission, whoever
+            // changed the entry bumped the generation: either that flush has reached
+            // every TLB, or this thread is behind and flushes before it goes back in.
+            // arm64 Linux does nothing here either (flush_tlb_fix_spurious_fault,
+            // arch/arm64/include/asm/pgtable.h).
+            TlbChange::Spurious.count();
             return Ok(());
         }
         let frame = self.populate(start, &vma, page, write).map_err(|_| SEGV_MAPERR)?;
@@ -1335,7 +1417,7 @@ impl AddressSpace {
         } else if write && !matches!(vma.backing, Backing::Shared { .. } | Backing::Dev { .. }) && !self.phys.is_sole_owner(paging::addr(e)) {
             // The kernel writes past the page tables: it must not reach a frame
             // another process still shares.
-            e = self.break_cow(slot, paging::addr(e), vma.prot)?;
+            e = self.break_cow(page, slot, paging::addr(e), vma.prot)?;
         }
         Ok(unsafe { self.phys.host(paging::addr(e)).add((va - page) as usize) })
     }
@@ -1478,12 +1560,53 @@ impl AddressSpace {
         }
         // Entries already changed are changed, whether or not the rest followed.
         if downgraded {
-            self.tlb_gen += 1;
+            self.tlb_changed(TlbChange::Fork, None);
         }
         match failed {
             Some(e) => Err(e),
             None => Ok(child),
         }
+    }
+
+    /// exec: this address space replaces `old` for the same threads, whose run loops
+    /// keep watching the flush state they started with.
+    /// Its own ASID's translations are flushed before it runs, as for any new one.
+    pub fn replace_tlb(&mut self, old: &AddressSpace) {
+        self.tlb = old.tlb.clone();
+        self.tlb_pages.clear();
+        self.tlb_stale(None); // counted as a NewSpace by new()
+    }
+
+    /// Entries changed in a way a TLB may still hold the old one of: in `page` only,
+    /// or anywhere (None). Under the lock, with what they pointed at already in `stale`.
+    fn tlb_changed(&mut self, why: TlbChange, page: Option<u64>) {
+        why.count();
+        self.tlb_stale(page);
+    }
+
+    fn tlb_stale(&mut self, page: Option<u64>) {
+        let flushed = self.tlb.flushed.load(Ordering::Acquire);
+        self.tlb_pages.retain(|&(g, _)| g > flushed);
+        let g = self.tlb.bump();
+        if self.tlb_pages.len() >= 8 {
+            self.tlb_pages.clear();
+            self.tlb_pages.push((g, WHOLE));
+        } else {
+            self.tlb_pages.push((g, page.unwrap_or(WHOLE)));
+        }
+    }
+
+    /// For a thread behind on the flushes, under the lock: the generation its flush
+    /// covers, and the one page every change since the last flush was to, if they
+    /// were all to one.
+    pub fn tlb_flush_scope(&mut self) -> (u64, Option<u64>) {
+        let flushed = self.tlb.flushed.load(Ordering::Acquire);
+        self.tlb_pages.retain(|&(g, _)| g > flushed);
+        let page = match self.tlb_pages.first() {
+            Some(&(_, p)) if p != WHOLE && self.tlb_pages.iter().all(|&(_, q)| q == p) => Some(p),
+            _ => None,
+        };
+        (self.tlb.current(), page)
     }
 
     /// What was unmapped since the last flush; release it once that happened.
@@ -1503,8 +1626,11 @@ impl Drop for AddressSpace {
         if rss_check() {
             self.check_resident();
         }
-        // Callers flush TLBs before dropping a space a vCPU may still cache
-        // (exec switches roots first; exited processes have no vCPUs left).
+        // No vCPU runs on it any more: exec switches roots first, once the other
+        // threads are gone, and an exited process has no vCPUs left. The TLBs may
+        // still hold its translations, under its ASID, but nothing runs under that
+        // ASID until it is given out again, and its next owner flushes it first
+        // (PhysMem::alloc_asid).
         let mut pages = Vec::new();
         self.visit(0, USER_TOP, &mut |_, _, va, e| pages.push((va, paging::addr(e))));
         for (va, frame) in pages {

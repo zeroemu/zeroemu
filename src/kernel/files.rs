@@ -2221,7 +2221,7 @@ impl Kernel {
             return Ok(None);
         }
         let m = t.proc.mm().read_u64(sigmask)? & !((1 << 8) | (1 << 18));
-        Ok(Some(t.mask.swap(m, Ordering::Relaxed)))
+        Ok(Some(t.set_mask(m)))
     }
 
     /// Ends a wait that ran under a temporary mask. On EINTR the handler runs
@@ -2229,9 +2229,9 @@ impl Kernel {
     fn restore_mask(&self, t: &Thread, old: Option<u64>, r: &Result<i64, i64>) {
         if let Some(m) = old {
             if matches!(r, Err(EINTR)) {
-                *t.saved_mask.lock().unwrap() = Some(m);
+                t.saved_mask.put(m);
             } else {
-                t.mask.store(m, Ordering::Relaxed);
+                t.set_mask(m);
             }
         }
     }

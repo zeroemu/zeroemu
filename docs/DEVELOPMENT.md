@@ -129,8 +129,9 @@ Stuck or busy guests:
 - `ZEROEMU_SYSCOUNT=1` adds to each thread dump what each thread has called since the
   last, which finds a thread in a loop: send `SIGUSR1` twice, a few seconds apart. From
   the second dump on, `[exits]` lines also give the exits from the VM per second since
-  the last dump, by kind (syscalls, page faults, kicks) and by syscall, and the share of
-  a core that page faults took.
+  the last dump, by kind (syscalls, page faults, kicks) and by syscall, the share of
+  a core that page faults took, and the TLB flushes run in the guest, by what they
+  covered and by why translations went stale.
 - `ZEROEMU_MEMSTAT=1` adds to each thread dump where memory has gone, by kind and by file.
 - `ZEROEMU_RSS_CHECK=1` checks each process's count of resident pages, which
   `/proc/<pid>/stat`, `statm`, `status` and `oom_score` and `getrusage` report, against a

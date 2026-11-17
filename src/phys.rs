@@ -271,8 +271,11 @@ impl PhysMem {
     }
 
     /// An address space id nothing has, taken in turn: one that went is used again last.
-    /// Whoever gets it starts on a vCPU that flushes first (a new one, or one switching
-    /// roots at exec), so nothing is left of what it meant before.
+    /// Nothing flushed its translations when its last owner went, so the TLBs may still
+    /// hold some. The new owner's first thread flushes the ASID before any of its code
+    /// runs: a new address space starts a generation behind (mm::TlbGen::fresh), and
+    /// exec bumps the generation for the one it puts in (AddressSpace::replace_tlb).
+    /// Without those the new owner would run on its predecessor's translations.
     pub fn alloc_asid(&self) -> Result<u16, i64> {
         let mut g = self.asids.lock().unwrap();
         let (used, next) = &mut *g;

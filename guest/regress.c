@@ -25,10 +25,13 @@ typedef unsigned int u32;
 #define NR_kill 129
 #define NR_tkill 130
 #define NR_rt_sigaction 134
+#define NR_rt_sigprocmask 135
 #define NR_setresuid 147
 #define NR_setresgid 149
+#define NR_getpid 172
 #define NR_gettid 178
 #define NR_munmap 215
+#define NR_madvise 233
 #define NR_mremap 216
 #define NR_clone 220
 #define NR_mmap 222
@@ -105,12 +108,99 @@ static i64 reap(i64 pid, i64 ms) {
 static volatile int handled;
 static void handler(int s) { (void)s; handled++; }
 
+// Spins in user code, with no syscall, until a signal's handler says to stop.
+static volatile int spin_tid, spin_stop, spin_done;
+static void spin_handler(int s) { (void)s; spin_stop = 1; }
+static void spin_on(void *arg) {
+    (void)arg;
+    spin_tid = (int)sys(NR_gettid);
+    while (!spin_stop) {}
+    spin_done = 1;
+}
+
+// Round after round, lets in with sigprocmask a SIGUSR1 that the main thread sends to
+// the whole process at about the same time, while no other thread lets it in. Then
+// it spins in user code until the handler has run: Linux delivers it on the way back
+// from sigprocmask, or wakes this thread for it (complete_signal, kernel/signal.c).
+// A round where it is still waiting after that long counts as missed.
+#define RACE_ROUNDS 2000
+static volatile int race_round, race_done, race_seen, race_missed;
+static void race_handler(int s) { (void)s; race_seen++; }
+static void race_on(void *arg) {
+    (void)arg;
+    u64 usr1 = 1UL << 9;
+    for (int i = 1; i <= RACE_ROUNDS; i++) {
+        while (race_round != i) {
+            if (race_round < 0) return;
+        }
+        // A different moment each round, against the main thread's kill.
+        for (int n = (i * 37) % 2000; n > 0; n--) __asm__ volatile("" ::: "memory");
+        sys(NR_rt_sigprocmask, 1 /* SIG_UNBLOCK */, &usr1, 0, 8);
+        for (long n = 0; race_seen != i && n < 50000000; n++) {}
+        if (race_seen != i) {
+            race_missed++;
+            sys(NR_getpid); // takes it on the way back
+        }
+        sys(NR_rt_sigprocmask, 0 /* SIG_BLOCK */, &usr1, 0, 8);
+        race_done = i;
+    }
+}
+
+// Reads a page in user code, with no syscall, until it is told the page was dropped.
+// Then whether it reads the zeros MADV_DONTNEED left (1) or the old value (2).
+static volatile int *watched;
+static volatile int watch_started, watch_dropped, watch_result;
+static void watch(void *arg) {
+    (void)arg;
+    watch_started = 1;
+    for (;;) {
+        int dropped = watch_dropped;
+        __asm__ volatile("dmb ish" ::: "memory");
+        int v = *watched;
+        if (dropped) {
+            watch_result = v == 0 ? 1 : 2;
+            return;
+        }
+    }
+}
+
+// The condition flags after a syscall (gettid) or a page fault (a write to `p`), set
+// to `in` just before.
+static u64 flags_through_syscall(u64 in) {
+    u64 out;
+    __asm__ volatile("msr nzcv, %1\n" "mov x8, #178\n" "svc #0\n" "mrs %0, nzcv\n" : "=&r"(out) : "r"(in) : "x0", "x8", "memory", "cc");
+    return out;
+}
+static u64 flags_through_fault(u64 in, volatile char *p) {
+    u64 out;
+    __asm__ volatile("msr nzcv, %1\n" "strb wzr, [%2]\n" "mrs %0, nzcv\n" : "=&r"(out) : "r"(in), "r"(p) : "memory", "cc");
+    return out;
+}
+
 static int fa, fb;
 static volatile i64 w1_ret = 99, w2_ret = 99;
 static void waiter1(void *arg) { (void)arg; i64 ts[2] = {0, 300000000}; w1_ret = sys(NR_futex, &fa, 0 /* WAIT */, 0, ts); }
 static void waiter2(void *arg) { (void)arg; i64 ts[2] = {3, 0}; w2_ret = sys(NR_futex, &fb, 0 /* WAIT */, 0, ts); }
-static char stacks[2][16384] __attribute__((aligned(16)));
-static int ctid[2];
+static char stacks[6][16384] __attribute__((aligned(16)));
+static int ctid[6];
+
+// MADV_DONTNEED of `pages` pages, one of which another thread is reading in user code:
+// once madvise returns, that thread no longer reads the old page. Linux's
+// flush_tlb_page and flush_tlb_range (arch/arm64/include/asm/tlbflush.h) reach every
+// CPU and wait for them.
+static void dropped_everywhere(u64 pages, int n, const char *name) {
+    char *m = (char *)sys(NR_mmap, 0, 4 * 4096, 3, 0x22, -1, 0);
+    watched = (volatile int *)(m + 4096);
+    *watched = 1;
+    watch_started = watch_dropped = watch_result = 0;
+    spawn(stacks[n] + 16384, watch, 0, &ctid[n]);
+    for (int i = 0; i < 200 && !watch_started; i++) nap_ms(5);
+    nap_ms(20); // reading it through its TLB by now
+    sys(NR_madvise, (u64)watched, pages * 4096, 4 /* MADV_DONTNEED */);
+    watch_dropped = 1;
+    for (int i = 0; i < 200 && !watch_result; i++) nap_ms(5);
+    check(watch_result == 1, name);
+}
 
 struct bwr { u64 wsize, wcons, wbuf, rsize, rcons, rbuf; };
 // binder_buffer_object: a scatter-gather buffer, and where in its parent its address goes.
@@ -250,6 +340,61 @@ int cmain(void) {
         sys(NR_exit_group, handled ? 0 : 3);
     }
     check(reap(pid, 3000) == 0, "sa_restorer is ignored without SA_RESTORER");
+
+    // --- a blocked signal runs its handler as soon as it is unblocked: Linux delivers it
+    // on the way back from sigprocmask, before the next instruction
+    handled = 0;
+    i64 usr1[4] = {(i64)handler, 0, 0, 0};
+    sys(NR_rt_sigaction, 10 /* SIGUSR1 */, usr1, 0, 8);
+    u64 block = 1UL << 9, old = 0;
+    sys(NR_rt_sigprocmask, 0 /* SIG_BLOCK */, &block, &old, 8);
+    sys(NR_tkill, sys(NR_gettid), 10);
+    int before = handled;
+    sys(NR_rt_sigprocmask, 2 /* SIG_SETMASK */, &old, 0, 8);
+    int after = handled;
+    check(before == 0 && after == 1, "a pending signal runs once unblocked, before sigprocmask returns");
+
+    // --- a signal reaches a thread that spins in user code and never makes a syscall
+    i64 usr2[4] = {(i64)spin_handler, 0, 0, 0};
+    sys(NR_rt_sigaction, 12 /* SIGUSR2 */, usr2, 0, 8);
+    spawn(stacks[2] + 16384, spin_on, 0, &ctid[2]);
+    for (int i = 0; i < 200 && !spin_tid; i++) nap_ms(5);
+    nap_ms(20); // well into its loop
+    sys(NR_tkill, spin_tid, 12);
+    for (int i = 0; i < 200 && !spin_done; i++) nap_ms(5);
+    check(spin_done, "a signal interrupts a thread spinning in user code");
+
+    // --- a signal sent to the process reaches the one thread that lets it in, even as
+    // it does so: Linux changes a mask, and picks a thread for a process's signal by
+    // its mask, under the same lock (kernel/signal.c)
+    i64 race_act[4] = {(i64)race_handler, 0, 0, 0};
+    sys(NR_rt_sigaction, 10 /* SIGUSR1 */, race_act, 0, 8);
+    u64 race_old = 0;
+    sys(NR_rt_sigprocmask, 0 /* SIG_BLOCK */, &block, &race_old, 8); // the new thread's too
+    spawn(stacks[5] + 16384, race_on, 0, &ctid[5]);
+    i64 self_pid = sys(NR_getpid);
+    for (int i = 1; i <= RACE_ROUNDS && race_missed < 4; i++) {
+        race_round = i;
+        sys(NR_kill, self_pid, 10);
+        while (race_done != i) {}
+    }
+    race_round = -1;
+    sys(NR_rt_sigprocmask, 2 /* SIG_SETMASK */, &race_old, 0, 8);
+    check(race_missed == 0 && race_seen == RACE_ROUNDS, "a process's signal reaches the thread letting it in as it is sent");
+
+    // --- the condition flags come back from a syscall and a page fault as they went in:
+    // Linux's kernel_exit puts back the PSTATE the exception saved (arch/arm64/kernel/entry.S)
+    char *fresh = (char *)sys(NR_mmap, 0, 16 * 4096, 3, 0x22, -1, 0);
+    int flags_kept = 1;
+    for (u64 f = 0; f < 16; f++) {
+        flags_kept &= flags_through_syscall(f << 28) == f << 28;
+        flags_kept &= flags_through_fault(f << 28, fresh + f * 4096) == f << 28;
+    }
+    check(flags_kept, "the condition flags survive a syscall and a page fault");
+
+    // --- pages dropped are gone for every thread when madvise returns
+    dropped_everywhere(1, 3, "another thread stops reading a page MADV_DONTNEED dropped");
+    dropped_everywhere(2, 4, "and one of two pages");
 
     // --- an exclusive load across a 16-byte boundary
     pid = fork_();

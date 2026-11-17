@@ -48,7 +48,7 @@ pub static WAITED: AtomicU64 = AtomicU64::new(0);
 /// destroyed and made a vCPU for them.
 const DROWSY: Duration = Duration::from_millis(2);
 
-/// How long a holder keeps its vCPU once others wait.
+/// How long a holder runs on, from when it took its place or last woke, once others wait.
 const SLICE: Duration = Duration::from_millis(10);
 
 /// How often free places are topped up, at most.
@@ -73,8 +73,10 @@ pub struct Pool {
 /// A thread holding a place.
 struct Holder {
     thread: Arc<Thread>,
-    /// When it took the place.
-    since: Instant,
+    /// When it took the place, or last woke from a sleep it kept the place through, in
+    /// ns after the pool's epoch: how long it has run, for a slice. A thread that slept
+    /// most of the time since it took the place has not kept anyone out.
+    run_since: AtomicU64,
     /// When its thread went to sleep in the kernel (`blocking`), in ns after the
     /// pool's epoch; 0 while it runs.
     asleep: AtomicU64,
@@ -123,7 +125,7 @@ impl Pool {
         let mut st = self.st.lock().unwrap();
         st.next += 1;
         let id = st.next;
-        let h = Arc::new(Holder { thread: thread.clone(), since: Instant::now(), asleep: AtomicU64::new(0) });
+        let h = Arc::new(Holder { thread: thread.clone(), run_since: AtomicU64::new(self.now_ns()), asleep: AtomicU64::new(0) });
         st.holders.insert(id, h.clone());
         (id, h)
     }
@@ -131,6 +133,11 @@ impl Pool {
     /// Now, as Holder::asleep counts it: never 0.
     fn now_ns(&self) -> u64 {
         self.epoch.elapsed().as_nanos() as u64 + 1
+    }
+
+    /// Whether `h` has run a slice since it took its place or last woke.
+    fn ran_slice(&self, h: &Holder) -> bool {
+        self.now_ns().saturating_sub(h.run_since.load(Ordering::Relaxed)) >= SLICE.as_nanos() as u64
     }
 
     /// Stops guest code: from now on threads wait at the door. Kicking those already
@@ -245,8 +252,8 @@ impl Pool {
                 // and then those that have run longest, once they have had their slice,
                 // which give theirs up at the exit this forces.
                 let asked = self.reclaim(&st, st.queue.len(), Duration::ZERO, true);
-                let mut running: Vec<_> = st.holders.values().filter(|h| h.asleep.load(Ordering::Relaxed) == 0 && h.since.elapsed() >= SLICE).collect();
-                running.sort_by_key(|h| h.since);
+                let mut running: Vec<_> = st.holders.values().filter(|h| h.asleep.load(Ordering::Relaxed) == 0 && self.ran_slice(h)).collect();
+                running.sort_by_key(|h| h.run_since.load(Ordering::Relaxed));
                 for h in running.iter().take(st.queue.len().saturating_sub(asked)) {
                     h.thread.kick();
                 }
@@ -402,12 +409,13 @@ impl Slot {
     }
 
     /// About to run guest code: no longer asleep, nor asked to give its vCPU back
-    /// because it was.
+    /// because it was, and its slice starts again.
     fn running(&self) {
         if let Some((_, h)) = &self.inner.borrow().held
             && h.asleep.load(Ordering::Relaxed) != 0
         {
             h.asleep.store(0, Ordering::Relaxed);
+            h.run_since.store(self.pool.now_ns(), Ordering::Relaxed);
             self.thread.give_back.store(false, Ordering::Relaxed);
         }
     }
@@ -437,12 +445,12 @@ impl Slot {
         self.pool.waiting.load(Ordering::Relaxed) > 0 || (gated && self.pool.background.as_ref().is_some_and(|g| g.waiting.load(Ordering::Relaxed) > 0))
     }
 
-    /// After an exit: give the vCPU up if others have waited a slice for one.
+    /// After an exit: give the vCPU up if others wait for one and it has run a slice.
     fn maybe_yield(&self) {
         if !self.wanted() {
             return;
         }
-        let held_long = self.inner.borrow().held.as_ref().is_some_and(|(_, h)| h.since.elapsed() >= SLICE);
+        let held_long = self.inner.borrow().held.as_ref().is_some_and(|(_, h)| self.pool.ran_slice(h));
         if held_long {
             self.park();
         }

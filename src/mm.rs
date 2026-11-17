@@ -661,7 +661,7 @@ impl Filler<'_> {
         if !write || self.phys.is_sole_owner(frame) {
             return Ok(frame);
         }
-        let copy = self.phys.alloc_for(self.owner);
+        let copy = self.phys.alloc_for_overwrite(self.owner);
         if let Ok(copy) = copy {
             unsafe { std::ptr::copy_nonoverlapping(self.phys.host(frame), self.phys.host(copy), PAGE as usize) };
         }
@@ -1101,7 +1101,7 @@ impl AddressSpace {
 
     /// Replaces a private frame still shared with other owners by a private copy.
     fn break_cow(&mut self, slot: u64, frame: u64, prot: u32) -> Result<u64, i64> {
-        let copy = self.phys.alloc_for(self.owner())?;
+        let copy = self.phys.alloc_for_overwrite(self.owner())?;
         unsafe { std::ptr::copy_nonoverlapping(self.phys.host(frame), self.phys.host(copy), PAGE as usize) };
         self.sync_for_exec(copy, prot);
         let e = paging::user_page(copy, prot);
@@ -1651,16 +1651,21 @@ impl AddressSpace {
         }
     }
 
-    /// A NUL-terminated string of at most 4 KiB (PATH_MAX).
+    /// A NUL-terminated string of at most 4 KiB (PATH_MAX). Looked for a page at a time,
+    /// as strncpy_from_user does, so a page after the NUL needn't be mapped.
     pub fn read_cstr(&mut self, va: u64) -> Result<String, i64> {
+        const MAX: usize = 4096;
         let mut out = Vec::new();
-        for i in 0..4096 {
-            let mut b = [0u8; 1];
-            self.read(va + i, &mut b)?;
-            if b[0] == 0 {
+        while out.len() < MAX {
+            let at = va.wrapping_add(out.len() as u64);
+            let n = ((PAGE - at % PAGE) as usize).min(MAX - out.len());
+            let p = self.host_ptr(at, false, false)?;
+            let bytes = unsafe { std::slice::from_raw_parts(p, n) };
+            if let Some(end) = bytes.iter().position(|&b| b == 0) {
+                out.extend_from_slice(&bytes[..end]);
                 return Ok(String::from_utf8_lossy(&out).into_owned());
             }
-            out.push(b[0]);
+            out.extend_from_slice(bytes);
         }
         Err(ENAMETOOLONG)
     }

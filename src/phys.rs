@@ -312,6 +312,16 @@ impl PhysMem {
     /// A zeroed frame for `owner` (an address space), which gets neighbouring frames
     /// where it can, since those are the ones that go when it does.
     pub fn alloc_for(&self, owner: u32) -> Result<u64, i64> {
+        self.take_for(owner, true)
+    }
+
+    /// As `alloc_for`, for a frame the caller writes whole before anything else can see
+    /// it (a copy of a page): its old contents aren't cleared first.
+    pub fn alloc_for_overwrite(&self, owner: u32) -> Result<u64, i64> {
+        self.take_for(owner, false)
+    }
+
+    fn take_for(&self, owner: u32, zero: bool) -> Result<u64, i64> {
         let mut a = self.alloc.lock().unwrap();
         if a.mapped == 0 {
             self.map_more(&mut a)?;
@@ -350,7 +360,7 @@ impl PhysMem {
             frame
         };
         drop(a);
-        if dirty {
+        if dirty && zero {
             unsafe { self.host(gpa).write_bytes(0, PAGE as usize) };
         }
         Ok(gpa)

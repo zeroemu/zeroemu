@@ -12,6 +12,7 @@ use crate::mm::SharedObject;
 use crate::phys::{PAGE, PhysMem};
 use crate::vfs::{FileSystem, io_errno};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::hash::BuildHasherDefault;
 use std::fs::File;
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -302,9 +303,33 @@ pub struct CachedFile {
 #[derive(Default)]
 struct FileState {
     /// By page: the frame, or'd with REFERENCED.
-    pages: HashMap<u32, u64>,
+    pages: HashMap<u32, u64, BuildHasherDefault<PageHasher>>,
     /// Windows being read, by someone who will wake the others.
-    loading: HashSet<u32>,
+    loading: HashSet<u32, BuildHasherDefault<PageHasher>>,
+}
+
+/// Hashes a page number. Every fault on a file looks its page up, and with the default
+/// SipHash the hashing cost more than the rest of the lookup. A page number needs only
+/// spreading: the multiply carries its low bits up, and the shift brings the mixed high
+/// bits back down to where the table takes its bucket from.
+#[derive(Default)]
+struct PageHasher(u64);
+
+impl std::hash::Hasher for PageHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.write_u32(b as u32 ^ (self.0 as u32).rotate_left(8));
+        }
+    }
+
+    fn write_u32(&mut self, n: u32) {
+        let h = (n as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        self.0 = h ^ h >> 32;
+    }
 }
 
 impl PageCache {

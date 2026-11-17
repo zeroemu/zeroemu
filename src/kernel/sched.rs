@@ -89,8 +89,10 @@ pub fn urgency(policy: u32, nice: i32, group: CpuGroup) -> Urgency {
 /// vCPU to queue for a background place. A pool thread answering calls from a more
 /// urgent thread would pay for both twice per call, to go back to sleep each time
 /// straight after its reply. So the host is told of a rise at once and of a fall only
-/// when the thread next sleeps in binder or takes another call: that is when it either
-/// stops running or runs at what the next call lends it.
+/// when the thread next sleeps in binder, or its read hands it something to act on (a
+/// call, an answer to its own call, an obituary): then it either stops running, or runs
+/// at its own priority or at what the next call lends it. Until then it runs only
+/// libbinder's loop, which reads again at once.
 impl Thread {
     /// The thread's own nice back after a call. Android sees it at once; the host only
     /// if that makes the thread more urgent.

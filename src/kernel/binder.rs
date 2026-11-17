@@ -1804,6 +1804,13 @@ impl Kernel {
                     };
                     let stop = self.emit(w, t, b.id, work, &mut out);
                     if stop {
+                        // The thread leaves the binder loop for code of its own: a call
+                        // to handle, its own call's answer or failure, an obituary. It
+                        // runs that at what the call lends it or at its own priority,
+                        // not at what the last call it answered left behind (see
+                        // Thread::restore_nice). Nothing else in a read takes a looper
+                        // out of libbinder's loop, which reads again at once.
+                        t.settle_urgency();
                         break;
                     }
                 }
@@ -1983,8 +1990,6 @@ impl Kernel {
                 } else if !oneway || saved > min {
                     t.set_nice(min);
                 }
-                // The call runs at what it lends, not at what the last one left.
-                t.settle_urgency();
                 if oneway {
                     w.txns.remove(&id);
                 } else {

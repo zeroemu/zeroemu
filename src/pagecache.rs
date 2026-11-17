@@ -23,8 +23,9 @@ pub trait PageSource: Send + Sync {
     /// The frame holding page `idx`, with a hold on it for the caller. None where
     /// the file has no such page: the caller's own zeros will do.
     fn page(&self, idx: u64) -> Result<Option<u64>, i64>;
-    /// As `page`, but None where that would read anything: a fault, which mustn't
-    /// while it has the address space locked (see `mm::PageRead`).
+    /// As `page`, but None where that would read anything, or wait for another thread
+    /// that may be: a fault, which mustn't while it has the address space locked (see
+    /// `mm::PageRead`).
     fn page_nowait(&self, idx: u64) -> Option<Result<Option<u64>, i64>> {
         Some(self.page(idx))
     }
@@ -33,8 +34,8 @@ pub trait PageSource: Send + Sync {
     fn read_bytes(&self, off: u64, len: usize) -> Result<Vec<u8>, i64>;
     /// For each (page, 0) of `pages`, the frame holding that page if it is in memory
     /// and mapped somewhere already, with a hold on it for the caller as `page` gives;
-    /// the others stay 0. It reads nothing and doesn't count as a use: it is for
-    /// mapping a fault's neighbours, which may never be touched (see
+    /// the others stay 0. It reads nothing, nor waits for a read, and doesn't count as a
+    /// use: it is for mapping a fault's neighbours, which may never be touched (see
     /// `AddressSpace::fault_around`).
     fn resident(&self, _pages: &mut [(u64, u64)]) {}
 }

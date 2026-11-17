@@ -9,7 +9,7 @@ use crate::paging::{self, KERNEL_WINDOW, PROT_EXEC, PROT_READ, PROT_WRITE, USER_
 use crate::phys::{PAGE, PhysMem};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 /// Lowest mappable address (Linux's mmap_min_addr on Android).
 pub const MIN_ADDR: u64 = 0x8000;
@@ -184,15 +184,30 @@ impl SharedObject {
         Ok(frame)
     }
 
-    /// As `map_frame`, but None if the page would have to be read back first, and it
-    /// leaves making room to whoever reads one (see `PageRead`). Mapping a page in
-    /// memory, or a new one, adds nothing that making room could take: a mapped page
-    /// can't go.
+    /// The pages, for a fault with its address space locked: None while another thread
+    /// has them, if that may be for as long as a read or write on the host's disk
+    /// (`in_memory`, `try_read` and `try_evict` do theirs holding them). The fault then
+    /// waits with the address space unlocked (see `PageRead`), as Linux's filemap_fault
+    /// lets go of mmap_lock to wait for a locked page (lock_folio_maybe_drop_mmap in
+    /// mm/filemap.c), and fault-around passes over the object, as filemap_map_pages
+    /// passes over a page it can't lock at once (next_uptodate_folio).
+    fn pages_nowait(&self) -> Option<MutexGuard<'_, Vec<Slot>>> {
+        if self.pager.is_none() {
+            // Nothing holds these longer than a copy in memory takes.
+            return Some(self.pages.lock().unwrap());
+        }
+        self.pages.try_lock().ok()
+    }
+
+    /// As `map_frame`, but None if the page would have to be read back first, or another
+    /// thread may be reading or writing one (`pages_nowait`), and it leaves making room
+    /// to whoever reads one (see `PageRead`). Mapping a page in memory, or a new one,
+    /// adds nothing that making room could take: a mapped page can't go.
     fn map_frame_nowait(&self, idx: usize) -> Option<Result<u64, i64>> {
         if idx >= MAX_PAGES {
             return Some(Err(EFAULT));
         }
-        let mut pages = self.pages.lock().unwrap();
+        let mut pages = self.pages_nowait()?;
         if pages.len() <= idx {
             pages.resize(idx + 1, Slot::default());
         }
@@ -210,9 +225,10 @@ impl SharedObject {
     /// For each (page, 0) of `pages`, the frame holding it if it is in memory now (and,
     /// with a pager, mapped somewhere already), with a hold on it for a mapping, as
     /// `map_frame` gives (`dirty` for a shared mapping that may write it); the others
-    /// stay 0. Nothing is read back or allocated.
+    /// stay 0. Nothing is read back or allocated, nor waited for while it may be read
+    /// (`pages_nowait`).
     fn resident_frames(&self, pages: &mut [(u64, u64)], dirty: bool) {
-        let mut slots = self.pages.lock().unwrap();
+        let Some(mut slots) = self.pages_nowait() else { return };
         for (idx, frame) in pages {
             let Some(slot) = usize::try_from(*idx).ok().and_then(|i| slots.get_mut(i)) else { continue };
             // With a pager, a page nothing maps stays unmapped, so that it can still go.
@@ -404,7 +420,7 @@ impl PageSource for SharedObject {
     }
 
     fn page_nowait(&self, idx: u64) -> Option<Result<Option<u64>, i64>> {
-        let mut pages = self.pages.lock().unwrap();
+        let mut pages = self.pages_nowait()?;
         let Some(idx) = usize::try_from(idx).ok().filter(|&i| pages.get(i).is_some_and(|s| s.frame != 0 || s.kept != 0)) else { return Some(Ok(None)) };
         if pages[idx].frame == 0 && self.pager.is_some() {
             return None;
@@ -1862,6 +1878,53 @@ mod tests {
         cache.reclaim(1 << 20);
         b.fault_reading(at, false, false).unwrap();
         assert_eq!(b.read_vec(at, 1).unwrap(), [5]);
+    }
+
+    /// A fault doesn't wait with the address space locked for a /data file's pages that
+    /// another thread has, which may be for a read from the host's disk: it waits
+    /// unlocked, and fault-around passes over that file meanwhile.
+    #[test]
+    fn a_fault_waits_unlocked_for_a_file_another_thread_has() {
+        let phys = PhysMem::new(Arc::new(crate::hv::NoHv));
+        let cache = PageCache::new(phys.clone());
+        let kernel = KernelWindow::new(&phys, &[]).unwrap();
+        let obj = SharedObject::with_pager(phys.clone(), Some(cache.clone()));
+        obj.write(0, &[5; 2 * PAGE as usize]).unwrap();
+        // Another process maps both pages, so fault-around would map the second.
+        let mut b = AddressSpace::new(phys.clone(), &kernel, 2).unwrap();
+        let there = b.map(Placement::Fixed(1 << 30), PAGE * 2, PROT_READ, Backing::Shared { obj: obj.clone(), offset: 0 }).unwrap();
+        b.fault_reading(there, false, false).unwrap();
+        b.fault_reading(there + PAGE, false, false).unwrap();
+        let mapped = |a: &AddressSpace| {
+            let mut n = 0;
+            a.each_resident(&mut |_, _, _, _| n += 1);
+            n
+        };
+        let mut a = AddressSpace::new(phys.clone(), &kernel, 1).unwrap();
+        let at = a.map(Placement::Fixed(1 << 30), PAGE * 2, PROT_READ, Backing::Shared { obj: obj.clone(), offset: 0 }).unwrap();
+        a.limit_prot(at, PAGE * 2, PROT_READ);
+        let held = obj.pages.lock().unwrap();
+        assert_eq!(a.fault(at, false, false), Err(FAULT_READ), "the page is in memory, but its file is taken");
+        drop(held);
+        let mut read = a.take_read().unwrap();
+        read.run();
+        let held = obj.pages.lock().unwrap();
+        a.give_read(read);
+        a.fault(at, false, false).unwrap();
+        drop(held);
+        a.forget_read();
+        assert_eq!(mapped(&a), 1, "no neighbours while the file is taken");
+        assert_eq!(a.read_vec(at + PAGE, 1).unwrap(), [5]);
+        // Private mappings of it too, and with it free, fault-around maps the neighbour.
+        let mut c = AddressSpace::new(phys.clone(), &kernel, 3).unwrap();
+        let at = c.map(Placement::Fixed(1 << 30), PAGE * 2, PROT_READ, Backing::File { src: obj.clone(), offset: 0 }).unwrap();
+        let held = obj.pages.lock().unwrap();
+        assert_eq!(c.fault(at, false, false), Err(FAULT_READ));
+        drop(held);
+        c.forget_read();
+        c.fault_reading(at, false, false).unwrap();
+        assert_eq!(mapped(&c), 2);
+        assert_eq!(c.read_vec(at, 1).unwrap(), [5]);
     }
 
     /// Fault-around says how many entries it filled: each one a page now present, which

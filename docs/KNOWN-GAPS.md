@@ -88,6 +88,18 @@ Emulator. [INTERNALS.md](INTERNALS.md) says how each part works.
 - userfaultfd has only what ART's compacting collector uses: SIGBUS mode, on private
   anonymous memory.
 
+## Threads and signals
+
+- A signal or an exit that comes just as a thread goes to sleep in `sigsuspend`,
+  `nanosleep`, `wait4`, a pipe or pty read or write, a file lock or binder can be missed
+  until the sleep's 2-second limit runs out. The thread is told without taking the lock
+  it sleeps under (`Thread::sleep`). Futex waits and `poll`, `select` and `epoll_wait`
+  aren't affected.
+- A signal sent to a whole process goes to one thread that lets it in. If that thread
+  blocks it before taking it, no other thread is told, where Linux passes it on
+  (`retarget_shared_pending` in kernel/signal.c): the signal waits for a thread that
+  lets it in to look at its signals.
+
 ## Graphics
 
 - Guest GLES reaches the renderer over virtio-gpu's pipe, not its shared-memory ring:

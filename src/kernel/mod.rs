@@ -868,6 +868,18 @@ impl Process {
         self.mm_taker.store(guest_tid(), Ordering::Relaxed);
         Mm(guard)
     }
+
+    /// The address space if nobody holds it now: for a caller that should not wait for
+    /// it under another lock (futex_wait).
+    pub fn try_mm(&self) -> Option<Mm<'_>> {
+        let guard = match self.mm.try_lock() {
+            Ok(g) => g,
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+            Err(std::sync::TryLockError::Poisoned(e)) => panic!("address space lock poisoned: {e}"),
+        };
+        self.mm_taker.store(guest_tid(), Ordering::Relaxed);
+        Some(Mm(guard))
+    }
 }
 
 /// ZEROEMU_SCHED_TRACE=1: every change in what the host is told about a thread.

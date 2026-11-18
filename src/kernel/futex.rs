@@ -5,8 +5,8 @@
 //! (kernel/futex/core.c), so futexes that hash apart never wait for each other.
 //!
 //! Lock order: a shard (for FUTEX_REQUEUE two, the lower first), then the address
-//! space. Only the PI calls and FUTEX_CMP_REQUEUE read the word under a shard; a
-//! plain wait reads it after it queues, holding none (futex_wait).
+//! space. A wait, the PI calls and FUTEX_CMP_REQUEUE read the word under a shard, so a
+//! waiter is on a queue only once its word held its value (futex_wait).
 
 use super::{BACKSTOP, ERESTARTSYS, Kernel, Thread};
 use crate::errno::*;
@@ -52,9 +52,6 @@ struct WaitState {
     woken: bool,
     /// Its thread sleeps on `cv` now, so a wake or a kick has to tell it.
     asleep: bool,
-    /// The bitset of the wake that took it, for a waiter that should never have been
-    /// queued to pass that wake on with (Futexes::unqueue_stale).
-    by: u32,
 }
 
 impl Waiter {
@@ -119,11 +116,10 @@ struct ToWake {
 impl ToWake {
     /// Marks `w` woken, under its shard's lock, so that a waiter giving up meanwhile
     /// finds itself both off the queue and woken. One not asleep yet needs no telling:
-    /// it looks before it sleeps. `by`: the waker's bitset.
-    fn take(&mut self, w: Arc<Waiter>, by: u32) {
+    /// it looks before it sleeps.
+    fn take(&mut self, w: Arc<Waiter>) {
         let mut st = w.st.lock().unwrap();
         st.woken = true;
-        st.by = by;
         if st.asleep {
             drop(st);
             self.asleep.push(w);
@@ -159,7 +155,7 @@ impl Futexes {
             while i < list.len() && wake.n < n as usize {
                 let e = &list[i];
                 if e.key == key && e.bitset & bitset != 0 && e.tid == 0 {
-                    wake.take(list.remove(i).w, bitset);
+                    wake.take(list.remove(i).w);
                 } else {
                     i += 1;
                 }
@@ -186,30 +182,17 @@ impl Futexes {
         }
     }
 
-    /// Takes off its queue a waiter whose word turned out not to hold the value it
-    /// waits for. On Linux it would never have been queued: futex_wait_setup
-    /// (kernel/futex/waitwake.c) reads the word with the bucket locked. So a wake that
-    /// took it off meanwhile, and counted it, goes on to the waiter that wake would
-    /// have reached next, which may have nothing else coming (a condition variable's
-    /// next waiter, for one). Waking one too many is allowed, as a futex waiter must
-    /// check why it woke; missing one is not.
-    fn unqueue_stale(&self, w: &Arc<Waiter>) {
-        if !self.remove(w) {
-            let key = *w.key.lock().unwrap();
-            let by = w.st.lock().unwrap().by;
-            self.wake(key, 1, by);
-        }
-    }
-
     /// FUTEX_REQUEUE: wakes up to `wake_n` waiters on `key`, and moves up to `move_n`
     /// of the rest to `key2`, behind those already there; FUTEX_CMP_REQUEUE first checks
     /// the word at `addr` is still `cmp`, under both shards' locks as Linux does
-    /// (futex_requeue in kernel/futex/requeue.c).
+    /// (futex_requeue in kernel/futex/requeue.c). Returns how many it woke and moved,
+    /// as Linux's task_count does for both.
     #[allow(clippy::too_many_arguments)]
     fn requeue(&self, t: &Thread, key: (i32, u64), key2: (i32, u64), addr: u64, cmp: Option<u32>, wake_n: usize, move_n: usize) -> i64 {
         let (a, b) = (shard_of(key), shard_of(key2));
         let (lo, hi) = (a.min(b), a.max(b));
         let mut wake = ToWake::default();
+        let moved_n;
         {
             let mut lo_g = self.shards[lo].0.lock().unwrap();
             let mut hi_g = (hi != lo).then(|| self.shards[hi].0.lock().unwrap());
@@ -235,16 +218,17 @@ impl Futexes {
                 }
                 let mut e = src.remove(i);
                 if wake.n < wake_n {
-                    wake.take(e.w, u32::MAX);
+                    wake.take(e.w);
                 } else {
                     e.key = key2;
                     *e.w.key.lock().unwrap() = key2;
                     moved.push(e);
                 }
             }
+            moved_n = moved.len();
             dst.unwrap_or(src).extend(moved);
         }
-        wake.tell() as i64
+        (wake.tell() + moved_n) as i64
     }
 }
 
@@ -444,7 +428,7 @@ impl Kernel {
             match res {
                 Ok((_, true)) => {
                     if let Some(i) = next {
-                        wake.take(list.remove(i).w, u32::MAX);
+                        wake.take(list.remove(i).w);
                     }
                     0
                 }
@@ -458,46 +442,30 @@ impl Kernel {
 
     fn futex_wait(&self, t: &Thread, key: (i32, u64), addr: u64, val: u32, deadline: Option<Instant>, bitset: u32) -> i64 {
         let w = &t.futex;
-        // Queued before the word is read. Linux reads it with the bucket locked
-        // (futex_wait_setup in kernel/futex/waitwake.c), so a FUTEX_WAKE after the
-        // change being waited for finds the waiter; queueing first does the same,
-        // and keeps the address space's lock, which a page fault may hold for a
-        // while, from being waited for under the shard's.
-        queue(&mut self.futex.shard(key).lock().unwrap(), w, key, bitset, 0);
-        let cur = t.proc.mm().read_u32(addr); // the address space's lock let go here
-        let err = match cur {
-            Ok(cur) if cur == val => return self.futex_sleep(t, w, deadline, -ETIMEDOUT, -EINTR),
-            Ok(_) => EAGAIN,
-            Err(e) => e,
+        // Queued only if the word holds `val`, read with the shard locked, as
+        // futex_wait_setup (kernel/futex/waitwake.c) reads it with the bucket locked: a
+        // wake after the change being waited for finds the waiter, and a wake or a
+        // requeue finds only waiters that sleep. A requeue that moved a waiter about to
+        // find its word changed would leave a sleeper behind, and lose its wakeup.
+        let mut list = self.futex.shard(key).lock().unwrap();
+        let cur = match t.proc.try_mm() {
+            Some(mut mm) => mm.read_u32(addr),
+            None => {
+                // A page fault may hold the address space for a while: wait for it
+                // without the shard, as Linux faults the word's page in with the
+                // bucket unlocked, then read again.
+                drop(list);
+                drop(t.proc.mm());
+                list = self.futex.shard(key).lock().unwrap();
+                t.proc.mm().read_u32(addr)
+            }
         };
-        self.futex.unqueue_stale(w);
-        -err
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_wake_taken_by_a_stale_waiter_goes_on_to_the_next() {
-        let f = Futexes::default();
-        let key = (1, 0x1000);
-        let (stale, next) = (Waiter::new(), Waiter::new());
-        queue(&mut f.shard(key).lock().unwrap(), &stale, key, 0b01, 0);
-        queue(&mut f.shard(key).lock().unwrap(), &next, key, 0b10, 0);
-        // FUTEX_WAKE_BITSET(1, 0b11) takes the first, whose word then reads changed. On
-        // Linux the first would not have been queued and the wake would reach the other,
-        // although its bitset isn't the first one's.
-        assert_eq!(f.wake(key, 1, 0b11), 1);
-        f.unqueue_stale(&stale);
-        assert!(next.st.lock().unwrap().woken, "passed on, with the waker's bitset");
-        assert!(!f.remove(&next), "and taken off the queue");
-        // One that leaves before any wake takes it wakes nobody.
-        queue(&mut f.shard(key).lock().unwrap(), &stale, key, u32::MAX, 0);
-        queue(&mut f.shard(key).lock().unwrap(), &next, key, u32::MAX, 0);
-        f.unqueue_stale(&stale);
-        assert!(!next.st.lock().unwrap().woken);
-        assert!(f.remove(&next));
+        match cur {
+            Ok(cur) if cur == val => queue(&mut list, w, key, bitset, 0),
+            Ok(_) => return -EAGAIN,
+            Err(e) => return -e,
+        }
+        drop(list);
+        self.futex_sleep(t, w, deadline, -ETIMEDOUT, -EINTR)
     }
 }

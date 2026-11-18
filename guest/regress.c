@@ -185,6 +185,9 @@ static void waiter2(void *arg) { (void)arg; i64 ts[2] = {3, 0}; w2_ret = sys(NR_
 static int fc;
 static volatile i64 w3_ret = 99;
 static void waiter3(void *arg) { (void)arg; w3_ret = sys(NR_futex, &fc, 9 /* WAIT_BITSET */, 0, 0, 0, 1); }
+// Waits for a value the word never holds, over and over: each FUTEX_WAIT is EAGAIN.
+static volatile int rq_word = 1, rq_dst, rq_stop;
+static void rq_noise(void *arg) { (void)arg; while (!rq_stop) sys(NR_futex, &rq_word, 128 /* WAIT_PRIVATE */, 0); }
 static char stacks[6][16384] __attribute__((aligned(16)));
 static int ctid[6];
 
@@ -448,6 +451,22 @@ int cmain(void) {
     check(none == 0 && one == 1 && w3_ret == 0, "FUTEX_WAKE_BITSET wakes only waiters with a bit in common");
     sys(NR_futex, &fc, 1, 10);
     nap_ms(50);
+
+    // --- FUTEX_REQUEUE moves only waiters that sleep. Linux queues a FUTEX_WAIT only
+    // once the word holds its value, so the requeue below never moves the noise
+    // threads' waits, and the wake behind it finds nobody. ART signals a condition
+    // variable this way: a stale wait moved in a sleeper's place loses the sleeper's
+    // wakeup.
+    for (int n = 0; n < 3; n++) spawn(stacks[n] + 16384, rq_noise, 0, &ctid[n]);
+    nap_ms(20);
+    i64 rq_moved = 0, rq_woke = 0;
+    for (int i = 0; i < 20000; i++) {
+        rq_moved += sys(NR_futex, &rq_word, 3 | 128 /* REQUEUE_PRIVATE */, 0, 1, &rq_dst);
+        rq_woke += sys(NR_futex, &rq_dst, 1 | 128 /* WAKE_PRIVATE */, 0x7fffffff);
+    }
+    rq_stop = 1;
+    nap_ms(50);
+    check(rq_moved == 0 && rq_woke == 0, "FUTEX_REQUEUE never moves a FUTEX_WAIT whose value was stale");
 
     // --- binder: a buffer's pointer goes inside its parent, not wherever the sender says
     int mgr = (int)sys(NR_openat, -100, "/dev/binder", 02000002, 0);

@@ -87,18 +87,24 @@ Emulator. [INTERNALS.md](INTERNALS.md) says how each part works.
   can't change its ids and fails.
 - userfaultfd has only what ART's compacting collector uses: SIGBUS mode, on private
   anonymous memory.
+- `epoll_wait` marks a one-shot registration as fired, and an edge-triggered one as
+  reported, before it copies the events out. If the copy fails (EFAULT), those events
+  are lost, where Linux puts them back (`ep_send_events` in fs/eventpoll.c).
 
 ## Threads and signals
 
 - A signal or an exit that comes just as a thread goes to sleep in `sigsuspend`,
-  `nanosleep`, `wait4`, a pipe or pty read or write, a file lock or binder can be missed
-  until the sleep's 2-second limit runs out. The thread is told without taking the lock
-  it sleeps under (`Thread::sleep`). Futex waits and `poll`, `select` and `epoll_wait`
-  aren't affected.
+  `nanosleep`, `wait4`, a pipe or pty read or write, a file lock or binder, or while it
+  waits for a vCPU, can be missed until the sleep's 2-second limit runs out. The thread
+  is told without taking the lock it sleeps under (`Thread::sleep`). In `rt_sigtimedwait`
+  (ART's signal catcher waits for SIGQUIT there) the window is wider: any of the
+  awaited signals sent between its look at what is pending and its sleep can wait the
+  2 seconds. Futex waits and `poll`, `select` and `epoll_wait` aren't affected.
 - A signal sent to a whole process goes to one thread that lets it in. If that thread
-  blocks it before taking it, no other thread is told, where Linux passes it on
-  (`retarget_shared_pending` in kernel/signal.c): the signal waits for a thread that
-  lets it in to look at its signals.
+  blocks it or exits before taking it, no other thread is told, where Linux passes it on
+  (`retarget_shared_pending`, from `__set_task_blocked` and `exit_signals` in
+  kernel/signal.c): the signal waits for a thread that lets it in to look at its
+  signals.
 
 ## Graphics
 

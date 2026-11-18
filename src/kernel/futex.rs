@@ -186,13 +186,16 @@ impl Futexes {
     /// of the rest to `key2`, behind those already there; FUTEX_CMP_REQUEUE first checks
     /// the word at `addr` is still `cmp`, under both shards' locks as Linux does
     /// (futex_requeue in kernel/futex/requeue.c). Returns how many it woke and moved,
-    /// as Linux's task_count does for both.
+    /// as Linux's task_count does for both. A PI lock's waiter on `key` stops it with
+    /// EINVAL, as on Linux: only FUTEX_UNLOCK_PI may hand it the lock. Those it took
+    /// before that stay woken or moved.
     #[allow(clippy::too_many_arguments)]
     fn requeue(&self, t: &Thread, key: (i32, u64), key2: (i32, u64), addr: u64, cmp: Option<u32>, wake_n: usize, move_n: usize) -> i64 {
         let (a, b) = (shard_of(key), shard_of(key2));
         let (lo, hi) = (a.min(b), a.max(b));
         let mut wake = ToWake::default();
         let moved_n;
+        let mut pi = false;
         {
             let mut lo_g = self.shards[lo].0.lock().unwrap();
             let mut hi_g = (hi != lo).then(|| self.shards[hi].0.lock().unwrap());
@@ -216,6 +219,10 @@ impl Futexes {
                     i += 1;
                     continue;
                 }
+                if src[i].tid != 0 {
+                    pi = true;
+                    break;
+                }
                 let mut e = src.remove(i);
                 if wake.n < wake_n {
                     wake.take(e.w);
@@ -228,7 +235,8 @@ impl Futexes {
             moved_n = moved.len();
             dst.unwrap_or(src).extend(moved);
         }
-        (wake.tell() + moved_n) as i64
+        let n = wake.tell() + moved_n;
+        if pi { -EINVAL } else { n as i64 }
     }
 }
 
@@ -247,6 +255,10 @@ impl Kernel {
     pub(super) fn sys_futex(&self, t: &Thread, uaddr: u64, op: u32, val: u32, timeout: u64, uaddr2: u64, val3: u32) -> i64 {
         let addr = crate::arch::untag(uaddr);
         let private = op & FUTEX_PRIVATE_FLAG != 0;
+        // A futex is an aligned word (get_futex_key in kernel/futex/core.c).
+        if !addr.is_multiple_of(4) {
+            return -EINVAL;
+        }
         let key = self.futex_key(t, addr, private);
         match op & FUTEX_CMD_MASK {
             FUTEX_WAIT | FUTEX_WAIT_BITSET => {
@@ -278,13 +290,22 @@ impl Kernel {
                 };
                 self.futex_wait(t, key, addr, val, deadline, bitset)
             }
-            FUTEX_WAKE => self.futex.wake(key, val, u32::MAX),
-            FUTEX_WAKE_BITSET => self.futex.wake(key, val, val3),
+            // The count is an int, and futex_wake (kernel/futex/waitwake.c) wakes a
+            // waiter before it compares: 0 or less wakes one.
+            FUTEX_WAKE => self.futex.wake(key, (val as i32).max(1) as u32, u32::MAX),
+            FUTEX_WAKE_BITSET if val3 == 0 => -EINVAL,
+            FUTEX_WAKE_BITSET => self.futex.wake(key, (val as i32).max(1) as u32, val3),
             FUTEX_REQUEUE | FUTEX_CMP_REQUEUE => {
+                // Both counts are ints, the second the timeout slot's low 32 bits
+                // (kernel/futex/syscalls.c), and a negative one is EINVAL, as is a target
+                // that isn't an aligned word (futex_requeue in kernel/futex/requeue.c).
+                let (wake_n, move_n) = (val as i32, timeout as u32 as i32);
+                if wake_n < 0 || move_n < 0 || !crate::arch::untag(uaddr2).is_multiple_of(4) {
+                    return -EINVAL;
+                }
                 let key2 = self.futex_key(t, uaddr2, private);
                 let cmp = (op & FUTEX_CMD_MASK == FUTEX_CMP_REQUEUE).then_some(val3);
-                // val2 travels in the timeout slot.
-                self.futex.requeue(t, key, key2, addr, cmp, val as usize, timeout as usize)
+                self.futex.requeue(t, key, key2, addr, cmp, wake_n as usize, move_n as usize)
             }
             FUTEX_LOCK_PI | FUTEX_LOCK_PI2 | FUTEX_TRYLOCK_PI => {
                 let cmd = op & FUTEX_CMD_MASK;
@@ -453,7 +474,9 @@ impl Kernel {
             None => {
                 // A page fault may hold the address space for a while: wait for it
                 // without the shard, as Linux faults the word's page in with the
-                // bucket unlocked, then read again.
+                // bucket unlocked, then read again under the shard. If someone took
+                // it again meanwhile, that read waits for it there, as FUTEX_CMP_REQUEUE
+                // and the PI calls do.
                 drop(list);
                 drop(t.proc.mm());
                 list = self.futex.shard(key).lock().unwrap();

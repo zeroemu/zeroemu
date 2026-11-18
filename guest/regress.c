@@ -188,8 +188,27 @@ static void waiter3(void *arg) { (void)arg; w3_ret = sys(NR_futex, &fc, 9 /* WAI
 // Waits for a value the word never holds, over and over: each FUTEX_WAIT is EAGAIN.
 static volatile int rq_word = 1, rq_dst, rq_stop;
 static void rq_noise(void *arg) { (void)arg; while (!rq_stop) sys(NR_futex, &rq_word, 128 /* WAIT_PRIVATE */, 0); }
+static volatile int wz, pi_word;
+static volatile i64 wz_ret = 99, pi_ret = 99;
+static void wz_waiter(void *arg) { (void)arg; i64 ts[2] = {2, 0}; wz_ret = sys(NR_futex, &wz, 128 /* WAIT_PRIVATE */, 0, ts); }
+static void pi_waiter(void *arg) {
+    (void)arg;
+    pi_ret = sys(NR_futex, &pi_word, 6 | 128 /* LOCK_PI_PRIVATE */, 0, 0);
+    if (pi_ret == 0) sys(NR_futex, &pi_word, 7 | 128 /* UNLOCK_PI_PRIVATE */);
+}
 static char stacks[6][16384] __attribute__((aligned(16)));
 static int ctid[6];
+// Waits up to a second for the threads spawned with these ctids, set nonzero first, to
+// exit: CLONE_CHILD_CLEARTID zeroes each.
+static int gone(int from, int to) {
+    for (int ms = 0; ms < 1000; ms += 5) {
+        int left = 0;
+        for (int n = from; n < to; n++) left |= ctid[n];
+        if (!left) return 1;
+        nap_ms(5);
+    }
+    return 0;
+}
 
 // MADV_DONTNEED of `pages` pages, one of which another thread is reading in user code:
 // once madvise returns, that thread no longer reads the old page. Linux's
@@ -460,11 +479,14 @@ int cmain(void) {
     nap_ms(50);
 
     // --- FUTEX_REQUEUE moves only waiters that sleep. Linux queues a FUTEX_WAIT only
-    // once the word holds its value, so the requeue below never moves the noise
-    // threads' waits, and the wake behind it finds nobody. ART signals a condition
-    // variable this way: a stale wait moved in a sleeper's place loses the sleeper's
-    // wakeup.
-    for (int n = 0; n < 3; n++) spawn(stacks[n] + 16384, rq_noise, 0, &ctid[n]);
+    // once the word holds its value (futex_wait_setup in kernel/futex/waitwake.c), so
+    // the requeue below never moves the noise threads' waits, and the wake behind it
+    // finds nobody. ART signals a condition variable this way: a stale wait moved in a
+    // sleeper's place loses the sleeper's wakeup.
+    for (int n = 0; n < 3; n++) {
+        ctid[n] = -1;
+        spawn(stacks[n] + 16384, rq_noise, 0, &ctid[n]);
+    }
     nap_ms(20);
     i64 rq_moved = 0, rq_woke = 0;
     for (int i = 0; i < 20000; i++) {
@@ -472,8 +494,29 @@ int cmain(void) {
         rq_woke += sys(NR_futex, &rq_dst, 1 | 128 /* WAKE_PRIVATE */, 0x7fffffff);
     }
     rq_stop = 1;
-    nap_ms(50);
-    check(rq_moved == 0 && rq_woke == 0, "FUTEX_REQUEUE never moves a FUTEX_WAIT whose value was stale");
+    check(gone(0, 3) && rq_moved == 0 && rq_woke == 0, "FUTEX_REQUEUE never moves a FUTEX_WAIT whose value was stale");
+
+    // --- futex arguments Linux refuses or reads its own way (kernel/futex/core.c,
+    // waitwake.c, requeue.c, syscalls.c)
+    check(sys(NR_futex, (u64)&rq_word + 1, 1 | 128, 1) == -22 && sys(NR_futex, &rq_word, 3 | 128, 0, 1, (u64)&rq_dst + 2) == -22,
+          "a futex word that isn't aligned is EINVAL");
+    check(sys(NR_futex, &rq_word, 10 | 128 /* WAKE_BITSET */, 1, 0, 0, 0) == -22, "FUTEX_WAKE_BITSET with no bits is EINVAL");
+    check(sys(NR_futex, &rq_word, 3 | 128, -1, 1, &rq_dst) == -22 && sys(NR_futex, &rq_word, 3 | 128, 0, 0xffffffffL, &rq_dst) == -22
+          && sys(NR_futex, &rq_word, 3 | 128, 0, 0x100000000L, &rq_dst) == 0, "FUTEX_REQUEUE's counts are ints, the second in the timeout's low half");
+    ctid[0] = -1;
+    spawn(stacks[0] + 16384, wz_waiter, 0, &ctid[0]);
+    nap_ms(60);
+    i64 wz_woke = sys(NR_futex, &wz, 1 | 128, 0);
+    check(gone(0, 1) && wz_woke == 1 && wz_ret == 0, "FUTEX_WAKE of 0 wakes one, as on Linux");
+    check(sys(NR_futex, &pi_word, 6 | 128, 0, 0) == 0, "FUTEX_LOCK_PI takes a free lock");
+    ctid[0] = -1;
+    spawn(stacks[0] + 16384, pi_waiter, 0, &ctid[0]);
+    nap_ms(60);
+    i64 pi_requeued = sys(NR_futex, &pi_word, 3 | 128, 1, 1, &rq_dst);
+    i64 pi_waiting = pi_ret;
+    sys(NR_futex, &pi_word, 7 | 128 /* UNLOCK_PI */);
+    check(pi_requeued == -22 && pi_waiting == 99 && gone(0, 1) && pi_ret == 0 && pi_word == 0,
+          "FUTEX_REQUEUE leaves a PI lock's waiter alone (EINVAL), and it gets the lock at unlock");
 
     // --- binder: a buffer's pointer goes inside its parent, not wherever the sender says
     int mgr = (int)sys(NR_openat, -100, "/dev/binder", 02000002, 0);

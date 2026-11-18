@@ -54,12 +54,13 @@ impl Kernel {
     /// mapped for the access yet, as touching it would, without a VM exit for each
     /// (madvise_populate in mm/madvise.c). Stops at the first page that can't be: EFAULT
     /// where touching it would have raised a signal. Lets go of the lock every 2 MB, so
-    /// that a large range doesn't hold up the process's other threads.
-    fn populate(&self, t: &Thread, start: u64, end: u64, write: bool) -> Result<(), i64> {
+    /// that a large range doesn't hold up the process's other threads. `force`: for
+    /// MAP_POPULATE (AddressSpace::needs_populate).
+    fn populate(&self, t: &Thread, start: u64, end: u64, write: bool, force: bool) -> Result<(), i64> {
         let mut mm = t.proc.mm();
         let mut at = start;
         while at < end {
-            if mm.needs_populate(at, write)? {
+            if mm.needs_populate(at, write, force)? {
                 let faulted;
                 (mm, faulted) = fault_in(&t.proc, mm, at, write, false);
                 faulted.map_err(|_| EFAULT)?;
@@ -208,7 +209,8 @@ impl Kernel {
         }
         drop(mm);
         // Best effort, as on Linux (populate_vma_page_range in mm/gup.c): a writable
-        // private mapping is written, so that what a write would copy is copied now.
+        // private mapping is written, so that what a write would copy is copied now, and
+        // any other mapping that allows some access is read, execute-only ones too.
         // MAP_NONBLOCK cancels it (do_mmap in mm/mmap.c).
         // Unlike Linux, a file's pages mapped here stay in memory as long as the mapping
         // does, touched or not (no reverse maps: see `AddressSpace::fault_around`). What
@@ -216,8 +218,8 @@ impl Kernel {
         // once to check their signatures and unmaps (MemoryMappedFileDataSource), about
         // 270 MB at boot: guest memory after opening seven apps was the same with or
         // without this, and those pages no longer fault one by one.
-        if flags & (MAP_POPULATE | MAP_NONBLOCK) == MAP_POPULATE && prot & (PROT_READ | PROT_WRITE) != 0 {
-            let _ = self.populate(t, a, a + page_up(len), prot & PROT_WRITE != 0 && !shared);
+        if flags & (MAP_POPULATE | MAP_NONBLOCK) == MAP_POPULATE && prot & (PROT_READ | PROT_WRITE | PROT_EXEC) != 0 {
+            let _ = self.populate(t, a, a + page_up(len), prot & PROT_WRITE != 0 && !shared, true);
         }
         a as i64
     }
@@ -319,7 +321,7 @@ impl Kernel {
         if matches!(advice, MADV_POPULATE_READ | MADV_POPULATE_WRITE) {
             let start = crate::arch::untag(addr);
             let Some(end) = start.checked_add(page_up(len)).filter(|_| start.is_multiple_of(PAGE)) else { return -EINVAL };
-            return match self.populate(t, start, end, advice == MADV_POPULATE_WRITE) {
+            return match self.populate(t, start, end, advice == MADV_POPULATE_WRITE, false) {
                 Ok(()) => 0,
                 Err(e) => -e,
             };

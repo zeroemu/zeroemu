@@ -338,6 +338,13 @@ int cmain(void) {
     check(sys(NR_mincore, pp, 2 * 4096, vec) == 0 && vec[0] && vec[1], "MAP_POPULATE maps the pages at once");
     i64 pn = sys(NR_mmap, 0, 2 * 4096, 3, 0x18022 /* MAP_POPULATE | MAP_NONBLOCK */, -1, 0);
     check(sys(NR_mincore, pn, 2 * 4096, vec) == 0 && !vec[0] && !vec[1], "MAP_NONBLOCK cancels MAP_POPULATE");
+    // Linux reads these in too (FOLL_FORCE in populate_vma_page_range, mm/gup.c), but
+    // MADV_POPULATE_READ wants PROT_READ.
+    i64 px = sys(NR_mmap, 0, 2 * 4096, 4 /* PROT_EXEC */, 0x8022 /* MAP_POPULATE */, -1, 0);
+    check(sys(NR_mincore, px, 2 * 4096, vec) == 0 && vec[0] && vec[1], "MAP_POPULATE maps an execute-only mapping");
+    i64 pw = sys(NR_mmap, 0, 2 * 4096, 2 /* PROT_WRITE */, 0x8021 /* MAP_POPULATE | MAP_SHARED */, -1, 0);
+    check(sys(NR_mincore, pw, 2 * 4096, vec) == 0 && vec[0] && vec[1], "MAP_POPULATE maps a shared write-only mapping");
+    check(sys(NR_madvise, px, 4096, 22) == -22 && sys(NR_madvise, pw, 4096, 22) == -22, "MADV_POPULATE_READ of either is EINVAL");
     sys(NR_mprotect, pm, 4096, 0);
     check(sys(NR_madvise, pm, 4096, 22 /* MADV_POPULATE_READ */) == -22, "MADV_POPULATE_READ of PROT_NONE is EINVAL");
     sys(NR_munmap, pm + 3 * 4096, 4096);

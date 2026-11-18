@@ -1198,11 +1198,21 @@ impl AddressSpace {
     /// For MADV_POPULATE_READ/WRITE and MAP_POPULATE: whether the page at `va` has to be
     /// faulted in for the access, or why it can't be, as Linux answers (madvise_populate in
     /// mm/madvise.c, check_vma_flags in mm/gup.c): ENOMEM where nothing is mapped, EINVAL
-    /// where the mapping doesn't allow the access, or is device memory.
-    pub fn needs_populate(&mut self, va: u64, write: bool) -> Result<bool, i64> {
+    /// where the mapping doesn't allow the access, or is device memory. `force`:
+    /// MAP_POPULATE's read, which any mapping that allows some access may have, as
+    /// populate_vma_page_range (mm/gup.c) asks with FOLL_FORCE: an execute-only or a
+    /// shared write-only mapping is read in too. MADV_POPULATE_READ needs PROT_READ.
+    pub fn needs_populate(&mut self, va: u64, write: bool, force: bool) -> Result<bool, i64> {
         let owner = self.owner();
         let (_, vma) = find_in(&self.vmas, va).ok_or(ENOMEM)?;
-        if vma.prot & if write { PROT_WRITE } else { PROT_READ } == 0 || matches!(vma.backing, Backing::Dev { .. }) {
+        let need = if write {
+            PROT_WRITE
+        } else if force {
+            PROT_READ | PROT_WRITE | PROT_EXEC
+        } else {
+            PROT_READ
+        };
+        if vma.prot & need == 0 || matches!(vma.backing, Backing::Dev { .. }) {
             return Err(EINVAL);
         }
         let Some(slot) = walk(&self.phys, owner, &mut self.tables, self.root.root, 0, va, false)? else { return Ok(true) };

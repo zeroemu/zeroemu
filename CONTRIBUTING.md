@@ -36,6 +36,7 @@ through the runner in `.cargo/config.toml` (`scripts/macos-runner.sh`). After a 
 | `scripts/test-android.sh` | Apple Silicon and the SDK image. Runs Android's linker, toybox and mksh from the image |
 | `scripts/test-net.py` | Apple Silicon, a signed release build and the guests |
 | `scripts/test-tcp.py` | Apple Silicon, a signed release build and the guests |
+| `scripts/test-controls.sh` | The same as `test-adb.sh`. Uses the window's toolbar, menu bar and shortcuts through a test FIFO, and checks what Android did |
 | `scripts/test-adb.sh` | Apple Silicon, a signed release build, and the SDK with `emulator`, `platform-tools` and the image. Boots Android (its window opens behind yours) and uses real adb against it |
 
 [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) says what each one checks, and lists the

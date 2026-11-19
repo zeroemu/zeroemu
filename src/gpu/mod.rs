@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+pub mod controls;
 pub(crate) mod fake;
 mod gfxstream;
 #[cfg(target_os = "macos")]
@@ -62,12 +63,101 @@ pub fn resize_window(w: f64, h: f64) {
     let _ = (w, h);
 }
 
-/// `f` runs when the user closes the window. It is called on the UI thread.
+/// `f` runs when the user closes the window or quits. It is called on the UI thread,
+/// or on the caller's if the user quit before this was called.
 pub fn on_window_closed(f: Box<dyn Fn() + Send + Sync>) {
     #[cfg(target_os = "macos")]
     window::on_closed(f);
     #[cfg(not(target_os = "macos"))]
     drop(f);
+}
+
+/// The device was turned (controls::turns): the window shows it so.
+fn turned() {
+    #[cfg(target_os = "macos")]
+    window::turned();
+}
+
+/// Saves the screen, turned upright for a device turned `turns` times, as a PNG where
+/// the Mac keeps screenshots. Returns where.
+#[cfg(target_os = "macos")]
+fn save_screenshot(turns: u8) -> std::io::Result<std::path::PathBuf> {
+    let Some((w, h, pixels)) = window::shown_frame() else {
+        return Err(std::io::Error::other("there's nothing on the screen yet"));
+    };
+    let (w, h, pixels) = controls::rotate_pixels(w, h, &pixels, turns);
+    // ZEROEMU_SCREENSHOTS=<dir>: somewhere else, for tests.
+    let folder = std::env::var_os("ZEROEMU_SCREENSHOTS").map(std::path::PathBuf::from).unwrap_or_else(window::screenshot_folder);
+    // As the Mac names its own, so they sort among them: "... 2026-11-19 at 10.15.32".
+    let mut t: libc::tm = unsafe { std::mem::zeroed() };
+    let now = unsafe { libc::time(std::ptr::null_mut()) };
+    unsafe { libc::localtime_r(&now, &mut t) };
+    let stamp = format!("{}-{:02}-{:02} at {:02}.{:02}.{:02}", t.tm_year + 1900, t.tm_mon + 1, t.tm_mday, t.tm_hour, t.tm_min, t.tm_sec);
+    // One at a time from naming to renaming: two in the same second get two names.
+    static SAVING: Mutex<()> = Mutex::new(());
+    let _one = SAVING.lock().unwrap_or_else(|p| p.into_inner());
+    let mut path = folder.join(format!("zeroemu Screenshot {stamp}.png"));
+    for n in 2.. {
+        if !path.exists() {
+            break;
+        }
+        path = folder.join(format!("zeroemu Screenshot {stamp} ({n}).png"));
+    }
+    // Under another name until it's whole, so nothing picks up half a file.
+    let partial = folder.join(format!(".{}.partial", path.file_name().unwrap().to_string_lossy()));
+    let saved = window::write_png(&partial, w, h, &pixels).and_then(|()| std::fs::rename(&partial, &path));
+    if saved.is_err() {
+        let _ = std::fs::remove_file(&partial);
+    }
+    saved?;
+    // Not for tests run behind someone's work (ZEROEMU_BACKGROUND).
+    if !window::background() {
+        window::shutter_sound();
+    }
+    Ok(path)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn save_screenshot(_turns: u8) -> std::io::Result<std::path::PathBuf> {
+    Err(std::io::Error::other("screenshots need the macOS window"))
+}
+
+/// A test FIFO line for the device controls (ZEROEMU_INPUT_FIFO, src/kernel/evdev.rs):
+/// `action NAME` does what a toolbar item or Device menu item does
+/// (controls::Action::name); `menu Menu/Item` chooses a menu item by its titles;
+/// `toolbar NAME` clicks a toolbar item; `keyeq MODS KEYCODE CHARS` types a key with
+/// modifiers into the window, for its shortcut; `click U V` clicks the shown picture.
+pub fn control_line(line: &str) {
+    let line = line.trim();
+    let (word, rest) = line.split_once(' ').unwrap_or((line, ""));
+    let rest = rest.trim();
+    match word {
+        "action" => match controls::Action::from_name(rest) {
+            Some(a) => controls::perform(a),
+            None => eprintln!("zeroemu: no action {rest:?}"),
+        },
+        #[cfg(target_os = "macos")]
+        "menu" => window::choose_menu_item(rest),
+        #[cfg(target_os = "macos")]
+        "toolbar" => window::click_toolbar_item(rest),
+        #[cfg(target_os = "macos")]
+        "click" => {
+            let mut w = rest.split_whitespace().map(|n| n.parse::<f64>());
+            match (w.next(), w.next()) {
+                (Some(Ok(u)), Some(Ok(v))) => window::post_click(u, v),
+                _ => eprintln!("zeroemu: click wants U V, not {rest:?}"),
+            }
+        }
+        #[cfg(target_os = "macos")]
+        "keyeq" => {
+            let mut w = rest.split_whitespace();
+            match (w.next(), w.next().and_then(|k| k.parse().ok()), w.next()) {
+                (Some(mods), Some(code), Some(chars)) => window::post_key(mods, code, chars),
+                _ => eprintln!("zeroemu: keyeq wants MODS KEYCODE CHARS, not {rest:?}"),
+            }
+        }
+        _ => eprintln!("zeroemu: {word} needs the macOS window"),
+    }
 }
 
 /// virtio-gpu capability set ids.

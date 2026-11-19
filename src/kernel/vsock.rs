@@ -18,6 +18,7 @@ use super::{ERESTARTSYS, IDLE, Kernel, Thread};
 use crate::arch::Sysno;
 use crate::errno::*;
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, Weak};
 
 pub const AF_VSOCK: u64 = 40;
@@ -73,6 +74,9 @@ impl Drop for Vsock {
         for io in st.backlog.iter().flatten().chain(st.stream.iter()) {
             io.close();
         }
+        if matches!(st.service, Some(Service::Sensors(_))) {
+            SENSOR_PIPES.lock().unwrap().retain(|w| w.strong_count() > 0);
+        }
     }
 }
 
@@ -116,15 +120,91 @@ struct Sensors {
 /// gyroscope, magnetic field, orientation, temperature, proximity, light,
 /// pressure, humidity.
 const SENSORS: u32 = 0x1ff;
+/// The ones whose readings change when the phone turns: accelerometer, magnetic
+/// field and orientation.
+const TURNING: u32 = 1 << 0 | 1 << 2 | 1 << 3;
 
-/// A phone lying still, screen up: gravity on z, the Earth's field, room
-/// light and temperature, nothing near the proximity sensor.
-fn readings(enabled: u32) -> Vec<String> {
+/// How the phone is held: quarter turns counterclockwise from upright, or FLAT
+/// until the window first turns it.
+static POSTURE: AtomicU8 = AtomicU8::new(FLAT);
+const FLAT: u8 = u8::MAX;
+
+/// The open sensors pipes, so that a turn reaches the HAL at once. The HAL keeps
+/// one, and opens another only if that one breaks.
+static SENSOR_PIPES: Mutex<Vec<Weak<Vsock>>> = Mutex::new(Vec::new());
+
+/// What a still phone's accelerometer, magnetometer and orientation sensor read
+/// in each posture. First lying flat, screen up, its top to the north: where
+/// every boot starts. Then held upright, facing the user, who looks north. Then
+/// turned a quarter at a time counterclockwise, as the user sees it.
+///
+/// Only the phone moves. Gravity and the field the flat phone reads (5.9 µT
+/// north, 48.4 µT down) stay put, and each reading is their size along the
+/// phone's own axes: x to the right of the screen, y to its top, z out of it.
+/// The accelerometer reads the push that holds the phone up against gravity, so
+/// +9.81 on whichever axis points up (SensorEvent.java).
+///
+/// Android picks the screen's rotation from the accelerometer alone: -atan2(-x, y),
+/// rounded to a quarter turn (WindowOrientationListener.java). So a phone turned
+/// q times gets ROTATION_0 + q, and x = 9.81 is ROTATION_90, "rotate CCW" in
+/// config.xml. The Android Emulator turns its model the same way: landscape is
+/// +90° about z, and reads x > 0 (android/hw-sensors.cpp, physics/PhysicalModel.cpp).
+///
+/// The orientation sensor's angles are azimuth, pitch and roll as SensorEvent.java
+/// defines them, in the order sensorservice's OrientationSensor.cpp takes them
+/// apart: azimuth about z, then roll about y, then pitch about x. A phone on its
+/// side has roll ±90°, where azimuth and pitch become one angle; there pitch is 0,
+/// and azimuth is where the top points.
+const POSES: [[&str; 3]; 5] = [
+    ["acceleration:0.00:0.00:9.81", "magnetic:0.00:5.90:-48.40", "orientation:0.00:0.00:0.00"],
+    ["acceleration:0.00:9.81:0.00", "magnetic:0.00:-48.40:-5.90", "orientation:0.00:-90.00:0.00"],
+    ["acceleration:9.81:0.00:0.00", "magnetic:-48.40:0.00:-5.90", "orientation:270.00:0.00:90.00"],
+    ["acceleration:0.00:-9.81:0.00", "magnetic:0.00:48.40:-5.90", "orientation:180.00:90.00:0.00"],
+    ["acceleration:-9.81:0.00:0.00", "magnetic:48.40:0.00:-5.90", "orientation:90.00:0.00:-90.00"],
+];
+
+/// Turns the phone: `turns` quarter turns counterclockwise from upright portrait,
+/// as the user looking at the screen sees it. 1 is on its side with its top to
+/// the left, 2 upside down, 3 top to the right; more than 3 goes round again.
+/// Android turns its screen to match when auto-rotate is on, as a phone does.
+/// Until this is first called the phone lies flat, as it always did.
+pub fn set_posture(turns: u8) {
+    POSTURE.store(turns % 4, Ordering::Relaxed);
+    let pipes: Vec<Arc<Vsock>> = SENSOR_PIPES.lock().unwrap().iter().filter_map(Weak::upgrade).collect();
+    for pipe in pipes {
+        let mut st = pipe.st.lock().unwrap();
+        let State { service: Some(Service::Sensors(s)), out, closed: false, .. } = &mut *st else { continue };
+        if s.enabled & TURNING == 0 {
+            continue;
+        }
+        // The posture is read again under the pipe's lock, as a sensor being turned
+        // on reads it, so the HAL ends up with the last one whichever goes first.
+        // The HAL keeps a continuous sensor's last reading and posts it again at
+        // the rate Android asked for (multihal_sensors.cpp), so one is enough.
+        report(out, s.enabled & TURNING, posture());
+        drop(st);
+        EVENTS.bump_key(Arc::as_ptr(&pipe) as usize);
+    }
+}
+
+/// How the phone is held: quarter turns counterclockwise from upright, or None
+/// while it still lies flat.
+pub fn posture() -> Option<u8> {
+    match POSTURE.load(Ordering::Relaxed) {
+        FLAT => None,
+        q => Some(q),
+    }
+}
+
+/// A phone held still in `posture` (POSES), so not spinning, in a lit room at
+/// room temperature, with nothing near the proximity sensor.
+fn readings(enabled: u32, posture: Option<u8>) -> Vec<String> {
+    let [acceleration, magnetic, orientation] = POSES[posture.map_or(0, |q| 1 + q as usize % 4)];
     let all: [(u32, &str); 9] = [
-        (0, "acceleration:0.00:0.00:9.81"),
+        (0, acceleration),
         (1, "gyroscope:0.00:0.00:0.00"),
-        (2, "magnetic:0.00:5.90:-48.40"),
-        (3, "orientation:0.00:0.00:0.00"),
+        (2, magnetic),
+        (3, orientation),
         (4, "temperature:25.00"),
         (5, "proximity:1.00"),
         (6, "light:400.00"),
@@ -136,6 +216,15 @@ fn readings(enabled: u32) -> Vec<String> {
 
 fn frame(out: &mut VecDeque<u8>, msg: &str) {
     out.extend(format!("{:04x}{msg}", msg.len()).bytes());
+}
+
+/// Queues the readings of the sensors in `bits`, then the "sync:<µs>" line that
+/// ends each batch the emulator sends (android/hw-sensors.cpp).
+fn report(out: &mut VecDeque<u8>, bits: u32, posture: Option<u8>) {
+    for r in readings(bits, posture) {
+        frame(out, &r);
+    }
+    frame(out, &format!("sync:{}", super::monotonic_ns() / 1000));
 }
 
 impl Vsock {
@@ -224,7 +313,10 @@ impl Vsock {
             rest = &rest[end + 1..];
             let name = String::from_utf8_lossy(&st.name).into_owned();
             match name.as_str() {
-                "pipe:qemud:sensors" => st.service = Some(Service::Sensors(Sensors { delay_ms: 200, ..Default::default() })),
+                "pipe:qemud:sensors" => {
+                    st.service = Some(Service::Sensors(Sensors { delay_ms: 200, ..Default::default() }));
+                    SENSOR_PIPES.lock().unwrap().push(Arc::downgrade(self));
+                }
                 "pipe:qemud:boot-properties" => st.service = Some(Service::BootProperties),
                 "pipe:QemuMiscPipe" => st.service = Some(Service::Misc),
                 "pipe:clipboard" | "pipe:qemud:fingerprintlisten" => st.service = Some(Service::Silent),
@@ -282,7 +374,7 @@ impl Vsock {
             at += 4 + len;
             let State { service, out, .. } = &mut *st;
             match service {
-                Some(Service::Sensors(s)) => sensors_message(s, out, &msg),
+                Some(Service::Sensors(s)) => sensors_message(s, out, &msg, posture()),
                 // A lone NUL ends the list of properties, and there are none to add.
                 Some(Service::BootProperties) => out.extend(b"0001\0"),
                 _ => {}
@@ -515,12 +607,13 @@ impl Kernel {
 }
 
 /// One message from the sensors HAL. A sensor's reading goes back when the HAL turns it
-/// on, and only then: the readings never change, and the HAL makes a continuous sensor's
-/// events itself, at the rate Android asked for, from the last reading it got (its batch
-/// thread); an on-change sensor reports when its value changes. The emulator sends every
-/// sensor at the fastest rate anything asks for, and the HAL turns them all on, so that
-/// was ten messages every 10 ms, each waking the HAL, with nothing new in any of them.
-fn sensors_message(s: &mut Sensors, out: &mut VecDeque<u8>, msg: &str) {
+/// on, and otherwise only when the phone turns (set_posture): nothing else changes the
+/// readings, and the HAL makes a continuous sensor's events itself, at the rate Android
+/// asked for, from the last reading it got (its batch thread); an on-change sensor
+/// reports when its value changes. The emulator sends every sensor at the fastest rate
+/// anything asks for, and the HAL turns them all on, so that was ten messages every
+/// 10 ms, each waking the HAL, with nothing new in any of them.
+fn sensors_message(s: &mut Sensors, out: &mut VecDeque<u8>, msg: &str, posture: Option<u8>) {
     if msg == "list-sensors" {
         frame(out, &SENSORS.to_string());
         return;
@@ -539,10 +632,7 @@ fn sensors_message(s: &mut Sensors, out: &mut VecDeque<u8>, msg: &str) {
             if on == "1" {
                 if s.enabled & 1 << bit == 0 {
                     s.enabled |= 1 << bit;
-                    for r in readings(1 << bit) {
-                        frame(out, &r);
-                    }
-                    frame(out, &format!("sync:{}", super::monotonic_ns() / 1000));
+                    report(out, 1 << bit, posture);
                 }
             } else {
                 s.enabled &= !(1 << bit);
@@ -550,4 +640,126 @@ fn sensors_message(s: &mut Sensors, out: &mut VecDeque<u8>, msg: &str) {
         }
     }
     // time:<ns> needs nothing back.
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The messages queued in `out`, without their length prefixes.
+    fn messages(out: &VecDeque<u8>) -> Vec<String> {
+        let bytes: Vec<u8> = out.iter().copied().collect();
+        let mut got = Vec::new();
+        let mut at = 0;
+        while at < bytes.len() {
+            let len = usize::from_str_radix(std::str::from_utf8(&bytes[at..at + 4]).unwrap(), 16).unwrap();
+            got.push(String::from_utf8(bytes[at + 4..at + 4 + len].to_vec()).unwrap());
+            at += 4 + len;
+        }
+        got
+    }
+
+    /// The three numbers of a reading like "acceleration:0.00:9.81:0.00".
+    fn vec3(reading: &str) -> [f64; 3] {
+        let (_, values) = reading.split_once(':').unwrap();
+        let v: Vec<f64> = values.split(':').map(|n| n.parse().unwrap()).collect();
+        v.try_into().unwrap()
+    }
+
+    fn dot(a: [f64; 3], b: [f64; 3]) -> f64 {
+        a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+    }
+
+    #[test]
+    fn android_turns_the_screen_with_the_phone() {
+        // WindowOrientationListener.java: the tilt is asin(z / |a|), and the
+        // screen's rotation is -atan2(-x, y) in degrees, to the nearest quarter turn.
+        let tilt = |[x, y, z]: [f64; 3]| (z / dot([x, y, z], [x, y, z]).sqrt()).asin().to_degrees().round();
+        let flat = vec3(&readings(1, None)[0]);
+        assert_eq!(flat, [0.0, 0.0, 9.81], "the same as before the phone could turn");
+        assert_eq!(tilt(flat), 90.0, "flat, so Android picks no rotation");
+        for q in 0..4 {
+            let [x, y, z] = vec3(&readings(1, Some(q))[0]);
+            assert_eq!(tilt([x, y, z]), 0.0, "upright");
+            let mut angle = (-(-x).atan2(y)).to_degrees().round() as i32;
+            if angle < 0 {
+                angle += 360;
+            }
+            assert_eq!((angle + 45) / 90 % 4, q as i32, "posture {q}");
+        }
+        assert_eq!(readings(1, Some(5)), readings(1, Some(1)));
+    }
+
+    #[test]
+    fn every_reading_is_one_pose_of_the_same_world() {
+        // The world is east, north, up. The flat phone reads gravity's push up z and
+        // the field 5.9 µT north and 48.4 µT down.
+        let up = [0.0, 0.0, 9.81];
+        let field = [0.0, 5.9, -48.4];
+        let add = |u: [f64; 3], s: f64, v: [f64; 3], t: f64| [u[0] * s + v[0] * t, u[1] * s + v[1] * t, u[2] * s + v[2] * t];
+        for posture in [None, Some(0), Some(1), Some(2), Some(3)] {
+            let got = readings(TURNING, posture);
+            let [azimuth, pitch, roll] = vec3(&got[2]).map(f64::to_radians);
+            // The phone's axes in the world after its orientation angles (SensorEvent.java).
+            // Azimuth is where y points, clockwise from north seen from above.
+            let (x, y, z) = ([azimuth.cos(), -azimuth.sin(), 0.0], [azimuth.sin(), azimuth.cos(), 0.0], [0.0, 0.0, 1.0]);
+            // Positive roll moves x toward z.
+            let (x, z) = (add(x, roll.cos(), z, roll.sin()), add(x, -roll.sin(), z, roll.cos()));
+            // Positive pitch moves z toward y.
+            let (y, z) = (add(y, pitch.cos(), z, -pitch.sin()), add(z, pitch.cos(), y, pitch.sin()));
+            let seen = |v: [f64; 3]| [dot(x, v), dot(y, v), dot(z, v)];
+            for (want, reading) in [(seen(up), &got[0]), (seen(field), &got[1])] {
+                let have = vec3(reading);
+                assert!((0..3).all(|i| (have[i] - want[i]).abs() < 0.01), "{posture:?}: {reading}, but its angles give {want:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_sensor_turned_on_gets_its_reading_then_a_sync() {
+        let mut s = Sensors::default();
+        let mut out = VecDeque::new();
+        sensors_message(&mut s, &mut out, "list-sensors", None);
+        assert_eq!(out.drain(..).collect::<Vec<u8>>(), b"0003511");
+        sensors_message(&mut s, &mut out, "set:acceleration:1", Some(1));
+        assert!(out.iter().copied().collect::<Vec<u8>>().starts_with(b"001bacceleration:9.81:0.00:0.00"));
+        let got = messages(&out);
+        assert_eq!(got.len(), 2);
+        assert!(got[1].strip_prefix("sync:").unwrap().parse::<u64>().is_ok(), "{}", got[1]);
+        out.clear();
+        sensors_message(&mut s, &mut out, "set:acceleration:1", Some(1));
+        assert!(out.is_empty(), "on already");
+        sensors_message(&mut s, &mut out, "set:magnetic-field:1", None);
+        assert_eq!(messages(&out)[0], "magnetic:0.00:5.90:-48.40");
+    }
+
+    #[test]
+    fn a_turn_reaches_each_pipe_that_listens() {
+        // A sensors pipe as write() leaves it once the HAL has named the service.
+        let pipe = |enabled| {
+            let v = Vsock::new();
+            {
+                let mut st = v.st.lock().unwrap();
+                st.connected = true;
+                st.service = Some(Service::Sensors(Sensors { enabled, delay_ms: 200 }));
+            }
+            SENSOR_PIPES.lock().unwrap().push(Arc::downgrade(&v));
+            v
+        };
+        let accelerometer = pipe(1);
+        let all = pipe(SENSORS);
+        let other = pipe(1 << 4);
+        drop(pipe(1));
+        set_posture(5);
+        assert_eq!(posture(), Some(1), "five quarter turns are one");
+        let got = messages(&accelerometer.st.lock().unwrap().out);
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0], "acceleration:9.81:0.00:0.00");
+        assert!(got[1].starts_with("sync:"));
+        let got = messages(&all.st.lock().unwrap().out);
+        assert_eq!(got[..3], ["acceleration:9.81:0.00:0.00", "magnetic:-48.40:0.00:-5.90", "orientation:270.00:0.00:90.00"]);
+        assert!(got[3].starts_with("sync:") && got.len() == 4);
+        assert!(other.st.lock().unwrap().out.is_empty(), "nothing it reports moved");
+        assert!(SENSOR_PIPES.lock().unwrap().iter().all(|w| w.strong_count() > 0), "the closed pipe left the list");
+    }
 }

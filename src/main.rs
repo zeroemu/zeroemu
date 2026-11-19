@@ -43,7 +43,7 @@ fn help() -> String {
     let stop = if cfg!(windows) {
         "Stop it with Ctrl-C; on Windows, /data isn't saved then."
     } else {
-        "Stop it by closing the window or pressing Ctrl-C;\n/data is saved then."
+        "Stop it by quitting (Command-Q), closing the window or pressing Ctrl-C;\n/data is saved then."
     };
     format!(
         "zeroemu {version}: runs Android's userspace from an Android SDK system image on the
@@ -426,7 +426,7 @@ fn print_status(c: &Chosen, data: Option<&Path>, adb: Option<u16>, window: bool)
     if let Some(port) = adb {
         eprintln!("zeroemu: adb serial emulator-{}", port - 1);
     }
-    let how = if window { "close the window or press Ctrl-C" } else { "press Ctrl-C" };
+    let how = if window { "quit (Command-Q), close the window or press Ctrl-C" } else { "press Ctrl-C" };
     let save = match data {
         Some(_) if cfg!(windows) => "; on Windows, /data isn't saved then",
         Some(_) => "; /data is saved then",

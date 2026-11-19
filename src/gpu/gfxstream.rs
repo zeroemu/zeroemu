@@ -587,7 +587,10 @@ impl Gfxstream {
             if !fb.is_null() {
                 g.subwindow.store(true, Ordering::Release);
             }
-            let up = !fb.is_null() && unsafe { setup(fb, win, p.x, p.y, p.w, p.h, p.w, p.h, p.dpr, 0.0, false, false) };
+            // A turned panel fills the rectangle turned: the rectangle is the turned
+            // shape, and so is the frame size given here, as the renderer stretches
+            // the turned frame over the whole viewport (texture_draw.cpp).
+            let up = !fb.is_null() && unsafe { setup(fb, win, p.x, p.y, p.w, p.h, p.w, p.h, p.dpr, p.z_rotation(), false, false) };
             g.direct.store(up, Ordering::Release);
             window::set_drawing(up);
             if !up {

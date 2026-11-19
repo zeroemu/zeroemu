@@ -33,8 +33,14 @@ Emulator. [INTERNALS.md](INTERNALS.md) says how each part works.
 
 ## The window
 
-- There is no menu bar, so Cmd-Q doesn't quit. Close the window, press Ctrl-C in the
-  terminal, or power off from Android.
+- Command doesn't reach Android as Meta: its key layout for zeroemu's keyboard
+  (`qwerty2.kl`) has no Meta key, so Android's Meta shortcuts don't work. Command
+  shortcuts that the menu bar doesn't use are sent as the key alone.
+- The Power toolbar button and menu item press the button briefly. A long press is
+  Android's assistant on this image; Device > Power Menu gives the power menu instead.
+- Rotation turns the window's picture and what the accelerometer reads. With auto-rotate
+  off, Android shows its rotate button rather than turning, as a phone does.
+- Quitting during a logout cancels the logout: zeroemu first saves `/data`, then exits.
 - On a MacBook keyboard, F1 (Home) and F2 (recent apps) need Fn held, unless the keys are
   set to act as standard function keys.
 

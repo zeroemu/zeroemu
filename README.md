@@ -216,9 +216,25 @@ What you see:
 - A window with a 1080x2400 phone display, scaled to fit your screen. Android finishes
   booting about 17 seconds after start on a first boot, and about 12 seconds on later
   boots.
-- The mouse is a finger, and scrolling drags one (a flick becomes a fling). F1 is Home,
-  Escape is Back, and F2 is recent apps; on a MacBook keyboard, hold Fn for F1 and F2.
-  Other keys type into Android.
+- The mouse is a finger, and scrolling drags one (a flick becomes a fling). Other keys
+  type into Android.
+- The toolbar in the title bar has Back, Home, Recents, Screenshot, Rotate and Power.
+  View > Customize Toolbar adds Volume, Mute, Notifications, Settings, Lock and more.
+- The **Device** menu has every control, with shortcuts:
+
+  | Control | Shortcut |
+  |---|---|
+  | Back, Home, Recent Apps | ⌘[, ⇧⌘H, ⇧⌘R (and Escape, F1, F2) |
+  | Notifications, Android Settings | ⌘N, ⌘I |
+  | Volume Up, Volume Down, Mute | ⌘↑, ⌘↓ |
+  | Power Button, Lock Screen, Power Menu | ⇧⌘P, ⌘L |
+  | Rotate Left, Rotate Right | ⌘←, ⌘→ |
+  | Take Screenshot in Android | |
+
+  File > Save Screenshot (⌘S) saves the screen as a PNG where your Mac saves its own
+  screenshots. On a MacBook keyboard, hold Fn for F1 and F2.
+- Rotating turns the phone: Android turns its screen as a phone does, if auto-rotate is
+  on and the app allows it, and the window takes the new shape.
 - The terminal shows Android's warnings and errors, and the renderer's errors.
   `ZEROEMU_LOG=I` shows more of Android's log, and `ZEROEMU_LOG=S` hides it.
   `ZEROEMU_GPU_LOG=<S|E|W|I|D>` sets how much of the renderer's own log shows.
@@ -226,9 +242,9 @@ What you see:
   or the next free pair of ports. adbd keeps its key check, and your own key
   (`~/.android/adbkey.pub`) is already authorized.
 - Each image keeps its own `/data`, in `~/Library/Application Support/zeroemu`. It is
-  saved on a clean exit: closing the window, Ctrl-C in the terminal, or powering off
-  from Android. A crash or `kill -9` loses what happened since the last save. There is
-  no menu bar, so Cmd-Q doesn't quit.
+  saved on a clean exit: quitting (⌘Q), closing the window, Ctrl-C in the terminal, or
+  powering off from Android. A crash or `kill -9` loses what happened since the last
+  save.
 - `ZEROEMU_BACKGROUND=1` opens the window behind your other windows, without taking focus.
 
 ## Supported images

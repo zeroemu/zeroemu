@@ -51,7 +51,7 @@ pub(crate) mod trace;
 mod unix;
 mod vcpus;
 pub(crate) mod vdso;
-mod vsock;
+pub(crate) mod vsock;
 mod wait;
 mod xattr;
 

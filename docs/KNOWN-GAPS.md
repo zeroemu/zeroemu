@@ -87,6 +87,19 @@ Emulator. [INTERNALS.md](INTERNALS.md) says how each part works.
   can't change its ids and fails.
 - userfaultfd has only what ART's compacting collector uses: SIGBUS mode, on private
   anonymous memory.
+- `madvise` isn't Linux's (mm/madvise.c) in three ways:
+  - Only MADV_DONTNEED, MADV_FREE, the fork advice and MADV_POPULATE_READ/WRITE do
+    anything. Any other advice, an unknown one too, returns 0: MADV_WILLNEED reads
+    nothing ahead, so a file's pages are read when first touched, and MADV_REMOVE leaves
+    a shared mapping's data, where Linux frees it and it reads back as zeros.
+  - Only the fork and populate advice check the range as Linux does. MADV_DONTNEED,
+    MADV_FREE and the advice that does nothing return 0 for a range that isn't all
+    mapped, where Linux returns ENOMEM after acting on the parts that are, and the advice
+    that does nothing returns 0 for a start that isn't page-aligned, where Linux returns
+    EINVAL.
+  - MADV_FREE drops the pages of any mapping, as MADV_DONTNEED does, so a private file
+    mapping's written pages read back from the file. Linux takes it only on private
+    anonymous memory and refuses it elsewhere with EINVAL (`madvise_free_single_vma`).
 - `epoll_wait` marks a one-shot registration as fired, and an edge-triggered one as
   reported, before it copies the events out. If the copy fails (EFAULT), those events
   are lost, where Linux puts them back (`ep_send_events` in fs/eventpoll.c).

@@ -290,6 +290,14 @@ impl Kernel {
         if op & FUTEX_CLOCK_REALTIME != 0 && !matches!(cmd, FUTEX_WAIT_BITSET | FUTEX_WAIT_REQUEUE_PI | FUTEX_LOCK_PI2) {
             return -ENOSYS;
         }
+        // Then a command zeroemu doesn't have, ENOSYS before the word is looked at, as
+        // do_futex's switch answers one it doesn't know. Of Linux's, FUTEX_WAKE_OP and the
+        // requeues to a PI lock aren't here.
+        if !matches!(cmd, FUTEX_WAIT | FUTEX_WAIT_BITSET | FUTEX_WAKE | FUTEX_WAKE_BITSET | FUTEX_REQUEUE | FUTEX_CMP_REQUEUE
+            | FUTEX_LOCK_PI | FUTEX_LOCK_PI2 | FUTEX_TRYLOCK_PI | FUTEX_UNLOCK_PI)
+        {
+            return -ENOSYS;
+        }
         // A futex is an aligned word (get_futex_key in kernel/futex/core.c).
         if !addr.is_multiple_of(4) {
             return -EINVAL;
@@ -465,7 +473,7 @@ impl Kernel {
         // touch would, and the read starts over, as futex_wait_setup's retry does.
         let mut shard = self.futex.shard(key);
         let mut list = shard.lock().unwrap();
-        let (mut waited, mut faulted) = (false, false);
+        let mut waited = false;
         let cur = loop {
             let mut mm = match t.proc.try_mm() {
                 Some(mm) => mm,
@@ -482,10 +490,9 @@ impl Kernel {
                 }
                 None => t.proc.mm(),
             };
-            // A page faulted in and gone again (another thread unmapped it) is read the
-            // old way, under the shard, so that this ends.
-            let cur = if faulted { Some(mm.read_u32(addr)) } else { mm.peek_u32(addr) };
-            if let Some(cur) = cur {
+            // Each time round faults the page in, so this goes round again only while
+            // another thread keeps taking the page away, as Linux's retry would.
+            if let Some(cur) = mm.peek_u32(addr) {
                 break cur;
             }
             drop(mm);
@@ -493,7 +500,6 @@ impl Kernel {
             if self.page_fault(t, addr, false, false).is_err() {
                 return -EFAULT;
             }
-            faulted = true;
             // A shared futex's key is its page's frame, which may be another one now:
             // worked out again, as that retry gets the key again.
             if !private {

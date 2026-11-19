@@ -180,7 +180,7 @@ static u64 flags_through_fault(u64 in, volatile char *p) {
 
 static int fa, fb;
 static volatile i64 w1_ret = 99, w2_ret = 99;
-static void waiter1(void *arg) { (void)arg; i64 ts[2] = {0, 300000000}; w1_ret = sys(NR_futex, &fa, 0 /* WAIT */, 0, ts); }
+static void waiter1(void *arg) { (void)arg; i64 ts[2] = {2, 0}; w1_ret = sys(NR_futex, &fa, 0 /* WAIT */, 0, ts); }
 static void waiter2(void *arg) { (void)arg; i64 ts[2] = {3, 0}; w2_ret = sys(NR_futex, &fb, 0 /* WAIT */, 0, ts); }
 static int fc;
 static volatile i64 w3_ret = 99;
@@ -200,12 +200,23 @@ static char stacks[6][16384] __attribute__((aligned(16)));
 static int ctid[6];
 // Waits up to a second for the threads spawned with these ctids, set nonzero first, to
 // exit: CLONE_CHILD_CLEARTID zeroes each.
-static int gone(int from, int to) {
-    for (int ms = 0; ms < 1000; ms += 5) {
+static int gone_in(int from, int to, int limit_ms) {
+    for (int ms = 0; ms < limit_ms; ms += 5) {
         int left = 0;
         for (int n = from; n < to; n++) left |= ctid[n];
         if (!left) return 1;
         nap_ms(5);
+    }
+    return 0;
+}
+static int gone(int from, int to) { return gone_in(from, to, 1000); }
+// Waits up to 2 s for a thread to wait on the futex `w` (`priv`: FUTEX_PRIVATE_FLAG or 0,
+// as the waiter's call). A FUTEX_REQUEUE onto the same word moves a waiter to the back of
+// its own queue, and its count says whether one was there.
+static int queued(volatile int *w, int priv) {
+    for (int ms = 0; ms < 2000; ms++) {
+        if (sys(NR_futex, w, 3 | priv /* REQUEUE */, 0, 1, w) == 1) return 1;
+        nap_ms(1);
     }
     return 0;
 }
@@ -455,30 +466,38 @@ int cmain(void) {
     // Some CPUs allow it; none may spin on it.
     check(status == 0 || (status & 0x7f) == 7, "a misaligned exclusive load is SIGBUS, not a loop");
 
-    // --- FUTEX_REQUEUE, then the requeued waiter times out
+    // --- FUTEX_REQUEUE, then the requeued waiter times out. The futex checks wait for the
+    // other thread by trying again, not for a set time: a guest thread can be slow to
+    // start. Waiter 1 waits 2 s, as long as the requeue keeps trying.
+    ctid[0] = -1;
     spawn(stacks[0] + 16384, waiter1, 0, &ctid[0]);
-    nap_ms(60);
-    i64 moved = sys(NR_futex, &fa, 3 /* REQUEUE */, 0, 1, &fb);
-    nap_ms(400); // waiter 1 has timed out by now
-    spawn(stacks[1] + 16384, waiter2, 0, &ctid[1]);
-    nap_ms(100);
-    i64 woke = sys(NR_futex, &fb, 1 /* WAKE */, 1);
-    nap_ms(300);
+    i64 moved = 0;
+    for (int ms = 0; moved == 0 && ms < 2000; ms++) {
+        moved = sys(NR_futex, &fa, 3 /* REQUEUE */, 0, 1, &fb);
+        if (moved == 0) nap_ms(1);
+    }
     // FUTEX_REQUEUE returns the waiters it woke and moved (futex_requeue in kernel/futex/requeue.c).
     check(moved == 1, "FUTEX_REQUEUE counts the waiter it moved");
-    check(w1_ret == -110 && woke == 1 && w2_ret == 0, "a requeued waiter that timed out doesn't take a later wake");
+    int w1_gone = gone_in(0, 1, 4000); // waiter 1 times out, on fb's queue
+    ctid[1] = -1;
+    spawn(stacks[1] + 16384, waiter2, 0, &ctid[1]);
+    i64 woke = 0;
+    for (int ms = 0; woke == 0 && ms < 2000; ms++) {
+        woke = sys(NR_futex, &fb, 1 /* WAKE */, 1);
+        if (woke == 0) nap_ms(1);
+    }
+    check(w1_gone && w1_ret == -110 && woke == 1 && gone(1, 2) && w2_ret == 0, "a requeued waiter that timed out doesn't take a later wake");
     sys(NR_futex, &fb, 1, 10);
-    nap_ms(50);
 
     // --- FUTEX_WAKE_BITSET wakes only the waiters it shares a bit with
+    ctid[0] = -1;
     spawn(stacks[0] + 16384, waiter3, 0, &ctid[0]);
-    nap_ms(60);
+    int w3_queued = queued(&fc, 0);
     i64 none = sys(NR_futex, &fc, 10 /* WAKE_BITSET */, 1, 0, 0, 2);
     i64 one = sys(NR_futex, &fc, 10, 1, 0, 0, 3);
-    nap_ms(100);
-    check(none == 0 && one == 1 && w3_ret == 0, "FUTEX_WAKE_BITSET wakes only waiters with a bit in common");
+    check(w3_queued && none == 0 && one == 1 && gone(0, 1) && w3_ret == 0, "FUTEX_WAKE_BITSET wakes only waiters with a bit in common");
     sys(NR_futex, &fc, 1, 10);
-    nap_ms(50);
+    gone(0, 1);
 
     // --- FUTEX_REQUEUE moves only waiters that sleep. Linux queues a FUTEX_WAIT only
     // once the word holds its value (futex_wait_setup in kernel/futex/waitwake.c), so
@@ -507,11 +526,11 @@ int cmain(void) {
           && sys(NR_futex, &rq_word, 3 | 128, 0, 0x100000000L, &rq_dst) == 0, "FUTEX_REQUEUE's counts are ints, the second in the timeout's low half");
     ctid[0] = -1;
     spawn(stacks[0] + 16384, wz_waiter, 0, &ctid[0]);
-    nap_ms(60);
+    int wz_queued = queued(&wz, 128);
     i64 wz_rt = sys(NR_futex, &wz, 1 | 128 | 256 /* CLOCK_REALTIME */, 1);
     nap_ms(20);
     i64 wz_still = wz_ret;
-    check(wz_rt == -38 && wz_still == 99, "FUTEX_CLOCK_REALTIME on FUTEX_WAKE is ENOSYS, and wakes nobody");
+    check(wz_queued && wz_rt == -38 && wz_still == 99, "FUTEX_CLOCK_REALTIME on FUTEX_WAKE is ENOSYS, and wakes nobody");
     i64 wz_woke = sys(NR_futex, &wz, 1 | 128, 0);
     check(gone(0, 1) && wz_woke == 1 && wz_ret == 0, "FUTEX_WAKE of 0 wakes one, as on Linux");
     check(sys(NR_futex, &rq_word, 0 | 128 | 256, 0 /* not its value */, 0) == -38 && sys(NR_futex, &rq_word, 3 | 128 | 256, 0, 1, &rq_dst) == -38
@@ -521,6 +540,7 @@ int cmain(void) {
     check(sys(NR_futex, &rq_word, 0 | 128 | 256, 0, 8 /* not mapped */) == -14 && sys(NR_futex, &rq_word, 0 | 128 | 256, 0, bad_ts) == -22,
           "and the timeout is read before that, as on Linux");
     check(sys(NR_futex, &rq_word, 1 | 128 | 0x200, 1) == -38, "a futex op with a bit Linux doesn't know is ENOSYS");
+    check(sys(NR_futex, (u64)&rq_word + 1, 0x7f | 128, 1) == -38, "an unknown futex command is ENOSYS before its word's alignment is looked at");
     // A word whose page isn't in yet: futex_wait faults the page in without its bucket
     // locked, then reads the word again.
     char *cold = (char *)sys(NR_mmap, 0, 2 * 4096, 3, 0x22, -1, 0);
@@ -537,8 +557,12 @@ int cmain(void) {
     check(sys(NR_futex, &pi_word, 6 | 128, 0, 0) == 0, "FUTEX_LOCK_PI takes a free lock");
     ctid[0] = -1;
     spawn(stacks[0] + 16384, pi_waiter, 0, &ctid[0]);
-    nap_ms(60);
-    i64 pi_requeued = sys(NR_futex, &pi_word, 3 | 128, 1, 1, &rq_dst);
+    // 0 until the waiter is queued.
+    i64 pi_requeued = 0;
+    for (int ms = 0; pi_requeued == 0 && ms < 2000; ms++) {
+        pi_requeued = sys(NR_futex, &pi_word, 3 | 128, 1, 1, &rq_dst);
+        if (pi_requeued == 0) nap_ms(1);
+    }
     i64 pi_waiting = pi_ret;
     sys(NR_futex, &pi_word, 7 | 128 /* UNLOCK_PI */);
     check(pi_requeued == -22 && pi_waiting == 99 && gone(0, 1) && pi_ret == 0 && pi_word == 0,

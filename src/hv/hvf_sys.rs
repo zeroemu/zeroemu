@@ -57,6 +57,7 @@ pub const HV_SYS_REG_MAIR_EL1: u16 = 0xc510;
 pub const HV_SYS_REG_VBAR_EL1: u16 = 0xc600;
 pub const HV_SYS_REG_TPIDR_EL0: u16 = 0xde82;
 pub const HV_SYS_REG_SP_EL1: u16 = 0xe208;
+pub const HV_SYS_REG_TPIDR_EL1: u16 = 0xc684;
 pub const HV_SYS_REG_CNTKCTL_EL1: u16 = 0xc708;
 pub const HV_SYS_REG_TPIDRRO_EL0: u16 = 0xde83;
 
@@ -113,4 +114,10 @@ pub fn check(what: &str, ret: hv_return_t) {
     if ret != HV_SUCCESS {
         panic!("{what} failed: hv_return_t = {ret:#x}");
     }
+}
+
+// The vCPU's virtual counter: CNTVCT_EL0 = mach_absolute_time() - vtimer_offset.
+#[link(name = "Hypervisor", kind = "framework")]
+unsafe extern "C" {
+    pub fn hv_vcpu_set_vtimer_offset(vcpu: hv_vcpu_t, offset: u64) -> hv_return_t;
 }

@@ -65,7 +65,7 @@ and say in the pull request which ones you ran.
 
 ## Sign your commits (DCO)
 
-Every commit must carry a `Signed-off-by` line, which says you agree to the
+Every commit you contribute must carry a `Signed-off-by` line, which says you agree to the
 [Developer Certificate of Origin](https://developercertificate.org): that you wrote the
 change, or otherwise have the right to submit it under the project's licence.
 `git commit -s` adds the line for you:
@@ -77,6 +77,7 @@ Signed-off-by: Your Name <you@example.com>
 Use your real name, or the name you are known by, and an email address you can be
 reached at. To sign off commits you already made, use `git rebase --signoff main`.
 Nothing checks for the line automatically yet; maintainers look for it in review.
+The maintainers' own commits don't carry it.
 
 ## Releases
 

@@ -12,8 +12,8 @@ use super::wait::EVENTS;
 use super::{ERESTARTSYS, IDLE, Thread};
 use crate::errno::*;
 use std::collections::VecDeque;
-use std::sync::{Arc, LazyLock, Mutex, OnceLock, Weak};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, LazyLock, Mutex, Weak};
+use std::time::{Duration, Instant};
 
 pub const INPUT_MAJOR: u32 = 13;
 const FIRST_MINOR: u32 = 64;
@@ -142,18 +142,16 @@ pub fn open(devt: u64) -> Option<Arc<Client>> {
     Some(c)
 }
 
-/// CLOCK_MONOTONIC's zero. Event times must be on that clock: InputDispatcher drops
-/// anything it thinks is more than ten seconds old.
-static BOOT: OnceLock<Instant> = OnceLock::new();
-
-/// CLOCK_MONOTONIC's zero, fixed by whoever asks first: the kernel's clock, input
-/// events and the GPU's fence and flip times all count from it.
+/// CLOCK_MONOTONIC's zero, fixed by whoever asks first (hv::clock::zero), as the
+/// Instant deadlines count from.
 pub fn boot_instant() -> Instant {
-    *BOOT.get_or_init(Instant::now)
+    crate::hv::clock::zero().1
 }
 
+/// CLOCK_MONOTONIC now (kernel/clock.rs). Event times must be on that clock:
+/// InputDispatcher drops anything it thinks is more than ten seconds old.
 pub(crate) fn since_boot() -> Duration {
-    BOOT.get_or_init(Instant::now).elapsed()
+    super::clock::monotonic()
 }
 
 impl Device {
@@ -429,8 +427,8 @@ impl Client {
         let t = if *self.clock.lock().unwrap() == CLOCK_MONOTONIC {
             at
         } else {
-            let ago = since_boot().saturating_sub(at);
-            SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().saturating_sub(ago)
+            // CLOCK_REALTIME, as the guest reads it (kernel/clock.rs).
+            Duration::from_nanos(super::clock::realtime_at(at.as_nanos() as u64))
         };
         out.extend_from_slice(&t.as_secs().to_le_bytes());
         out.extend_from_slice(&(t.subsec_micros() as u64).to_le_bytes());

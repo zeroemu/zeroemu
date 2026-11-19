@@ -16,6 +16,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Instant;
 
+const EPOLLIN: u32 = 0x1;
 pub const EPOLLERR: u32 = 0x8;
 pub const EPOLLHUP: u32 = 0x10;
 const EPOLLONESHOT: u32 = 1 << 30;
@@ -157,6 +158,12 @@ impl Epoll {
     fn deadline_within(&self, depth: u32) -> Option<Instant> {
         let list = self.interest.lock().unwrap();
         list.values()
+            // Only registrations a timer's expiry can make ready. A timer's wake is
+            // EPOLLIN, and ep_poll_callback (fs/eventpoll.c) drops it for a
+            // registration that doesn't ask for that, or a one-shot one that has
+            // fired and waits for MOD: nobody here would look at the timer to move a
+            // past deadline on, and its waiters would wake over and over for it.
+            .filter(|i| !i.fired && i.events & EPOLLIN != 0)
             .filter_map(|i| i.file.upgrade())
             .filter_map(|f| match &f.kind {
                 Kind::Timer(tf) => tf.deadline(),

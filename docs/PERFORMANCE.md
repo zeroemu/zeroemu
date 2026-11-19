@@ -36,12 +36,50 @@ guest memory twice. This is accounting: the page exists once either way.
 
 ## System calls
 
-A syscall round trip (guest → host → guest) is ~1.0 µs on an M1 Pro (1M
-`getpid` calls in 1.0 s), about 10x a native syscall. Planned mitigations:
+A syscall round trip (guest → host → guest) is about 0.92 µs on an M1 Pro: 1M `getpid`
+calls (`guest/bench_aarch64.S`) took 0.92 s, against 1.04 s before the changes below, the
+two run in turn on a busy machine. The figures here come from microbenchmarks and from
+counts in single boots; what they add up to for a whole device is under "Before and
+after", below.
 
-- a vDSO page so `clock_gettime` / `gettimeofday` never exit the VM;
-- fewer register accesses per exit;
-- implementing binder transactions and futex wakeups without extra round trips.
+- A syscall exit makes 9 calls into Hypervisor.framework rather than 14. The EL0 vector
+  goes back to EL0 through its own `eret`, so zeroemu reads no EL1 register and writes
+  neither PC nor PSTATE for a syscall; a page fault reads ESR, ELR and FAR only.
+- On the way back into the guest a thread takes no lock unless a signal is pending or a
+  TLB flush is due: pending signals keep a bitmask beside them, and the address space's
+  TLB generations are atomics.
+- A TLB flush invalidates only the address space's ASID, or the one page that changed,
+  as arm64 Linux's `flush_tlb_mm` and `flush_tlb_page` do, and a new vCPU no longer
+  flushes. At idle after boot, flushes of the whole VM went from about 730 a second to
+  none; about 390 a second now flush one ASID and 130 one page.
+- A synchronous binder call's `BR_TRANSACTION_COMPLETE` comes with its reply, as Linux
+  defers it, so a call and its reply take 4 exits rather than 5.
+
+arm64 programs get a vDSO, as on Linux, so `clock_gettime`, `gettimeofday` (and
+`time`) and `clock_getres` don't exit the VM: they read the virtual counter, which
+every vCPU sets to count from CLOCK_MONOTONIC's zero, and a read-only page of the
+kernel's offsets. A clock read takes about 25 ns that way, against about 0.95 µs as a
+syscall (`guest/clocks.c` measures both). On a device idle after boot, clock calls
+were about half of all syscall exits, 1,350 a second; 36 a second are left, for what
+the vDSO passes on to the syscall, as Linux's does: the CPU-time clocks, mostly.
+`ZEROEMU_NO_VDSO=1` turns it off.
+
+Page faults exit too. As Linux's fault-around does, a fault also maps the other pages
+of its 16-page window that are in memory already. In a file mapped read-only, that is
+on a read or exec fault, and only pages another mapping has already, since zeroemu
+can't take a page back from a mapping to reclaim it. In shared memory and device memory
+it is on any fault (for a `/data` file mapped shared, only where the mapping can't
+write). In one boot each, that took faults at idle from about 1,700 a second to 1,100.
+A fault whose page has to be read from the system image or `/data` reads it with the
+address space unlocked, as Linux does with `VM_FAULT_RETRY`, so the process's other
+threads don't wait for the read.
+
+Planned:
+
+- a save slot per vCPU at EL1, so that a syscall exit is one `hv_vcpu_run` and one
+  register write: an exit alone measures 0.88 µs, against 0.95 µs with the register
+  accesses still made;
+- futex wakeups without extra round trips.
 
 ## Smoothness
 
@@ -76,11 +114,15 @@ the app list included): the median frame went from 29 ms to 18 ms and janky fram
   and SurfaceFlinger's vsync model was fed times it couldn't use.
 
 What's left is mostly the first time something is drawn: a shader compiled, or icons
-uploaded, can cost 50 to 150 ms.
+uploaded, can cost 50 to 150 ms. The work under System calls and CPU left this as it
+was: in the runs under "Before and after", janky frames were 0.2 to 0.6% either way,
+and the 99th percentile 17 to 22 ms.
 
-Smoothness is expected to come from what disappears: there is no virtual GPU
-pipe, no second compositor, no guest kernel scheduler, and no virtual device
-emulation.
+The graphics path is the Android Emulator's: GL calls go through the same gfxstream pipe
+to the same renderer. What differs is the kernel. zeroemu has no guest kernel and no
+emulated devices, but each syscall and page fault leaves the VM, where a guest kernel
+would handle it without an exit, and each guest thread that sleeps or wakes is a host
+thread doing the same.
 
 ## CPU
 
@@ -91,6 +133,9 @@ CPU, as macOS counts zeroemu's threads (Activity Monitor's figure), a settled de
 | Idle at the home screen | 51% of a core | 16% |
 | Flinging the app list | 270-320% | 95% |
 
+The "Now" column was measured before the changes under System calls and before the
+vCPU and 2-second wakeup items below; "Before and after" has what they changed.
+
 - Threads asleep in poll, epoll and the like are woken by keys their files hash onto.
   There were 63 keys for well over a thousand sleeping threads, so every event woke
   dozens of threads that had nothing to do, and that was most of the idle CPU. There
@@ -99,8 +144,14 @@ CPU, as macOS counts zeroemu's threads (Activity Monitor's figure), a settled de
 - A vCPU belongs to its host thread, and the hypervisor allows 64. Threads that went to
   sleep holding one kept it for as long as they slept, which kept the pool short, so
   every thread that blocked for a moment gave its own up and made a new one when it
-  woke: 150 a second at idle. Now threads asleep in the kernel for a second give theirs
-  back when places run short.
+  woke: 150 a second at idle. Now a thread keeps its vCPU while it sleeps, and an eighth
+  of the places are kept free by asking the threads that have slept longest for theirs;
+  only when that falls behind does a thread give its own up as it blocks. Opening seven
+  apps made 2,300 vCPUs a second before this and 960 after.
+- Threads asleep in a futex, poll, select or epoll woke every 2 seconds, in case a
+  wakeup had been lost. Every wakeup now reaches them under the lock they sleep under,
+  so they sleep until woken, with a 30-second backstop. With 300 such sleepers,
+  zeroemu's host context switches over 10 seconds went from about 1,700 to 120.
 - The emulated sensors sent all nine sensors' readings every 10 ms, the fastest rate
   anything had asked for, each reading waking the sensors HAL. The HAL makes Android's
   events itself, at each sensor's rate, from the last reading it got, so zeroemu now
@@ -117,6 +168,35 @@ What idle CPU is left is mostly Android's: the composer calls SurfaceFlinger wit
 vsync 60 times a second whatever is on screen, as the emulator's images tell
 SurfaceFlinger not to trust present fences, and it keeps hardware vsync on for as long
 as it doesn't.
+
+## Before and after
+
+The changes under System calls, the vCPU, wakeup and fault items under CPU, and the GPU
+calls taken off the renderer's thread, on a whole device: an M1 Pro in ordinary use
+(an editor and a browser open, nothing heavy running), no network, zeroemu's own CPU
+time as `ps` counts it. The build before is the one the changes started from. Each
+figure is the median of three runs, before and after run in turn (before, after,
+after, before, before, after), each from a copy of the same settled `/data`:
+
+| | Before | After |
+|---|---|---|
+| Idle, a minute from 2.5 minutes after boot | 18.8% of a core | 13.7% |
+| Opening 13 apps, scrolling each, then flinging the launcher (about 145 s) | 73.6% of a core | 58.4% |
+| Syscall exits a second, idle | 1,640 | 900 |
+| Syscall exits a second, opening the apps | 22,200 | 12,550 |
+| Page faults a second, opening the apps | 4,610 | 3,500 |
+| Memory idle, and after opening the apps (`top`) | 3.03, 4.46 GB | 2.95, 4.26 GB |
+| App launch, `am start -W` TotalTime, sum of 12 apps' medians | 4.15 s | 3.30 s |
+| Launcher fling: janky frames, 99th percentile | 0.2%, 20 ms | 0.4%, 18 ms |
+| Boot, to `sys.boot_completed` | 10.9 s | 10.8 s |
+
+Every app but Calendar (about the same) opened faster: Chrome in 215 ms rather than
+324, Maps in 381 rather than 505, the Play Store in 168 rather than 249. A first boot
+gains more than a settled one: in the same runs from an empty `/data`, boot went from
+16.0 s to 13.0 s, CPU while opening the apps from 88% to 67% of a core, and idle from
+18.5% to 14.0%, while Android was still setting itself up. Frame statistics didn't
+change either way. The runs' scripts aren't in the repository; `ZEROEMU_SYSCOUNT=1`
+with `kill -USR1` gives the exit counts.
 
 ## Measuring
 

@@ -11,7 +11,7 @@ use super::wait::EVENTS;
 use std::sync::OnceLock;
 use super::inet;
 use super::inotify;
-use super::{ERESTARTSYS, IDLE, Kernel, Thread, int};
+use super::{BACKSTOP, ERESTARTSYS, Kernel, Thread, int};
 use crate::arch::Sysno;
 use crate::errno::*;
 use crate::mm::SharedObject;
@@ -407,6 +407,7 @@ impl Drop for PipeEnd {
 impl Pipe {
     fn read(&self, t: &Thread, max: usize, nonblock: bool) -> Result<Vec<u8>, i64> {
         let mut st = self.st.lock().unwrap();
+        let mut yielded = false;
         loop {
             if !st.buf.is_empty() {
                 let n = max.min(st.buf.len());
@@ -425,14 +426,28 @@ impl Pipe {
             if t.interrupted() {
                 return Err(ERESTARTSYS);
             }
-            super::vcpus::blocking();
+            if !yielded {
+                st = self.yield_vcpu(st);
+                yielded = true;
+                continue;
+            }
             st = t.sleep(&self.cv, st, super::IDLE);
+            yielded = false;
         }
+    }
+
+    /// vcpus::blocking() without the pipe's lock, which the other end wants, as giving
+    /// the vCPU back can take a while. The caller looks again before it sleeps.
+    fn yield_vcpu<'a>(&'a self, st: std::sync::MutexGuard<'a, PipeState>) -> std::sync::MutexGuard<'a, PipeState> {
+        drop(st);
+        super::vcpus::blocking();
+        self.st.lock().unwrap()
     }
 
     fn write(&self, t: &Thread, data: &[u8], nonblock: bool) -> Result<usize, i64> {
         let mut st = self.st.lock().unwrap();
         let mut done = 0;
+        let mut yielded = false;
         loop {
             if st.readers == 0 {
                 return Err(EPIPE);
@@ -454,8 +469,13 @@ impl Pipe {
             if t.interrupted() {
                 return if done > 0 { Ok(done) } else { Err(ERESTARTSYS) };
             }
-            super::vcpus::blocking();
+            if !yielded {
+                st = self.yield_vcpu(st);
+                yielded = true;
+                continue;
+            }
             st = t.sleep(&self.cv, st, super::IDLE);
+            yielded = false;
         }
     }
 }
@@ -2221,7 +2241,7 @@ impl Kernel {
             return Ok(None);
         }
         let m = t.proc.mm().read_u64(sigmask)? & !((1 << 8) | (1 << 18));
-        Ok(Some(t.mask.swap(m, Ordering::Relaxed)))
+        Ok(Some(t.set_mask(m)))
     }
 
     /// Ends a wait that ran under a temporary mask. On EINTR the handler runs
@@ -2229,9 +2249,9 @@ impl Kernel {
     fn restore_mask(&self, t: &Thread, old: Option<u64>, r: &Result<i64, i64>) {
         if let Some(m) = old {
             if matches!(r, Err(EINTR)) {
-                *t.saved_mask.lock().unwrap() = Some(m);
+                t.saved_mask.put(m);
             } else {
-                t.mask.store(m, Ordering::Relaxed);
+                t.set_mask(m);
             }
         }
     }
@@ -2304,6 +2324,7 @@ impl Kernel {
         let wanted = |fd: usize, s: &Vec<u64>| !s.is_empty() && s[fd / 64] & 1 << (fd % 64) != 0;
         let old = self.swap_mask(t, sigmask)?;
         let mut watching = super::wait::Mask::plain();
+        let mut fell_back = false;
         let r = loop {
             // As the last pass found them. A descriptor closed and reopened since is
             // a surprise this finds out about from its timeout.
@@ -2324,9 +2345,7 @@ impl Kernel {
                         Ok(f) => f,
                         Err(e) => break_with(e)?,
                     };
-                    if let Kind::Timer(tf) = &f.kind {
-                        timer = timer.into_iter().chain(tf.deadline()).min();
-                    }
+                    timer = timer.into_iter().chain(timer_deadline(&f)).min();
                     mask |= poll_mask(&f, t, 0);
                     let r = poll_ready(&f, t, 0);
                     for (i, mask) in [POLLIN | POLLHUP | POLLERR, POLLOUT | POLLERR, POLLPRI].iter().enumerate() {
@@ -2336,6 +2355,9 @@ impl Kernel {
                         }
                     }
                 }
+            }
+            if count > 0 && fell_back && late_wake_log() {
+                eprintln!("[zeroemu] late wake: tid {} select: only the fallback timeout noticed {count} ready descriptors", t.tid);
             }
             if count > 0 || deadline.is_some_and(|d| Instant::now() >= d) {
                 let mut mm = t.proc.mm();
@@ -2355,7 +2377,8 @@ impl Kernel {
                 watching = mask;
                 continue;
             }
-            EVENTS.wait(seen, nap(deadline, timer));
+            let nap = nap(deadline, timer);
+            fell_back = EVENTS.wait(seen, nap) && nap == BACKSTOP;
         };
         self.restore_mask(t, old, &r);
         r
@@ -2363,6 +2386,7 @@ impl Kernel {
 
     fn ppoll_wait(&self, t: &Thread, fds: u64, mut raw: Vec<u8>, deadline: Option<Instant>) -> Result<i64, i64> {
         let mut watching = super::wait::Mask::plain();
+        let mut fell_back = false;
         loop {
             let seen = EVENTS.watch(&watching);
             let mut ready = 0;
@@ -2379,9 +2403,7 @@ impl Kernel {
                         let f = t.files().get(fd as i64);
                         match f {
                             Ok(f) => {
-                                if let Kind::Timer(tf) = &f.kind {
-                                    timer = timer.into_iter().chain(tf.deadline()).min();
-                                }
+                                timer = timer.into_iter().chain(timer_deadline(&f)).min();
                                 mask |= poll_mask(&f, t, 0);
                                 poll_ready(&f, t, 0) & (events | POLLERR | POLLHUP)
                             }
@@ -2394,6 +2416,9 @@ impl Kernel {
                     }
                 }
             }
+            if ready > 0 && fell_back && late_wake_log() {
+                eprintln!("[zeroemu] late wake: tid {} ppoll: only the fallback timeout noticed {ready} ready descriptors", t.tid);
+            }
             if ready > 0 || deadline.is_some_and(|d| Instant::now() >= d) {
                 t.proc.mm().write(fds, &raw)?;
                 return Ok(ready);
@@ -2405,7 +2430,8 @@ impl Kernel {
                 watching = mask;
                 continue;
             }
-            EVENTS.wait(seen, nap(deadline, timer));
+            let nap = nap(deadline, timer);
+            fell_back = EVENTS.wait(seen, nap) && nap == BACKSTOP;
         }
     }
 
@@ -2440,7 +2466,7 @@ impl Kernel {
                 break Err(EINTR);
             }
             let nap = nap(deadline, ep.deadline());
-            fell_back = EVENTS.wait(seen, nap) && nap == IDLE;
+            fell_back = EVENTS.wait(seen, nap) && nap == BACKSTOP;
         };
         self.restore_mask(t, old, &r);
         r
@@ -2462,17 +2488,31 @@ fn epoll_timespec_ms(t: &Thread, ts: u64) -> Result<i64, i64> {
     Ok(sec.saturating_mul(1000).saturating_add((nsec + 999_999) / 1_000_000))
 }
 
-/// How long a poller may sleep: until its deadline or the next timer. Changes,
-/// signals and exits all wake it, so the limit is only a backstop, and at hundreds of
-/// threads in epoll it had better be a long one.
-fn nap(deadline: Option<Instant>, timer: Option<Instant>) -> Duration {
-    let until = deadline.into_iter().chain(timer).min();
-    until.map_or(IDLE, |d| d.saturating_duration_since(Instant::now()).min(IDLE)).max(Duration::from_micros(50))
+/// When a timerfd behind `f` next fires: its own, or the first of an epoll's, nested
+/// ones too. On Linux the timer's hrtimer wakes the pollers when it fires
+/// (timerfd_tmrproc in fs/timerfd.c), and through an epoll, ep_poll_callback in
+/// fs/eventpoll.c passes that on to those polling the epoll. Here nothing announces it
+/// (the timer counts when somebody looks), so a poller sleeps no later than this.
+fn timer_deadline(f: &File) -> Option<Instant> {
+    match &f.kind {
+        Kind::Timer(tf) => tf.deadline(),
+        Kind::Epoll(ep) => ep.deadline(),
+        _ => None,
+    }
 }
 
-/// ZEROEMU_LATEWAKE=1: reports readiness nothing announced with EVENTS.bump.
-/// Those files work, but only as fast as the fallback timeout.
-fn late_wake_log() -> bool {
+/// How long a poller may sleep: until its deadline or the next timer. Changes,
+/// signals and exits all wake it, each under the lock of its EVENTS slot, so the limit
+/// is only a backstop, and at hundreds of threads in epoll it had better be a long one.
+fn nap(deadline: Option<Instant>, timer: Option<Instant>) -> Duration {
+    let until = deadline.into_iter().chain(timer).min();
+    until.map_or(BACKSTOP, |d| d.saturating_duration_since(Instant::now()).min(BACKSTOP)).max(Duration::from_micros(50))
+}
+
+/// ZEROEMU_LATEWAKE=1: reports readiness nothing announced with EVENTS.bump, and
+/// futex waits that only the fallback timeout ended. Those work, but only as fast as
+/// that timeout.
+pub(super) fn late_wake_log() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("ZEROEMU_LATEWAKE").is_some())
 }

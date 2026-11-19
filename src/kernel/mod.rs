@@ -12,6 +12,7 @@ mod binder;
 mod block;
 mod bpf;
 mod cgroup;
+pub(crate) mod clock;
 mod control;
 mod creds;
 mod drm;
@@ -49,6 +50,7 @@ mod timers;
 pub(crate) mod trace;
 mod unix;
 mod vcpus;
+pub(crate) mod vdso;
 mod vsock;
 mod wait;
 mod xattr;
@@ -131,6 +133,11 @@ pub(super) const POLL: Duration = Duration::from_millis(200);
 /// For sleeps every wakeup reaches directly (Thread::sleep): only a kick lost
 /// in the instant before the sleep starts ever waits this long.
 pub(super) const IDLE: Duration = Duration::from_secs(2);
+/// For sleeps that every wakeup, kicks included, reaches under the lock they look and
+/// sleep under (futex waits, and the EVENTS waits of poll, select and epoll): nothing
+/// can be lost, and this only bounds what a bug would cost. IDLE, two seconds, woke a
+/// thousand sleeping threads a second for nothing.
+pub(super) const BACKSTOP: Duration = Duration::from_secs(30);
 /// Guest threads at once (each is a host thread; vCPUs are shared).
 const MAX_THREADS: usize = 16384;
 
@@ -165,8 +172,11 @@ pub struct Kernel {
     live_threads: AtomicUsize,
     persist: Option<Persist>,
     pub(crate) pressure: pressure::Pressure,
-    /// Where signal handlers return to: one page, the same in every process.
+    /// Where signal handlers return to without a vDSO: one page, the same in every
+    /// process.
     sigpage: Arc<crate::mm::SharedObject>,
+    /// The vDSO and its [vvar] page, the same in every process (arm64 only).
+    vdso: Option<vdso::Vdso>,
     /// The vCPUs guest threads share.
     vcpus: Arc<vcpus::Pool>,
     futex: futex::Futexes,
@@ -532,7 +542,7 @@ pub struct Process {
     /// Set by exit_group / a fatal signal: the status the process will report.
     exiting: Mutex<Option<i32>>,
     /// Process-directed pending signals.
-    pending: Mutex<HashMap<u32, SigInfo>>,
+    pending: signal::Pending,
     timers: Mutex<timers::ProcTimers>,
     mm_taker: AtomicI32,
     files_taker: AtomicI32,
@@ -569,8 +579,8 @@ pub struct Thread {
     clear_child_tid: AtomicU64,
     mask: AtomicU64,
     /// Mask to restore after a sigsuspend once its handler returns.
-    saved_mask: Mutex<Option<u64>>,
-    pending: Mutex<HashMap<u32, SigInfo>>,
+    saved_mask: signal::SavedMask,
+    pending: signal::Pending,
     altstack: Mutex<(u64, u64, i32)>,
     kick: Mutex<Option<Arc<dyn Kick>>>,
     dying: AtomicBool,
@@ -585,11 +595,13 @@ pub struct Thread {
     /// SELinux exec/fscreate/keycreate/sockcreate contexts.
     pub sec: selinux::ThreadSec,
     /// The syscall in progress, for thread dumps.
-    in_syscall: Mutex<Option<SyscallSnap>>,
+    in_syscall: InSyscall,
     /// The host thread it runs on, once it does, for its CPU time.
     host: std::sync::OnceLock<crate::hv::HostThread>,
-    /// Asked to give its vCPU back the next time it blocks (vcpus::reclaim_sleepers).
+    /// Asked to give its vCPU back the next time it blocks (vcpus::Pool::reclaim).
     give_back: AtomicBool,
+    /// Its place on the futex queues, where a kick finds it asleep in a futex wait.
+    futex: Arc<futex::Waiter>,
     /// A descriptor table of its own: cloned without CLONE_FILES. Bionic's
     /// crash handler makes such a thread and closes everything in it.
     own_files: Option<Arc<Mutex<FdTable>>>,
@@ -601,16 +613,83 @@ pub struct Thread {
 static SYSCALL_COUNTS: std::sync::LazyLock<Option<Mutex<HashMap<(i32, u64, i64), u64>>>> =
     std::sync::LazyLock::new(|| (std::env::var("ZEROEMU_SYSCOUNT").as_deref() == Ok("1")).then(Mutex::default));
 
+/// With ZEROEMU_SYSCOUNT too: every exit from the guest since the last thread dump, by
+/// kind (syscall, page fault, kick, anything else), and the time page faults took.
+static EXITS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+static FAULT_NS: AtomicU64 = AtomicU64::new(0);
+static EXITS_SINCE: Mutex<Option<Instant>> = Mutex::new(None);
+
 /// Where a thread entered the kernel: what a thread dump prints for it. The
 /// registers for its backtrace are read only under ZEROEMU_DUMP (they cost a
 /// trip to the hypervisor on every syscall).
+#[derive(Clone, Copy)]
 struct SyscallSnap {
     nr: u64,
     args: [u64; 6],
     pc: u64,
     lr: u64,
     fp: u64,
-    since: Instant,
+    /// When it entered: the guest's CLOCK_MONOTONIC, ns.
+    since: u64,
+}
+
+/// The syscall a thread is in, written by the thread on every syscall and read by
+/// others only for thread dumps and /proc. A sequence count
+/// rather than a lock, as Linux's seqcount_t (include/linux/seqlock.h), so the
+/// thread itself never waits or takes a lock for it: `seq` is a multiple of 4 while
+/// the thread is out of syscalls, one more while it writes the fields, and two more
+/// while it is in a syscall and they hold.
+#[derive(Default)]
+struct InSyscall {
+    seq: AtomicU64,
+    nr: AtomicU64,
+    args: [AtomicU64; 6],
+    pc: AtomicU64,
+    lr: AtomicU64,
+    fp: AtomicU64,
+    since: AtomicU64,
+}
+
+impl InSyscall {
+    /// Only ever called by its own thread, the one writer.
+    fn enter(&self, snap: &SyscallSnap) {
+        let seq = self.seq.load(Ordering::Relaxed);
+        self.seq.store(seq + 1, Ordering::Relaxed);
+        // Readers that see these fields see the odd count too.
+        std::sync::atomic::fence(Ordering::Release);
+        self.nr.store(snap.nr, Ordering::Relaxed);
+        for (a, &v) in self.args.iter().zip(&snap.args) {
+            a.store(v, Ordering::Relaxed);
+        }
+        self.pc.store(snap.pc, Ordering::Relaxed);
+        self.lr.store(snap.lr, Ordering::Relaxed);
+        self.fp.store(snap.fp, Ordering::Relaxed);
+        self.since.store(snap.since, Ordering::Relaxed);
+        self.seq.store(seq + 2, Ordering::Release);
+    }
+
+    fn leave(&self) {
+        let seq = self.seq.load(Ordering::Relaxed);
+        self.seq.store(seq + 2, Ordering::Release);
+    }
+
+    /// Ok(None) out of syscalls, Err while it is entering one or has just left
+    /// the one it read.
+    fn read(&self) -> Result<Option<SyscallSnap>, ()> {
+        let seq = self.seq.load(Ordering::Acquire);
+        match seq % 4 {
+            0 => return Ok(None),
+            2 => {}
+            _ => return Err(()),
+        }
+        let load = |a: &AtomicU64| a.load(Ordering::Relaxed);
+        let snap = SyscallSnap { nr: load(&self.nr), args: self.args.each_ref().map(load), pc: load(&self.pc), lr: load(&self.lr), fp: load(&self.fp), since: load(&self.since) };
+        std::sync::atomic::fence(Ordering::Acquire);
+        if self.seq.load(Ordering::Relaxed) != seq {
+            return Err(());
+        }
+        Ok(Some(snap))
+    }
 }
 
 /// ZEROEMU_DUMP=<secs>: every that many seconds, print every guest thread,
@@ -646,9 +725,14 @@ pub fn wakeup_stats(over: Duration) -> String {
     );
     *last = (plain, keyed, wakes);
     static MADE_LAST: AtomicU64 = AtomicU64::new(0);
-    let made = vcpus::MADE.load(Ordering::Relaxed);
-    let (used, max) = vcpus::MAIN.get().and_then(|p| p.upgrade()).map_or((0, 0), |p| p.usage());
-    let s = format!("{s}, {:.0} vCPUs made/s, {used} of {max} in use", (made - MADE_LAST.swap(made, Ordering::Relaxed)) as f64 / secs);
+    static WAITED_LAST: AtomicU64 = AtomicU64::new(0);
+    let (made, waited) = (vcpus::MADE.load(Ordering::Relaxed), vcpus::WAITED.load(Ordering::Relaxed));
+    let (used, asleep, max) = vcpus::MAIN.get().and_then(|p| p.upgrade()).map_or((0, 0, 0), |p| p.usage());
+    let s = format!(
+        "{s}, {:.0} vCPUs made/s, {used} of {max} in use ({asleep} asleep), {:.0} waits for one/s",
+        (made - MADE_LAST.swap(made, Ordering::Relaxed)) as f64 / secs,
+        (waited - WAITED_LAST.swap(waited, Ordering::Relaxed)) as f64 / secs
+    );
     let top = wait::top_wakers(4);
     if top.is_empty() {
         return s;
@@ -784,6 +868,18 @@ impl Process {
         self.mm_taker.store(guest_tid(), Ordering::Relaxed);
         Mm(guard)
     }
+
+    /// The address space if nobody holds it now: for a caller that should not wait for
+    /// it under another lock (futex_wait).
+    pub fn try_mm(&self) -> Option<Mm<'_>> {
+        let guard = match self.mm.try_lock() {
+            Ok(g) => g,
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+            Err(std::sync::TryLockError::Poisoned(e)) => panic!("address space lock poisoned: {e}"),
+        };
+        self.mm_taker.store(guest_tid(), Ordering::Relaxed);
+        Some(Mm(guard))
+    }
 }
 
 /// ZEROEMU_SCHED_TRACE=1: every change in what the host is told about a thread.
@@ -805,8 +901,8 @@ impl Thread {
             proc,
             clear_child_tid: AtomicU64::new(0),
             mask: AtomicU64::new(mask),
-            saved_mask: Mutex::new(None),
-            pending: Mutex::new(HashMap::new()),
+            saved_mask: Default::default(),
+            pending: Default::default(),
             altstack: Mutex::new((0, 0, signal::SS_DISABLE)),
             kick: Mutex::new(None),
             dying: AtomicBool::new(false),
@@ -815,20 +911,16 @@ impl Thread {
             cpu_group: AtomicU8::new(sched::CpuGroup::Other as u8),
             urgency: AtomicU8::new(Urgency::Normal as u8),
             sec: Default::default(),
-            in_syscall: Mutex::new(None),
+            in_syscall: Default::default(),
             host: std::sync::OnceLock::new(),
             give_back: AtomicBool::new(false),
+            futex: futex::Waiter::new(),
         })
     }
 
     /// Whether it is in a syscall now (a thread dump's view of it).
     pub fn in_syscall(&self) -> bool {
-        self.in_syscall.try_lock().is_ok_and(|s| s.is_some())
-    }
-
-    /// How long it has been in the syscall it is in, if it is in one.
-    pub(super) fn in_syscall_for(&self) -> Option<Duration> {
-        self.in_syscall.try_lock().ok().and_then(|s| s.as_ref().map(|s| s.since.elapsed()))
+        self.in_syscall.read().is_ok_and(|s| s.is_some())
     }
 
     /// CPU time it has used, in ns.
@@ -925,6 +1017,7 @@ impl Thread {
         if let Some(cv) = &*self.sleeping_on.lock().unwrap() {
             unsafe { (*cv.0).notify_all() };
         }
+        self.futex.kick();
     }
 
     /// Sleeps on `cv` until it is notified, the thread is kicked, or `timeout`
@@ -977,6 +1070,7 @@ impl Kernel {
         v.set_page_cache(crate::pagecache::PageCache::new(phys.clone()));
         let sigpage = crate::mm::SharedObject::new(phys.clone());
         sigpage.write(0, &signal::trampoline_page()).map_err(|e| format!("signal page: errno {e}"))?;
+        let vdso = vdso::Vdso::new(&phys).map_err(|e| format!("vDSO: errno {e}"))?;
         let (dev, data) = mount_tmpfs(&mut v, &phys);
         let mut persist = None;
         if boot {
@@ -1107,6 +1201,7 @@ impl Kernel {
             persist,
             pressure: pressure::Pressure::default(),
             sigpage,
+            vdso,
             futex: futex::Futexes::default(),
             root_pid: AtomicI32::new(0),
             props,
@@ -1129,9 +1224,13 @@ impl Kernel {
     pub fn new_address_space(&self) -> Result<AddressSpace, i64> {
         let asid = self.phys.alloc_asid()?;
         let mut mm = AddressSpace::new(self.phys.clone(), &self.kwin, asid).inspect_err(|_| self.phys.free_asid(asid))?;
-        // Where signal handlers return to (Linux puts this in the vDSO).
-        mm.map(Placement::Fixed(signal::SIGRETURN_TRAMPOLINE), PAGE, PROT_READ | PROT_EXEC, Backing::File { src: self.sigpage.clone(), offset: 0 })?;
-        mm.set_name(signal::SIGRETURN_TRAMPOLINE, PAGE, "[sigpage]");
+        // Where signal handlers return to: the vDSO, as on Linux, or a page of its own.
+        if let Some(v) = &self.vdso {
+            v.map(&mut mm)?;
+        } else {
+            mm.map(Placement::Fixed(signal::SIGRETURN_TRAMPOLINE), PAGE, PROT_READ | PROT_EXEC, Backing::File { src: self.sigpage.clone(), offset: 0 })?;
+            mm.set_name(signal::SIGRETURN_TRAMPOLINE, PAGE, "[sigpage]");
+        }
         Ok(mm)
     }
 
@@ -1251,6 +1350,39 @@ impl Kernel {
         eprintln!("[zeroemu] ---- thread dump: {} processes ----", procs.len());
         if let Some(counts) = &*SYSCALL_COUNTS {
             let mut busiest: Vec<_> = counts.lock().unwrap().drain().collect();
+            let now = Instant::now();
+            let since = EXITS_SINCE.lock().unwrap().replace(now);
+            let secs = since.map_or(0.0, |s| (now - s).as_secs_f64()).max(0.001);
+            let [sys, faults, kicks, other] = [0, 1, 2, 3].map(|i| EXITS[i].swap(0, Ordering::Relaxed));
+            // The first dump has no start to divide by: it only starts the count.
+            if since.is_none() {
+                FAULT_NS.store(0, Ordering::Relaxed);
+                crate::hv::TLB_FLUSHES.iter().chain(&crate::mm::TLB_CHANGES).for_each(|n| n.store(0, Ordering::Relaxed));
+                eprintln!("[exits] counting from now; the next dump gives the rates");
+            } else {
+                eprintln!(
+                    "[exits] {secs:.1} s: {:.0}/s syscalls, {:.0}/s page faults taking {:.1}% of a core, {:.0}/s kicks, {other} other",
+                    sys as f64 / secs,
+                    faults as f64 / secs,
+                    FAULT_NS.swap(0, Ordering::Relaxed) as f64 / secs / 1e7,
+                    kicks as f64 / secs
+                );
+                let mut by_nr: HashMap<u64, u64> = HashMap::new();
+                for &((_, nr, _), n) in &busiest {
+                    *by_nr.entry(nr).or_default() += n;
+                }
+                let mut by_nr: Vec<_> = by_nr.into_iter().collect();
+                by_nr.sort_by_key(|&(_, n)| std::cmp::Reverse(n));
+                let flushes: Vec<String> =
+                    crate::hv::TlbFlush::NAMES.iter().zip(&crate::hv::TLB_FLUSHES).map(|(name, n)| format!("{:.0}/s {name}", n.swap(0, Ordering::Relaxed) as f64 / secs)).collect();
+                eprintln!("[exits] TLB flushes: {}", flushes.join(", "));
+                let changes: Vec<String> =
+                    crate::mm::TlbChange::NAMES.iter().zip(&crate::mm::TLB_CHANGES).map(|(name, n)| format!("{:.0}/s {name}", n.swap(0, Ordering::Relaxed) as f64 / secs)).collect();
+                eprintln!("[exits] stale translations from: {}", changes.join(", "));
+                for (nr, n) in by_nr.into_iter().take(30) {
+                    eprintln!("[exits] {:.0}/s {:?}", n as f64 / secs, self.arch.sysno(nr));
+                }
+            }
             busiest.sort_by_key(|&(_, n)| std::cmp::Reverse(n));
             for ((tid, nr, result), n) in busiest.into_iter().take(40) {
                 eprintln!("[syscount] {n} tid {tid} {:?} ({nr}) -> {result}", self.arch.sysno(nr));
@@ -1276,7 +1408,8 @@ impl Kernel {
             let exe = p.exe.try_lock().map(|e| e.clone()).unwrap_or_else(|_| "?".into());
             for t in threads {
                 let comm = t.attrs.try_lock().map(|a| a.comm.clone()).unwrap_or_else(|_| "?".into());
-                let Ok(snap) = t.in_syscall.try_lock().map(|s| s.as_ref().map(|s| (s.nr, s.args, s.pc, s.lr, s.fp, s.since.elapsed()))) else {
+                let now = monotonic_ns();
+                let Ok(snap) = t.in_syscall.read().map(|s| s.map(|s| (s.nr, s.args, s.pc, s.lr, s.fp, Duration::from_nanos(now.saturating_sub(s.since))))) else {
                     eprintln!("[zeroemu] {} {} {comm} ({exe}): entering or leaving a syscall", p.pid, t.tid);
                     continue;
                 };
@@ -1369,7 +1502,7 @@ impl Kernel {
             child_cv: Condvar::new(),
             status: Mutex::new(None),
             exiting: Mutex::new(None),
-            pending: Mutex::new(HashMap::new()),
+            pending: Default::default(),
             knobs: Mutex::default(),
             creds: Mutex::new(creds::Creds::root()),
             attrs: Mutex::new(control::ProcAttrs::first()),
@@ -1456,7 +1589,10 @@ impl Kernel {
         t.event_slot.store(wait::EVENTS.slot_of_this_thread(), Ordering::Relaxed);
         wait::set_slot_tid(t.tid);
         crate::vfs::set_current_ns(t.proc.mnt_ns.load(Ordering::Relaxed));
-        let root = t.proc.mm().root;
+        let (root, tlb) = {
+            let mm = t.proc.mm();
+            (mm.root, mm.tlb.clone())
+        };
         let mut vcpu: Box<dyn Vcpu> = Box::new(vcpus::LazyVcpu::new(self.hv.clone(), self.vcpus.clone(), t.clone(), root, state));
         let mut stale = crate::mm::Stale::default();
         let mut restart: Option<SyscallRegs> = None;
@@ -1468,19 +1604,26 @@ impl Kernel {
             if t.dying.load(Ordering::Acquire) {
                 break;
             }
-            self.deliver_signals(t, vcpu.as_mut(), restart.take());
-            if t.dying.load(Ordering::Acquire) {
-                break;
+            // Neither check takes a lock: they run on every way in. A signal sent or a
+            // flush asked for after they look kicks this vCPU, or is the work of a
+            // thread that flushes before it next runs guest code.
+            if restart.is_some() || t.signals_to_look_at() {
+                self.deliver_signals(t, vcpu.as_mut(), restart.take());
+                if t.dying.load(Ordering::Acquire) {
+                    break;
+                }
             }
             // Last thing before going in: writing a signal frame just now may have copied
             // a page that the guest would otherwise go on reading the old way.
-            {
+            if tlb.behind() {
                 let mut mm = t.proc.mm();
-                if mm.flushed_gen < mm.tlb_gen {
-                    stale.absorb(mm.take_stale());
-                    vcpu.flush_tlb();
-                    flushing = Some(mm.tlb_gen);
+                stale.absorb(mm.take_stale());
+                let (generation, page) = mm.tlb_flush_scope();
+                match page {
+                    Some(va) => vcpu.flush_tlb_page(va),
+                    None => vcpu.flush_tlb(),
                 }
+                flushing = Some(generation);
             }
             let exit = vcpu.run();
             // The flush requested last time ran on entry; now frames are safe to
@@ -1489,10 +1632,17 @@ impl Kernel {
             if !matches!(exit, Exit::Interrupted | Exit::Fault { pc: 0, addr: 0, .. })
                 && let Some(generation) = flushing.take()
             {
-                let mut mm = t.proc.mm();
-                mm.flushed_gen = mm.flushed_gen.max(generation);
-                drop(mm);
+                tlb.flushed_to(generation);
                 stale.release(&self.phys);
+            }
+            if SYSCALL_COUNTS.is_some() {
+                let kind = match exit {
+                    Exit::Syscall => 0,
+                    Exit::PageFault { .. } => 1,
+                    Exit::Interrupted => 2,
+                    _ => 3,
+                };
+                EXITS[kind].fetch_add(1, Ordering::Relaxed);
             }
             match exit {
                 Exit::Syscall => {
@@ -1508,7 +1658,11 @@ impl Kernel {
                     }
                 }
                 Exit::PageFault { pc, addr, write, exec } => {
-                    let faulted = t.proc.mm().fault(addr, write, exec);
+                    let started = SYSCALL_COUNTS.is_some().then(Instant::now);
+                    let faulted = self.page_fault(t, addr, write, exec);
+                    if let Some(s) = started {
+                        FAULT_NS.fetch_add(s.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                    }
                     if faulted == Err(crate::mm::FAULT_UFFD) {
                         const BUS_ADRERR: i32 = 2;
                         if !self.signal_caught(t, signal::SIGBUS) {
@@ -1559,12 +1713,12 @@ impl Kernel {
             Some(CpuState::Aarch64(st)) => (st.pc, st.x[30], st.x[29]),
             _ => (0, 0, 0),
         };
-        *t.in_syscall.lock().unwrap() = Some(SyscallSnap { nr: regs.nr, args: a, pc, lr, fp, since: Instant::now() });
+        t.in_syscall.enter(&SyscallSnap { nr: regs.nr, args: a, pc, lr, fp, since: monotonic_ns() });
         let ret = match sysno {
             None => Ret::Value(-ENOSYS),
             Some(no) => self.dispatch(no, t, vcpu, a),
         };
-        *t.in_syscall.lock().unwrap() = None;
+        t.in_syscall.leave();
         if let Some(counts) = &*SYSCALL_COUNTS {
             let result = if let Ret::Value(v) = ret { v.min(1) } else { 1 };
             *counts.lock().unwrap().entry((t.tid, regs.nr, result)).or_default() += 1;

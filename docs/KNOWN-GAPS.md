@@ -87,6 +87,48 @@ Emulator. [INTERNALS.md](INTERNALS.md) says how each part works.
   can't change its ids and fails.
 - userfaultfd has only what ART's compacting collector uses: SIGBUS mode, on private
   anonymous memory.
+- `madvise` isn't Linux's (mm/madvise.c) in three ways:
+  - Only MADV_DONTNEED, MADV_FREE, the fork advice and MADV_POPULATE_READ/WRITE do
+    anything. Any other advice, an unknown one too, returns 0: MADV_WILLNEED reads
+    nothing ahead, so a file's pages are read when first touched, and MADV_REMOVE leaves
+    a shared mapping's data, where Linux frees it and it reads back as zeros.
+  - A range with a hole: Linux acts on every mapped part, then returns ENOMEM.
+    MADV_DONTNEED, MADV_FREE and the advice that does nothing return 0, the fork advice
+    changes nothing and returns ENOMEM, and MADV_POPULATE_READ/WRITE fill in the pages
+    before the hole and return ENOMEM. Where a mapping in the range can't take the fork
+    advice (EINVAL), zeroemu changes nothing, and Linux has changed the mappings before
+    that one. The advice that does nothing returns 0 for a start that isn't page-aligned, where
+    Linux returns EINVAL.
+  - MADV_FREE drops the pages of any mapping, as MADV_DONTNEED does, so a private file
+    mapping's written pages read back from the file. Linux takes it only on private
+    anonymous memory and refuses it elsewhere with EINVAL (`madvise_free_single_vma`).
+- `epoll_wait` marks a one-shot registration as fired, and an edge-triggered one as
+  reported, before it copies the events out. If the copy fails (EFAULT), those events
+  are lost, where Linux puts them back (`ep_send_events` in fs/eventpoll.c).
+
+## Threads and signals
+
+- A signal or an exit that comes just as a thread goes to sleep in `sigsuspend`,
+  `nanosleep`, `wait4`, a pipe or pty read or write, a file lock or binder, or while it
+  waits for a vCPU, can be missed until the sleep's 2-second limit runs out. The thread
+  is told without taking the lock it sleeps under (`Thread::sleep`). In `rt_sigtimedwait`
+  (ART's signal catcher waits for SIGQUIT there) the window is wider: any of the
+  awaited signals sent between its look at what is pending and its sleep can wait the
+  2 seconds. Futex waits and `poll`, `select` and `epoll_wait` aren't affected.
+- `futex` has no FUTEX_WAKE_OP, FUTEX_WAIT_REQUEUE_PI or FUTEX_CMP_REQUEUE_PI: they
+  return ENOSYS.
+- FUTEX_CMP_REQUEUE, FUTEX_LOCK_PI and FUTEX_UNLOCK_PI read or change the futex word
+  with its bucket locked, and fault the word's page in there if it isn't in: a page read
+  from a file then holds up the other futexes in that bucket. Linux faults the page in
+  with the bucket unlocked and tries again (`futex_requeue` in kernel/futex/requeue.c,
+  `futex_lock_pi` and `futex_unlock_pi` in kernel/futex/pi.c), as zeroemu's futex wait
+  does. The callers in bionic and ART have just written or compared the word, so its
+  page is in.
+- A signal sent to a whole process goes to one thread that lets it in. If that thread
+  blocks it or exits before taking it, no other thread is told, where Linux passes it on
+  (`retarget_shared_pending`, from `__set_task_blocked` and `exit_signals` in
+  kernel/signal.c): the signal waits for a thread that lets it in to look at its
+  signals.
 
 ## Graphics
 

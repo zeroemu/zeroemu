@@ -97,6 +97,9 @@ Tracing:
 
 - `ZEROEMU_STRACE=1` (or `--strace`) logs every syscall (`ZEROEMU_STRACE=<name>`:
   only of programs whose path contains it).
+- `ZEROEMU_NO_VDSO=1` gives arm64 programs no vDSO, so their `clock_gettime`,
+  `gettimeofday` and `clock_getres` calls are syscalls again, which `ZEROEMU_STRACE`
+  logs and `ZEROEMU_SYSCOUNT` counts. With the vDSO they never leave the VM.
 - `ZEROEMU_BINDER_TRACE=1` logs every binder transaction.
 - `ZEROEMU_BINDER_RING=1` keeps each thread's last binder events, ioctls included, and
   prints them when its process is killed by a signal.
@@ -110,8 +113,9 @@ Tracing:
   sticky directory, owner only, a missing capability).
 - `ZEROEMU_FAULTLOG=1` reports every fault that raises a signal, handled or not
   (`ZEROEMU_FAULTLOG=0x<address>`: only faults at that address).
-- `ZEROEMU_LATEWAKE=1` reports readiness that no wakeup announced. Such files work,
-  but only as fast as the fallback timeout.
+- `ZEROEMU_LATEWAKE=1` reports a poll, select, epoll or futex wait that only its
+  fallback timeout (30 s) ended: readiness, a signal or an ask for the thread's vCPU
+  that no wakeup announced. Such waits work, but only as fast as that timeout.
 - `ZEROEMU_TRACE=<file>` writes Android's own trace markers to a host file, each with the
   guest's monotonic time, pid and tid, with zeroemu's GPU ioctls on the guest thread that made
   them; turn Android's tags on with `ZEROEMU_PROPS=debug.atrace.tags.enableflags=0x86e`
@@ -127,8 +131,16 @@ Stuck or busy guests:
   syscall it is in, for how long, and its backtrace; `kill -USR1` on zeroemu prints one
   such dump at any time (without backtraces unless `ZEROEMU_DUMP` is set).
 - `ZEROEMU_SYSCOUNT=1` adds to each thread dump what each thread has called since the
-  last, which finds a thread in a loop: send `SIGUSR1` twice, a few seconds apart.
+  last, which finds a thread in a loop: send `SIGUSR1` twice, a few seconds apart. From
+  the second dump on, `[exits]` lines also give the exits from the VM per second since
+  the last dump, by kind (syscalls, page faults, kicks) and by syscall, the share of
+  a core that page faults took, and the TLB flushes run in the guest, by what they
+  covered and by why translations went stale.
 - `ZEROEMU_MEMSTAT=1` adds to each thread dump where memory has gone, by kind and by file.
+- `ZEROEMU_RSS_CHECK=1` checks each process's count of resident pages, which
+  `/proc/<pid>/stat`, `statm`, `status` and `oom_score` and `getrusage` report, against a
+  walk of its page tables, at each read of it and when the address space goes. It prints
+  any difference, and at the first check and every thousandth how many differed.
 - `ZEROEMU_WAKE_STATS=1` adds the keys that woke the most to `ZEROEMU_GPU_STATS=1`'s
   line, and prints where a key that wakes over a hundred threads at once is announced
   from.
@@ -158,7 +170,9 @@ Graphics:
   asks for (by default `Minigbm:enabled`, as the guest's gralloc is minigbm).
 - `ZEROEMU_GPU_STATS=1` prints the display's frame rate every five seconds (and black
   frames, when frames are read back); the line also says how many sleeping threads
-  events woke and how many vCPUs were made each second.
+  events woke, how many vCPUs were made, how often a thread waited for one, and how
+  many calls waited for the renderer's one thread (`virtio-gpu`), each second, and how
+  many vCPUs are in use and how many of their holders are asleep.
 - `ZEROEMU_DRM_TRACE=1` logs GPU ioctls, transfers and fences.
 - `ZEROEMU_GPU_LOG=<S|E|W|I|D>` sets how much of the renderer's own log shows, from
   nothing (`S`) to everything (`D`). By default its errors show during a boot.

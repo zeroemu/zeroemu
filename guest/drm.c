@@ -1,7 +1,8 @@
 // Freestanding arm64 test of zeroemu's virtio-gpu DRM node: version and
-// capsets, a guest blob and a host-visible blob (mmap both), PRIME, a
-// sync_file fence, and one atomic page flip. Exits 0 with no device, so the
-// default headless run stays green; ZEROEMU_GPU=fake is what exercises it.
+// capsets, a guest blob and a host-visible blob (mmap both), a 3D buffer
+// (transfers and mmap), PRIME, a sync_file fence, and one atomic page flip.
+// Exits 0 with no device, so the default headless run stays green;
+// ZEROEMU_GPU=fake is what exercises it.
 
 typedef unsigned long u64;
 typedef long i64;
@@ -127,6 +128,40 @@ int cmain(void) {
         hp[0] = 0xa5;
         check(hp[0] == 0xa5, "host blob store is visible");
         sys(NR_munmap, hp, 16384);
+    }
+
+    // A 3D buffer gets its guest pages on first use: first a transfer, then a map.
+    for (int i = 0; i < 2; i++) {
+        memset(buf, 0, 56);
+        w32(buf, 0, 2);     // PIPE_TEXTURE_2D
+        w32(buf, 4, 1);     // B8G8R8A8
+        w32(buf, 8, 2);     // RENDER_TARGET
+        w32(buf, 12, 64);
+        w32(buf, 16, 64);
+        w32(buf, 20, 1);
+        w32(buf, 24, 1);
+        check(xioctl(rd, ioc(3, 'd', 0x44, 56), buf) == 0 && r32(buf, 48) == 64 * 64 * 4, "RESOURCE_CREATE");
+        u32 handle = r32(buf, 40);
+        u8 xfer[44];
+        memset(xfer, 0, 44);
+        w32(xfer, 0, handle);
+        w32(xfer, 16, 64); // box w, h, d
+        w32(xfer, 20, 64);
+        w32(xfer, 24, 1);
+        w32(xfer, 36, 64 * 4);
+        if (i == 0) check(xioctl(rd, ioc(3, 'd', 0x46, 44), xfer) == 0, "TRANSFER_FROM_HOST before any map");
+        u8 *p = (u8 *)map_gem(rd, handle, 64 * 64 * 4);
+        check((u64)p < (u64)-4096, "mmap 3D buffer");
+        if ((u64)p < (u64)-4096) {
+            check(p[0] == 0 && p[64 * 64 * 4 - 1] == 0, "3D buffer starts zeroed");
+            p[100] = 0x3c;
+            check(p[100] == 0x3c, "3D buffer store is visible");
+            sys(NR_munmap, p, 64 * 64 * 4);
+        }
+        if (i == 1) check(xioctl(rd, ioc(3, 'd', 0x47, 44), xfer) == 0, "TRANSFER_TO_HOST after a map");
+        memset(buf, 0, 8);
+        w32(buf, 0, handle);
+        check(xioctl(rd, ioc(3, 'd', 0x09, 8), buf) == 0, "GEM_CLOSE 3D buffer");
     }
 
     memset(buf, 0, 12);

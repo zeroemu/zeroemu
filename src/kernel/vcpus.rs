@@ -2,25 +2,35 @@
 //! (HVF: 64) and Android runs hundreds of threads, most of them blocked in
 //! the kernel (idle binder pools, futex and poll waits). A vCPU belongs to the
 //! host thread that made it (HVF's rule), so it cannot be handed to another
-//! thread; instead a thread that blocks while the pool runs short saves its
-//! registers and destroys its vCPU, and makes a new one when it next runs
-//! guest code. While parked, its register state is answered from the copy.
+//! thread; instead a thread asked for its place saves its registers and
+//! destroys its vCPU, and makes a new one when it next runs guest code. While
+//! parked, its register state is answered from the copy.
 //!
-//! The first thread in line for a vCPU kicks those that have held theirs longest,
-//! which give them up at their next exit, so threads spinning in user code cannot
-//! starve the rest. Everyone else in line sleeps until it is first: hundreds of them
-//! polling this lock would be a load all of its own.
+//! Destroying and making a vCPU are costly calls to the hypervisor, so a thread
+//! that blocks keeps its vCPU while places are free. A few places are kept free by
+//! asking the threads that have slept longest to give theirs back: most sleeps are
+//! short, and a thread asleep for a long time is likely to stay asleep. Only when
+//! that falls behind, or someone waits for a place, does a thread that blocks give
+//! its own up at once: a thread that wakes to find no place has to wait for one.
+//!
+//! The first thread in line for a vCPU asks the longest sleepers too, and kicks
+//! the threads that have run longest, which give their vCPUs up at their next exit,
+//! so threads spinning in user code cannot starve the rest. Everyone else in line
+//! sleeps until it is first: hundreds of them polling this lock would be a load all
+//! of its own.
 //!
 //! Background threads also need a place in a much smaller pool, the cores a phone
 //! would have kept them to. There is nowhere better to hold them back: they
 //! wait here at the door of the guest, holding no kernel lock anyone could want.
+//! A thread asleep in the kernel uses no core, so it gives that place up when it
+//! blocks, and takes one again, or waits in line without its vCPU, when it wakes.
 
 use super::Thread;
 use crate::hv::{CpuState, Exit, Hypervisor, Kick, PageTableRoot, SyscallRegs, Urgency, Vcpu, set_thread_urgency};
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering, fence};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -28,13 +38,21 @@ use std::time::{Duration, Instant};
 pub static MAIN: std::sync::OnceLock<std::sync::Weak<Pool>> = std::sync::OnceLock::new();
 
 /// vCPUs made, for wakeup_stats: each costs the hypervisor a fresh one.
-pub static MADE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static MADE: AtomicU64 = AtomicU64::new(0);
 
-/// A holder asleep in the kernel this long gives its vCPU back when places run short.
-const ASLEEP: Duration = Duration::from_secs(1);
+/// Times a thread waited in line for a place in the whole pool, for wakeup_stats.
+pub static WAITED: AtomicU64 = AtomicU64::new(0);
 
-/// How long a holder keeps its vCPU once others wait.
+/// A holder asleep in the kernel this long may be asked for its vCPU to keep places free.
+/// Shorter sleeps are most of them, and are over before the hypervisor would have
+/// destroyed and made a vCPU for them.
+const DROWSY: Duration = Duration::from_millis(2);
+
+/// How long a holder runs on, from when it took its place or last woke, once others wait.
 const SLICE: Duration = Duration::from_millis(10);
+
+/// How often free places are topped up, at most.
+const TOP_UP: Duration = Duration::from_millis(1);
 
 pub struct Pool {
     max: usize,
@@ -46,12 +64,28 @@ pub struct Pool {
     /// Threads waiting for a vCPU (read without the lock on every exit).
     waiting: AtomicUsize,
     used: AtomicUsize,
+    /// What Holder::asleep counts from.
+    epoch: Instant,
+    /// When free places were last topped up, after `epoch` in ns.
+    topped_up: AtomicU64,
+}
+
+/// A thread holding a place.
+struct Holder {
+    thread: Arc<Thread>,
+    /// When it took the place, or last woke from a sleep it kept the place through, in
+    /// ns after the pool's epoch: how long it has run, for a slice. A thread that slept
+    /// most of the time since it took the place has not kept anyone out.
+    run_since: AtomicU64,
+    /// When its thread went to sleep in the kernel (`blocking`), in ns after the
+    /// pool's epoch; 0 while it runs.
+    asleep: AtomicU64,
 }
 
 #[derive(Default)]
 struct PoolState {
     next: u64,
-    holders: HashMap<u64, (Instant, Arc<Thread>)>,
+    holders: HashMap<u64, Arc<Holder>>,
     /// Waiters, served in order: a thread that just gave its vCPU up must not take it
     /// straight back past the threads it yielded to.
     queue: VecDeque<(u64, Arc<Condvar>)>,
@@ -75,15 +109,35 @@ impl Pool {
     }
 
     fn sized(max: usize, background: Option<Arc<Pool>>) -> Arc<Pool> {
-        Arc::new(Pool { max: max.max(1), background, frozen: AtomicBool::new(false), st: Mutex::default(), waiting: AtomicUsize::new(0), used: AtomicUsize::new(0) })
+        Arc::new(Pool {
+            max: max.max(1),
+            background,
+            frozen: AtomicBool::new(false),
+            st: Mutex::default(),
+            waiting: AtomicUsize::new(0),
+            used: AtomicUsize::new(0),
+            epoch: Instant::now(),
+            topped_up: AtomicU64::new(0),
+        })
     }
 
-    fn add_holder(&self, thread: &Arc<Thread>) -> u64 {
+    fn add_holder(&self, thread: &Arc<Thread>) -> (u64, Arc<Holder>) {
         let mut st = self.st.lock().unwrap();
         st.next += 1;
         let id = st.next;
-        st.holders.insert(id, (Instant::now(), thread.clone()));
-        id
+        let h = Arc::new(Holder { thread: thread.clone(), run_since: AtomicU64::new(self.now_ns()), asleep: AtomicU64::new(0) });
+        st.holders.insert(id, h.clone());
+        (id, h)
+    }
+
+    /// Now, as Holder::asleep counts it: never 0.
+    fn now_ns(&self) -> u64 {
+        self.epoch.elapsed().as_nanos() as u64 + 1
+    }
+
+    /// Whether `h` has run a slice since it took its place or last woke.
+    fn ran_slice(&self, h: &Holder) -> bool {
+        self.now_ns().saturating_sub(h.run_since.load(Ordering::Relaxed)) >= SLICE.as_nanos() as u64
     }
 
     /// Stops guest code: from now on threads wait at the door. Kicking those already
@@ -92,38 +146,86 @@ impl Pool {
         self.frozen.store(true, Ordering::Release);
     }
 
-    /// (in use, the most there can be), for wakeup_stats.
-    pub fn usage(&self) -> (usize, usize) {
-        (self.used.load(Ordering::Relaxed), self.max)
+    /// (in use, held by threads asleep in the kernel, the most there can be), for
+    /// wakeup_stats.
+    pub fn usage(&self) -> (usize, usize, usize) {
+        let asleep = self.st.lock().unwrap().holders.values().filter(|h| h.asleep.load(Ordering::Relaxed) != 0).count();
+        (self.used.load(Ordering::Relaxed), asleep, self.max)
     }
 
-    /// Few enough free vCPUs that blocked threads should give theirs back.
-    fn short(&self) -> bool {
-        self.waiting.load(Ordering::Relaxed) > 0 || self.used.load(Ordering::Relaxed) * 4 >= self.max * 3
+    /// So few places free that a thread going to sleep should give its own up now: half
+    /// of what top_up keeps.
+    fn low(&self) -> bool {
+        self.max.saturating_sub(self.used.load(Ordering::Relaxed)) <= self.max / 16
     }
 
-    /// Places run short: wakes holders that have slept in the kernel for a while, which
-    /// give theirs back as they go to sleep again. Otherwise those keep their places for
-    /// as long as they sleep, which can be for ever, and every thread that blocks for a
-    /// moment gives up its own, to make a new vCPU when it wakes: at idle that was 150 a
-    /// second, each a costly call to the hypervisor. At most ten times a second.
-    fn reclaim_sleepers(&self) {
-        static LAST: Mutex<Option<Instant>> = Mutex::new(None);
-        {
-            let mut last = LAST.lock().unwrap();
-            if last.is_some_and(|l| l.elapsed() < Duration::from_millis(100)) {
-                return;
+    /// Asks up to `n` holders asleep in the kernel for at least `min`, longest asleep
+    /// first, to give their places back: woken, each finds nothing to do and gives its
+    /// vCPU up as it goes back to sleep (`blocking`). Returns how many it asked: one
+    /// found awake by then isn't.
+    /// `again`: those already asked count too, and are woken again, in case the last
+    /// wakeup came before they slept.
+    fn reclaim(&self, st: &PoolState, n: usize, min: Duration, again: bool) -> usize {
+        if n == 0 {
+            return 0;
+        }
+        let now = self.now_ns();
+        let min = min.as_nanos() as u64;
+        let mut sleepers: Vec<(u64, &Holder)> = st
+            .holders
+            .values()
+            .filter_map(|h| {
+                let asleep = h.asleep.load(Ordering::Relaxed);
+                (asleep != 0 && now.saturating_sub(asleep) >= min && (again || !h.thread.give_back.load(Ordering::Relaxed))).then_some((asleep, &**h))
+            })
+            .collect();
+        sleepers.sort_unstable_by_key(|(asleep, _)| *asleep);
+        sleepers.truncate(n);
+        let mut asked = 0;
+        for (_, h) in &sleepers {
+            h.thread.give_back.store(true, Ordering::Relaxed);
+            // It may have woken since it was read asleep: `running` clears the ask, but
+            // it may have done so before this set it, and then the thread would give
+            // its vCPU up at its next sleep for no reason. With the fence in `running`,
+            // either this sees it awake and takes the ask back, or `running` clears it.
+            fence(Ordering::SeqCst);
+            if h.asleep.load(Ordering::Relaxed) == 0 {
+                h.thread.give_back.store(false, Ordering::Relaxed);
+                continue;
             }
-            *last = Some(Instant::now());
+            nudge(&h.thread);
+            asked += 1;
         }
-        let sleepers: Vec<Arc<Thread>> = {
-            let st = self.st.lock().unwrap();
-            st.holders.values().filter(|(_, th)| th.in_syscall_for().is_some_and(|d| d >= ASLEEP)).map(|(_, th)| th.clone()).collect()
-        };
-        for th in sleepers {
-            th.give_back.store(true, Ordering::Relaxed);
-            th.kick();
+        asked
+    }
+
+    /// After a place was taken: keeps an eighth of the places free, so a thread that
+    /// wakes finds one without waiting, by asking those that have slept longest for
+    /// theirs. Otherwise the pool fills with sleepers, which can sleep for ever.
+    fn top_up(&self, st: &PoolState) {
+        let free = self.max.saturating_sub(self.used.load(Ordering::Relaxed));
+        let reserve = self.max / 8;
+        if free >= reserve {
+            return;
         }
+        // Under the pool's lock, so no other thread is here at once.
+        let now = self.now_ns();
+        if now.saturating_sub(self.topped_up.load(Ordering::Relaxed)) < TOP_UP.as_nanos() as u64 {
+            return;
+        }
+        self.topped_up.store(now, Ordering::Relaxed);
+        self.reclaim(st, reserve - free, DROWSY, false);
+    }
+
+    /// Takes a place now if one is free and nobody is in line for it.
+    fn try_acquire(&self) -> bool {
+        let st = self.st.lock().unwrap();
+        if self.used.load(Ordering::Relaxed) < self.max && st.queue.is_empty() {
+            self.used.fetch_add(1, Ordering::Relaxed);
+            self.top_up(&st);
+            return true;
+        }
+        false
     }
 
     /// Takes a place, waiting for one. False if there is no point any more: the thread
@@ -135,6 +237,7 @@ impl Pool {
         }
         if self.used.load(Ordering::Relaxed) < self.max && st.queue.is_empty() {
             self.used.fetch_add(1, Ordering::Relaxed);
+            self.top_up(&st);
             return true;
         }
         st.next += 1;
@@ -142,6 +245,9 @@ impl Pool {
         let cv = Arc::new(Condvar::new());
         st.queue.push_back((ticket, cv.clone()));
         self.waiting.fetch_add(1, Ordering::Relaxed);
+        if self.background.is_some() {
+            WAITED.fetch_add(1, Ordering::Relaxed);
+        }
         let got = loop {
             if t.dying.load(Ordering::Acquire) || !still_wanted() {
                 break false;
@@ -149,16 +255,19 @@ impl Pool {
             let first = st.queue.front().is_some_and(|(x, _)| *x == ticket);
             if first && self.used.load(Ordering::Relaxed) < self.max {
                 self.used.fetch_add(1, Ordering::Relaxed);
+                self.top_up(&st);
                 break true;
             }
             if first {
-                // As many of the longest holders as there are threads in line, once
-                // they have had their slice. One running guest code gives up its place
-                // at the exit this forces, and one asleep in the kernel when it wakes.
-                let mut holders: Vec<_> = st.holders.values().filter(|(since, _)| since.elapsed() >= SLICE).collect();
-                holders.sort_by_key(|(since, _)| *since);
-                for (_, holder) in holders.iter().take(st.queue.len()) {
-                    holder.kick();
+                // As many holders as there are threads in line: those asleep in the
+                // kernel longest, which give their places up as they go back to sleep,
+                // and then those that have run longest, once they have had their slice,
+                // which give theirs up at the exit this forces.
+                let asked = self.reclaim(&st, st.queue.len(), Duration::ZERO, true);
+                let mut running: Vec<_> = st.holders.values().filter(|h| h.asleep.load(Ordering::Relaxed) == 0 && self.ran_slice(h)).collect();
+                running.sort_by_key(|h| h.run_since.load(Ordering::Relaxed));
+                for h in running.iter().take(st.queue.len().saturating_sub(asked)) {
+                    h.thread.kick();
                 }
             }
             st = t.wait_for_turn(&cv, st, if first { SLICE / 2 } else { super::IDLE });
@@ -182,15 +291,18 @@ struct Inner {
     /// The registers while parked (stale while a vCPU is live).
     state: CpuState,
     root: PageTableRoot,
-    /// Holder id and when the vCPU was made, while live.
-    held: Option<(u64, Instant)>,
+    /// Holder id and entry, while live.
+    held: Option<(u64, Arc<Holder>)>,
     /// Holder id in the background pool, if this vCPU took a place there.
     gated: Option<u64>,
     /// What the host was last told about this thread.
     told: Option<Urgency>,
     /// A TLB flush asked for with no vCPU to ask: the next one does it. A new vCPU
-    /// flushing for itself isn't enough, since others hold translations too.
+    /// doesn't flush otherwise.
     flush_wanted: bool,
+    /// A flush asked of the live vCPU that it may not have run yet: if it is
+    /// destroyed first, the next one does it.
+    flush_asked: bool,
 }
 
 /// One guest thread's vCPU, made and destroyed on its own host thread.
@@ -239,11 +351,12 @@ impl Slot {
         };
         if std::mem::take(&mut i.flush_wanted) {
             v.flush_tlb();
+            i.flush_asked = true;
         }
-        let id = self.pool.add_holder(&self.thread);
-        i.gated = gate.map(|g| g.add_holder(&self.thread));
+        let held = self.pool.add_holder(&self.thread);
+        i.gated = gate.map(|g| g.add_holder(&self.thread).0);
         *self.thread.kick.lock().unwrap() = Some(v.kicker());
-        i.held = Some((id, Instant::now()));
+        i.held = Some(held);
         i.vcpu = Some(v);
         Ok(true)
     }
@@ -264,19 +377,64 @@ impl Slot {
         want
     }
 
-    /// The thread's urgency may have changed: tells the host, and brings its place
-    /// in the background pool into line.
+    /// The thread's urgency may have changed, or it slept: tells the host, and brings
+    /// its place in the background pool into line.
     fn follow_urgency(&self) {
         let want = self.tell_host();
-        let mut i = self.inner.borrow_mut();
         let background = want == Urgency::Background;
-        if background && i.vcpu.is_some() && i.gated.is_none() {
-            drop(i);
-            self.park(); // ensure() queues for a place
-        } else if !background && let Some(id) = i.gated.take() {
-            let g = self.pool.background.as_ref().unwrap();
-            g.st.lock().unwrap().holders.remove(&id);
-            g.release();
+        if !background {
+            self.leave_gate();
+            return;
+        }
+        let mut i = self.inner.borrow_mut();
+        if i.vcpu.is_some() && i.gated.is_none() && let Some(g) = self.pool.background.as_deref() {
+            if g.try_acquire() {
+                i.gated = Some(g.add_holder(&self.thread).0);
+            } else {
+                // Not waiting in line with a vCPU: places in the whole pool would then
+                // wait on background work. ensure() queues for both, in order.
+                drop(i);
+                self.park();
+            }
+        }
+    }
+
+    /// Gives up its place in the background pool, if it has one.
+    fn leave_gate(&self) {
+        let Some(id) = self.inner.borrow_mut().gated.take() else { return };
+        let g = self.pool.background.as_ref().unwrap();
+        g.st.lock().unwrap().holders.remove(&id);
+        g.release();
+    }
+
+    /// Going to sleep in the kernel.
+    fn blocking(&self) {
+        // Asleep, it uses no core.
+        self.leave_gate();
+        let asked = self.thread.give_back.swap(false, Ordering::Relaxed);
+        if asked || self.pool.waiting.load(Ordering::Relaxed) > 0 || self.pool.low() {
+            self.park();
+            return;
+        }
+        // Kept: noted for `reclaim`, from the first time it blocks in this syscall.
+        if let Some((_, h)) = &self.inner.borrow().held
+            && h.asleep.load(Ordering::Relaxed) == 0
+        {
+            h.asleep.store(self.pool.now_ns(), Ordering::Relaxed);
+        }
+    }
+
+    /// About to run guest code: no longer asleep, nor asked to give its vCPU back
+    /// because it was, and its slice starts again.
+    fn running(&self) {
+        if let Some((_, h)) = &self.inner.borrow().held
+            && h.asleep.load(Ordering::Relaxed) != 0
+        {
+            h.asleep.store(0, Ordering::Relaxed);
+            h.run_since.store(self.pool.now_ns(), Ordering::Relaxed);
+            // Pairs with the one in `reclaim`.
+            fence(Ordering::SeqCst);
+            self.thread.give_back.store(false, Ordering::Relaxed);
         }
     }
 
@@ -284,8 +442,14 @@ impl Slot {
         let mut i = self.inner.borrow_mut();
         let Some(v) = i.vcpu.take() else { return };
         i.state = v.state();
+        i.flush_wanted |= std::mem::take(&mut i.flush_asked);
         if let Some((id, _)) = i.held.take() {
             self.pool.st.lock().unwrap().holders.remove(&id);
+            // Its place is given back, so any ask is answered. One can come in as it
+            // leaves (`reclaim` read it asleep in an earlier sleep of this syscall), but
+            // only under the pool's lock, which the removal waited for; none can come
+            // now. Left set, it would make the next vCPU's first sleep give it up too.
+            self.thread.give_back.store(false, Ordering::Relaxed);
         }
         let gated = i.gated.take();
         if let Some(id) = gated {
@@ -305,12 +469,12 @@ impl Slot {
         self.pool.waiting.load(Ordering::Relaxed) > 0 || (gated && self.pool.background.as_ref().is_some_and(|g| g.waiting.load(Ordering::Relaxed) > 0))
     }
 
-    /// After an exit: give the vCPU up if others have waited a slice for one.
+    /// After an exit: give the vCPU up if others wait for one and it has run a slice.
     fn maybe_yield(&self) {
         if !self.wanted() {
             return;
         }
-        let held_long = self.inner.borrow().held.is_some_and(|(_, since)| since.elapsed() >= SLICE);
+        let held_long = self.inner.borrow().held.as_ref().is_some_and(|(_, h)| self.pool.ran_slice(h));
         if held_long {
             self.park();
         }
@@ -322,7 +486,7 @@ pub struct LazyVcpu(Rc<Slot>);
 
 impl LazyVcpu {
     pub fn new(hv: Arc<dyn Hypervisor>, pool: Arc<Pool>, thread: Arc<Thread>, root: PageTableRoot, state: CpuState) -> LazyVcpu {
-        let slot = Rc::new(Slot { hv, pool, thread, inner: RefCell::new(Inner { vcpu: None, state, root, held: None, gated: None, told: None, flush_wanted: false }) });
+        let slot = Rc::new(Slot { hv, pool, thread, inner: RefCell::new(Inner { vcpu: None, state, root, held: None, gated: None, told: None, flush_wanted: false, flush_asked: false }) });
         CURRENT.with(|c| *c.borrow_mut() = Some(slot.clone()));
         LazyVcpu(slot)
     }
@@ -335,21 +499,24 @@ impl Drop for LazyVcpu {
     }
 }
 
-/// Called by blocking waits: hands the current thread's vCPU back when the pool runs short.
+/// Called by blocking waits, before each sleep: hands the current thread's vCPU back
+/// if another thread is waiting for a place, places are low, or it was asked to.
 pub fn blocking() {
     CURRENT.with(|c| {
         if let Some(s) = c.borrow().as_ref() {
-            let gated = s.inner.borrow().gated.is_some();
-            let asked = s.thread.give_back.swap(false, Ordering::Relaxed);
-            let short = s.pool.short();
-            if short || asked || (gated && s.pool.background.as_ref().is_some_and(|g| g.short())) {
-                if short {
-                    s.pool.reclaim_sleepers();
-                }
-                s.park();
-            }
+            s.blocking();
         }
     });
+}
+
+/// Wakes a thread asleep in the kernel, without stopping it if it runs guest code
+/// (as `Thread::kick` would): it was asked for its vCPU because it slept.
+fn nudge(th: &Thread) {
+    th.wake_sleeper();
+    let slot = th.event_slot.load(Ordering::Relaxed);
+    if slot != usize::MAX {
+        super::wait::EVENTS.wake_slot(slot);
+    }
 }
 
 impl Vcpu for LazyVcpu {
@@ -372,7 +539,16 @@ impl Vcpu for LazyVcpu {
             }
             Ok(false) => {}
         }
-        let exit = self.0.inner.borrow_mut().vcpu.as_mut().unwrap().run();
+        self.0.running();
+        let exit = {
+            let mut i = self.0.inner.borrow_mut();
+            let exit = i.vcpu.as_mut().unwrap().run();
+            // It went in, and through any flush asked for.
+            if !matches!(exit, Exit::Interrupted) {
+                i.flush_asked = false;
+            }
+            exit
+        };
         self.0.maybe_yield();
         exit
     }
@@ -420,16 +596,32 @@ impl Vcpu for LazyVcpu {
     fn flush_tlb(&mut self) {
         let mut i = self.0.inner.borrow_mut();
         match &mut i.vcpu {
-            Some(v) => v.flush_tlb(),
+            Some(v) => {
+                v.flush_tlb();
+                i.flush_asked = true;
+            }
+            None => i.flush_wanted = true,
+        }
+    }
+
+    fn flush_tlb_page(&mut self, va: u64) {
+        let mut i = self.0.inner.borrow_mut();
+        match &mut i.vcpu {
+            Some(v) => {
+                v.flush_tlb_page(va);
+                i.flush_asked = true;
+            }
             None => i.flush_wanted = true,
         }
     }
 
     fn flush_tlb_now(&mut self) {
-        // ready() came first, but keep to what a parked thread can do: a new
+        // ready() came first, but keep to what a parked thread can do: the next
         // vCPU flushes on its first entry, and nothing else here is on the way.
-        if let Some(v) = &mut self.0.inner.borrow_mut().vcpu {
-            v.flush_tlb_now();
+        let mut i = self.0.inner.borrow_mut();
+        match &mut i.vcpu {
+            Some(v) => v.flush_tlb_now(),
+            None => i.flush_wanted = true,
         }
     }
 

@@ -9,8 +9,8 @@ use super::window::{self, NativeWindow};
 use super::{Blob, Box3, Fence, GpuBackend, Iov, Resource3d, ResourceInfo, Transfer};
 use std::ffi::{CStr, CString, c_void};
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, mpsc};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, mpsc};
 use std::time::{Duration, Instant};
 
 // This build's get_cap_set wrapper discards max_ver and only writes max_size
@@ -197,6 +197,9 @@ struct Worker {
 
 type Job = Box<dyn FnOnce() + Send>;
 
+/// Calls handed to the worker from other threads, for ZEROEMU_GPU_STATS.
+static WORKER_CALLS: AtomicU64 = AtomicU64::new(0);
+
 impl Worker {
     fn spawn() -> Worker {
         let (tx, rx) = mpsc::channel::<Job>();
@@ -231,6 +234,7 @@ impl Worker {
         // SAFETY: this returns only after the job has run (or was dropped
         // unrun), so what it borrows outlives it.
         let job: Job = unsafe { std::mem::transmute::<Box<dyn FnOnce() + '_>, Job>(job) };
+        WORKER_CALLS.fetch_add(1, Ordering::Relaxed);
         if self.tx.lock().unwrap_or_else(|p| p.into_inner()).send(job).is_ok() {
             let _ = wait.recv();
         }
@@ -257,7 +261,9 @@ struct FenceSlot {
 pub struct Gfxstream {
     api: Api,
     worker: Worker,
-    live: Mutex<bool>,
+    /// The renderer is up. Calls made on the calling thread rather than the worker hold
+    /// it shared, so that teardown, which takes it exclusively, waits for them.
+    live: std::sync::RwLock<bool>,
     /// The renderer's user-data cookie: it holds a reference of its own, never given
     /// back, as the renderer's threads can outlive this (see Drop).
     fences: Arc<Mutex<FenceSlot>>,
@@ -277,8 +283,9 @@ pub struct Gfxstream {
     pipe_ctx: Mutex<std::collections::HashMap<u32, Arc<Mutex<()>>>>,
     /// The renderer's resource and context maps have no lock of their own. Calls
     /// that insert or erase entries hold this exclusively, on the worker; pipe
-    /// transfers, which only look entries up, share it.
-    maps: std::sync::RwLock<()>,
+    /// transfers and calls made on the calling thread, which only look entries up,
+    /// share it.
+    maps: MapsLock,
     /// The renderer's subwindow is (or was) up: teardown must remove it first.
     subwindow: AtomicBool,
     // Kept mapped for the process lifetime. dlclose races the renderer's threads.
@@ -405,6 +412,8 @@ fn flush_stats(took: Duration, frame: Option<&[u8]>) {
         black: u32,
         total: Duration,
         worst: Duration,
+        /// WORKER_CALLS when it started.
+        calls: u64,
     }
     static ON: OnceLock<bool> = OnceLock::new();
     static STATS: Mutex<Option<Window>> = Mutex::new(None);
@@ -412,7 +421,14 @@ fn flush_stats(took: Duration, frame: Option<&[u8]>) {
         return;
     }
     let mut g = STATS.lock().unwrap_or_else(|p| p.into_inner());
-    let w = g.get_or_insert_with(|| Window { since: Instant::now(), frames: 0, black: 0, total: Duration::ZERO, worst: Duration::ZERO });
+    let w = g.get_or_insert_with(|| Window {
+        since: Instant::now(),
+        frames: 0,
+        black: 0,
+        total: Duration::ZERO,
+        worst: Duration::ZERO,
+        calls: WORKER_CALLS.load(Ordering::Relaxed),
+    });
     w.frames += 1;
     // A sample is plenty, as a frame is either wholly black or it isn't. Alpha aside.
     if frame.is_some_and(|f| f.chunks_exact(4).step_by(1009).all(|p| p[..3] == [0, 0, 0] || p[1..] == [0, 0, 0])) {
@@ -422,14 +438,16 @@ fn flush_stats(took: Duration, frame: Option<&[u8]>) {
     w.worst = w.worst.max(took);
     let elapsed = w.since.elapsed();
     if elapsed >= Duration::from_secs(5) {
+        let calls = WORKER_CALLS.load(Ordering::Relaxed) - w.calls;
         eprintln!(
-            "zeroemu: display {:.1} fps, {} black, {} avg {:.1} ms, worst {:.1} ms, window {}; {}",
+            "zeroemu: display {:.1} fps, {} black, {} avg {:.1} ms, worst {:.1} ms, window {}; virtio-gpu thread {:.0} calls/s; {}",
             w.frames as f64 / elapsed.as_secs_f64(),
             w.black,
             if frame.is_some() { "readback" } else { "post" },
             w.total.as_secs_f64() * 1000.0 / w.frames as f64,
             w.worst.as_secs_f64() * 1000.0,
             if window::on_screen() { "on screen" } else { "covered" },
+            calls as f64 / elapsed.as_secs_f64(),
             crate::kernel::wakeup_stats(elapsed)
         );
         *g = None;
@@ -476,14 +494,14 @@ pub fn open(width: u32, height: u32) -> Result<Arc<dyn GpuBackend>, String> {
     let gfx = Arc::new(Gfxstream {
         api,
         worker: Worker::spawn(),
-        live: Mutex::new(false),
+        live: std::sync::RwLock::new(false),
         fences: Arc::new(Mutex::new(FenceSlot { handler: None, pending: Vec::new() })),
         frame: Mutex::new(Vec::new()),
         direct: AtomicBool::new(false),
         scanout: AtomicU32::new(0),
         pipes: Mutex::new(std::collections::HashMap::new()),
         pipe_ctx: Mutex::new(std::collections::HashMap::new()),
-        maps: std::sync::RwLock::new(()),
+        maps: MapsLock::default(),
         subwindow: AtomicBool::new(false),
         _lib: lib,
     });
@@ -531,7 +549,7 @@ impl Gfxstream {
         if r != 0 {
             return Err(format!("stream_renderer_init returned {r}"));
         }
-        *self.live.lock().unwrap_or_else(|p| p.into_inner()) = true;
+        *self.live.write().unwrap_or_else(|p| p.into_inner()) = true;
         #[cfg(target_os = "macos")]
         install_window_ops(self._lib);
         #[cfg(target_os = "macos")]
@@ -585,7 +603,7 @@ impl Gfxstream {
 impl Drop for Gfxstream {
     fn drop(&mut self) {
         let live = {
-            let mut g = self.live.lock().unwrap_or_else(|p| p.into_inner());
+            let mut g = self.live.write().unwrap_or_else(|p| p.into_inner());
             let was = *g;
             *g = false;
             was
@@ -633,15 +651,22 @@ impl GpuBackend for Gfxstream {
             num_in_fences: in_fences.len() as u32,
             in_fences: if in_fences.is_empty() { std::ptr::null() } else { in_fences.as_ptr() },
         };
+        if only_queues_a_wait(cmds) {
+            return self.on_caller(|| unsafe { (self.api.submit_cmd)(&mut cmd) });
+        }
         ck(self.worker.run(|| unsafe { (self.api.submit_cmd)(&mut cmd) }))
     }
 
+    /// On the calling thread: stream_renderer_create_fence only queues the fence on its
+    /// ring's timeline (VirtioGpuTimelines::enqueueFence, under the timelines' own
+    /// mutex), behind whatever this thread queued there before. When nothing is pending
+    /// it signals at once, on this thread; on_fence takes no lock a caller holds.
     fn create_fence(&self, fence: Fence) -> Result<(), i64> {
         let c = CFence { flags: fence.flags, fence_id: fence.fence_id, ctx_id: fence.ctx_id, ring_idx: fence.ring_idx };
-        ck(self.worker.run(|| unsafe { (self.api.create_fence)(&c) }))
+        self.on_caller(|| unsafe { (self.api.create_fence)(&c) })
     }
 
-    fn resource_create(&self, args: &Resource3d, iov: Iov) -> Result<(), i64> {
+    fn resource_create(&self, args: &Resource3d, iov: Iov, ctx_id: u32) -> Result<(), i64> {
         let c = CResCreate {
             handle: args.handle,
             target: args.target,
@@ -657,26 +682,67 @@ impl GpuBackend for Gfxstream {
         };
         let buf = iov_buf(&iov);
         let ptr = if buf.is_empty() { std::ptr::null() } else { buf.as_ptr() };
-        ck(self.exclusive(|| unsafe { (self.api.resource_create)(&c, ptr, buf.len() as u32) }))?;
+        // One trip to the worker for both.
+        ck(self.exclusive(|| unsafe {
+            let r = (self.api.resource_create)(&c, ptr, buf.len() as u32);
+            if r == 0 && ctx_id != 0 {
+                (self.api.ctx_attach)(ctx_id as i32, args.handle as i32);
+            }
+            r
+        }))?;
         // As the renderer tells them apart (GetResourceType).
         const PIPE_BUFFER: u32 = 0;
         const VIRGL_BIND_CUSTOM: u32 = 1 << 17;
         if args.target == PIPE_BUFFER && args.bind == VIRGL_BIND_CUSTOM {
-            self.pipes.lock().unwrap_or_else(|p| p.into_inner()).insert(args.handle, Pipe::default());
+            self.pipes.lock().unwrap_or_else(|p| p.into_inner()).insert(args.handle, Pipe { ctx: ctx_id, ..Pipe::default() });
         }
         Ok(())
     }
 
-    fn resource_create_blob(&self, ctx_id: u32, handle: u32, blob: &Blob, iov: Iov) -> Result<(), i64> {
+    fn resource_create_blob(&self, ctx_id: u32, handle: u32, blob: &Blob, iov: Iov, cmd: &[u8]) -> Result<(), i64> {
         let c = CBlob { blob_mem: blob.blob_mem, blob_flags: blob.blob_flags, blob_id: blob.blob_id, size: blob.size };
         let buf = iov_buf(&iov);
         let ptr = if buf.is_empty() { std::ptr::null() } else { buf.as_ptr() };
-        ck(self.exclusive(|| unsafe { (self.api.create_blob)(ctx_id, handle, &c, ptr, buf.len() as u32, std::ptr::null()) }))
+        let mut command = CCommand { ctx_id, cmd_size: cmd.len() as u32, cmd: cmd.as_ptr() as *mut u8, num_in_fences: 0, in_fences: std::ptr::null() };
+        // One trip to the worker for all four.
+        ck(self.exclusive(|| unsafe {
+            if !cmd.is_empty() {
+                let r = (self.api.submit_cmd)(&mut command);
+                if r != 0 {
+                    return r;
+                }
+            }
+            let r = (self.api.create_blob)(ctx_id, handle, &c, ptr, buf.len() as u32, std::ptr::null());
+            if r != 0 {
+                return r;
+            }
+            // This build's create_blob wrapper ignores the iov, so a guest blob is
+            // attached again explicitly.
+            if !buf.is_empty() {
+                let r = (self.api.attach_iov)(handle as i32, ptr, buf.len() as i32);
+                if r != 0 {
+                    (self.api.resource_unref)(handle);
+                    return r;
+                }
+            }
+            if ctx_id != 0 {
+                (self.api.ctx_attach)(ctx_id as i32, handle as i32);
+            }
+            0
+        }))
     }
 
-    fn resource_unref(&self, handle: u32) {
+    fn resource_unref(&self, handle: u32, unmap: bool, detach: bool) {
         self.pipes.lock().unwrap_or_else(|p| p.into_inner()).remove(&handle);
-        self.exclusive(|| unsafe { (self.api.resource_unref)(handle) });
+        self.exclusive(|| unsafe {
+            if unmap {
+                (self.api.resource_unmap)(handle);
+            }
+            if detach {
+                (self.api.detach_iov)(handle as i32);
+            }
+            (self.api.resource_unref)(handle)
+        });
     }
 
     fn attach_iov(&self, handle: u32, iov: Iov) -> Result<(), i64> {
@@ -834,9 +900,7 @@ impl Gfxstream {
         // Null iov: the renderer uses the iovec attached to the resource.
         let b = c_box(&t.bx);
         let call = || unsafe { f(handle, t.ctx_id, t.level, t.stride, t.layer_stride, &b, t.offset, std::ptr::null(), 0) };
-        static SERIAL: OnceLock<bool> = OnceLock::new();
-        let serial = *SERIAL.get_or_init(|| std::env::var_os("ZEROEMU_GPU_SERIAL").is_some());
-        let pipe = if serial { None } else { self.pipes.lock().unwrap_or_else(|p| p.into_inner()).get(&handle).copied() };
+        let pipe = if serial() { None } else { self.pipes.lock().unwrap_or_else(|p| p.into_inner()).get(&handle).copied() };
         match pipe {
             None => ck(self.worker.run(call)),
             // Connected, and on the pipe of the one context it has been attached to: on the
@@ -844,7 +908,7 @@ impl Gfxstream {
             Some(p) if p.connected && !p.shared && p.ctx != 0 && p.ctx == t.ctx_id => {
                 let one = self.pipe_ctx.lock().unwrap_or_else(|p| p.into_inner()).entry(p.ctx).or_default().clone();
                 let _one = one.lock().unwrap_or_else(|p| p.into_inner());
-                let _shared = self.maps.read().unwrap_or_else(|p| p.into_inner());
+                let _shared = self.maps.read();
                 ck(call())
             }
             // The first write is the guest's connect, which makes the renderer create the
@@ -862,6 +926,21 @@ impl Gfxstream {
         }
     }
 
+    /// A call that needs no GL context and changes none of the renderer's maps: on the
+    /// calling thread, while the renderer is up. It shares the maps as a pipe transfer
+    /// does, as the renderer may look the context up in them.
+    fn on_caller(&self, f: impl FnOnce() -> i32) -> Result<(), i64> {
+        if serial() {
+            return ck(self.worker.run(f));
+        }
+        let live = self.live.read().unwrap_or_else(|p| p.into_inner());
+        if !*live {
+            return Err(19); // ENODEV
+        }
+        let _shared = self.maps.read();
+        ck(f())
+    }
+
     /// A call about one resource that changes no map: on the worker, and with no
     /// pipe transfer running if the resource is a pipe.
     fn for_resource<R>(&self, handle: u32, f: impl FnOnce() -> R) -> R {
@@ -876,10 +955,110 @@ impl Gfxstream {
     /// worker, with no pipe transfer looking at them.
     fn exclusive<R>(&self, f: impl FnOnce() -> R) -> R {
         self.worker.run(|| {
-            let _only = self.maps.write().unwrap_or_else(|p| p.into_inner());
+            let _only = self.maps.write();
             f()
         })
     }
+}
+
+/// The lock on the renderer's maps. Unlike std's RwLock, a reader doesn't queue behind a
+/// writer that is only waiting for the readers to finish. A pipe read waits for its
+/// render thread to reply, which for the sync object HWUI makes each frame means the
+/// whole frame decoded, and a resource create queued behind one would otherwise stop
+/// every GL thread in the system, SurfaceFlinger's included, until it is through. A
+/// writer that has waited PATIENCE does make new readers wait, so a steady stream of
+/// transfers can't keep it out for long.
+#[derive(Default)]
+struct MapsLock {
+    st: Mutex<MapsState>,
+    cv: Condvar,
+}
+
+#[derive(Default)]
+struct MapsState {
+    readers: u32,
+    writer: bool,
+    /// Since when a writer has waited for the readers to finish.
+    waiting: Option<Instant>,
+}
+
+const PATIENCE: Duration = Duration::from_millis(4);
+
+struct MapsRead<'a>(&'a MapsLock);
+struct MapsWrite<'a>(&'a MapsLock);
+
+impl MapsLock {
+    fn state(&self) -> MutexGuard<'_, MapsState> {
+        self.st.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn read(&self) -> MapsRead<'_> {
+        let mut st = self.state();
+        while st.writer || st.waiting.is_some_and(|t| t.elapsed() >= PATIENCE) {
+            st = self.cv.wait(st).unwrap_or_else(|p| p.into_inner());
+        }
+        st.readers += 1;
+        MapsRead(self)
+    }
+
+    fn write(&self) -> MapsWrite<'_> {
+        let mut st = self.state();
+        let since = Instant::now();
+        while st.writer || st.readers > 0 {
+            st.waiting.get_or_insert(since);
+            st = self.cv.wait(st).unwrap_or_else(|p| p.into_inner());
+        }
+        st.waiting = None;
+        st.writer = true;
+        MapsWrite(self)
+    }
+}
+
+impl Drop for MapsRead<'_> {
+    fn drop(&mut self) {
+        let mut st = self.0.state();
+        st.readers -= 1;
+        if st.readers == 0 && st.waiting.is_some() {
+            self.0.cv.notify_all();
+        }
+    }
+}
+
+impl Drop for MapsWrite<'_> {
+    fn drop(&mut self) {
+        self.0.state().writer = false;
+        self.0.cv.notify_all();
+    }
+}
+
+/// ZEROEMU_GPU_SERIAL=1: every call on the worker, as before calls ran elsewhere.
+fn serial() -> bool {
+    static SERIAL: OnceLock<bool> = OnceLock::new();
+    *SERIAL.get_or_init(|| std::env::var_os("ZEROEMU_GPU_SERIAL").is_some())
+}
+
+/// Commands whose handling only queues work elsewhere, so they run on the calling
+/// thread rather than wait their turn on the worker. In this renderer
+/// (VirtioGpuFrontend::processCommand, checked in the 37.1.11 library), the sync
+/// commands queue a task on the context's ring (VirtioGpuTimelines::enqueueTask, under
+/// the timelines' own mutex) and hand the wait for the guest's sync object to the sync
+/// thread (FrameBuffer::asyncWaitForGpu*WithCb, which looks the object up under a lock
+/// of its own); none makes a GL context current or changes the frontend's maps of
+/// contexts and resources. The rest stay on the worker: CONTEXT_CREATE starts a render
+/// thread, which takes on its creator's priority; pings, RESOURCE_CREATE_3D and
+/// ACQUIRE_SYNC read or change per-context state that has no lock.
+/// The opcodes are gfxstream's VirtioGpuGfxstreamProtocol.h.
+fn only_queues_a_wait(cmds: &[u8]) -> bool {
+    const CREATE_EXPORT_SYNC: u32 = 0x9000;
+    const CREATE_EXPORT_SYNC_VK: u32 = 0xa000;
+    const CREATE_IMPORT_SYNC_VK: u32 = 0xa001;
+    const CREATE_QSRI_EXPORT_VK: u32 = 0xa002;
+    const PLACEHOLDER_COMMAND_VK: u32 = 0xf002;
+    let Some(op) = cmds.get(..4) else { return false };
+    matches!(
+        u32::from_le_bytes(op.try_into().unwrap()),
+        CREATE_EXPORT_SYNC | CREATE_EXPORT_SYNC_VK | CREATE_IMPORT_SYNC_VK | CREATE_QSRI_EXPORT_VK | PLACEHOLDER_COMMAND_VK
+    )
 }
 
 /// The renderer library: ZEROEMU_GFXSTREAM, else the SDK's Android Emulator's.

@@ -1,15 +1,18 @@
 //! Memory syscalls: thin wrappers over the process's `AddressSpace`.
 
-use super::{Kernel, Thread};
+use super::{Kernel, Mm, Process, Thread};
 use crate::errno::*;
-use crate::mm::{Backing, OnFork, PROT_ALL, Placement, SharedObject};
+use crate::mm::{Backing, FAULT_READ, OnFork, PROT_ALL, Placement, SharedObject, page_up};
 use crate::phys::PAGE;
 
 const MAP_SHARED: u64 = 0x01;
+const PROT_READ: u32 = 1;
 const PROT_WRITE: u32 = 2;
 const PROT_EXEC: u32 = 4;
 const MAP_FIXED: u64 = 0x10;
 const MAP_ANONYMOUS: u64 = 0x20;
+const MAP_POPULATE: u64 = 0x8000;
+const MAP_NONBLOCK: u64 = 0x1_0000;
 const MAP_FIXED_NOREPLACE: u64 = 0x10_0000;
 const MREMAP_MAYMOVE: u64 = 1;
 const MREMAP_FIXED: u64 = 2;
@@ -19,10 +22,58 @@ const MADV_DONTFORK: u64 = 10;
 const MADV_DOFORK: u64 = 11;
 const MADV_WIPEONFORK: u64 = 18;
 const MADV_KEEPONFORK: u64 = 19;
+const MADV_POPULATE_READ: u64 = 22;
+const MADV_POPULATE_WRITE: u64 = 23;
 /// PROT_GROWSDOWN / PROT_GROWSUP / arm64 PROT_BTI and PROT_MTE.
 const PROT_IGNORED: u32 = 0x0100_0000 | 0x0200_0000 | 0x10 | 0x20;
 
+/// `AddressSpace::fault` with `proc`'s address space locked, except while a page it needs
+/// is read in (see `mm::PageRead`). Each time round, the fault starts over: the mapping
+/// may have changed while the lock was let go. Gives the lock back.
+fn fault_in<'a>(proc: &'a Process, mut mm: Mm<'a>, addr: u64, write: bool, exec: bool) -> (Mm<'a>, Result<(), i32>) {
+    loop {
+        let faulted = mm.fault(addr, write, exec);
+        let Some(mut read) = (faulted == Err(FAULT_READ)).then(|| mm.take_read()).flatten() else {
+            mm.forget_read();
+            return (mm, faulted);
+        };
+        drop(mm);
+        read.run();
+        mm = proc.mm();
+        mm.give_read(read);
+    }
+}
+
 impl Kernel {
+    /// A guest page fault.
+    pub(super) fn page_fault(&self, t: &Thread, addr: u64, write: bool, exec: bool) -> Result<(), i32> {
+        fault_in(&t.proc, t.proc.mm(), addr, write, exec).1
+    }
+
+    /// MADV_POPULATE_READ/WRITE and MAP_POPULATE: faults in each page of [start, end) not
+    /// mapped for the access yet, as touching it would, without a VM exit for each
+    /// (madvise_populate in mm/madvise.c). Stops at the first page that can't be: EFAULT
+    /// where touching it would have raised a signal. Lets go of the lock every 2 MB, so
+    /// that a large range doesn't hold up the process's other threads. `force`: for
+    /// MAP_POPULATE (AddressSpace::needs_populate).
+    fn populate(&self, t: &Thread, start: u64, end: u64, write: bool, force: bool) -> Result<(), i64> {
+        let mut mm = t.proc.mm();
+        let mut at = start;
+        while at < end {
+            if mm.needs_populate(at, write, force)? {
+                let faulted;
+                (mm, faulted) = fault_in(&t.proc, mm, at, write, false);
+                faulted.map_err(|_| EFAULT)?;
+            }
+            at += PAGE;
+            if at.is_multiple_of(2 << 20) {
+                drop(mm);
+                mm = t.proc.mm();
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn sys_brk(&self, t: &Thread, want: u64) -> i64 {
         t.proc.mm().set_brk(want) as i64
     }
@@ -146,18 +197,31 @@ impl Kernel {
         };
         let name = if flags & MAP_ANONYMOUS == 0 { self.fd_name(t, fd) } else { None };
         let mut mm = t.proc.mm();
-        match mm.map(place, len, prot & !PROT_IGNORED, backing) {
-            Ok(a) => {
-                if let Some(n) = name {
-                    mm.set_name(a, len, &n);
-                }
-                if max_prot != PROT_ALL {
-                    mm.limit_prot(a, len, max_prot);
-                }
-                a as i64
-            }
-            Err(e) => -e,
+        let a = match mm.map(place, len, prot & !PROT_IGNORED, backing) {
+            Ok(a) => a,
+            Err(e) => return -e,
+        };
+        if let Some(n) = name {
+            mm.set_name(a, len, &n);
         }
+        if max_prot != PROT_ALL {
+            mm.limit_prot(a, len, max_prot);
+        }
+        drop(mm);
+        // Best effort, as on Linux (populate_vma_page_range in mm/gup.c): a writable
+        // private mapping is written, so that what a write would copy is copied now, and
+        // any other mapping that allows some access is read, execute-only ones too.
+        // MAP_NONBLOCK cancels it (do_mmap in mm/mmap.c).
+        // Unlike Linux, a file's pages mapped here stay in memory as long as the mapping
+        // does, touched or not (no reverse maps: see `AddressSpace::fault_around`). What
+        // Android populates is 1 MB windows of APKs that system_server reads through
+        // once to check their signatures and unmaps (MemoryMappedFileDataSource), about
+        // 270 MB at boot: guest memory after opening seven apps was the same with or
+        // without this, and those pages no longer fault one by one.
+        if flags & (MAP_POPULATE | MAP_NONBLOCK) == MAP_POPULATE && prot & (PROT_READ | PROT_WRITE | PROT_EXEC) != 0 {
+            let _ = self.populate(t, a, a + page_up(len), prot & PROT_WRITE != 0 && !shared, true);
+        }
+        a as i64
     }
 
     pub(super) fn sys_munmap(&self, t: &Thread, addr: u64, len: u64) -> i64 {
@@ -250,6 +314,14 @@ impl Kernel {
         };
         if let Some(on_fork) = on_fork {
             return match t.proc.mm().set_on_fork(crate::arch::untag(addr), len, on_fork) {
+                Ok(()) => 0,
+                Err(e) => -e,
+            };
+        }
+        if matches!(advice, MADV_POPULATE_READ | MADV_POPULATE_WRITE) {
+            let start = crate::arch::untag(addr);
+            let Some(end) = start.checked_add(page_up(len)).filter(|_| start.is_multiple_of(PAGE)) else { return -EINVAL };
+            return match self.populate(t, start, end, advice == MADV_POPULATE_WRITE, false) {
                 Ok(()) => 0,
                 Err(e) => -e,
             };

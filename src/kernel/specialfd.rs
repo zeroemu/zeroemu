@@ -7,7 +7,7 @@ use super::{ERESTARTSYS, POLL, Thread};
 use crate::errno::*;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 const EFD_SEMAPHORE: u64 = 1;
 const COUNTER_MAX: u64 = u64::MAX - 1;
@@ -36,8 +36,11 @@ impl EventFd {
     }
 
     pub fn read(&self, t: &Thread, nonblock: bool) -> Result<u64, i64> {
+        // Watched only when there is nothing to read. Nearly every read follows an epoll
+        // that said there was, and a watch here would move the thread's place in EVENTS
+        // off its epoll set and back again, an atomic for each bucket each way.
+        let mut seen = None;
         loop {
-            let seen = EVENTS.watch_key(self.key());
             {
                 let mut c = self.count.lock().unwrap();
                 if *c > 0 {
@@ -54,7 +57,7 @@ impl EventFd {
             if t.interrupted() {
                 return Err(ERESTARTSYS);
             }
-            EVENTS.wait(seen, POLL);
+            watch_then_wait(&mut seen, self.key(), POLL);
         }
     }
 
@@ -62,8 +65,9 @@ impl EventFd {
         if v == u64::MAX {
             return Err(EINVAL);
         }
+        // As read: a write that fits, nearly all of them, watches nothing.
+        let mut seen = None;
         loop {
-            let seen = EVENTS.watch_key(self.key());
             {
                 let mut c = self.count.lock().unwrap();
                 if COUNTER_MAX - *c >= v {
@@ -79,7 +83,20 @@ impl EventFd {
             if t.interrupted() {
                 return Err(ERESTARTSYS);
             }
-            EVENTS.wait(seen, POLL);
+            watch_then_wait(&mut seen, self.key(), POLL);
+        }
+    }
+}
+
+/// For a loop that tried, found nothing, and will try again: the first time watches
+/// `key`, for the loop to look once more before it sleeps (whatever changed between
+/// the look and the watch is seen then); the next time sleeps. A watch must come
+/// before the look that a sleep follows, or a change in between would be lost.
+fn watch_then_wait(seen: &mut Option<u64>, key: usize, nap: Duration) {
+    match seen.take() {
+        None => *seen = Some(EVENTS.watch_key(key)),
+        Some(s) => {
+            EVENTS.wait(s, nap);
         }
     }
 }
@@ -118,7 +135,7 @@ pub(super) fn deadline_for(clock: u64, boot: Instant, value: Duration, abstime: 
     let delay = if !abstime {
         value
     } else if matches!(clock, 0 | 8 | 11) {
-        value.saturating_sub(SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default())
+        value.saturating_sub(super::clock::realtime())
     } else {
         value.saturating_sub(boot.elapsed())
     };

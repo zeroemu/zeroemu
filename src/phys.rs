@@ -30,6 +30,13 @@ const MAP_UNIT: u64 = 64 << 20;
 /// In a frame's count: the page cache holds it. Its own hold isn't counted, so
 /// a count of 0 with this set is a cached page that nothing has mapped.
 const CACHED: u32 = 1 << 31;
+/// In a frame's count, with CACHED: what it holds won't change while the page cache has
+/// it (a file on a read-only image), so instruction caches need telling only once.
+const FROZEN: u32 = 1 << 30;
+/// In a frame's count, with FROZEN: they have been told.
+const SYNCED: u32 = 1 << 29;
+/// The count itself.
+const HOLDS: u32 = SYNCED - 1;
 
 /// Memory goes back to the host by this much: a whole number of host pages, big
 /// enough not to take too many memory objects, small enough to come free whole.
@@ -82,6 +89,8 @@ pub struct PhysMem {
     /// Address space ids in use, and where to look for the next: two live address
     /// spaces with one id would hit each other's translations.
     asids: Mutex<(Box<[u64]>, u32)>,
+    #[cfg(test)]
+    icache_syncs: AtomicU64,
 }
 
 struct Alloc {
@@ -227,6 +236,8 @@ impl PhysMem {
             cached: AtomicU64::new(0),
             cached_idle: AtomicU64::new(0),
             asids: Mutex::new((vec![0u64; 1 << 10].into_boxed_slice(), 1)),
+            #[cfg(test)]
+            icache_syncs: AtomicU64::new(0),
         })
     }
 
@@ -271,8 +282,11 @@ impl PhysMem {
     }
 
     /// An address space id nothing has, taken in turn: one that went is used again last.
-    /// Whoever gets it starts on a vCPU that flushes first (a new one, or one switching
-    /// roots at exec), so nothing is left of what it meant before.
+    /// Nothing flushed its translations when its last owner went, so the TLBs may still
+    /// hold some. The new owner's first thread flushes the ASID before any of its code
+    /// runs: a new address space starts a generation behind (mm::TlbGen::fresh), and
+    /// exec bumps the generation for the one it puts in (AddressSpace::replace_tlb).
+    /// Without those the new owner would run on its predecessor's translations.
     pub fn alloc_asid(&self) -> Result<u16, i64> {
         let mut g = self.asids.lock().unwrap();
         let (used, next) = &mut *g;
@@ -301,6 +315,16 @@ impl PhysMem {
     /// A zeroed frame for `owner` (an address space), which gets neighbouring frames
     /// where it can, since those are the ones that go when it does.
     pub fn alloc_for(&self, owner: u32) -> Result<u64, i64> {
+        self.take_for(owner, true)
+    }
+
+    /// As `alloc_for`, for a frame the caller writes whole before anything else can see
+    /// it (a copy of a page): its old contents aren't cleared first.
+    pub fn alloc_for_overwrite(&self, owner: u32) -> Result<u64, i64> {
+        self.take_for(owner, false)
+    }
+
+    fn take_for(&self, owner: u32, zero: bool) -> Result<u64, i64> {
         let mut a = self.alloc.lock().unwrap();
         if a.mapped == 0 {
             self.map_more(&mut a)?;
@@ -339,7 +363,7 @@ impl PhysMem {
             frame
         };
         drop(a);
-        if dirty {
+        if dirty && zero {
             unsafe { self.host(gpa).write_bytes(0, PAGE as usize) };
         }
         Ok(gpa)
@@ -363,8 +387,8 @@ impl PhysMem {
     pub fn free(&self, gpa: u64) {
         debug_assert!(gpa != 0 && gpa.is_multiple_of(PAGE));
         let others = &self.extra_refs[(gpa / PAGE) as usize];
-        if let Ok(before) = others.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| (n & !CACHED).checked_sub(1).map(|left| left | (n & CACHED))) {
-            if before == CACHED | 1 {
+        if let Ok(before) = others.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| (n & HOLDS).checked_sub(1).map(|left| left | (n & !HOLDS))) {
+            if before & (CACHED | HOLDS) == CACHED | 1 {
                 self.cached_idle.fetch_add(1, Ordering::Relaxed);
             }
             return;
@@ -401,14 +425,14 @@ impl PhysMem {
 
     /// One more owner of a frame (fork's copy-on-write, a cached page mapped).
     pub fn share(&self, gpa: u64) {
-        if self.extra_refs[(gpa / PAGE) as usize].fetch_add(1, Ordering::AcqRel) == CACHED {
+        if self.extra_refs[(gpa / PAGE) as usize].fetch_add(1, Ordering::AcqRel) & (CACHED | HOLDS) == CACHED {
             self.cached_idle.fetch_sub(1, Ordering::Relaxed);
         }
     }
 
     /// Whether the caller is the frame's only owner.
     pub fn is_sole_owner(&self, gpa: u64) -> bool {
-        self.extra_refs[(gpa / PAGE) as usize].load(Ordering::Acquire) & !CACHED == 0
+        self.extra_refs[(gpa / PAGE) as usize].load(Ordering::Acquire) & HOLDS == 0
     }
 
     /// A frame the caller alone owns now belongs to the page cache.
@@ -418,11 +442,19 @@ impl PhysMem {
         self.cached_idle.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// The page cache lets go of a frame, which lives on if something has it mapped.
+    /// A cached frame the host has written for the last time: it stays as it is until the
+    /// page cache lets go of it.
+    pub fn freeze(&self, gpa: u64) {
+        // Not synced yet, whatever the frame's last owner left in its count.
+        let _ = self.extra_refs[(gpa / PAGE) as usize].fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| Some(n & !SYNCED | FROZEN));
+    }
+
+    /// The page cache lets go of a frame, which lives on if something has it mapped. Its
+    /// next owner may write it.
     pub fn release_cached(&self, gpa: u64) {
-        let before = self.extra_refs[(gpa / PAGE) as usize].fetch_and(!CACHED, Ordering::AcqRel);
+        let before = self.extra_refs[(gpa / PAGE) as usize].fetch_and(!(CACHED | FROZEN | SYNCED), Ordering::AcqRel);
         self.cached.fetch_sub(1, Ordering::Relaxed);
-        if before == CACHED {
+        if before & (CACHED | HOLDS) == CACHED {
             self.cached_idle.fetch_sub(1, Ordering::Relaxed);
         }
         self.free(gpa);
@@ -442,10 +474,26 @@ impl PhysMem {
         self.cached_idle.load(Ordering::Relaxed)
     }
 
-    /// Makes instruction fetches see what the host wrote to a frame.
+    /// Makes instruction fetches see what the host wrote to a frame, which the caller
+    /// holds. A frozen frame needs it once: arm64 Linux keeps the same note per page
+    /// (PG_dcache_clean, in __sync_icache_dcache in arch/arm64/mm/flush.c), cleared when
+    /// the kernel writes the page. Invalidating 4 KB takes about 0.9 us on an M1 Pro,
+    /// about what a whole page fault does otherwise.
     pub fn sync_icache(&self, gpa: u64) {
         if gpa < PHYS_MAX {
+            let flags = &self.extra_refs[(gpa / PAGE) as usize];
+            let frozen = flags.load(Ordering::Acquire) & (FROZEN | SYNCED);
+            if frozen == FROZEN | SYNCED {
+                return;
+            }
             os::sync_icache(self.host(gpa), PAGE as usize);
+            #[cfg(test)]
+            self.icache_syncs.fetch_add(1, Ordering::Relaxed);
+            if frozen == FROZEN {
+                // After the invalidate, which reaches every core's instruction cache. Not if
+                // the page cache let go of the frame meanwhile: the mark would outlive it.
+                let _ = flags.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| (n & FROZEN != 0).then_some(n | SYNCED));
+            }
         }
     }
 
@@ -701,6 +749,36 @@ mod tests {
         // With none, it does get used, before anything new.
         let i = phys.alloc_for(10).unwrap();
         assert_eq!(block_of(i), a);
+    }
+
+    /// A frozen page cache frame is synced for instruction fetches once, and once it
+    /// leaves the cache its next owner's are synced again; other frames every time.
+    #[test]
+    fn a_frozen_frame_is_synced_once() {
+        let phys = phys();
+        let syncs = || phys.icache_syncs.load(Ordering::Relaxed);
+        let f = phys.alloc().unwrap();
+        phys.mark_cached(f);
+        phys.freeze(f);
+        phys.share(f);
+        phys.share(f);
+        assert_eq!(phys.cached_idle_frames(), 0);
+        phys.sync_icache(f);
+        phys.sync_icache(f);
+        assert_eq!(syncs(), 1);
+        // The flags don't count as holds.
+        assert!(!phys.is_sole_owner(f));
+        phys.free(f);
+        phys.free(f);
+        assert!(phys.is_sole_owner(f));
+        assert_eq!(phys.cached_idle_frames(), 1);
+        phys.release_cached(f);
+        assert_eq!((phys.cached_frames(), phys.cached_idle_frames(), phys.frames_in_use()), (0, 0, 0));
+        let g = phys.alloc().unwrap();
+        assert_eq!(g, f, "the same frame, for another owner");
+        phys.sync_icache(g);
+        phys.sync_icache(g);
+        assert_eq!(syncs(), 3);
     }
 
     #[test]

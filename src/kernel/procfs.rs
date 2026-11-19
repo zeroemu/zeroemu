@@ -92,6 +92,54 @@ const ALL: [K; 52] = [
     K::AttrCurrent, K::AttrPrev, K::AttrExec, K::AttrFscreate, K::AttrKeycreate, K::AttrSockcreate,
     K::ConfigGz, K::Net, K::NetDev, K::Vmstat, K::Zoneinfo,
 ];
+
+/// /proc's own entries, besides sys, pressure and the processes.
+const ROOT_DIR: [(&str, K); 16] = [
+    ("self", K::Self_),
+    ("thread-self", K::ThreadSelf),
+    ("meminfo", K::Meminfo),
+    ("cpuinfo", K::Cpuinfo),
+    ("stat", K::Stat),
+    ("uptime", K::Uptime),
+    ("loadavg", K::Loadavg),
+    ("version", K::Version),
+    ("filesystems", K::Filesystems),
+    ("cmdline", K::Cmdline),
+    ("mounts", K::Mounts),
+    ("cgroups", K::Cgroups),
+    ("config.gz", K::ConfigGz),
+    ("net", K::Net),
+    ("vmstat", K::Vmstat),
+    ("zoneinfo", K::Zoneinfo),
+];
+
+/// A process's directory.
+const PID_DIR: [(&str, K); 20] = [
+    ("cmdline", K::PCmdline),
+    ("comm", K::PComm),
+    ("exe", K::PExe),
+    ("cwd", K::PCwd),
+    ("fd", K::PFd),
+    ("maps", K::PMaps),
+    ("status", K::PStatus),
+    ("stat", K::PStat),
+    ("statm", K::PStatm),
+    ("task", K::PTask),
+    ("attr", K::PAttr),
+    ("mounts", K::PMounts),
+    ("mountinfo", K::PMountinfo),
+    ("oom_score_adj", K::POom),
+    ("oom_adj", K::POomAdj),
+    ("oom_score", K::POomScore),
+    ("timerslack_ns", K::PTimerslack),
+    ("ns", K::PNs),
+    ("cgroup", K::PCgroup),
+    ("environ", K::PEnviron),
+];
+
+/// A thread's directory: the process's view, with the thread's comm and attributes.
+const TASK_DIR: [(&str, K); 6] = [("comm", K::PComm), ("stat", K::PStat), ("status", K::PStatus), ("attr", K::PAttr), ("cgroup", K::PCgroup), ("ns", K::PNs)];
+
 const ATTR_K: [K; 6] = [K::AttrCurrent, K::AttrPrev, K::AttrExec, K::AttrFscreate, K::AttrKeycreate, K::AttrSockcreate];
 
 /// (pid, tid, index into selinux::ATTRS) of an attr file.
@@ -256,6 +304,24 @@ fn decode(ino: u64) -> Option<(K, i32, u64)> {
     Some((k, ((ino >> 16) & 0xffff_ffff) as i32, ino >> 48))
 }
 
+/// Whether a node of this kind is a directory, as `content` would make it. stat and
+/// readdir go by this rather than making the node, as Linux's procfs takes an inode's
+/// type from its tables of entries (fs/proc/base.c's pid_entry) and makes a file's text
+/// only when it is read (seq_file).
+fn is_dir(k: K, extra: u64) -> bool {
+    match k {
+        K::Root | K::Net | K::Pid | K::PFd | K::PTask | K::Task | K::PAttr | K::PNs | K::Pressure => true,
+        // /proc/sys: sysctl.rs numbers its files first and its directories after them.
+        K::Sysctl => extra as u16 >= Sysctl::root(),
+        _ => false,
+    }
+}
+
+/// Whether a node of this kind is a symbolic link, as `content` would make it.
+fn is_link(k: K) -> bool {
+    matches!(k, K::Self_ | K::ThreadSelf | K::PExe | K::PCwd | K::PFdLink | K::PNsLink)
+}
+
 enum Content {
     Dir(Vec<(String, u64)>),
     File(Vec<u8>),
@@ -300,6 +366,46 @@ impl ProcFs {
         self.kernel()?.process(pid).ok_or_else(|| err(ENOENT))
     }
 
+    /// Whether a node that isn't a link is there, by the checks `content` makes for it,
+    /// without making it. An open makes a file's text once, when it is first read: a
+    /// process's stat or status made at each step of the path walk and again at open
+    /// was most of what reading them cost.
+    fn check(&self, k: K, pid: i32, extra: u64) -> io::Result<()> {
+        let kernel = self.kernel()?;
+        match k {
+            K::Pid | K::PStatus | K::PStat | K::PStatm => {
+                self.proc_or_zombie(pid)?;
+            }
+            K::Mounts | K::PMounts | K::PMountinfo => {
+                if pid != 0 {
+                    self.proc(pid)?;
+                }
+                kernel.vfs.as_deref().ok_or_else(|| err(ENOENT))?;
+            }
+            K::Sysctl => {
+                if !Sysctl::exists(extra as u16) {
+                    return Err(err(ENOENT));
+                }
+            }
+            K::PMaps => {
+                if self.proc(pid)?.mm.lock().unwrap().is_none() {
+                    return Err(err(ENOENT));
+                }
+            }
+            K::PTimerslack => {
+                thread_of(&*self.proc(pid)?, extra as i32).ok_or_else(|| err(ESRCH))?;
+            }
+            K::PCmdline | K::PComm | K::PFd | K::PTask | K::POom | K::POomAdj | K::POomScore | K::PNs | K::PCgroup => {
+                self.proc(pid)?;
+            }
+            K::AttrCurrent | K::AttrPrev | K::AttrExec | K::AttrFscreate | K::AttrKeycreate | K::AttrSockcreate => {
+                self.proc(pid)?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
     fn content(&self, ino: u64) -> io::Result<Content> {
         let (k, pid, extra) = decode(ino).ok_or_else(|| err(ENOENT))?;
         let kernel = self.kernel()?;
@@ -307,27 +413,7 @@ impl ProcFs {
         let d = |items: &[(&str, K)]| Ok(Content::Dir(items.iter().map(|(n, k)| (n.to_string(), mk(*k, pid, extra))).collect()));
         match k {
             K::Root => {
-                let mut v: Vec<(String, u64)> = [
-                    ("self", K::Self_),
-                    ("thread-self", K::ThreadSelf),
-                    ("meminfo", K::Meminfo),
-                    ("cpuinfo", K::Cpuinfo),
-                    ("stat", K::Stat),
-                    ("uptime", K::Uptime),
-                    ("loadavg", K::Loadavg),
-                    ("version", K::Version),
-                    ("filesystems", K::Filesystems),
-                    ("cmdline", K::Cmdline),
-                    ("mounts", K::Mounts),
-                    ("cgroups", K::Cgroups),
-                    ("config.gz", K::ConfigGz),
-                    ("net", K::Net),
-                    ("vmstat", K::Vmstat),
-                    ("zoneinfo", K::Zoneinfo),
-                ]
-                .iter()
-                .map(|(n, k)| (n.to_string(), mk(*k, 0, 0)))
-                .collect();
+                let mut v: Vec<(String, u64)> = ROOT_DIR.iter().map(|(n, k)| (n.to_string(), mk(*k, 0, 0))).collect();
                 v.push(("sys".into(), mk(K::Sysctl, 0, Sysctl::root() as u64)));
                 v.push(("pressure".into(), mk(K::Pressure, 0, 0)));
                 let mut pids: Vec<i32> = kernel.procs.lock().unwrap().values().map(|p| p.pid).collect();
@@ -425,28 +511,7 @@ impl ProcFs {
 
             K::Pid => {
                 self.proc_or_zombie(pid)?;
-                d(&[
-                    ("cmdline", K::PCmdline),
-                    ("comm", K::PComm),
-                    ("exe", K::PExe),
-                    ("cwd", K::PCwd),
-                    ("fd", K::PFd),
-                    ("maps", K::PMaps),
-                    ("status", K::PStatus),
-                    ("stat", K::PStat),
-                    ("statm", K::PStatm),
-                    ("task", K::PTask),
-                    ("attr", K::PAttr),
-                    ("mounts", K::PMounts),
-                    ("mountinfo", K::PMountinfo),
-                    ("oom_score_adj", K::POom),
-                    ("oom_adj", K::POomAdj),
-                    ("oom_score", K::POomScore),
-                    ("timerslack_ns", K::PTimerslack),
-                    ("ns", K::PNs),
-                    ("cgroup", K::PCgroup),
-                    ("environ", K::PEnviron),
-                ])
+                d(&PID_DIR)
             }
             K::PCmdline => {
                 let p = self.proc(pid)?;
@@ -563,8 +628,7 @@ impl ProcFs {
                 let tids: Vec<i32> = p.threads.lock().unwrap().iter().map(|t| t.tid).collect();
                 Ok(Content::Dir(tids.into_iter().map(|t| (t.to_string(), mk(K::Task, pid, t as u64))).collect()))
             }
-            // A thread directory: the process's view, with the thread's comm and attributes.
-            K::Task => Ok(Content::Dir([("comm", K::PComm), ("stat", K::PStat), ("status", K::PStatus), ("attr", K::PAttr), ("cgroup", K::PCgroup), ("ns", K::PNs)].iter().map(|(n, k)| (n.to_string(), mk(*k, pid, extra))).collect())),
+            K::Task => d(&TASK_DIR),
             K::PAttr => Ok(Content::Dir(super::selinux::ATTRS.iter().zip(ATTR_K).map(|(n, k)| (n.to_string(), mk(k, pid, extra))).collect())),
             K::AttrCurrent | K::AttrPrev | K::AttrExec | K::AttrFscreate | K::AttrKeycreate | K::AttrSockcreate => {
                 let (_, tid, which) = attr_node(ino).ok_or_else(|| err(ENOENT))?;
@@ -661,13 +725,22 @@ impl FileSystem for ProcFs {
     }
 
     fn stat(&self, ino: u64) -> io::Result<Stat> {
-        let (mode, size) = match self.content(ino)? {
-            Content::Dir(_) if matches!(decode(ino), Some((K::PNs, _, _))) => (S_IFDIR | 0o511, 0),
-            Content::Dir(_) => (S_IFDIR | 0o555, 0),
-            Content::Link(t) => (S_IFLNK | 0o777, t.len() as u64),
-            Content::File(_) if matches!(decode(ino), Some((K::PTimerslack, _, _))) => (S_IFREG | 0o666, 0),
-            Content::File(_) if self.write_ok(ino) => (S_IFREG | 0o644, 0),
-            Content::File(_) => (S_IFREG | 0o444, 0), // like Linux, procfs files report size 0
+        let (k, pid, extra) = decode(ino).ok_or_else(|| err(ENOENT))?;
+        let (mode, size) = if is_link(k) {
+            // A link's target is quick to make, and its length is its size.
+            match self.content(ino)? {
+                Content::Link(t) => (S_IFLNK | 0o777, t.len() as u64),
+                _ => return Err(err(EIO)),
+            }
+        } else {
+            self.check(k, pid, extra)?;
+            match k {
+                K::PNs => (S_IFDIR | 0o511, 0),
+                _ if is_dir(k, extra) => (S_IFDIR | 0o555, 0),
+                K::PTimerslack => (S_IFREG | 0o666, 0),
+                _ if self.write_ok(ino) => (S_IFREG | 0o644, 0),
+                _ => (S_IFREG | 0o444, 0), // like Linux, procfs files report size 0
+            }
         };
         let mtime = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
         // An nsfs inode's number is the namespace's id.
@@ -779,13 +852,55 @@ impl FileSystem for ProcFs {
                 _ => ROOT,
             }));
         }
-        // Any thread has a /proc/<tid>, though readdir lists only group leaders.
-        if dir == ROOT
-            && let Ok(tid) = name.parse::<i32>()
-            && let Some(th) = self.kernel()?.task(tid)
-        {
-            let pid = th.proc.pid;
-            return Ok(Some(mk(K::Pid, pid, if tid == pid { 0 } else { tid as u64 })));
+        // Any thread has a /proc/<tid>, though readdir lists only group leaders. A
+        // process's own number, live or a zombie, is one map lookup; only another thread's
+        // number needs every process's threads searched.
+        if dir == ROOT && let Ok(tid) = name.parse::<i32>() {
+            let kernel = self.kernel()?;
+            if let Some(p) = kernel.process(tid).filter(|p| p.pid.to_string() == name) {
+                return Ok(Some(mk(K::Pid, p.pid, 0)));
+            }
+            if let Some(th) = kernel.task(tid) {
+                let pid = th.proc.pid;
+                return Ok(Some(mk(K::Pid, pid, if tid == pid { 0 } else { tid as u64 })));
+            }
+        }
+        // /proc and the fixed directories are looked in without being listed: every open
+        // of a process's file looks names up in both, and a list of /proc names every process.
+        // Linux looks them up the same way (fs/proc/base.c: proc_pident_lookup, proc_pid_lookup).
+        let fixed = |table: &[(&str, K)], pid: i32, extra: u64| table.iter().find(|(n, _)| *n == name).map(|(_, k)| mk(*k, pid, extra));
+        match decode(dir) {
+            Some((K::Pid, pid, extra)) => {
+                self.proc_or_zombie(pid)?;
+                return Ok(fixed(&PID_DIR, pid, extra));
+            }
+            Some((K::Task, pid, extra)) => return Ok(fixed(&TASK_DIR, pid, extra)),
+            // A thread or an fd, by its number as readdir spells it (fs/proc/base.c's
+            // name_to_int, which proc_task_lookup and fs/proc/fd.c's proc_lookupfd_common
+            // use): listing them made a name for each of a process's threads, or files, to find one.
+            Some((K::PTask, pid, _)) => {
+                let p = self.proc(pid)?;
+                let tid = name.parse::<i32>().ok().filter(|t| t.to_string() == name);
+                return Ok(tid.filter(|&t| p.threads.lock().unwrap().iter().any(|th| th.tid == t)).map(|t| mk(K::Task, pid, t as u64)));
+            }
+            Some((K::PFd, pid, _)) => {
+                let p = self.proc(pid)?;
+                let fd = name.parse::<i64>().ok().filter(|f| f.to_string() == name);
+                return Ok(fd.filter(|&f| p.files.lock().unwrap().get(f).is_ok()).map(|f| mk(K::PFdLink, pid, f as u64)));
+            }
+            Some((K::Root, _, _)) => {
+                return Ok(match name {
+                    "sys" => Some(mk(K::Sysctl, 0, Sysctl::root() as u64)),
+                    "pressure" => Some(mk(K::Pressure, 0, 0)),
+                    // A process none of whose threads is left, a zombie, keeps its directory
+                    // until it is reaped. Its number, as readdir spells it.
+                    _ => match name.parse::<i32>() {
+                        Ok(pid) => self.kernel()?.process(pid).filter(|p| p.pid.to_string() == name).map(|p| mk(K::Pid, p.pid, 0)),
+                        Err(_) => fixed(&ROOT_DIR, 0, 0),
+                    },
+                });
+            }
+            _ => {}
         }
         match self.content(dir)? {
             Content::Dir(entries) => Ok(entries.into_iter().find(|(n, _)| n == name).map(|(_, i)| i)),
@@ -796,10 +911,12 @@ impl FileSystem for ProcFs {
     fn readdir(&self, dir: u64) -> io::Result<Vec<Dirent>> {
         let Content::Dir(entries) = self.content(dir)? else { return Err(err(ENOTDIR)) };
         let mut out = vec![Dirent { name: ".".into(), ino: dir, dtype: 4 }, Dirent { name: "..".into(), ino: ROOT, dtype: 4 }];
+        // Each entry's type by its kind: listing /proc made every process's directory, and
+        // listing one made its stat, status and maps.
         for (name, i) in entries {
-            let dtype = match self.content(i) {
-                Ok(Content::Dir(_)) => 4,
-                Ok(Content::Link(_)) => 10,
+            let dtype = match decode(i) {
+                Some((k, _, extra)) if is_dir(k, extra) => 4,
+                Some((k, _, _)) if is_link(k) => 10,
                 _ => 8,
             };
             out.push(Dirent { name, ino: i, dtype });

@@ -17,6 +17,8 @@ typedef unsigned int u32;
 #define NR_nanosleep 101
 #define NR_close 57
 #define NR_futex 98
+#define NR_pipe2 59
+#define NR_read 63
 
 static i64 sys6(i64 n, i64 a, i64 b, i64 c, i64 d, i64 e, i64 f) {
     register i64 x8 __asm__("x8") = n;
@@ -168,6 +170,9 @@ static void send_txn(int fd, u32 cmd, u32 target, u32 code, void *data, u64 dsiz
 #define CHILD_OBJECT 0x1234
 #define MANAGER_OBJECT 0x3333
 
+// The child says here that it has read its reply.
+static int replied[2];
+
 static void child(void) {
     int fd = open_binder();
     int bad = 0;
@@ -178,6 +183,7 @@ static void child(void) {
     if (r < 0) bad |= 1;
     if (find(BR_INCREFS, CHILD_OBJECT) < 0 || find(BR_ACQUIRE, CHILD_OBJECT) < 0) bad |= 2;
     if (find(BR_RELEASE, CHILD_OBJECT) >= 0) bad |= 4; // the manager holds it
+    sys(NR_write, replied[1], "r", 1);
 
     // The reply carries the manager's object. Hold it, then free the buffer.
     if (r >= 0) {
@@ -233,6 +239,7 @@ int cmain(void) {
     u32 enter = BC_ENTER_LOOPER;
     bw(mgr, &enter, 4, 0, 0, 0);
 
+    sys(NR_pipe2, replied, 0);
     i64 pid = sys(NR_clone, 17, 0, 0, 0, 0);
     if (pid == 0) child();
 
@@ -254,6 +261,11 @@ int cmain(void) {
     check(await(mgr, BR_ACQUIRE, MANAGER_OBJECT) >= 0 && find(BR_INCREFS, MANAGER_OBJECT) >= 0, "the owner hears BR_INCREFS and BR_ACQUIRE");
     check(find(BR_RELEASE, MANAGER_OBJECT) < 0, "and no BR_RELEASE while the buffer holds it");
 
+    // BR_INCREFS and BR_ACQUIRE come to the child with its reply, as on Linux, which
+    // says what holds the object when they are read: let go before then, and the child
+    // would hear only of a weak reference.
+    char c;
+    sys(NR_read, replied[0], &c, 1);
     command(mgr, BC_RELEASE, handle);
     int st = -1;
     sys(NR_wait4, pid, &st, 0, 0);
@@ -302,13 +314,16 @@ int cmain(void) {
             struct flat obj = { TYPE_BINDER, 0, 0x9999, 0xaaaa };
             u64 offs[1] = { 0 };
             send_txn(fd, BC_TRANSACTION, 0, 5, &obj, sizeof obj, offs, sizeof offs);
+            // BR_INCREFS and BR_ACQUIRE come with the reply, as on Linux. The manager's
+            // buffer holds the object strongly until our next call reaches it.
             int bad = await(fd, BR_REPLY, 0) < 0;
-            bad |= await(fd, BR_RELEASE, 0x9999) < 0;
-            // Now the manager tries to take it strong again. Nothing may come of it:
-            // it tells us by a second call that it tried.
+            bad |= find(BR_ACQUIRE, 0x9999) < 0;
+            // Then the manager lets go and tries to take it strong again. Nothing may
+            // come of it: our call's reply says that it tried.
             nsaid = 0;
             send_txn(fd, BC_TRANSACTION, 0, 6, "x", 1, 0, 0);
             bad |= await(fd, BR_REPLY, 0) < 0;
+            bad |= await(fd, BR_RELEASE, 0x9999) < 0;
             bad |= find(BR_ACQUIRE, 0x9999) >= 0;
             sys(NR_exit_group, bad);
         }
@@ -318,11 +333,12 @@ int cmain(void) {
             u32 h3 = (u32)((struct flat *)said[tt].t.buffer)->binder_or_handle;
             u64 buffer = said[tt].t.buffer;
             command(mgr, BC_INCREFS, h3); // keep the handle, weakly
-            free_buffer(mgr, buffer);     // and let go of the strong count the buffer had
             send_txn(mgr, BC_REPLY, 0, 0, "", 0, 0, 0);
+            // The owner has read its BR_ACQUIRE, with the reply, once its next call is here.
             nsaid = 0;
             int t2 = await(mgr, BR_TRANSACTION, 0);
             u64 buffer2 = t2 >= 0 ? said[t2].t.buffer : 0;
+            free_buffer(mgr, buffer); // let go of the strong count the first buffer had
             command(mgr, BC_ACQUIRE, h3);
             // Calling through the weak handle must fail, and must not wake the object.
             nsaid = 0;

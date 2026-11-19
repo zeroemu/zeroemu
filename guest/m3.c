@@ -16,11 +16,13 @@ typedef unsigned int u32;
 #define NR_read 63
 #define NR_write 64
 #define NR_mmap 222
+#define NR_pselect6 72
 #define NR_ppoll 73
 #define NR_signalfd4 74
 #define NR_timerfd_create 85
 #define NR_timerfd_settime 86
 #define NR_exit_group 94
+#define NR_clock_gettime 113
 #define NR_kill 129
 #define NR_rt_sigprocmask 135
 #define NR_getpid 172
@@ -66,6 +68,8 @@ static void check(int cond, const char *name) {
     puts_("\n");
     if (!cond) failures++;
 }
+
+static i64 now_ms(void) { i64 ts[2] = {0, 0}; sys(NR_clock_gettime, 1 /* MONOTONIC */, ts); return ts[0] * 1000 + ts[1] / 1000000; }
 
 static i64 fork_(void) { return sys(NR_clone, 17 /* SIGCHLD */, 0, 0, 0, 0); }
 static int wait_status(i64 pid) { int st = -1; sys(NR_wait4, pid, &st, 0, 0); return st; }
@@ -128,6 +132,60 @@ int cmain(void) {
     u64 expirations = 0;
     sys(NR_read, tfd, &expirations, 8);
     check(n == 1 && out[0].data == 333 && expirations >= 1, "timerfd fires and wakes epoll");
+
+    // ---- poll and select on an epoll fd that holds a timerfd ----
+    // Linux wakes them when the timer fires, through the epoll. Nothing announces a
+    // timer's expiry in zeroemu, so they must sleep only until it is due.
+    {
+        int ep2 = (int)sys(NR_epoll_create1, 0);
+        int tfd2 = (int)sys(NR_timerfd_create, 1 /* MONOTONIC */, 0);
+        struct epoll_event e4 = { 1, 0, 444 };
+        sys(NR_epoll_ctl, ep2, 1, tfd2, &e4);
+        u64 once[4] = { 0, 0, 0, 30000000 }; // once, in 30 ms
+        sys(NR_timerfd_settime, tfd2, 0, once, 0);
+        struct { int fd; short events, revents; } pe = { ep2, 1, 0 };
+        i64 t0 = now_ms();
+        i64 got = sys(NR_ppoll, &pe, 1, 0, 0, 8); // no timeout
+        check(got == 1 && (pe.revents & 1) && now_ms() - t0 < 1000, "poll on an epoll fd wakes when its timerfd fires");
+        sys(NR_read, tfd2, &expirations, 8);
+        sys(NR_timerfd_settime, tfd2, 0, once, 0);
+        u64 rset = 1ul << ep2;
+        t0 = now_ms();
+        got = sys(NR_pselect6, ep2 + 1, &rset, 0, 0, 0, 0); // no timeout
+        check(got == 1 && rset == 1ul << ep2 && now_ms() - t0 < 1000, "select on an epoll fd wakes when its timerfd fires");
+        sys(NR_close, tfd2);
+        sys(NR_close, ep2);
+    }
+
+    // ---- a one-shot registration that has fired: its timer wakes nobody ----
+    // Linux drops a timer's wakes for an EPOLLONESHOT registration that has reported,
+    // until EPOLL_CTL_MOD (ep_poll_callback in fs/eventpoll.c), so waits on the epoll fd
+    // sleep through the timer's later expiries rather than wake for each.
+    {
+        int ep3 = (int)sys(NR_epoll_create1, 0);
+        int tfd3 = (int)sys(NR_timerfd_create, 1 /* MONOTONIC */, 0);
+        struct epoll_event e5 = { 1 | 1u << 30 /* EPOLLIN | EPOLLONESHOT */, 0, 555 };
+        sys(NR_epoll_ctl, ep3, 1, tfd3, &e5);
+        u64 every[4] = { 0, 5000000, 0, 5000000 }; // every 5 ms
+        sys(NR_timerfd_settime, tfd3, 0, every, 0);
+        n = sys(NR_epoll_pwait, ep3, out, 4, 1000, 0, 8);
+        check(n == 1 && out[0].data == 555, "a one-shot timerfd registration reports");
+        struct { int fd; short events, revents; } pe = { ep3, 1, 0 };
+        i64 cpu0[2] = { 0, 0 }, cpu1[2] = { 0, 0 }, tmo[2] = { 0, 200000000 }, stmo[2] = { 0, 200000000 };
+        sys(NR_clock_gettime, 3 /* THREAD_CPUTIME_ID */, cpu0);
+        i64 polled = sys(NR_ppoll, &pe, 1, tmo, 0, 8);
+        u64 rset = 1ul << ep3;
+        i64 selected = sys(NR_pselect6, ep3 + 1, &rset, 0, 0, stmo, 0);
+        i64 waited = sys(NR_epoll_pwait, ep3, out, 4, 200, 0, 8);
+        sys(NR_clock_gettime, 3, cpu1);
+        i64 spent = (cpu1[0] - cpu0[0]) * 1000000000 + cpu1[1] - cpu0[1];
+        check(polled == 0 && selected == 0 && waited == 0 && spent < 30000000,
+              "poll, select and epoll_wait sleep through a fired one-shot registration's timer");
+        sys(NR_epoll_ctl, ep3, 3 /* MOD */, tfd3, &e5);
+        check(sys(NR_epoll_pwait, ep3, out, 4, 1000, 0, 8) == 1 && out[0].data == 555, "and MOD turns it back on");
+        sys(NR_close, tfd3);
+        sys(NR_close, ep3);
+    }
 
     // ---- signalfd ----
     u64 usr1 = 1ul << (10 - 1);

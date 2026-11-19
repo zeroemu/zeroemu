@@ -66,6 +66,8 @@ check "/dev/null node"      "crw-rw-rw-"          /system/bin/toybox ls -l /dev/
 check "ps"                  "toybox"              /system/bin/toybox ps -A -o NAME
 check "/proc/config.gz"     "CONFIG_VMAP_STACK=y" /system/bin/sh -c 'zcat /proc/config.gz'
 check "/proc/self/maps"     "/system/bin/toybox"  /system/bin/toybox cat /proc/self/maps
+check "vDSO in maps"        "[vdso]"              /system/bin/toybox cat /proc/self/maps
+check "date via the vDSO"   "20"                  /system/bin/toybox date +%Y
 check "/proc/self/fd"       "/dev/pts/0"          /system/bin/toybox ls -l /proc/self/fd
 check "mount"               "on /data type tmpfs" /system/bin/toybox mount
 check "nproc via /sys"      "0-"                  /system/bin/toybox cat /sys/devices/system/cpu/possible

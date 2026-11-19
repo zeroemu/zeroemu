@@ -72,6 +72,43 @@ pub fn on_window_closed(f: Box<dyn Fn() + Send + Sync>) {
     drop(f);
 }
 
+/// zeroemu.app couldn't run Android, or Android stopped: says why in an alert, as there
+/// is no terminal to, and offers to show the log. Main thread. Not for tests run behind
+/// someone's work (ZEROEMU_BACKGROUND).
+pub fn alert_failure(title: &str, why: &str, log: Option<&std::path::Path>) {
+    #[cfg(target_os = "macos")]
+    if !window::background() && window::alert(title, why, log.is_some()) && let Some(log) = log {
+        window::open_file(log);
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = (title, why, log);
+}
+
+/// zeroemu.app panicked, on whatever thread: says so before it exits, as it would
+/// otherwise just vanish. The first panic's thread shows the alert; another's waits
+/// for that one to exit.
+pub fn alert_crash(log: Option<&std::path::Path>) {
+    #[cfg(target_os = "macos")]
+    {
+        static SHOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if window::background() {
+            return;
+        }
+        if SHOWN.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            loop {
+                std::thread::park();
+            }
+        }
+        let text = "A bug in zeroemu stopped it, and /data wasn't saved: what changed since this boot started is lost. \
+                    The log says where the bug is; a report at github.com/zeroemu/zeroemu/issues with it helps.";
+        if window::alert_any_thread("zeroemu stopped", text, log.is_some()) && let Some(log) = log {
+            window::open_file(log);
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = log;
+}
+
 /// The device was turned (controls::turns): the window shows it so.
 fn turned() {
     #[cfg(target_os = "macos")]

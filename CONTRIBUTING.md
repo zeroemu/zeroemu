@@ -25,6 +25,8 @@ macOS refuses to create a virtual machine for a binary without the
 `com.apple.security.hypervisor` entitlement. `cargo run` and `cargo test` sign for you,
 through the runner in `.cargo/config.toml` (`scripts/macos-runner.sh`). After a plain
 `cargo build`, sign again as above, since the build drops the signature.
+`scripts/build-app.sh` builds and signs `zeroemu.app` (README.md, "As a Mac app"), and
+`scripts/make-icon.sh` redraws its icon after `packaging/macos/icon.swift` changes.
 
 ## Tests
 

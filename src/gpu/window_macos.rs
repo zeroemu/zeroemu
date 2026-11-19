@@ -197,6 +197,7 @@ pub fn open(fb_w: u32, fb_h: u32) -> Result<NativeWindow, String> {
         }
         // NSApplicationActivationPolicyRegular = 0, so the process can come forward.
         msg_i64(app, sel("setActivationPolicy:"), 0);
+        set_app_icon(app);
         APP.store(app, Ordering::Release);
 
         let screen = msg0(cls("NSScreen"), sel("mainScreen"));
@@ -1152,6 +1153,88 @@ fn about() {
             std::mem::transmute(objc_msgSend as *const ());
         let options = f(cls("NSDictionary"), sel("dictionaryWithObjects:forKeys:count:"), values.as_ptr(), keys.as_ptr(), 3);
         msg_id(APP.load(Ordering::Acquire), sel("orderFrontStandardAboutPanelWithOptions:"), options);
+    }
+}
+
+/// An alert for zeroemu.app, which has no terminal to say why it stops: `title`, then
+/// `text`, with Quit, and Show Log when there is a log. True when Show Log was chosen.
+/// Main thread, before or after the window.
+pub fn alert(title: &str, text: &str, has_log: bool) -> bool {
+    with_pool(|| unsafe {
+        let app = msg0(cls("NSApplication"), sel("sharedApplication"));
+        if app.is_null() {
+            return false;
+        }
+        msg_i64(app, sel("setActivationPolicy:"), 0);
+        set_app_icon(app);
+        msg_bool(app, sel("activateIgnoringOtherApps:"), 1);
+        let alert = msg0(msg0(cls("NSAlert"), sel("alloc")), sel("init"));
+        msg_id(alert, sel("setMessageText:"), ns_str(title));
+        msg_id(alert, sel("setInformativeText:"), ns_str(text));
+        msg_id_ret(alert, sel("addButtonWithTitle:"), ns_str("Quit"));
+        if has_log {
+            msg_id_ret(alert, sel("addButtonWithTitle:"), ns_str("Show Log"));
+        }
+        // NSAlertFirstButtonReturn is 1000, the second 1001.
+        msg_i64_ret(alert, sel("runModal")) == 1001
+    })
+}
+
+#[link(name = "CoreFoundation", kind = "framework")]
+unsafe extern "C" {
+    fn CFStringCreateWithBytes(alloc: *const c_void, bytes: *const u8, len: isize, encoding: u32, external: u8) -> *const c_void;
+    fn CFUserNotificationDisplayAlert(
+        timeout: f64,
+        flags: usize,
+        icon: *const c_void,
+        sound: *const c_void,
+        localization: *const c_void,
+        header: *const c_void,
+        message: *const c_void,
+        default_button: *const c_void,
+        alternate_button: *const c_void,
+        other_button: *const c_void,
+        response: *mut usize,
+    ) -> i32;
+}
+
+/// `alert` for any thread, as a panic's is: AppKit's alerts are the main thread's, and
+/// CFUserNotification's are shown by another process. Blocks until a button is chosen.
+pub fn alert_any_thread(title: &str, text: &str, has_log: bool) -> bool {
+    const UTF8: u32 = 0x0800_0100;
+    unsafe {
+        let cf = |s: &str| CFStringCreateWithBytes(std::ptr::null(), s.as_ptr(), s.len() as isize, UTF8, 0);
+        let (title, text, quit) = (cf(title), cf(text), cf("Quit"));
+        let show = if has_log { cf("Show Log") } else { std::ptr::null() };
+        let mut response = 0usize;
+        let null = std::ptr::null();
+        let r = CFUserNotificationDisplayAlert(0.0, 0, null, null, null, title, text, quit, show, null, &mut response);
+        for s in [title, text, quit, show] {
+            if !s.is_null() {
+                CFRelease(s);
+            }
+        }
+        // kCFUserNotificationAlternateResponse, in the low bits.
+        r == 0 && response & 3 == 1
+    }
+}
+
+/// Opens a file in the app the Mac opens it with, Console for a log; from any thread.
+pub fn open_file(path: &std::path::Path) {
+    let _ = std::process::Command::new("/usr/bin/open").arg(path).status();
+}
+
+/// zeroemu's icon, as the Dock shows it, also when it runs from a terminal rather than
+/// as zeroemu.app (whose bundle has the same icon).
+unsafe fn set_app_icon(app: *mut c_void) {
+    static ICON: &[u8] = include_bytes!("../../packaging/macos/zeroemu.icns");
+    unsafe {
+        let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *const u8, u64) -> *mut c_void = std::mem::transmute(objc_msgSend as *const ());
+        let data = f(cls("NSData"), sel("dataWithBytes:length:"), ICON.as_ptr(), ICON.len() as u64);
+        let image = if data.is_null() { std::ptr::null_mut() } else { msg_id_ret(msg0(cls("NSImage"), sel("alloc")), sel("initWithData:"), data) };
+        if !image.is_null() {
+            msg_id(app, sel("setApplicationIconImage:"), image);
+        }
     }
 }
 

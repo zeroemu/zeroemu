@@ -128,6 +128,28 @@ codesign -s - -f --entitlements entitlements.plist "${CARGO_HOME:-$HOME/.cargo}/
 Without the entitlement, zeroemu can't create its virtual machine and stops with an
 error that names it. `zeroemu doctor` checks for it.
 
+### As a Mac app
+
+From a source checkout, `scripts/build-app.sh` builds `zeroemu.app`, signed as above,
+and `scripts/build-app.sh --install` also copies it into `/Applications` (or
+`~/Applications` if `/Applications` isn't writable). Open it like any other app, from
+Finder, Launchpad, Spotlight or the Dock: it boots the tested image, with the same saved
+`/data`, as `zeroemu` does. It has no terminal, so:
+
+- What zeroemu would print goes to `~/Library/Logs/zeroemu/zeroemu.log`, with the run
+  before's as `zeroemu.previous.log`. Console opens them. Of Android's own log, only
+  init's is there, a few hundred lines a boot, since the rest adds thousands of lines a
+  minute: `adb logcat` shows it.
+- If Android can't start, stops by itself, or zeroemu crashes, an alert says so, with
+  the fix when there is one, and offers the log.
+- The app looks for the SDK only in its usual place, `~/Library/Android/sdk`: apps don't
+  see your shell's `ANDROID_HOME`. To use an SDK that's somewhere else, link it there:
+  `mkdir -p ~/Library/Android && ln -s "$ANDROID_HOME" ~/Library/Android/sdk`.
+- Only one zeroemu can use a device's `/data` at a time. While `zeroemu` runs the same
+  image in a terminal, the app says so and doesn't start.
+
+Quit it (⌘Q) or close its window to stop the device; `/data` is saved then.
+
 ## The Android SDK pieces
 
 zeroemu brings no part of Android with it. It uses these packages from Google's

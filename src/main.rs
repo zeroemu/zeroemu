@@ -2,6 +2,7 @@
 //! inside a kernel-less hardware VM, implementing the Linux syscall ABI in Rust.
 
 mod android;
+mod app;
 mod arch;
 mod doctor;
 mod elf;
@@ -155,19 +156,36 @@ fn main() -> ExitCode {
     kernel::reserve_dump_signal();
     #[cfg(unix)]
     raise_fd_limit();
+    // zeroemu.app has no terminal: its output goes to a log, and why it stops to an alert.
+    let as_app = app::opened_as_app();
+    let log = if as_app { app::start_log() } else { None };
     let default = std::panic::take_hook();
+    let panic_log = log.clone();
     std::panic::set_hook(Box::new(move |info| {
         default(info);
         kernel::trace::flush_if_free();
         eprintln!("[zeroemu] internal error in {}; stopping", std::thread::current().name().unwrap_or("?"));
+        if as_app {
+            gpu::alert_crash(panic_log.as_deref());
+        }
         std::process::exit(101);
     }));
     let result = run();
     kernel::trace::flush();
     match result {
-        Ok(code) => ExitCode::from(code as u8),
+        Ok(code) => {
+            let booted = !PROGRAM.load(Ordering::Relaxed);
+            if as_app && booted && let Some(why) = app::stopped_by_itself(code, kernel::reboot_target().as_deref()) {
+                eprintln!("zeroemu: {why}");
+                gpu::alert_failure("Android stopped", &why, log.as_deref());
+            }
+            ExitCode::from(code as u8)
+        }
         Err(e) => {
             eprintln!("zeroemu: {e}");
+            if as_app {
+                gpu::alert_failure("zeroemu can't run Android", &e, log.as_deref());
+            }
             ExitCode::from(if PROGRAM.load(Ordering::Relaxed) { 127 } else { 1 })
         }
     }
@@ -182,7 +200,7 @@ struct Chosen {
 }
 
 fn run() -> Result<i32, String> {
-    let mut args = std::env::args().skip(1).peekable();
+    let mut args = app::args().peekable();
     if let Some(cmd) = args.next_if(|a| a == "images" || a == "doctor") {
         if let Some(extra) = args.next() {
             return Err(format!("{cmd} takes no arguments, got {extra}\n{USAGE}"));
@@ -282,7 +300,7 @@ fn run() -> Result<i32, String> {
     }
     PROGRAM.store(!boot && inspect.is_none(), Ordering::Relaxed);
     if boot {
-        kernel::quiet_logs();
+        kernel::quiet_logs(app::opened_as_app());
     }
     // The VM first: without one nothing else matters. The guest's threads use this one.
     let hv = match inspect {
@@ -314,7 +332,7 @@ fn run() -> Result<i32, String> {
     }
     let system = chosen.as_ref().map(|c| c.path.clone());
     let data = match &system {
-        Some(img) if boot && !ephemeral => data.or_else(|| default_data_image(img)).map(|path| kernel::DataImage { path, wipe: wipe_data }),
+        Some(img) if boot && !ephemeral => data.or_else(|| default_data_image(img)).map(|path| kernel::DataImage { path, wipe: wipe_data, stop_if_in_use: app::opened_as_app() }),
         _ => None,
     };
     // Before any thread starts: they all inherit the mask.

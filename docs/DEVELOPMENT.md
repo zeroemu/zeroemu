@@ -89,8 +89,10 @@ creates a VM runs on a developer's Mac.
 Android log records (`liblog`, i.e. `ALOGI` and friends) print to stderr as
 `<secs since start> <pid> <tid> <prio> <tag>: <message>`; `ZEROEMU_LOG=<V|D|I|W|E|F|S>`
 sets the lowest priority shown (by default `W` for a boot and `I` for a program run;
-`S` silences them). zeroemu's own notes for its developers print only when it is `I`
-or more verbose.
+`S` silences them). zeroemu.app's default is `S`, except for init's `/dev/kmsg` records,
+which print from `W`: its log is a file, and the rest of Android's log would grow it by
+thousands of lines a minute. zeroemu's own notes for its developers print only when it
+is `I` or more verbose.
 
 ## Debugging variables
 

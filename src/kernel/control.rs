@@ -505,10 +505,10 @@ impl Kernel {
         if magic1 != 0xfee1_dead || ![0x2812_1969, 0x0512_1996, 0x1604_1998, 0x2011_2000].contains(&magic2) {
             return Err(EINVAL);
         }
-        let (what, code, reason) = match cmd {
+        let (what, code, target) = match cmd {
             CMD_CAD_ON | CMD_CAD_OFF => return Ok(0),
-            CMD_POWER_OFF | CMD_HALT => ("power off", 0, String::new()),
-            CMD_RESTART | CMD_KEXEC => ("reboot", 1, String::new()),
+            CMD_POWER_OFF | CMD_HALT => ("power off", 0, None),
+            CMD_RESTART | CMD_KEXEC => ("reboot", 1, Some(String::new())),
             CMD_RESTART2 => {
                 let mut mm = t.proc.mm();
                 let mut s = Vec::new();
@@ -520,11 +520,15 @@ impl Kernel {
                     }
                     s.push(b[0]);
                 }
-                ("reboot", 1, format!(": {}", String::from_utf8_lossy(&s)))
+                ("reboot", 1, Some(String::from_utf8_lossy(&s).into_owned()))
             }
             _ => return Err(EINVAL),
         };
+        let reason = target.as_deref().filter(|t| !t.is_empty()).map(|t| format!(": {t}")).unwrap_or_default();
         eprintln!("[zeroemu] {what} requested by pid {}{reason}", t.proc.pid);
+        if target.is_some() {
+            *super::REBOOT_TARGET.lock().unwrap() = target;
+        }
         {
             let (lock, cv) = &self.exit;
             lock.lock().unwrap().get_or_insert(code << 8);

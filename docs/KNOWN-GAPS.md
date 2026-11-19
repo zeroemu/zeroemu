@@ -41,6 +41,8 @@ Emulator. [INTERNALS.md](INTERNALS.md) says how each part works.
 - Rotation turns the window's picture and what the accelerometer reads. With auto-rotate
   off, Android shows its rotate button rather than turning, as a phone does.
 - Quitting during a logout cancels the logout: zeroemu first saves `/data`, then exits.
+- Restart, in Android's power menu or from `adb reboot`, stops zeroemu as Power off does,
+  after saving `/data`, rather than starting Android again.
 - On a MacBook keyboard, F1 (Home) and F2 (recent apps) need Fn held, unless the keys are
   set to act as standard function keys.
 

@@ -2017,7 +2017,7 @@ impl Kernel {
                     Some((prio, rest)) if prio.chars().all(|c| c.is_ascii_digit()) => (prio.parse().ok(), rest),
                     _ => (None, &*text),
                 };
-                if super::logd::shows(super::logd::kmsg_prio(level)) {
+                if super::logd::shows_kmsg(level) {
                     eprintln!("[kmsg] {}", text.trim_end());
                 }
                 data.len()

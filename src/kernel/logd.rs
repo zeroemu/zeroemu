@@ -64,7 +64,7 @@ impl Entry {
     /// Prints a text record the way `logcat -v threadtime` does, with time
     /// since boot in place of the date.
     fn print(&self) {
-        let (level, boot) = printer();
+        let (level, _, boot) = printer();
         if let Some(out) = self.text(level, boot.elapsed()) {
             eprint!("{out}");
         }
@@ -135,18 +135,25 @@ struct Logd {
 /// Android's priorities: 2 V, 3 D, 4 I, 5 W, 6 E, 7 F.
 pub const INFO: u8 = 4;
 pub const WARN: u8 = 5;
+/// Nothing at all (ZEROEMU_LOG=S).
+pub const SILENT: u8 = u8::MAX;
 
-/// The lowest priority printed when ZEROEMU_LOG doesn't say.
+/// The lowest priority printed when ZEROEMU_LOG doesn't say: of liblog's records, and
+/// of /dev/kmsg's (init's and ueventd's), which can differ (kernel::quiet_logs).
 static DEFAULT_LEVEL: AtomicU8 = AtomicU8::new(INFO);
+static DEFAULT_KMSG_LEVEL: AtomicU8 = AtomicU8::new(INFO);
 
-/// Sets what ZEROEMU_LOG defaults to; before anything is printed.
-pub fn set_default_level(level: u8) {
+/// Sets what ZEROEMU_LOG defaults to, for liblog and for /dev/kmsg; before anything
+/// is printed.
+pub fn set_default_level(level: u8, kmsg: u8) {
     DEFAULT_LEVEL.store(level, Ordering::Relaxed);
+    DEFAULT_KMSG_LEVEL.store(kmsg, Ordering::Relaxed);
 }
 
-/// (lowest priority printed to stderr, time zero), fixed at first use.
-fn printer() -> (u8, Instant) {
-    static PRINTER: OnceLock<(u8, Instant)> = OnceLock::new();
+/// (lowest priority printed to stderr, the same for /dev/kmsg, time zero), fixed at
+/// first use. ZEROEMU_LOG sets both.
+fn printer() -> (u8, u8, Instant) {
+    static PRINTER: OnceLock<(u8, u8, Instant)> = OnceLock::new();
     *PRINTER.get_or_init(|| {
         let level = match std::env::var("ZEROEMU_LOG").ok().and_then(|v| v.bytes().next()) {
             Some(b'V' | b'v') => 2,
@@ -155,10 +162,10 @@ fn printer() -> (u8, Instant) {
             Some(b'W' | b'w') => WARN,
             Some(b'E' | b'e') => 6,
             Some(b'F' | b'f') => 7,
-            Some(b'S' | b's') => u8::MAX,
-            _ => DEFAULT_LEVEL.load(Ordering::Relaxed),
+            Some(b'S' | b's') => SILENT,
+            _ => return (DEFAULT_LEVEL.load(Ordering::Relaxed), DEFAULT_KMSG_LEVEL.load(Ordering::Relaxed), Instant::now()),
         };
-        (level, Instant::now())
+        (level, level, Instant::now())
     })
 }
 
@@ -167,9 +174,14 @@ pub fn shows(prio: u8) -> bool {
     prio >= printer().0
 }
 
+/// Whether a /dev/kmsg record of this syslog level prints.
+pub fn shows_kmsg(level: Option<u32>) -> bool {
+    kmsg_prio(level) >= printer().1
+}
+
 /// The priority of a /dev/kmsg record, from its syslog level (the N of a `<N>`
 /// prefix, facility included; Linux takes a record without one as a warning).
-pub fn kmsg_prio(level: Option<u32>) -> u8 {
+fn kmsg_prio(level: Option<u32>) -> u8 {
     match level.map(|l| l & 7) {
         Some(0..=3) => 6,
         Some(4) | None => WARN,

@@ -117,6 +117,13 @@ Emulator. [INTERNALS.md](INTERNALS.md) says how each part works.
   2 seconds. Futex waits and `poll`, `select` and `epoll_wait` aren't affected.
 - `futex` has no FUTEX_WAKE_OP, FUTEX_WAIT_REQUEUE_PI or FUTEX_CMP_REQUEUE_PI: they
   return ENOSYS.
+- FUTEX_CMP_REQUEUE, FUTEX_LOCK_PI and FUTEX_UNLOCK_PI read or change the futex word
+  with its bucket locked, and fault the word's page in there if it isn't in: a page read
+  from a file then holds up the other futexes in that bucket. Linux faults the page in
+  with the bucket unlocked and tries again (`futex_requeue` in kernel/futex/requeue.c,
+  `futex_lock_pi` and `futex_unlock_pi` in kernel/futex/pi.c), as zeroemu's futex wait
+  does. The callers in bionic and ART have just written or compared the word, so its
+  page is in.
 - A signal sent to a whole process goes to one thread that lets it in. If that thread
   blocks it or exits before taking it, no other thread is told, where Linux passes it on
   (`retarget_shared_pending`, from `__set_task_blocked` and `exit_signals` in

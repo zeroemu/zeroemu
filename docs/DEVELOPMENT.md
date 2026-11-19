@@ -176,6 +176,17 @@ Behaviour:
   customized or not. The FIFO must exist before zeroemu starts.
 - `ZEROEMU_SCREENSHOTS=<dir>` saves the window's screenshots there rather than where
   the Mac saves its own.
+- `ZEROEMU_LIST_FIFO=<path>` works zeroemu.app's list of devices
+  (src/gpu/window_macos/list.rs) from a host FIFO, for tests that must not touch the
+  host's mouse: `new NAME` makes a device of the tested image (or the first that
+  boots), `start NAME` starts one as Start does, and `quit` closes the list. With
+  `HOME` set to a scratch folder, the devices are the test's own; with the FIFO, an
+  empty list doesn't open New Device by itself. A list reopened when a device's window
+  closes gets the same variables, so the next lines go to it. The FIFO must exist
+  before the app opens.
+- `ZEROEMU_LIST_SNAPSHOT=<dir>` draws the list of devices and the form making one, in
+  light and dark, into PNGs in that folder without showing them, then exits: for
+  looking at their layout without a screen.
 - `ZEROEMU_BACKGROUND=1` opens the window behind other windows without taking focus.
 - `ZEROEMU_NET=1` gives a program run (not a boot) the network interface;
   `scripts/test-guests.sh` turns it on only for the guest that expects one.

@@ -133,8 +133,30 @@ error that names it. `zeroemu doctor` checks for it.
 From a source checkout, `scripts/build-app.sh` builds `zeroemu.app`, signed as above,
 and `scripts/build-app.sh --install` also copies it into `/Applications` (or
 `~/Applications` if `/Applications` isn't writable). Open it like any other app, from
-Finder, Launchpad, Spotlight or the Dock: it boots the tested image, with the same saved
-`/data`, as `zeroemu` does. It has no terminal, so:
+Finder, Launchpad, Spotlight or the Dock.
+
+It opens on a list of your devices, as Android Studio's Device Manager does. A device is
+a name, a system image from your SDK, and its own `/data`. The first time, the app asks
+you to make one: **New Device** (⌘N) takes a name and one of your installed images. The
+image zeroemu is tested with is chosen first, and images it can't boot are listed but
+can't be chosen.
+
+- **Start** boots a device in the window. Closing its window brings the list back; Quit
+  (⌘Q) stops it and quits.
+- A device that is already running says so, and **Show** brings its window forward.
+  File > Show Device List (⇧⌘D) opens the list beside a running device, to start
+  another one: each runs in its own zeroemu, with its own adb serial.
+- A device's ⋯ menu, or a right click, renames it, wipes its data, shows its files in
+  Finder, or deletes it.
+- What `zeroemu` saved for an image in a terminal (without `--device`) shows up in the
+  list as a device of that image, so nothing is lost: the device and `zeroemu` share
+  that `/data`, and it shows as running while the terminal runs it.
+
+Devices are kept in `~/Library/Application Support/zeroemu/devices`. `zeroemu devices`
+lists them in a terminal, with the `/data` a terminal boot keeps for each image, and
+`zeroemu --device <name>` boots one.
+
+The app has no terminal, so:
 
 - What zeroemu would print goes to `~/Library/Logs/zeroemu/zeroemu.log`, with the run
   before's as `zeroemu.previous.log`. Console opens them. Of Android's own log, only
@@ -145,10 +167,10 @@ Finder, Launchpad, Spotlight or the Dock: it boots the tested image, with the sa
 - The app looks for the SDK only in its usual place, `~/Library/Android/sdk`: apps don't
   see your shell's `ANDROID_HOME`. To use an SDK that's somewhere else, link it there:
   `mkdir -p ~/Library/Android && ln -s "$ANDROID_HOME" ~/Library/Android/sdk`.
-- Only one zeroemu can use a device's `/data` at a time. While `zeroemu` runs the same
-  image in a terminal, the app says so and doesn't start.
+- Only one zeroemu can use a device's `/data` at a time: a running device's Start
+  becomes Show.
 
-Quit it (⌘Q) or close its window to stop the device; `/data` is saved then.
+Quitting or closing a device's window stops it, and saves its `/data`.
 
 ## The Android SDK pieces
 
@@ -205,6 +227,7 @@ issue; a tested one can be installed by hand from Google's
 ```
 zeroemu [options]       Boot Android in a window. --boot means the same.
 zeroemu images          List the system images installed in the SDK, and whether each can boot
+zeroemu devices         List your devices, and whether each is running
 zeroemu doctor          Check everything a boot needs, and print the exact fix for each problem
 zeroemu --help, -h      Show usage
 zeroemu --version, -V   Print the version
@@ -219,6 +242,7 @@ Boot options:
 |---|---|
 | `--image <name>` | Boot an installed image: `android-36.1`, `android-36.1/google_apis_playstore`, or the SDK package path `system-images;android-36.1;google_apis_playstore;arm64-v8a`. The ABI is always the host's |
 | `--system <path>` | Boot a `system.img` file, or the folder that holds it |
+| `--device <name>` | Boot a device made in zeroemu.app, with its image and its `/data` |
 | `--data <file>` | Keep the device's `/data` in this file instead of the default one |
 | `--ephemeral` | Keep nothing: start with an empty `/data` and throw it away at exit |
 | `--wipe-data` | Start over with an empty `/data` |

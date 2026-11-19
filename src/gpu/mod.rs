@@ -72,6 +72,39 @@ pub fn on_window_closed(f: Box<dyn Fn() + Send + Sync>) {
     drop(f);
 }
 
+/// zeroemu.app's list of devices, until one is chosen to boot (its id), or None when
+/// the list is closed or zeroemu quits. Main thread.
+pub fn choose_device() -> Option<String> {
+    #[cfg(target_os = "macos")]
+    return window::list::choose();
+    #[cfg(not(target_os = "macos"))]
+    None
+}
+
+/// ZEROEMU_LIST_SNAPSHOT: the list and its form, drawn into PNGs in `dir` unshown.
+pub fn snapshot_list(dir: &std::path::Path) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    return window::list::snapshot(dir);
+    #[cfg(not(target_os = "macos"))]
+    Err(format!("{}: there's no list of devices on this system", dir.display()))
+}
+
+/// Whether the device stopped because Quit was chosen, rather than its window closed.
+pub fn quit_chosen() -> bool {
+    #[cfg(target_os = "macos")]
+    return window::quit_chosen();
+    #[cfg(not(target_os = "macos"))]
+    false
+}
+
+/// The device's name, for its window's title.
+pub fn set_title(name: &str) {
+    #[cfg(target_os = "macos")]
+    window::set_title(name);
+    #[cfg(not(target_os = "macos"))]
+    let _ = name;
+}
+
 /// zeroemu.app couldn't run Android, or Android stopped: says why in an alert, as there
 /// is no terminal to, and offers to show the log. Main thread. Not for tests run behind
 /// someone's work (ZEROEMU_BACKGROUND).

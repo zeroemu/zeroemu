@@ -4,6 +4,7 @@
 mod android;
 mod app;
 mod arch;
+mod devices;
 mod doctor;
 mod elf;
 mod errno;
@@ -28,7 +29,7 @@ use std::sync::{Arc, Mutex};
 
 /// What an error with the command line prints, on stderr.
 const USAGE: &str = "usage: zeroemu [options]                  boot Android in a window
-       zeroemu images | doctor
+       zeroemu images | devices | doctor
        zeroemu [--system <img>] <program> [args...]
 zeroemu --help lists the options.";
 
@@ -55,6 +56,9 @@ usage:
   zeroemu images          list the system images installed in the Android SDK,
                           and whether each can boot: tested, untested, or
                           unsupported (and why)
+  zeroemu devices         list your devices, and whether each is running: those
+                          zeroemu.app made, and the /data a boot without
+                          --device keeps for each image
   zeroemu doctor          check what a boot needs, and say how to fix what's
                           missing
   zeroemu --help | -h     show this help
@@ -67,6 +71,7 @@ Boot options:
                             {package}
                           The ABI is always this computer's.
   --system <path>         a system.img file, or the folder holding it
+  --device <name>         a device zeroemu.app made: its image and its /data
   --data <file>           keep /data in this file (by default, a file per image
                           in {data})
   --ephemeral             keep nothing: /data starts empty and is thrown away
@@ -170,7 +175,26 @@ fn main() -> ExitCode {
         }
         std::process::exit(101);
     }));
-    let result = run();
+    // Development: the list of devices drawn into PNGs, for looking at its layout.
+    if let Some(dir) = std::env::var_os("ZEROEMU_LIST_SNAPSHOT") {
+        return match gpu::snapshot_list(Path::new(&dir)) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("zeroemu: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    let mut args: Vec<String> = app::args().collect();
+    // Opened with nothing to do: the app's list of devices, which boots one here.
+    let from_list = as_app && args.is_empty();
+    if from_list {
+        match gpu::choose_device() {
+            Some(id) => args = vec!["--device".into(), id],
+            None => return ExitCode::SUCCESS,
+        }
+    }
+    let result = run(args);
     kernel::trace::flush();
     match result {
         Ok(code) => {
@@ -178,6 +202,10 @@ fn main() -> ExitCode {
             if as_app && booted && let Some(why) = app::stopped_by_itself(code, kernel::reboot_target().as_deref()) {
                 eprintln!("zeroemu: {why}");
                 gpu::alert_failure("Android stopped", &why, log.as_deref());
+            } else if from_list && !gpu::quit_chosen() && !app::list_opened() {
+                // The device's window was closed, or Android powered off: back to the
+                // list, in a zeroemu of its own, as this one's VM can't be made again.
+                app::open_list();
             }
             ExitCode::from(code as u8)
         }
@@ -199,17 +227,22 @@ struct Chosen {
     support: sdk::Support,
 }
 
-fn run() -> Result<i32, String> {
-    let mut args = app::args().peekable();
-    if let Some(cmd) = args.next_if(|a| a == "images" || a == "doctor") {
+fn run(args: Vec<String>) -> Result<i32, String> {
+    let mut args = args.into_iter().peekable();
+    if let Some(cmd) = args.next_if(|a| a == "images" || a == "devices" || a == "doctor") {
         if let Some(extra) = args.next() {
             return Err(format!("{cmd} takes no arguments, got {extra}\n{USAGE}"));
         }
-        return Ok(if cmd == "images" { doctor::images() } else { doctor::doctor() });
+        return Ok(match cmd.as_str() {
+            "images" => doctor::images(),
+            "devices" => devices::print_list(),
+            _ => doctor::doctor(),
+        });
     }
     let mut root = PathBuf::from("/");
     let mut system: Option<PathBuf> = None;
     let mut image: Option<String> = None;
+    let mut device: Option<String> = None;
     let mut inspect: Option<(String, String)> = None;
     let mut strace = std::env::var_os("ZEROEMU_STRACE").is_some();
     let mut boot = false;
@@ -243,6 +276,7 @@ fn run() -> Result<i32, String> {
             "--root" => root = value()?.into(),
             "--system" => system = Some(value()?.into()),
             "--image" => image = Some(value()?),
+            "--device" => device = Some(value()?),
             "--ls" | "--cat" => inspect = Some((flag.clone(), value()?)),
             "--strace" => strace = true,
             // Android's init as pid 1. First-stage init's work (mounting
@@ -298,6 +332,17 @@ fn run() -> Result<i32, String> {
     if image.is_some() && system.is_some() {
         return Err("--image and --system both name an image; give one".into());
     }
+    let mut device_ini = None;
+    if let Some(name) = &device {
+        if image.is_some() || system.is_some() || data.is_some() || ephemeral || !argv.is_empty() || inspect.is_some() {
+            return Err("--device names an image and its /data: give it without --image, --system, --data, --ephemeral or a program".into());
+        }
+        let d = find_device(name)?;
+        gpu::set_title(&d.name);
+        device_ini = Some(d.ini());
+        image = Some(d.package);
+        data = Some(d.data);
+    }
     PROGRAM.store(!boot && inspect.is_none(), Ordering::Relaxed);
     if boot {
         kernel::quiet_logs(app::opened_as_app());
@@ -332,7 +377,12 @@ fn run() -> Result<i32, String> {
     }
     let system = chosen.as_ref().map(|c| c.path.clone());
     let data = match &system {
-        Some(img) if boot && !ephemeral => data.or_else(|| default_data_image(img)).map(|path| kernel::DataImage { path, wipe: wipe_data, stop_if_in_use: app::opened_as_app() }),
+        Some(img) if boot && !ephemeral => data.or_else(|| default_data_image(img)).map(|path| kernel::DataImage {
+            path,
+            wipe: wipe_data,
+            stop_if_in_use: app::opened_as_app(),
+            must_exist: device_ini.clone(),
+        }),
         _ => None,
     };
     // Before any thread starts: they all inherit the mask.
@@ -572,9 +622,26 @@ pub fn data_dirs() -> Option<(PathBuf, PathBuf)> {
     Some((base.join("zeroemu"), base.join("droidrt")))
 }
 
+/// The device `name` names, with its image installed.
+fn find_device(name: &str) -> Result<devices::Device, String> {
+    let store = devices::Store::open().ok_or("can't tell where devices are kept: HOME isn't set")?;
+    let sdk = sdk::require()?;
+    let images = sdk.images();
+    store.adopt(&images, |i| default_data_image(&i.system_img()));
+    let d = store.find(name)?;
+    if d.image(&images).is_none() {
+        return Err(Problem::new(
+            format!("{}'s system image isn't installed: {}", d.name, d.package),
+            [format!("{} installs it", sdk.sdkmanager(&d.package))],
+        )
+        .to_string());
+    }
+    Ok(d)
+}
+
 /// A file for this image's device in the user's application data. Moves devices
 /// saved under the project's old name first.
-fn default_data_image(system: &Path) -> Option<PathBuf> {
+pub fn default_data_image(system: &Path) -> Option<PathBuf> {
     // FNV-1a of the image's path: a device per image.
     let path = std::fs::canonicalize(system).ok()?;
     let id = path.to_string_lossy().bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ b as u64).wrapping_mul(0x0100_0000_01b3));

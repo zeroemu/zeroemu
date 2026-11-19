@@ -1,8 +1,9 @@
 #!/bin/sh
 # Builds zeroemu.app: the release binary in a Mac app bundle with its icon and
 # Info.plist (packaging/macos), signed ad hoc with the hypervisor entitlement, as
-# target/release/zeroemu.app. Opened from Finder, the Dock or Launchpad, it boots the
-# tested image as `zeroemu` does; its output goes to ~/Library/Logs/zeroemu/zeroemu.log.
+# target/release/zeroemu.app. Opened from Finder, the Dock or Launchpad, it shows its
+# list of devices and boots the one started there; its output goes to
+# ~/Library/Logs/zeroemu/zeroemu.log.
 # With --install, it is copied to /Applications, or to ~/Applications when
 # /Applications can't be written.
 set -eu

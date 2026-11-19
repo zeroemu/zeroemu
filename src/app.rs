@@ -66,6 +66,41 @@ pub fn start_log() -> Option<PathBuf> {
     None
 }
 
+/// The bundle this zeroemu runs from: <x>.app, three folders up from the binary.
+pub fn bundle() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let bundle = exe.parent()?.parent()?.parent()?;
+    (bundle.extension()? == "app").then(|| bundle.to_path_buf())
+}
+
+/// File > Show Device List opened a list: closing the device doesn't open another.
+static LIST_OPENED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn list_opened() -> bool {
+    LIST_OPENED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Opens the app's list of devices in a zeroemu of its own, as `open -n` does: one
+/// process runs one device, and this one may be running one, or be about to exit.
+/// What this one was given of HOME, the SDK's variables and ZEROEMU_*'s goes with it,
+/// as LaunchServices would give it launchd's: a test's scratch HOME and its FIFOs.
+pub fn open_list() {
+    let Some(bundle) = bundle() else { return };
+    LIST_OPENED.store(true, std::sync::atomic::Ordering::Relaxed);
+    let mut open = std::process::Command::new("/usr/bin/open");
+    open.arg("-n");
+    for (k, v) in std::env::vars_os() {
+        let name = k.to_string_lossy();
+        if name.starts_with("ZEROEMU_") || ["HOME", "ANDROID_HOME", "ANDROID_SDK_ROOT"].contains(&&*name) {
+            let mut pair = k.clone();
+            pair.push("=");
+            pair.push(&v);
+            open.arg("--env").arg(pair);
+        }
+    }
+    let _ = open.arg(&bundle).status();
+}
+
 /// Why a boot of zeroemu.app ended that nobody asked to end, for an alert: None for a
 /// quit, a power off, or a restart asked for in Android (its power menu's Restart is
 /// "userrequested") or with `adb reboot` (no target), which zeroemu takes as a power

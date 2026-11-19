@@ -238,6 +238,11 @@ pub struct DataImage {
     /// Stop when another zeroemu has the file, rather than boot a /data that won't be
     /// kept: zeroemu.app, whose user would never see the warning that it isn't.
     pub stop_if_in_use: bool,
+    /// A file that must still be there once /data is locked: a device's device.ini
+    /// (src/devices.rs), which zeroemu.app's list may delete, holding the same lock,
+    /// while this boot starts. Without it the device would come back as a folder no
+    /// list shows.
+    pub must_exist: Option<std::path::PathBuf>,
 }
 
 /// What a device keeps between boots: its /data and /metadata, in one host file.
@@ -272,11 +277,23 @@ impl Persist {
         // create_dir_all takes and read_dir doesn't.
         let dir = self.path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(std::path::Path::new("."));
         std::fs::create_dir_all(dir)?;
-        let lock = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(self.beside(".lock"))?;
-        match lock.try_lock() {
-            Ok(()) => {}
-            Err(std::fs::TryLockError::WouldBlock) => return Ok(false),
-            Err(std::fs::TryLockError::Error(e)) => return Err(e),
+        let mut lock = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(self.beside(".lock"))?;
+        // Twice: zeroemu.app's device list takes the lock for a moment to see whether
+        // a device is running (devices::Device::running).
+        let mut tries = 0;
+        loop {
+            match lock.try_lock() {
+                Ok(()) => break,
+                Err(std::fs::TryLockError::WouldBlock) if tries == 0 => std::thread::sleep(Duration::from_millis(100)),
+                Err(std::fs::TryLockError::WouldBlock) => return Ok(false),
+                Err(std::fs::TryLockError::Error(e)) => return Err(e),
+            }
+            tries += 1;
+        }
+        // Who has it, for the list to bring that zeroemu's window forward.
+        {
+            use std::io::{Seek, Write};
+            let _ = lock.set_len(0).and_then(|()| lock.rewind()).and_then(|()| writeln!(lock, "{}", std::process::id()));
         }
         self.lock = Some(lock);
         // Not being able to look is no reason not to keep /data.
@@ -1134,6 +1151,16 @@ impl Kernel {
             if let Some(image) = &extras.data {
                 let mut p = Persist { path: image.path.clone(), trees: vec![("data", data.clone()), ("metadata", metadata)], lock: None };
                 let mut keep = match p.lock() {
+                    Ok(true) if image.must_exist.as_ref().is_some_and(|f| !f.exists()) => {
+                        // Gone as it was being started: what the lock made goes too.
+                        let lock = p.beside(".lock");
+                        drop(p);
+                        let _ = std::fs::remove_file(&lock);
+                        if let Some(dir) = lock.parent() {
+                            let _ = std::fs::remove_dir(dir);
+                        }
+                        return Err("the device was deleted as it started".into());
+                    }
                     Ok(true) => true,
                     // Two can't share a device: the second gets one that lasts as long as it does.
                     Ok(false) if image.stop_if_in_use => {

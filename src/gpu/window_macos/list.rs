@@ -1,0 +1,1032 @@
+//! zeroemu.app's list of devices (src/devices.rs), which it shows when it is opened
+//! with nothing to do: make a device from an installed system image, start one, and
+//! rename, wipe or delete one. Starting one ends the list, and this process boots it:
+//! a process runs one device, as Hypervisor.framework gives it one VM. AppKit through
+//! the same raw messages as the device's window (super).
+
+use super::*;
+use crate::devices::{self, Device, Store};
+use crate::sdk::{self, Image, Support};
+use std::cell::RefCell;
+
+type Id = *mut c_void;
+
+/// What the list shows, kept on the UI thread.
+struct List {
+    window: Id,
+    table: Id,
+    scroll: Id,
+    empty: Id,
+    store: Store,
+    images: Vec<Image>,
+    /// Whether each image can boot, worked out the first time the form wants it:
+    /// that reads every image's partitions.
+    supports: Option<Vec<Support>>,
+    devices: Vec<Device>,
+    running: Vec<Option<Option<u32>>>,
+}
+
+/// The form making a device: its fields, and the name it suggested, which a change of
+/// image replaces until the name is typed over.
+struct Form {
+    field: Id,
+    popup: Id,
+    suggested: String,
+}
+
+thread_local! {
+    static LIST: RefCell<Option<List>> = const { RefCell::new(None) };
+    static FORM: RefCell<Option<Form>> = const { RefCell::new(None) };
+}
+
+/// The list is done with: a device to boot, or None to quit.
+static DONE: AtomicBool = AtomicBool::new(false);
+static CHOSEN: Mutex<Option<String>> = Mutex::new(None);
+
+/// `f` with the list, if there is one. Not across an alert or a menu: those run
+/// events, which may want the list too.
+fn with_list<R>(f: impl FnOnce(&mut List) -> R) -> Option<R> {
+    LIST.with(|l| l.borrow_mut().as_mut().map(f))
+}
+
+/// The list's window until a device is chosen, which this returns, or None when the
+/// window is closed or zeroemu quit.
+pub fn choose() -> Option<String> {
+    let Some(store) = Store::open() else {
+        super::alert("zeroemu can't keep devices", "HOME isn't set, so there's nowhere to keep them.", false);
+        return None;
+    };
+    let images = installed_images();
+    store.adopt(&images, |i| crate::default_data_image(&i.system_img()));
+    let show = !background();
+    let mut timer = std::ptr::null_mut();
+    with_pool(|| unsafe {
+        let app = msg0(cls("NSApplication"), sel("sharedApplication"));
+        msg_i64(app, sel("setActivationPolicy:"), 0);
+        set_app_icon(app);
+        APP.store(app, Ordering::Release);
+        msg_id(app, sel("setDelegate:"), list_object());
+        set_up_list_menus(app);
+        build(store, images);
+        let window = with_list(|l| l.window).unwrap_or(std::ptr::null_mut());
+        if show {
+            msg_id(window, sel("makeKeyAndOrderFront:"), std::ptr::null_mut());
+            msg_bool(app, sel("activateIgnoringOtherApps:"), 1);
+        } else {
+            msg_id(window, sel("orderBack:"), std::ptr::null_mut());
+        }
+        finish_launching(app);
+        // Running devices change in other zeroemus: looked at every two seconds.
+        let f: unsafe extern "C" fn(Id, Id, f64, Id, Id, Id, i8) -> Id = std::mem::transmute(objc_msgSend as *const ());
+        timer = f(cls("NSTimer"), sel("scheduledTimerWithTimeInterval:target:selector:userInfo:repeats:"), 2.0, list_object(), sel("tick:"), std::ptr::null_mut(), 1);
+        // Nothing to start: the form at once, once the window is up. Not for a test
+        // working the list from its FIFO, which the form would hold up.
+        let fifo = std::env::var_os("ZEROEMU_LIST_FIFO").is_some();
+        if show && !fifo && with_list(|l| l.devices.is_empty()).unwrap_or(false) {
+            let f: unsafe extern "C" fn(Id, Id, Id, Id, f64) = std::mem::transmute(objc_msgSend as *const ());
+            f(list_object(), sel("performSelector:withObject:afterDelay:"), sel("newDevice:"), std::ptr::null_mut(), 0.3);
+        }
+    });
+    start_fifo();
+    while !DONE.load(Ordering::Acquire) {
+        with_pool(|| unsafe {
+            let app = APP.load(Ordering::Acquire);
+            let until = msg_f64_id(cls("NSDate"), sel("dateWithTimeIntervalSinceNow:"), 0.25);
+            let event = msg_next_event(app, sel("nextEventMatchingMask:untilDate:inMode:dequeue:"), u64::MAX, until, NSDefaultRunLoopMode, 1);
+            if !event.is_null() {
+                msg_id(app, sel("sendEvent:"), event);
+                msg_void(app, sel("updateWindows"));
+            }
+        });
+    }
+    let chosen = CHOSEN.lock().unwrap().take();
+    // Nothing of the list may act once a device runs in this process: its timer, a
+    // New Device still pending, its table's calls, its FIFO reader.
+    with_pool(|| unsafe {
+        msg_void(timer, sel("invalidate"));
+        msg_id(cls("NSObject"), sel("cancelPreviousPerformRequestsWithTarget:"), list_object());
+        if let Some((window, table)) = with_list(|l| (l.window, l.table)) {
+            msg_id(table, sel("setDataSource:"), std::ptr::null_mut());
+            msg_id(table, sel("setDelegate:"), std::ptr::null_mut());
+            msg_id(window, sel("setDelegate:"), std::ptr::null_mut());
+            msg_id(window, sel("orderOut:"), std::ptr::null_mut());
+        }
+    });
+    LIST.with(|l| l.borrow_mut().take());
+    stop_fifo();
+    chosen
+}
+
+/// The SDK's images now: the list looks again whenever it shows, as the way to get one
+/// it gives is to install it.
+fn installed_images() -> Vec<Image> {
+    sdk::find().filter(|s| s.exists()).map(|s| s.images()).unwrap_or_default()
+}
+
+/// ZEROEMU_LIST_SNAPSHOT=<dir>: draws the list and the form making a device, light and
+/// dark, into list-light.png, new-device-dark.png and so on there, without showing
+/// either: for tests, and for looking at their layout without a screen.
+pub fn snapshot(dir: &std::path::Path) -> Result<(), String> {
+    let store = Store::open().ok_or("HOME isn't set")?;
+    let images = installed_images();
+    std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    with_pool(|| unsafe {
+        let app = msg0(cls("NSApplication"), sel("sharedApplication"));
+        msg_i64(app, sel("setActivationPolicy:"), 2); // prohibited: no Dock icon
+        set_app_icon(app);
+        build(store, images);
+        let (window, table) = with_list(|l| (l.window, l.table)).unwrap();
+        let (alert, _) = form_alert(None)?;
+        let sheet = msg0(alert, sel("window"));
+        for (look, name) in [("light", "NSAppearanceNameAqua"), ("dark", "NSAppearanceNameDarkAqua")] {
+            let appearance = msg_id_ret(cls("NSAppearance"), sel("appearanceNamed:"), ns_str(name));
+            for w in [window, sheet] {
+                msg_id(w, sel("setAppearance:"), appearance);
+            }
+            let content = msg0(window, sel("contentView"));
+            msg_void(content, sel("layoutSubtreeIfNeeded"));
+            msg_void(table, sel("reloadData"));
+            msg_void(content, sel("layoutSubtreeIfNeeded"));
+            draw_view(content, appearance, &dir.join(format!("list-{look}.png")))?;
+            msg_void(alert, sel("layout"));
+            draw_view(msg0(sheet, sel("contentView")), appearance, &dir.join(format!("new-device-{look}.png")))?;
+        }
+        Ok(())
+    })
+}
+
+#[link(name = "AppKit", kind = "framework")]
+unsafe extern "C" {
+    fn NSRectFill(rect: NSRect);
+}
+
+/// `view` on its window's background, as a PNG.
+unsafe fn draw_view(view: Id, appearance: Id, path: &std::path::Path) -> Result<(), String> {
+    unsafe {
+        let bounds = msg_rect(view, sel("bounds"));
+        let f: unsafe extern "C" fn(Id, Id, NSRect) -> Id = std::mem::transmute(objc_msgSend as *const ());
+        let rep = f(view, sel("bitmapImageRepForCachingDisplayInRect:"), bounds);
+        if rep.is_null() {
+            return Err(format!("{}: nothing to draw", path.display()));
+        }
+        let context = msg_id_ret(cls("NSGraphicsContext"), sel("graphicsContextWithBitmapImageRep:"), rep);
+        msg_void(cls("NSGraphicsContext"), sel("saveGraphicsState"));
+        msg_id(cls("NSGraphicsContext"), sel("setCurrentContext:"), context);
+        let previous = msg0(cls("NSAppearance"), sel("currentAppearance"));
+        msg_id(cls("NSAppearance"), sel("setCurrentAppearance:"), appearance);
+        msg_void(msg0(cls("NSColor"), sel("windowBackgroundColor")), sel("setFill"));
+        NSRectFill(bounds);
+        let g: unsafe extern "C" fn(Id, Id, NSRect, Id) = std::mem::transmute(objc_msgSend as *const ());
+        g(view, sel("displayRectIgnoringOpacity:inContext:"), bounds, context);
+        msg_id(cls("NSAppearance"), sel("setCurrentAppearance:"), previous);
+        msg_void(cls("NSGraphicsContext"), sel("restoreGraphicsState"));
+        // NSBitmapImageFileTypePNG.
+        let h: unsafe extern "C" fn(Id, Id, u64, Id) -> Id = std::mem::transmute(objc_msgSend as *const ());
+        let data = h(rep, sel("representationUsingType:properties:"), 4, msg0(cls("NSDictionary"), sel("dictionary")));
+        let png = std::slice::from_raw_parts(msg0(data, sel("bytes")) as *const u8, msg_i64_ret(data, sel("length")) as usize);
+        std::fs::write(path, png).map_err(|e| format!("{}: {e}", path.display()))
+    }
+}
+
+// ---- Building the window ----
+
+/// The window and what it shows, unshown (UI thread).
+unsafe fn build(store: Store, images: Vec<Image>) {
+    unsafe {
+        let rect = NSRect { origin: NSPoint { x: 0.0, y: 0.0 }, size: NSSize { width: 560.0, height: 420.0 } };
+        // titled | closable | miniaturizable | resizable, buffered, don't defer.
+        let window = msg_init_window(msg0(cls("NSWindow"), sel("alloc")), sel("initWithContentRect:styleMask:backing:defer:"), rect, 15, 2, 0);
+        msg_id(window, sel("setTitle:"), ns_str("zeroemu"));
+        msg_bool(window, sel("setReleasedWhenClosed:"), 0);
+        msg_bool(cls("NSWindow"), sel("setAllowsAutomaticWindowTabbing:"), 0);
+        msg_size(window, sel("setContentMinSize:"), NSSize { width: 440.0, height: 300.0 });
+        msg_void(window, sel("center"));
+        msg_id_bool_ret(window, sel("setFrameAutosaveName:"), ns_str("zeroemu.devices"));
+        msg_id(window, sel("setDelegate:"), list_object());
+        let content = msg0(window, sel("contentView"));
+
+        let title = label("Devices");
+        msg_id(title, sel("setFont:"), font(20.0, WEIGHT_SEMIBOLD));
+        let new = button("New Device…", "newDevice:", 0);
+        msg_id(new, sel("setImage:"), symbol("plus", 12.0));
+        msg_i64(new, sel("setImagePosition:"), IMAGE_LEADING);
+        let header = row_stack(&[title, new], 12.0);
+        hug(title, 1.0);
+        add(content, header);
+        pin(header, "topAnchor", content, "topAnchor", 16.0);
+        pin(header, "leadingAnchor", content, "leadingAnchor", 20.0);
+        pin(header, "trailingAnchor", content, "trailingAnchor", -20.0);
+
+        let table = msg0(msg0(cls("NSTableView"), sel("alloc")), sel("init"));
+        msg_i64(table, sel("setStyle:"), 2); // inset: rows away from the edges, rounded
+        msg_id(table, sel("setHeaderView:"), std::ptr::null_mut());
+        msg_f64(table, sel("setRowHeight:"), 56.0);
+        msg_i64(table, sel("setColumnAutoresizingStyle:"), 1); // the one column fills it
+        let column = msg_id_ret(msg0(cls("NSTableColumn"), sel("alloc")), sel("initWithIdentifier:"), ns_str("device"));
+        msg_id(table, sel("addTableColumn:"), column);
+        msg_id(table, sel("setDataSource:"), list_object());
+        msg_id(table, sel("setDelegate:"), list_object());
+        msg_id(table, sel("setTarget:"), list_object());
+        msg_id(table, sel("setDoubleAction:"), sel("startClicked:"));
+        let context = msg_id_ret(msg0(cls("NSMenu"), sel("alloc")), sel("initWithTitle:"), ns_str("Device"));
+        msg_id(context, sel("setDelegate:"), list_object());
+        msg_id(table, sel("setMenu:"), context);
+        let scroll = msg0(msg0(cls("NSScrollView"), sel("alloc")), sel("init"));
+        msg_id(scroll, sel("setDocumentView:"), table);
+        msg_bool(scroll, sel("setHasVerticalScroller:"), 1);
+        msg_bool(scroll, sel("setAutohidesScrollers:"), 1);
+        msg_bool(scroll, sel("setDrawsBackground:"), 0);
+        add(content, scroll);
+        pin(scroll, "topAnchor", header, "bottomAnchor", 8.0);
+        pin(scroll, "leadingAnchor", content, "leadingAnchor", 10.0);
+        pin(scroll, "trailingAnchor", content, "trailingAnchor", -10.0);
+        pin(scroll, "bottomAnchor", content, "bottomAnchor", -12.0);
+
+        // No devices: what they are, and the way to make one.
+        let icon = image_view(symbol("iphone.gen3", 44.0), "tertiaryLabelColor");
+        let none = label("No Devices");
+        msg_id(none, sel("setFont:"), font(17.0, WEIGHT_SEMIBOLD));
+        let what = wrapping_label("A device runs a system image from your Android SDK, with its own apps and data.");
+        msg_i64(what, sel("setAlignment:"), 1); // centered (NSTextAlignmentCenter on Apple silicon)
+        let make = button("New Device…", "newDevice:", 0);
+        let empty = column_stack(&[icon, none, what, make], 10.0, ALIGN_CENTER_X);
+        add(content, empty);
+        pin(empty, "centerXAnchor", scroll, "centerXAnchor", 0.0);
+        pin(empty, "centerYAnchor", scroll, "centerYAnchor", -10.0);
+        pin_const(what, "widthAnchor", 320.0);
+
+        LIST.with(|l| {
+            *l.borrow_mut() = Some(List { window, table, scroll, empty, store, images, supports: None, devices: Vec::new(), running: Vec::new() })
+        });
+        refresh(None);
+    }
+}
+
+/// Reads the devices again and shows them, keeping `select` (an id) or the selected
+/// device selected.
+fn refresh(select: Option<&str>) {
+    let Some(table) = with_list(|l| l.table) else { return };
+    // AppKit calls back into the list (rows, view_for_row) from what these do, so
+    // never while it is borrowed.
+    let selected = unsafe { msg_i64_ret(table, sel("selectedRow")) };
+    let images = installed_images();
+    let Some((row, none, scroll, empty)) = with_list(|l| {
+        let keep = select.map(str::to_string).or_else(|| usize::try_from(selected).ok().and_then(|i| l.devices.get(i)).map(|d| d.id.clone()));
+        if images.iter().map(Image::package).ne(l.images.iter().map(Image::package)) {
+            l.supports = None;
+        }
+        l.images = images;
+        // What a terminal boot saved since, as a device too.
+        l.store.adopt(&l.images, |i| crate::default_data_image(&i.system_img()));
+        l.devices = l.store.list();
+        l.running = l.devices.iter().map(Device::running).collect();
+        let row = keep.and_then(|id| l.devices.iter().position(|d| d.id == id));
+        (row, l.devices.is_empty(), l.scroll, l.empty)
+    }) else {
+        return;
+    };
+    unsafe {
+        msg_void(table, sel("reloadData"));
+        if let Some(row) = row {
+            let set = msg_i64_id_ret(cls("NSIndexSet"), sel("indexSetWithIndex:"), row as i64);
+            let f: unsafe extern "C" fn(Id, Id, Id, i8) = std::mem::transmute(objc_msgSend as *const ());
+            f(table, sel("selectRowIndexes:byExtendingSelection:"), set, 0);
+        }
+        msg_bool(scroll, sel("setHidden:"), none as i8);
+        msg_bool(empty, sel("setHidden:"), (!none) as i8);
+    }
+}
+
+/// One device's row: its name, its image and whether it runs, Start (or Show, for one
+/// running in another zeroemu) and a menu of the rest.
+unsafe fn device_row(row: i64, d: &Device, shown: &str, running: bool, installed: bool) -> Id {
+    unsafe {
+        let cell = msg0(msg0(cls("NSTableCellView"), sel("alloc")), sel("init"));
+        let icon = image_view(symbol("iphone.gen3", 22.0), "secondaryLabelColor");
+        let name = label(&d.name);
+        msg_id(name, sel("setFont:"), font(13.0, WEIGHT_SEMIBOLD));
+        let detail = label(&if running { format!("{shown} · Running") } else { shown.to_string() });
+        msg_id(detail, sel("setFont:"), font(11.0, 0.0));
+        msg_id(detail, sel("setTextColor:"), msg0(cls("NSColor"), sel("secondaryLabelColor")));
+        for l in [name, detail] {
+            msg_i64(l, sel("setLineBreakMode:"), 4); // …at the end
+            squeeze(l);
+        }
+        let texts = column_stack(&[name, detail], 2.0, ALIGN_LEADING);
+        hug(texts, 1.0);
+        squeeze(texts);
+        let start = button(if running { "Show" } else { "Start" }, "startDevice:", row);
+        msg_id(start, sel("setImage:"), symbol(if running { "macwindow" } else { "play.fill" }, 11.0));
+        msg_i64(start, sel("setImagePosition:"), IMAGE_LEADING);
+        msg_bool(start, sel("setEnabled:"), (running || installed) as i8);
+        if !installed {
+            msg_id(start, sel("setToolTip:"), ns_str("Its system image isn't installed"));
+        }
+        let more = msg_id_id_ret_sel(cls("NSButton"), sel("buttonWithImage:target:action:"), symbol("ellipsis.circle", 15.0), list_object(), sel("deviceMenu:"));
+        msg_bool(more, sel("setBordered:"), 0);
+        msg_i64(more, sel("setTag:"), row);
+        msg_id(more, sel("setToolTip:"), ns_str("More"));
+        let line = row_stack(&[icon, texts, start, more], 12.0);
+        add(cell, line);
+        pin(line, "leadingAnchor", cell, "leadingAnchor", 8.0);
+        pin(line, "trailingAnchor", cell, "trailingAnchor", -6.0);
+        pin(line, "centerYAnchor", cell, "centerYAnchor", 0.0);
+        msg0(cell, sel("autorelease"))
+    }
+}
+
+// ---- The object AppKit calls ----
+
+static LIST_OBJECT: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+
+/// The list's target, data source, delegate and the application's delegate, made once
+/// (UI thread). Never let go: AppKit holds it weakly.
+fn list_object() -> Id {
+    let have = LIST_OBJECT.load(Ordering::Acquire);
+    if !have.is_null() {
+        return have;
+    }
+    unsafe {
+        let name = CString::new("ZeroemuDeviceList").unwrap();
+        let class = objc_allocateClassPair(cls("NSObject"), name.as_ptr(), 0);
+        if class.is_null() {
+            return std::ptr::null_mut();
+        }
+        let action = "v24@0:8@16";
+        let methods: [(&str, *const c_void, &str); 15] = [
+            ("numberOfRowsInTableView:", rows as *const c_void, "q24@0:8@16"),
+            ("tableView:viewForTableColumn:row:", view_for_row as *const c_void, "@40@0:8@16@24q32"),
+            ("startDevice:", start_device as *const c_void, action),
+            ("startClicked:", start_clicked as *const c_void, action),
+            ("newDevice:", new_device as *const c_void, action),
+            ("deviceMenu:", device_menu as *const c_void, action),
+            ("renameDevice:", rename_device as *const c_void, action),
+            ("wipeDevice:", wipe_device as *const c_void, action),
+            ("revealDevice:", reveal_device as *const c_void, action),
+            ("deleteDevice:", delete_device as *const c_void, action),
+            ("imageChosen:", image_chosen as *const c_void, action),
+            ("menuNeedsUpdate:", menu_needs_update as *const c_void, action),
+            ("windowWillClose:", window_will_close as *const c_void, action),
+            ("windowDidBecomeKey:", became_key as *const c_void, action),
+            ("tick:", tick as *const c_void, action),
+        ];
+        for (selector, imp, types) in methods {
+            let types = CString::new(types).unwrap();
+            class_addMethod(class, sel(selector), imp, types.as_ptr());
+        }
+        objc_registerClassPair(class);
+        let obj = msg0(msg0(class, sel("alloc")), sel("init"));
+        LIST_OBJECT.store(obj, Ordering::Release);
+        obj
+    }
+}
+
+extern "C" fn rows(_this: Id, _cmd: Id, _table: Id) -> i64 {
+    with_list(|l| l.devices.len() as i64).unwrap_or(0)
+}
+
+extern "C" fn view_for_row(_this: Id, _cmd: Id, _table: Id, _column: Id, row: i64) -> Id {
+    let Some((d, shown, running, installed)) = with_list(|l| {
+        let i = usize::try_from(row).ok()?;
+        let d = l.devices.get(i)?.clone();
+        let running = l.running.get(i).is_some_and(Option::is_some);
+        Some((d.image_shown(&l.images), running, d.image(&l.images).is_some(), d)).map(|(shown, running, installed, d)| (d, shown, running, installed))
+    })
+    .flatten() else {
+        return std::ptr::null_mut();
+    };
+    unsafe { device_row(row, &d, &shown, running, installed) }
+}
+
+/// The device in `row`, and its process id if it is running in some zeroemu.
+fn device_at(row: i64) -> Option<(Device, Option<Option<u32>>)> {
+    with_list(|l| {
+        let i = usize::try_from(row).ok()?;
+        Some((l.devices.get(i)?.clone(), l.running.get(i).copied().flatten()))
+    })
+    .flatten()
+}
+
+extern "C" fn start_device(_this: Id, _cmd: Id, sender: Id) {
+    start(unsafe { msg_i64_ret(sender, sel("tag")) });
+}
+
+/// A double click, or Start in a row's menu, whose tag is -1: the clicked row's.
+extern "C" fn start_clicked(_this: Id, _cmd: Id, _sender: Id) {
+    if let Some(row) = with_list(|l| unsafe { msg_i64_ret(l.table, sel("clickedRow")) }) {
+        start(row);
+    }
+}
+
+/// Starts the device in `row` here, or brings forward the zeroemu running it.
+fn start(row: i64) {
+    let Some((d, running)) = device_at(row) else { return };
+    // Running already, perhaps since the list last looked.
+    let running = running.or_else(|| d.running());
+    if let Some(pid) = running {
+        if let Some(pid) = pid {
+            unsafe {
+                let other = msg_i64_id_ret(cls("NSRunningApplication"), sel("runningApplicationWithProcessIdentifier:"), pid as i64);
+                if !other.is_null() {
+                    msg_i64(other, sel("activateWithOptions:"), 1); // all its windows
+                }
+            }
+        }
+        return;
+    }
+    let installed = with_list(|l| d.image(&l.images).is_some()).unwrap_or(false);
+    if !installed {
+        let fix = sdk::find().map(|s| s.sdkmanager(&d.package)).unwrap_or_default();
+        show_alert(&format!("{}'s system image isn't installed", d.name), &format!("{}\n\nInstall it with:\n{fix}", d.package), &["OK"]);
+        return;
+    }
+    choose_device(d.id);
+}
+
+fn choose_device(id: String) {
+    // By id, which `--device` takes as such: a name may be another device's id.
+    *CHOSEN.lock().unwrap() = Some(format!("id:{id}"));
+    DONE.store(true, Ordering::Release);
+}
+
+extern "C" fn new_device(_this: Id, _cmd: Id, _sender: Id) {
+    refresh(None);
+    let Some((have_images, any_boots)) = with_list(|l| {
+        let supports = l.supports.get_or_insert_with(|| l.images.iter().map(sdk::classify).collect());
+        (!l.images.is_empty(), supports.iter().any(Support::boots))
+    }) else {
+        return;
+    };
+    if !any_boots {
+        let (title, text, command) = match sdk::require() {
+            Err(p) => ("There's no Android SDK".to_string(), p.to_string(), None),
+            Ok(s) => {
+                let command = s.sdkmanager(&sdk::tested_package());
+                let title = if have_images { "None of your system images can start" } else { "No system images are installed" };
+                (title.to_string(), format!("Install the one zeroemu is tested with, then make a device again:\n\n{command}"), Some(command))
+            }
+        };
+        let buttons: &[&str] = if command.is_some() { &["Copy Command", "OK"] } else { &["OK"] };
+        if show_alert(&title, &text, buttons) == 0
+            && let Some(c) = command
+        {
+            copy_text(&c);
+        }
+        return;
+    }
+    let mut entered: Option<(String, usize)> = None;
+    loop {
+        let Ok((alert, form)) = (unsafe { form_alert(entered.as_ref()) }) else { return };
+        FORM.with(|f| *f.borrow_mut() = Some(form));
+        let answer = unsafe { msg_i64_ret(alert, sel("runModal")) };
+        let Some(form) = FORM.with(|f| f.borrow_mut().take()) else { return };
+        if answer != 1000 {
+            return;
+        }
+        let name = unsafe { rust_str(msg0(form.field, sel("stringValue"))) };
+        let index = unsafe { msg_i64_ret(form.popup, sel("indexOfSelectedItem")) }.max(0) as usize;
+        let made = with_list(|l| match (l.images.get(index), l.supports.as_ref().and_then(|s| s.get(index))) {
+            (Some(img), Some(support)) if support.boots() => l.store.create(&name, img),
+            _ => Err("choose a system image that can start".into()),
+        });
+        match made {
+            Some(Ok(d)) => return refresh(Some(&d.id)),
+            Some(Err(e)) => {
+                show_alert("The device wasn't made", &e, &["OK"]);
+                entered = Some((name, index));
+            }
+            None => return,
+        }
+    }
+}
+
+/// The form making a device, as an alert with Create and Cancel: a name, and the
+/// installed images, those that can't boot shown but not chosen. `entered` is what
+/// was typed and chosen before, when that was refused.
+unsafe fn form_alert(entered: Option<&(String, usize)>) -> Result<(Id, Form), String> {
+    let (images, supports, devices) = with_list(|l| {
+        let supports = l.supports.get_or_insert_with(|| l.images.iter().map(sdk::classify).collect()).clone();
+        (l.images.clone(), supports, l.devices.clone())
+    })
+    .ok_or("no list")?;
+    unsafe {
+        let alert = msg0(new_alert(), sel("autorelease"));
+        msg_id(alert, sel("setMessageText:"), ns_str("New Device"));
+        msg_id(alert, sel("setInformativeText:"), ns_str("A device runs one system image from your Android SDK and keeps its own apps and data."));
+        msg_id_ret(alert, sel("addButtonWithTitle:"), ns_str("Create"));
+        msg_id_ret(alert, sel("addButtonWithTitle:"), ns_str("Cancel"));
+
+        let popup = msg_init_popup(msg0(cls("NSPopUpButton"), sel("alloc")), sel("initWithFrame:pullsDown:"), NSRect { origin: NSPoint { x: 0.0, y: 0.0 }, size: NSSize { width: 280.0, height: 26.0 } }, 0);
+        msg_bool(popup, sel("setAutoenablesItems:"), 0);
+        // Into its menu, not with addItemWithTitle:, which drops an item of the same
+        // title: each item's place must be its image's in `images`.
+        let menu = msg0(popup, sel("menu"));
+        for (title, (img, support)) in image_titles(&images).into_iter().zip(images.iter().zip(&supports)) {
+            let title = match support {
+                Support::Tested => format!("{title} (tested)"),
+                Support::Untested => title,
+                Support::Unsupported(_) => format!("{title} (can't boot)"),
+            };
+            let item = menu_item(&title, "", "", 0, 0, std::ptr::null_mut());
+            msg_id(item, sel("setAction:"), std::ptr::null_mut());
+            msg_id(menu, sel("addItem:"), item);
+            msg_void(item, sel("release"));
+            msg_id(item, sel("setToolTip:"), ns_str(&format!("{} ({})", img.name(), match support {
+                Support::Unsupported(why) => why.clone(),
+                other => other.to_string(),
+            })));
+            msg_bool(item, sel("setEnabled:"), support.boots() as i8);
+        }
+        // The tested image, or else the first that boots.
+        let first = supports.iter().position(|s| *s == Support::Tested).or_else(|| supports.iter().position(Support::boots));
+        let chosen = entered.map(|e| e.1).or(first).unwrap_or(0);
+        msg_i64(popup, sel("selectItemAtIndex:"), chosen as i64);
+        msg_id(popup, sel("setTarget:"), list_object());
+        msg_id(popup, sel("setAction:"), sel("imageChosen:"));
+        msg0(popup, sel("autorelease"));
+
+        let suggested = images.get(chosen).map(|i| devices::default_name(i, &devices)).unwrap_or_default();
+        let field = msg_id_ret(cls("NSTextField"), sel("textFieldWithString:"), ns_str(entered.map_or(&suggested, |e| &e.0)));
+        pin_const(field, "widthAnchor", 280.0);
+        pin_const(popup, "widthAnchor", 280.0);
+
+        let mut rows = vec![[label("Name:"), field], [label("System image:"), popup]];
+        if supports.contains(&Support::Untested) {
+            let note = wrapping_label("zeroemu is tested with one image; others may not start all the way.");
+            msg_id(note, sel("setFont:"), font(11.0, 0.0));
+            pin_const(note, "widthAnchor", 280.0);
+            rows.push([msg0(cls("NSGridCell"), sel("emptyContentView")), note]);
+        }
+        let rows: Vec<Id> = rows.iter().map(|r| ns_array(r)).collect();
+        let grid = msg_id_ret(cls("NSGridView"), sel("gridViewWithViews:"), ns_array(&rows));
+        msg_f64(grid, sel("setRowSpacing:"), 10.0);
+        msg_f64(grid, sel("setColumnSpacing:"), 8.0);
+        msg_i64(msg_i64_id_ret(grid, sel("columnAtIndex:"), 0), sel("setXPlacement:"), 3); // trailing
+        msg_i64(grid, sel("setRowAlignment:"), 2); // first baselines
+        let fit = msg_size_ret(grid, sel("fittingSize"));
+        msg_size(grid, sel("setFrameSize:"), fit);
+        msg_id(alert, sel("setAccessoryView:"), grid);
+        msg_void(alert, sel("layout"));
+        msg_id(msg0(alert, sel("window")), sel("setInitialFirstResponder:"), field);
+        Ok((alert, Form { field, popup, suggested }))
+    }
+}
+
+/// What the form calls each image: its Android version and kind, with its level, then
+/// its ABI, where two would otherwise read the same (android-36 and android-36.1 are
+/// both Android 16).
+fn image_titles(images: &[Image]) -> Vec<String> {
+    let mut titles: Vec<String> = images.iter().map(devices::image_shown).collect();
+    for more in [|i: &Image| format!(" · API {}", i.api), |i: &Image| format!(" · {}", i.abi)] {
+        let same: Vec<bool> = titles.iter().map(|t| titles.iter().filter(|u| *u == t).count() > 1).collect();
+        for (i, same) in same.into_iter().enumerate() {
+            if same {
+                titles[i] += &more(&images[i]);
+            }
+        }
+    }
+    titles
+}
+
+/// Another image chosen: its name for the device, unless one was typed.
+extern "C" fn image_chosen(_this: Id, _cmd: Id, _sender: Id) {
+    let Some((field, popup, suggested)) = FORM.with(|f| f.borrow().as_ref().map(|f| (f.field, f.popup, f.suggested.clone()))) else { return };
+    unsafe {
+        if rust_str(msg0(field, sel("stringValue"))) != suggested {
+            return;
+        }
+        let index = msg_i64_ret(popup, sel("indexOfSelectedItem")).max(0) as usize;
+        let Some(name) = with_list(|l| l.images.get(index).map(|i| devices::default_name(i, &l.devices))).flatten() else { return };
+        msg_id(field, sel("setStringValue:"), ns_str(&name));
+        FORM.with(|f| {
+            if let Some(f) = f.borrow_mut().as_mut() {
+                f.suggested = name;
+            }
+        });
+    }
+}
+
+/// A row's menu: what the ⋯ button and a right click offer.
+unsafe fn fill_menu(menu: Id, row: i64) {
+    unsafe {
+        msg_void(menu, sel("removeAllItems"));
+        let Some((_, running)) = device_at(row) else { return };
+        let me = list_object();
+        let items: [(&str, &str, bool); 5] = [
+            (if running.is_some() { "Show" } else { "Start" }, "startDevice:", true),
+            ("Rename…", "renameDevice:", true),
+            ("Wipe Data…", "wipeDevice:", running.is_none()),
+            ("Show in Finder", "revealDevice:", true),
+            ("Delete…", "deleteDevice:", running.is_none()),
+        ];
+        for (i, (title, action, enabled)) in items.into_iter().enumerate() {
+            if i == 1 || i == 4 {
+                msg_id(menu, sel("addItem:"), msg0(cls("NSMenuItem"), sel("separatorItem")));
+            }
+            let item = menu_item(title, action, "", 0, 0, me);
+            msg_i64(item, sel("setTag:"), row);
+            msg_bool(item, sel("setEnabled:"), enabled as i8);
+            msg_id(menu, sel("addItem:"), item);
+            msg0(item, sel("release"));
+        }
+        msg_bool(menu, sel("setAutoenablesItems:"), 0);
+    }
+}
+
+extern "C" fn device_menu(_this: Id, _cmd: Id, sender: Id) {
+    unsafe {
+        let row = msg_i64_ret(sender, sel("tag"));
+        let menu = msg0(msg0(msg0(cls("NSMenu"), sel("alloc")), sel("init")), sel("autorelease"));
+        fill_menu(menu, row);
+        let bounds = msg_rect(sender, sel("bounds"));
+        let f: unsafe extern "C" fn(Id, Id, Id, NSPoint, Id) -> i8 = std::mem::transmute(objc_msgSend as *const ());
+        f(menu, sel("popUpMenuPositioningItem:atLocation:inView:"), std::ptr::null_mut(), NSPoint { x: 0.0, y: bounds.size.height + 4.0 }, sender);
+    }
+}
+
+/// The table's own menu, for a right click: the clicked row's.
+extern "C" fn menu_needs_update(_this: Id, _cmd: Id, menu: Id) {
+    let Some(row) = with_list(|l| unsafe { msg_i64_ret(l.table, sel("clickedRow")) }) else { return };
+    unsafe { fill_menu(menu, row) };
+}
+
+extern "C" fn rename_device(_this: Id, _cmd: Id, sender: Id) {
+    let Some((d, _)) = device_at(unsafe { msg_i64_ret(sender, sel("tag")) }) else { return };
+    let Some(name) = (unsafe { ask_text("Rename Device", &format!("A new name for “{}”.", d.name), &d.name, "Rename") }) else { return };
+    match with_list(|l| l.store.rename(&d, &name)) {
+        Some(Ok(_)) => refresh(Some(&d.id)),
+        Some(Err(e)) => {
+            show_alert("The device wasn't renamed", &e, &["OK"]);
+        }
+        None => {}
+    }
+}
+
+extern "C" fn wipe_device(_this: Id, _cmd: Id, sender: Id) {
+    let Some((d, _)) = device_at(unsafe { msg_i64_ret(sender, sel("tag")) }) else { return };
+    let text = "Its apps, accounts, settings and files are deleted, and it starts as new. This can't be undone.";
+    if show_alert(&format!("Wipe the data of “{}”?", d.name), text, &["Wipe Data", "Cancel"]) != 0 {
+        return;
+    }
+    if let Some(Err(e)) = with_list(|l| l.store.wipe(&d)) {
+        show_alert("The data wasn't wiped", &e, &["OK"]);
+    }
+    refresh(None);
+}
+
+extern "C" fn reveal_device(_this: Id, _cmd: Id, sender: Id) {
+    let Some((d, _)) = device_at(unsafe { msg_i64_ret(sender, sel("tag")) }) else { return };
+    // Its data, or its folder before its first start.
+    let path = if d.data.exists() { d.data.clone() } else { d.data.parent().map(std::path::Path::to_path_buf).unwrap_or_default() };
+    let _ = std::process::Command::new("/usr/bin/open").arg("-R").arg(path).status();
+}
+
+extern "C" fn delete_device(_this: Id, _cmd: Id, sender: Id) {
+    let Some((d, _)) = device_at(unsafe { msg_i64_ret(sender, sel("tag")) }) else { return };
+    let text = "The device and its apps, accounts, settings and files are deleted. This can't be undone.";
+    if show_alert(&format!("Delete “{}”?", d.name), text, &["Delete", "Cancel"]) != 0 {
+        return;
+    }
+    if let Some(Err(e)) = with_list(|l| l.store.delete(&d)) {
+        show_alert("The device wasn't deleted", &e, &["OK"]);
+    }
+    refresh(None);
+}
+
+/// Closing the list quits: there's nothing else in this zeroemu.
+extern "C" fn window_will_close(_this: Id, _cmd: Id, _note: Id) {
+    DONE.store(true, Ordering::Release);
+}
+
+extern "C" fn became_key(_this: Id, _cmd: Id, _note: Id) {
+    refresh(None);
+}
+
+/// Every two seconds: shows devices that started or stopped in another zeroemu.
+extern "C" fn tick(_this: Id, _cmd: Id, _timer: Id) {
+    let changed = with_list(|l| l.devices.iter().map(Device::running).collect::<Vec<_>>() != l.running).unwrap_or(false);
+    if changed {
+        refresh(None);
+    }
+}
+
+// ---- Alerts ----
+
+/// An alert with zeroemu's icon, which a zeroemu outside its app bundle has only as
+/// the application's icon image (set_app_icon), not as a file.
+pub(super) unsafe fn new_alert() -> Id {
+    unsafe {
+        let alert = msg0(msg0(cls("NSAlert"), sel("alloc")), sel("init"));
+        let icon = msg0(msg0(cls("NSApplication"), sel("sharedApplication")), sel("applicationIconImage"));
+        if !icon.is_null() {
+            msg_id(alert, sel("setIcon:"), icon);
+        }
+        alert
+    }
+}
+
+/// An alert with these buttons, the first the default. Which was chosen, from 0.
+fn show_alert(title: &str, text: &str, buttons: &[&str]) -> i64 {
+    unsafe {
+        let alert = msg0(new_alert(), sel("autorelease"));
+        msg_id(alert, sel("setMessageText:"), ns_str(title));
+        msg_id(alert, sel("setInformativeText:"), ns_str(text));
+        for (i, b) in buttons.iter().enumerate() {
+            let button = msg_id_ret(alert, sel("addButtonWithTitle:"), ns_str(b));
+            if i == 0 && matches!(*b, "Delete" | "Wipe Data") {
+                msg_bool(button, sel("setHasDestructiveAction:"), 1);
+            }
+        }
+        msg_i64_ret(alert, sel("runModal")) - 1000
+    }
+}
+
+/// An alert asking for one line of text: what was typed, or None for Cancel.
+unsafe fn ask_text(title: &str, text: &str, value: &str, ok: &str) -> Option<String> {
+    unsafe {
+        let alert = msg0(new_alert(), sel("autorelease"));
+        msg_id(alert, sel("setMessageText:"), ns_str(title));
+        msg_id(alert, sel("setInformativeText:"), ns_str(text));
+        msg_id_ret(alert, sel("addButtonWithTitle:"), ns_str(ok));
+        msg_id_ret(alert, sel("addButtonWithTitle:"), ns_str("Cancel"));
+        let field = msg_id_ret(cls("NSTextField"), sel("textFieldWithString:"), ns_str(value));
+        msg_size(field, sel("setFrameSize:"), NSSize { width: 280.0, height: 24.0 });
+        msg_id(alert, sel("setAccessoryView:"), field);
+        msg_void(alert, sel("layout"));
+        msg_id(msg0(alert, sel("window")), sel("setInitialFirstResponder:"), field);
+        (msg_i64_ret(alert, sel("runModal")) == 1000).then(|| rust_str(msg0(field, sel("stringValue"))))
+    }
+}
+
+fn copy_text(text: &str) {
+    unsafe {
+        let board = msg0(cls("NSPasteboard"), sel("generalPasteboard"));
+        msg_void(board, sel("clearContents"));
+        msg_id_id_ret(board, sel("setString:forType:"), ns_str(text), ns_str("public.utf8-plain-text"));
+    }
+}
+
+// ---- The menu bar while the list shows ----
+
+/// The application's menu, File with New Device, Edit (which the form's text fields
+/// need for copy and paste), Window and Help. Quit quits at once: no device runs yet.
+unsafe fn set_up_list_menus(app: Id) {
+    let none = std::ptr::null_mut();
+    unsafe {
+        let me = list_object();
+        let controls = controls_object();
+        let bar = msg0(msg0(cls("NSMenu"), sel("alloc")), sel("init"));
+        submenu(bar, "zeroemu", &[
+            menu_item("About zeroemu", "deviceAction:", "", 0, TAG_ABOUT, controls),
+            none,
+            menu_item("Hide zeroemu", "hide:", "h", COMMAND_MASK, 0, none),
+            menu_item("Hide Others", "hideOtherApplications:", "h", COMMAND_MASK | OPTION_MASK, 0, none),
+            menu_item("Show All", "unhideAllApplications:", "", 0, 0, none),
+            none,
+            menu_item("Quit zeroemu", "terminate:", "q", COMMAND_MASK, 0, none),
+        ]);
+        submenu(bar, "File", &[
+            menu_item("New Device…", "newDevice:", "n", COMMAND_MASK, 0, me),
+            none,
+            menu_item("Close", "performClose:", "w", COMMAND_MASK, 0, none),
+        ]);
+        submenu(bar, "Edit", &[
+            menu_item("Undo", "undo:", "z", COMMAND_MASK, 0, none),
+            menu_item("Redo", "redo:", "Z", COMMAND_MASK, 0, none),
+            none,
+            menu_item("Cut", "cut:", "x", COMMAND_MASK, 0, none),
+            menu_item("Copy", "copy:", "c", COMMAND_MASK, 0, none),
+            menu_item("Paste", "paste:", "v", COMMAND_MASK, 0, none),
+            menu_item("Select All", "selectAll:", "a", COMMAND_MASK, 0, none),
+        ]);
+        let window = submenu(bar, "Window", &[
+            menu_item("Minimize", "performMiniaturize:", "m", COMMAND_MASK, 0, none),
+            menu_item("Zoom", "performZoom:", "", 0, 0, none),
+            none,
+            menu_item("Bring All to Front", "arrangeInFront:", "", 0, 0, none),
+        ]);
+        let help = submenu(bar, "Help", &[
+            menu_item("zeroemu Help", "deviceAction:", "", 0, TAG_HELP, controls),
+            menu_item("Known Gaps", "deviceAction:", "", 0, TAG_GAPS, controls),
+        ]);
+        msg_id(app, sel("setMainMenu:"), bar);
+        msg_id(app, sel("setWindowsMenu:"), window);
+        msg_id(app, sel("setHelpMenu:"), help);
+    }
+}
+
+// ---- The test FIFO ----
+
+/// ZEROEMU_LIST_FIFO=<path>: lines from this host FIFO work the list for tests run
+/// behind someone's work: `new <name>` makes a device of the tested image (or the
+/// first that boots), `start <name>` starts one, `quit` closes the list.
+fn start_fifo() {
+    let Ok(path) = std::env::var("ZEROEMU_LIST_FIFO") else { return };
+    let _ = std::thread::Builder::new().name("list-fifo".into()).spawn(move || {
+        use std::io::BufRead;
+        while !DONE.load(Ordering::Acquire) {
+            let Ok(f) = std::fs::File::open(&path) else { return };
+            for line in std::io::BufReader::new(f).lines().map_while(Result::ok) {
+                if DONE.load(Ordering::Acquire) {
+                    return;
+                }
+                // The list's last line: what follows is for a list opened after it,
+                // which reads the same FIFO (app::open_list passes it on).
+                let last = matches!(line.split_whitespace().next(), Some("start" | "quit"));
+                on_ui_thread(Box::new(move || fifo_line(&line)));
+                if last {
+                    return;
+                }
+            }
+        }
+    });
+}
+
+/// Frees the FIFO reader if it waits for a writer, to find the list done and end.
+fn stop_fifo() {
+    use std::os::unix::fs::OpenOptionsExt;
+    if let Ok(path) = std::env::var("ZEROEMU_LIST_FIFO") {
+        // Opening to write without a reader fails at once (ENXIO) rather than waits.
+        let _ = std::fs::OpenOptions::new().write(true).custom_flags(libc::O_NONBLOCK).open(path);
+    }
+}
+
+fn fifo_line(line: &str) {
+    let (word, rest) = line.trim().split_once(' ').unwrap_or((line.trim(), ""));
+    let rest = rest.trim();
+    match word {
+        "new" => {
+            let made = with_list(|l| {
+                let supports = l.supports.get_or_insert_with(|| l.images.iter().map(sdk::classify).collect());
+                let i = supports.iter().position(|s| *s == Support::Tested).or_else(|| supports.iter().position(Support::boots)).ok_or("no image boots")?;
+                l.store.create(rest, &l.images[i])
+            });
+            match made {
+                Some(Ok(d)) => refresh(Some(&d.id)),
+                Some(Err(e)) => eprintln!("zeroemu: list: new {rest}: {e}"),
+                None => {}
+            }
+        }
+        "start" => match with_list(|l| l.store.find(rest)) {
+            Some(Ok(d)) => match with_list(|l| l.devices.iter().position(|x| x.id == d.id)).flatten() {
+                Some(row) => start(row as i64),
+                None => eprintln!("zeroemu: list: start {rest}: not shown"),
+            },
+            Some(Err(e)) => eprintln!("zeroemu: list: start {rest}: {e}"),
+            None => {}
+        },
+        "quit" => DONE.store(true, Ordering::Release),
+        _ => eprintln!("zeroemu: list: unknown line {line:?}"),
+    }
+}
+
+// ---- Views ----
+
+const WEIGHT_SEMIBOLD: f64 = 0.3;
+const IMAGE_LEADING: i64 = 7;
+const ALIGN_LEADING: i64 = 5;
+const ALIGN_CENTER_X: i64 = 9;
+const ALIGN_CENTER_Y: i64 = 10;
+
+unsafe fn msg_f64(obj: Id, sel: Id, a: f64) {
+    let f: unsafe extern "C" fn(Id, Id, f64) = unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+    unsafe { f(obj, sel, a) }
+}
+
+unsafe fn msg_size_ret(obj: Id, sel: Id) -> NSSize {
+    let f: unsafe extern "C" fn(Id, Id) -> NSSize = unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+    unsafe { f(obj, sel) }
+}
+
+unsafe fn msg_init_popup(obj: Id, sel: Id, frame: NSRect, pulls_down: i8) -> Id {
+    let f: unsafe extern "C" fn(Id, Id, NSRect, i8) -> Id = unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+    unsafe { f(obj, sel, frame, pulls_down) }
+}
+
+unsafe fn msg_id_id_ret_sel(obj: Id, sel: Id, a: Id, b: Id, c: Id) -> Id {
+    let f: unsafe extern "C" fn(Id, Id, Id, Id, Id) -> Id = unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+    unsafe { f(obj, sel, a, b, c) }
+}
+
+unsafe fn label(text: &str) -> Id {
+    unsafe { msg_id_ret(cls("NSTextField"), sel("labelWithString:"), ns_str(text)) }
+}
+
+unsafe fn wrapping_label(text: &str) -> Id {
+    unsafe {
+        let l = msg_id_ret(cls("NSTextField"), sel("wrappingLabelWithString:"), ns_str(text));
+        msg_id(l, sel("setTextColor:"), msg0(cls("NSColor"), sel("secondaryLabelColor")));
+        l
+    }
+}
+
+unsafe fn font(size: f64, weight: f64) -> Id {
+    let f: unsafe extern "C" fn(Id, Id, f64, f64) -> Id = unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+    unsafe { f(cls("NSFont"), sel("systemFontOfSize:weight:"), size, weight) }
+}
+
+unsafe fn symbol(name: &str, points: f64) -> Id {
+    unsafe { super::symbol(name, name, points) }
+}
+
+unsafe fn image_view(image: Id, tint: &str) -> Id {
+    unsafe {
+        let v = msg_id_ret(cls("NSImageView"), sel("imageViewWithImage:"), image);
+        msg_id(v, sel("setContentTintColor:"), msg0(cls("NSColor"), sel(tint)));
+        v
+    }
+}
+
+unsafe fn button(title: &str, action: &str, tag: i64) -> Id {
+    unsafe {
+        let b = msg_id_id_ret_sel(cls("NSButton"), sel("buttonWithTitle:target:action:"), ns_str(title), list_object(), sel(action));
+        msg_i64(b, sel("setTag:"), tag);
+        b
+    }
+}
+
+/// Views side by side, centred on a line; the one that `hug` lets go takes the room.
+unsafe fn row_stack(views: &[Id], spacing: f64) -> Id {
+    unsafe {
+        let s = msg_id_ret(cls("NSStackView"), sel("stackViewWithViews:"), ns_array(views));
+        msg_i64(s, sel("setOrientation:"), 0);
+        msg_i64(s, sel("setAlignment:"), ALIGN_CENTER_Y);
+        msg_i64(s, sel("setDistribution:"), 0); // fill
+        msg_f64(s, sel("setSpacing:"), spacing);
+        s
+    }
+}
+
+unsafe fn column_stack(views: &[Id], spacing: f64, align: i64) -> Id {
+    unsafe {
+        let s = msg_id_ret(cls("NSStackView"), sel("stackViewWithViews:"), ns_array(views));
+        msg_i64(s, sel("setOrientation:"), 1);
+        msg_i64(s, sel("setAlignment:"), align);
+        msg_f64(s, sel("setSpacing:"), spacing);
+        s
+    }
+}
+
+/// Lets `v` grow across: it takes a row's spare width.
+unsafe fn hug(v: Id, priority: f32) {
+    let f: unsafe extern "C" fn(Id, Id, f32, i64) = unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+    unsafe { f(v, sel("setContentHuggingPriority:forOrientation:"), priority, 0) }
+}
+
+/// Lets `v` be narrower than its text, which it then cuts short, rather than push
+/// the row's buttons out.
+unsafe fn squeeze(v: Id) {
+    let f: unsafe extern "C" fn(Id, Id, f32, i64) = unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+    unsafe { f(v, sel("setContentCompressionResistancePriority:forOrientation:"), 250.0, 0) }
+}
+
+unsafe fn add(parent: Id, child: Id) {
+    unsafe {
+        msg_bool(child, sel("setTranslatesAutoresizingMaskIntoConstraints:"), 0);
+        msg_id(parent, sel("addSubview:"), child);
+    }
+}
+
+/// `a`'s anchor at `b`'s, `c` points on (Auto Layout).
+unsafe fn pin(a: Id, a_anchor: &str, b: Id, b_anchor: &str, c: f64) {
+    unsafe {
+        let f: unsafe extern "C" fn(Id, Id, Id, f64) -> Id = std::mem::transmute(objc_msgSend as *const ());
+        let constraint = f(msg0(a, sel(a_anchor)), sel("constraintEqualToAnchor:constant:"), msg0(b, sel(b_anchor)), c);
+        msg_bool(constraint, sel("setActive:"), 1);
+    }
+}
+
+unsafe fn pin_const(a: Id, anchor: &str, c: f64) {
+    unsafe {
+        let constraint = msg_f64_id(msg0(a, sel(anchor)), sel("constraintEqualToConstant:"), c);
+        msg_bool(constraint, sel("setActive:"), 1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn image(sdk: &std::path::Path, level: &str, tag: &str, release: &str) -> Image {
+        let dir = sdk.join("system-images").join(level).join(tag).join(sdk::host_abi());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("build.prop"), format!("ro.build.version.release={release}\n")).unwrap();
+        Image::from_dir(&dir)
+    }
+
+    #[test]
+    fn images_that_read_the_same_get_their_level() {
+        let sdk = std::env::temp_dir().join(format!("zeroemu-titles-{}", std::process::id()));
+        let images = [
+            image(&sdk, "android-36.1", "google_apis", "16"),
+            image(&sdk, "android-36.1", "google_apis_playstore", "16"),
+            image(&sdk, "android-36", "google_apis", "16"),
+        ];
+        assert_eq!(image_titles(&images), [
+            "Android 16 · Google APIs · API 36.1",
+            "Android 16 · Google Play",
+            "Android 16 · Google APIs · API 36",
+        ]);
+        let _ = std::fs::remove_dir_all(&sdk);
+    }
+}

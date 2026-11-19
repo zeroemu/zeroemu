@@ -41,7 +41,23 @@ pub struct NativeWindow {
     pub px_height: i32,
 }
 
+pub mod list;
+
 static APP: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+/// The window's title: the device's name, for the Window menu and Mission Control.
+static TITLE: Mutex<Option<String>> = Mutex::new(None);
+
+pub fn set_title(name: &str) {
+    *TITLE.lock().unwrap() = Some(name.to_string());
+}
+
+/// finishLaunching, once: the list of devices may have called it before the window.
+unsafe fn finish_launching(app: *mut c_void) {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if !DONE.swap(true, Ordering::AcqRel) {
+        unsafe { msg_void(app, sel("finishLaunching")) };
+    }
+}
 static WINDOW: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
 static WINDOW_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -216,8 +232,8 @@ pub fn open(fb_w: u32, fb_h: u32) -> Result<NativeWindow, String> {
         if window.is_null() {
             return Err("NSWindow init failed".into());
         }
-        let title = msg_cstr(cls("NSString"), sel("stringWithUTF8String:"), "zeroemu");
-        msg_id(window, sel("setTitle:"), title);
+        let title = TITLE.lock().unwrap().clone().unwrap_or_else(|| "zeroemu".into());
+        msg_id(window, sel("setTitle:"), ns_str(&title));
         msg_bool(window, sel("setReleasedWhenClosed:"), 0); // this stays pointed at it
         // No tab bar or its menu items: the window is the device.
         msg_bool(cls("NSWindow"), sel("setAllowsAutomaticWindowTabbing:"), 0);
@@ -241,7 +257,7 @@ pub fn open(fb_w: u32, fb_h: u32) -> Result<NativeWindow, String> {
             msg_id(window, sel("makeKeyAndOrderFront:"), std::ptr::null_mut());
             msg_bool(app, sel("activateIgnoringOtherApps:"), 1);
         }
-        msg_void(app, sel("finishLaunching"));
+        finish_launching(app);
         // A device keeps running when its window is covered or minimized, as a phone's
         // apps do with its screen off: no App Nap, which throttled a covered zeroemu's
         // threads and timers until frames took about eight times as long. The Mac may
@@ -609,6 +625,11 @@ pub fn on_closed(f: Box<dyn Fn() + Send + Sync>) {
 
 /// Quit was chosen.
 static QUIT: AtomicBool = AtomicBool::new(false);
+
+/// Whether the device stopped because Quit was chosen, rather than its window closed.
+pub fn quit_chosen() -> bool {
+    QUIT.load(Ordering::Acquire)
+}
 
 /// Quit stops the device as closing its window does, so that /data is saved, rather
 /// than exiting from inside AppKit. The window goes at once; zeroemu exits once the
@@ -1002,6 +1023,7 @@ static CONTROLS: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
 const TAG_HELP: i64 = 100;
 const TAG_GAPS: i64 = 101;
 const TAG_ABOUT: i64 = 102;
+const TAG_LIST: i64 = 103;
 
 /// The toolbar's items at first, in order; Customize Toolbar offers these and `MORE`.
 const TOOLBAR: [Action; 6] = [Action::Back, Action::Home, Action::Recents, Action::Screenshot, Action::RotateRight, Action::Power];
@@ -1072,6 +1094,7 @@ extern "C" fn device_action(_this: *mut c_void, _cmd: *mut c_void, sender: *mut 
         TAG_HELP => open_url("https://github.com/zeroemu/zeroemu#readme"),
         TAG_GAPS => open_url("https://github.com/zeroemu/zeroemu/blob/main/docs/KNOWN-GAPS.md"),
         TAG_ABOUT => about(),
+        TAG_LIST => crate::app::open_list(),
         _ => {
             if let Some(a) = Action::from_tag(tag) {
                 super::controls::perform(a);
@@ -1087,7 +1110,7 @@ extern "C" fn toolbar_item(_this: *mut c_void, _cmd: *mut c_void, _toolbar: *mut
         msg_id(item, sel("setLabel:"), ns_str(a.label()));
         msg_id(item, sel("setPaletteLabel:"), ns_str(a.title()));
         msg_id(item, sel("setToolTip:"), ns_str(a.tooltip()));
-        let image = msg_id_id_ret(cls("NSImage"), sel("imageWithSystemSymbolName:accessibilityDescription:"), ns_str(a.symbol()), ns_str(a.title()));
+        let image = toolbar_symbol(a.symbol(), a.title());
         if !image.is_null() {
             msg_id(item, sel("setImage:"), image);
         }
@@ -1107,6 +1130,28 @@ extern "C" fn toolbar_item(_this: *mut c_void, _cmd: *mut c_void, _toolbar: *mut
         // Not ours to keep: the toolbar retains what it gets (the selector isn't one
         // that hands over ownership).
         msg0(item, sel("autorelease"))
+    }
+}
+
+/// An SF Symbol for a toolbar item, at 15 points rather than the toolbar's own size,
+/// which nearly fills the compact toolbar's 24-point buttons: this leaves the icon
+/// room around it.
+unsafe fn toolbar_symbol(name: &str, description: &str) -> *mut c_void {
+    unsafe { symbol(name, description, 15.0) }
+}
+
+/// An SF Symbol at `points`, of regular weight.
+unsafe fn symbol(name: &str, description: &str, points: f64) -> *mut c_void {
+    unsafe {
+        let image = msg_id_id_ret(cls("NSImage"), sel("imageWithSystemSymbolName:accessibilityDescription:"), ns_str(name), ns_str(description));
+        if image.is_null() {
+            return image;
+        }
+        let f: unsafe extern "C" fn(*mut c_void, *mut c_void, f64, f64) -> *mut c_void = std::mem::transmute(objc_msgSend as *const ());
+        // NSFontWeightRegular is 0.
+        let config = f(cls("NSImageSymbolConfiguration"), sel("configurationWithPointSize:weight:"), points, 0.0);
+        let sized = if config.is_null() { std::ptr::null_mut() } else { msg_id_ret(image, sel("imageWithSymbolConfiguration:"), config) };
+        if sized.is_null() { image } else { sized }
     }
 }
 
@@ -1168,7 +1213,7 @@ pub fn alert(title: &str, text: &str, has_log: bool) -> bool {
         msg_i64(app, sel("setActivationPolicy:"), 0);
         set_app_icon(app);
         msg_bool(app, sel("activateIgnoringOtherApps:"), 1);
-        let alert = msg0(msg0(cls("NSAlert"), sel("alloc")), sel("init"));
+        let alert = list::new_alert();
         msg_id(alert, sel("setMessageText:"), ns_str(title));
         msg_id(alert, sel("setInformativeText:"), ns_str(text));
         msg_id_ret(alert, sel("addButtonWithTitle:"), ns_str("Quit"));
@@ -1335,7 +1380,12 @@ unsafe fn set_up_menus(app: *mut c_void) {
             none,
             menu_item("Quit zeroemu", "terminate:", "q", COMMAND_MASK, 0, none),
         ]);
-        submenu(bar, "File", &[action_item(Action::Screenshot)]);
+        // zeroemu.app's list of devices, in a zeroemu of its own, to start another.
+        if crate::app::bundle().is_some() {
+            submenu(bar, "File", &[menu_item("Show Device List", "deviceAction:", "D", COMMAND_MASK, TAG_LIST, me), none, action_item(Action::Screenshot)]);
+        } else {
+            submenu(bar, "File", &[action_item(Action::Screenshot)]);
+        }
         submenu(bar, "View", &[
             menu_item("Show Toolbar", "toggleToolbarShown:", "t", COMMAND_MASK | OPTION_MASK, 0, none),
             menu_item("Customize Toolbar…", "runToolbarCustomizationPalette:", "", 0, 0, none),

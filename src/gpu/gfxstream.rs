@@ -157,6 +157,10 @@ type FnGetFb = unsafe extern "C" fn() -> *mut c_void;
 /// delete_existing, hide): what gfxstream_backend_setup_window ends in, there with a
 /// pixel ratio fixed at 1. True when the subwindow is up.
 type FnSetupSubWindow = unsafe extern "C" fn(*mut c_void, *mut c_void, i32, i32, i32, i32, i32, i32, f32, f32, bool, bool) -> bool;
+/// FrameBuffer::readColorBufferDeprecated(this, handle, x, y, w, h, GL format, GL type,
+/// pixels, size): a color buffer's pixels, in GL's terms, which don't change between
+/// renderer builds as its own format enum may.
+type FnReadColorBuffer = unsafe extern "C" fn(*mut c_void, u32, i32, i32, i32, i32, u32, u32, *mut c_void, u64);
 type FnTeardown = unsafe extern "C" fn();
 
 struct Api {
@@ -183,6 +187,8 @@ struct Api {
     map_info: FnMapInfo,
     /// FrameBuffer::getFB and setupSubWindow, C++ methods this build exports.
     subwindow: Option<(FnGetFb, FnSetupSubWindow)>,
+    /// FrameBuffer::readColorBufferDeprecated, where this build exports it.
+    read_color_buffer: Option<FnReadColorBuffer>,
     teardown: FnTeardown,
 }
 
@@ -591,10 +597,7 @@ impl Gfxstream {
         let me = Arc::downgrade(self);
         let source = move || {
             let g = me.upgrade()?;
-            let handle = g.scanout.load(Ordering::Acquire);
-            let info = g.resource_info(handle)?;
-            let (w, h, px) = g.read_pixels(handle)?;
-            Some((w, h, info.drm_fourcc, px))
+            g.read_frame(g.scanout.load(Ordering::Acquire))
         };
         window::attach_renderer(Box::new(attach), Box::new(source));
     }
@@ -848,22 +851,10 @@ impl GpuBackend for Gfxstream {
             flush_stats(started.elapsed(), None);
             return;
         }
-        if self.pipes.lock().unwrap_or_else(|p| p.into_inner()).contains_key(&handle) {
-            return; // a pipe, not a picture
-        }
-        let Some(info) = self.resource_info(handle) else { return };
-        let (w, h) = (info.width, info.height);
-        if w == 0 || h == 0 || w > 8192 || h > 8192 {
-            return;
-        }
-        let stride = w * 4;
         let mut buf = self.frame.lock().unwrap_or_else(|p| p.into_inner());
-        buf.resize(stride as usize * h as usize, 0);
-        let iov = Iovec { iov_base: buf.as_mut_ptr() as *mut c_void, iov_len: buf.len() };
-        let b = CBox { x: 0, y: 0, z: 0, w, h, d: 1 };
         let started = Instant::now();
-        if self.worker.run(|| unsafe { (self.api.transfer_read)(handle, 0, 0, stride, 0, &b, 0, &iov, 1) }) == 0 {
-            window::present(w, h, stride, info.drm_fourcc, &buf);
+        if let Some((w, h, fourcc)) = self.read_frame_into(handle, &mut buf) {
+            window::present(w, h, w * 4, fourcc, &buf);
         }
         flush_stats(started.elapsed(), Some(&buf));
     }
@@ -896,6 +887,49 @@ impl GpuBackend for Gfxstream {
 }
 
 impl Gfxstream {
+    /// A scanout's pixels: width, height, DRM fourcc and rows. A buffer only the GPU
+    /// touches has no guest pages until it's mapped or transferred (drm's
+    /// Resource::guest_pages), so the renderer has no copy of it for a transfer to read
+    /// from (VirtioGpuResource::AttachIov sizes that copy): its color buffer is read
+    /// instead, as the transfer itself would read it.
+    fn read_frame(&self, handle: u32) -> Option<(u32, u32, u32, Vec<u8>)> {
+        let mut px = Vec::new();
+        let (w, h, fourcc) = self.read_frame_into(handle, &mut px)?;
+        Some((w, h, fourcc, px))
+    }
+
+    /// `read_frame` into a buffer kept from frame to frame: width, height and fourcc.
+    fn read_frame_into(&self, handle: u32, px: &mut Vec<u8>) -> Option<(u32, u32, u32)> {
+        const GL_RGBA: u32 = 0x1908;
+        const GL_UNSIGNED_BYTE: u32 = 0x1401;
+        const DRM_FORMAT_ABGR8888: u32 = 0x3432_4241; // R, G, B, A bytes
+        if self.pipes.lock().unwrap_or_else(|p| p.into_inner()).contains_key(&handle) {
+            return None; // a pipe, not a picture
+        }
+        let info = self.resource_info(handle)?;
+        let (w, h) = (info.width, info.height);
+        if w == 0 || h == 0 || w > 8192 || h > 8192 {
+            return None;
+        }
+        px.resize(w as usize * h as usize * 4, 0);
+        let (ptr, len) = (px.as_mut_ptr() as *mut c_void, px.len() as u64);
+        if let (Some(read), Some((get_fb, _))) = (self.api.read_color_buffer, self.api.subwindow) {
+            let ok = self.worker.run(|| unsafe {
+                let fb = get_fb();
+                if !fb.is_null() {
+                    read(fb, handle, 0, 0, w as i32, h as i32, GL_RGBA, GL_UNSIGNED_BYTE, ptr, len);
+                }
+                !fb.is_null()
+            });
+            if ok {
+                return Some((w, h, DRM_FORMAT_ABGR8888));
+            }
+        }
+        let iov = Iovec { iov_base: ptr, iov_len: len as usize };
+        let b = CBox { x: 0, y: 0, z: 0, w, h, d: 1 };
+        (self.worker.run(|| unsafe { (self.api.transfer_read)(handle, 0, 0, w * 4, 0, &b, 0, &iov, 1) }) == 0).then_some((w, h, info.drm_fourcc))
+    }
+
     fn xfer(&self, f: FnXfer, handle: u32, t: &Transfer, write: bool) -> Result<(), i64> {
         // Null iov: the renderer uses the iovec attached to the resource.
         let b = c_box(&t.bx);
@@ -1100,6 +1134,7 @@ fn load_api(lib: *mut c_void) -> Result<Api, String> {
         subwindow: lookup(lib, "_ZN9gfxstream4host11FrameBuffer5getFBEv")
             .and_then(|get| Ok((get, lookup(lib, "_ZN9gfxstream4host11FrameBuffer14setupSubWindowEPviiiiiiffbb")?)))
             .ok(),
+        read_color_buffer: lookup(lib, "_ZN9gfxstream4host11FrameBuffer25readColorBufferDeprecatedEjiiiijjPvy").ok(),
         teardown: lookup(lib, "stream_renderer_teardown")?,
     })
 }

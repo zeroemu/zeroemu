@@ -458,12 +458,14 @@ int cmain(void) {
     // --- FUTEX_REQUEUE, then the requeued waiter times out
     spawn(stacks[0] + 16384, waiter1, 0, &ctid[0]);
     nap_ms(60);
-    sys(NR_futex, &fa, 3 /* REQUEUE */, 0, 1, &fb);
+    i64 moved = sys(NR_futex, &fa, 3 /* REQUEUE */, 0, 1, &fb);
     nap_ms(400); // waiter 1 has timed out by now
     spawn(stacks[1] + 16384, waiter2, 0, &ctid[1]);
     nap_ms(100);
     i64 woke = sys(NR_futex, &fb, 1 /* WAKE */, 1);
     nap_ms(300);
+    // FUTEX_REQUEUE returns the waiters it woke and moved (futex_requeue in kernel/futex/requeue.c).
+    check(moved == 1, "FUTEX_REQUEUE counts the waiter it moved");
     check(w1_ret == -110 && woke == 1 && w2_ret == 0, "a requeued waiter that timed out doesn't take a later wake");
     sys(NR_futex, &fb, 1, 10);
     nap_ms(50);
@@ -506,8 +508,32 @@ int cmain(void) {
     ctid[0] = -1;
     spawn(stacks[0] + 16384, wz_waiter, 0, &ctid[0]);
     nap_ms(60);
+    i64 wz_rt = sys(NR_futex, &wz, 1 | 128 | 256 /* CLOCK_REALTIME */, 1);
+    nap_ms(20);
+    i64 wz_still = wz_ret;
+    check(wz_rt == -38 && wz_still == 99, "FUTEX_CLOCK_REALTIME on FUTEX_WAKE is ENOSYS, and wakes nobody");
     i64 wz_woke = sys(NR_futex, &wz, 1 | 128, 0);
     check(gone(0, 1) && wz_woke == 1 && wz_ret == 0, "FUTEX_WAKE of 0 wakes one, as on Linux");
+    check(sys(NR_futex, &rq_word, 0 | 128 | 256, 0 /* not its value */, 0) == -38 && sys(NR_futex, &rq_word, 3 | 128 | 256, 0, 1, &rq_dst) == -38
+          && sys(NR_futex, &rq_word, 9 | 128 | 256, 0, 0, 0, -1) == -11,
+          "FUTEX_CLOCK_REALTIME is ENOSYS but on the calls whose clock the caller picks");
+    i64 bad_ts[2] = {0, 2000000000};
+    check(sys(NR_futex, &rq_word, 0 | 128 | 256, 0, 8 /* not mapped */) == -14 && sys(NR_futex, &rq_word, 0 | 128 | 256, 0, bad_ts) == -22,
+          "and the timeout is read before that, as on Linux");
+    check(sys(NR_futex, &rq_word, 1 | 128 | 0x200, 1) == -38, "a futex op with a bit Linux doesn't know is ENOSYS");
+    // A word whose page isn't in yet: futex_wait faults the page in without its bucket
+    // locked, then reads the word again.
+    char *cold = (char *)sys(NR_mmap, 0, 2 * 4096, 3, 0x22, -1, 0);
+    char *noprot = (char *)sys(NR_mmap, 0, 4096, 0, 0x22, -1, 0);
+    i64 cf = sys(NR_openat, -100, "/tmp/futex-word", 0102 /* O_RDWR|O_CREAT */, 0600);
+    int fw = 0x12345678;
+    sys(NR_write, cf, &fw, 4);
+    char *fm = (char *)sys(NR_mmap, 0, 4096, 1, 2 /* MAP_PRIVATE */, cf, 0);
+    i64 ten_ms[2] = {0, 10000000};
+    check(sys(NR_futex, cold, 128, 1, 0) == -11 && sys(NR_futex, cold + 4096, 128, 0, ten_ms) == -110
+          && sys(NR_futex, fm, 128, 0x12345678, ten_ms) == -110 && sys(NR_futex, noprot, 128, 0, 0) == -14,
+          "FUTEX_WAIT reads a word whose page isn't in yet, and EFAULT where it can't be read");
+    sys(NR_close, cf);
     check(sys(NR_futex, &pi_word, 6 | 128, 0, 0) == 0, "FUTEX_LOCK_PI takes a free lock");
     ctid[0] = -1;
     spawn(stacks[0] + 16384, pi_waiter, 0, &ctid[0]);

@@ -24,7 +24,9 @@ const FUTEX_TRYLOCK_PI: u32 = 8;
 const FUTEX_WAIT_BITSET: u32 = 9;
 const FUTEX_WAKE_BITSET: u32 = 10;
 const FUTEX_CLOCK_REALTIME: u32 = 256;
-const FUTEX_CMD_MASK: u32 = 0x7f;
+/// Linux's mask (include/uapi/linux/futex.h): any other bit makes an unknown command.
+const FUTEX_CMD_MASK: u32 = !(FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME);
+const FUTEX_WAIT_REQUEUE_PI: u32 = 11;
 const FUTEX_LOCK_PI2: u32 = 13;
 const FUTEX_PRIVATE_FLAG: u32 = 128;
 /// A PI futex word: the owner's tid, plus a bit set while threads wait in
@@ -255,40 +257,51 @@ impl Kernel {
     pub(super) fn sys_futex(&self, t: &Thread, uaddr: u64, op: u32, val: u32, timeout: u64, uaddr2: u64, val3: u32) -> i64 {
         let addr = crate::arch::untag(uaddr);
         let private = op & FUTEX_PRIVATE_FLAG != 0;
+        let cmd = op & FUTEX_CMD_MASK;
+        // In Linux's order: the timeout first, for the calls that take one (sys_futex and
+        // futex_init_timeout in kernel/futex/syscalls.c). FUTEX_WAIT's is relative,
+        // FUTEX_LOCK_PI's an absolute CLOCK_REALTIME time, and the others' absolute, on
+        // CLOCK_MONOTONIC unless FUTEX_CLOCK_REALTIME asks otherwise.
+        let deadline = if timeout == 0 || !matches!(cmd, FUTEX_WAIT | FUTEX_LOCK_PI | FUTEX_LOCK_PI2 | FUTEX_WAIT_BITSET | FUTEX_WAIT_REQUEUE_PI) {
+            None
+        } else {
+            let (s, ns) = {
+                let mut mm = t.proc.mm();
+                match (mm.read_u64(timeout), mm.read_u64(timeout + 8)) {
+                    (Ok(s), Ok(ns)) => (s, ns),
+                    _ => return -EFAULT,
+                }
+            };
+            let d = match super::wait::guest_timespec(s, ns) {
+                Ok(d) => d,
+                Err(e) => return -e,
+            };
+            Some(if cmd == FUTEX_WAIT {
+                super::wait::instant_after(d)
+            } else if cmd == FUTEX_LOCK_PI || op & FUTEX_CLOCK_REALTIME != 0 {
+                super::wait::instant_after(d.saturating_sub(super::clock::realtime()))
+            } else {
+                self.boot + d.min(super::wait::CENTURY)
+            })
+        };
+        // Then FUTEX_CLOCK_REALTIME, which only the calls whose clock the caller picks
+        // take: do_futex refuses it on any other with ENOSYS, before it looks at the word
+        // or the queue.
+        if op & FUTEX_CLOCK_REALTIME != 0 && !matches!(cmd, FUTEX_WAIT_BITSET | FUTEX_WAIT_REQUEUE_PI | FUTEX_LOCK_PI2) {
+            return -ENOSYS;
+        }
         // A futex is an aligned word (get_futex_key in kernel/futex/core.c).
         if !addr.is_multiple_of(4) {
             return -EINVAL;
         }
         let key = self.futex_key(t, addr, private);
-        match op & FUTEX_CMD_MASK {
+        match cmd {
             FUTEX_WAIT | FUTEX_WAIT_BITSET => {
-                let bitset = if op & FUTEX_CMD_MASK == FUTEX_WAIT { u32::MAX } else { val3 };
+                let bitset = if cmd == FUTEX_WAIT { u32::MAX } else { val3 };
                 if bitset == 0 {
                     return -EINVAL;
                 }
-                let deadline = if timeout == 0 {
-                    None
-                } else {
-                    let (s, ns) = {
-                        let mut mm = t.proc.mm();
-                        match (mm.read_u64(timeout), mm.read_u64(timeout + 8)) {
-                            (Ok(s), Ok(ns)) => (s, ns),
-                            _ => return -EFAULT,
-                        }
-                    };
-                    let d = match super::wait::guest_timespec(s, ns) {
-                        Ok(d) => d,
-                        Err(e) => return -e,
-                    };
-                    Some(if op & FUTEX_CMD_MASK == FUTEX_WAIT {
-                        super::wait::instant_after(d) // relative
-                    } else if op & FUTEX_CLOCK_REALTIME != 0 {
-                        super::wait::instant_after(d.saturating_sub(super::clock::realtime()))
-                    } else {
-                        self.boot + d.min(super::wait::CENTURY) // absolute CLOCK_MONOTONIC
-                    })
-                };
-                self.futex_wait(t, key, addr, val, deadline, bitset)
+                self.futex_wait(t, key, private, addr, val, deadline, bitset)
             }
             // The count is an int, and futex_wake (kernel/futex/waitwake.c) wakes a
             // waiter before it compares: 0 or less wakes one.
@@ -304,35 +317,11 @@ impl Kernel {
                     return -EINVAL;
                 }
                 let key2 = self.futex_key(t, uaddr2, private);
-                let cmp = (op & FUTEX_CMD_MASK == FUTEX_CMP_REQUEUE).then_some(val3);
+                let cmp = (cmd == FUTEX_CMP_REQUEUE).then_some(val3);
                 self.futex.requeue(t, key, key2, addr, cmp, wake_n as usize, move_n as usize)
             }
-            FUTEX_LOCK_PI | FUTEX_LOCK_PI2 | FUTEX_TRYLOCK_PI => {
-                let cmd = op & FUTEX_CMD_MASK;
-                let deadline = if cmd == FUTEX_TRYLOCK_PI || timeout == 0 {
-                    None
-                } else {
-                    let (s, ns) = {
-                        let mut mm = t.proc.mm();
-                        match (mm.read_u64(timeout), mm.read_u64(timeout + 8)) {
-                            (Ok(s), Ok(ns)) => (s, ns),
-                            _ => return -EFAULT,
-                        }
-                    };
-                    let d = match super::wait::guest_timespec(s, ns) {
-                        Ok(d) => d,
-                        Err(e) => return -e,
-                    };
-                    // Absolute: LOCK_PI on CLOCK_REALTIME, LOCK_PI2 on
-                    // CLOCK_MONOTONIC unless asked otherwise.
-                    Some(if cmd == FUTEX_LOCK_PI || op & FUTEX_CLOCK_REALTIME != 0 {
-                        super::wait::instant_after(d.saturating_sub(super::clock::realtime()))
-                    } else {
-                        self.boot + d.min(super::wait::CENTURY)
-                    })
-                };
-                self.futex_lock_pi(t, key, addr, cmd == FUTEX_TRYLOCK_PI, deadline)
-            }
+            // FUTEX_TRYLOCK_PI takes no timeout: `deadline` is None for it.
+            FUTEX_LOCK_PI | FUTEX_LOCK_PI2 | FUTEX_TRYLOCK_PI => self.futex_lock_pi(t, key, addr, cmd == FUTEX_TRYLOCK_PI, deadline),
             FUTEX_UNLOCK_PI => self.futex_unlock_pi(t, key, addr),
             _ => -ENOSYS,
         }
@@ -461,27 +450,57 @@ impl Kernel {
         ret
     }
 
-    fn futex_wait(&self, t: &Thread, key: (i32, u64), addr: u64, val: u32, deadline: Option<Instant>, bitset: u32) -> i64 {
+    #[allow(clippy::too_many_arguments)]
+    fn futex_wait(&self, t: &Thread, mut key: (i32, u64), private: bool, addr: u64, val: u32, deadline: Option<Instant>, bitset: u32) -> i64 {
         let w = &t.futex;
         // Queued only if the word holds `val`, read with the shard locked, as
         // futex_wait_setup (kernel/futex/waitwake.c) reads it with the bucket locked: a
         // wake after the change being waited for finds the waiter, and a wake or a
         // requeue finds only waiters that sleep. A requeue that moved a waiter about to
         // find its word changed would leave a sleeper behind, and lose its wakeup.
-        let mut list = self.futex.shard(key).lock().unwrap();
-        let cur = match t.proc.try_mm() {
-            Some(mut mm) => mm.read_u32(addr),
-            None => {
-                // A page fault may hold the address space for a while: wait for it
-                // without the shard, as Linux faults the word's page in with the
-                // bucket unlocked, then read again under the shard. If someone took
-                // it again meanwhile, that read waits for it there, as FUTEX_CMP_REQUEUE
-                // and the PI calls do.
-                drop(list);
-                drop(t.proc.mm());
-                list = self.futex.shard(key).lock().unwrap();
-                t.proc.mm().read_u32(addr)
+        //
+        // The read under the shard doesn't fault the page in, as futex_get_value_locked
+        // reads with page faults disabled: a page read from a file would hold up every
+        // futex in the shard. A page not in yet is faulted in without the shard, as a
+        // touch would, and the read starts over, as futex_wait_setup's retry does.
+        let mut shard = self.futex.shard(key);
+        let mut list = shard.lock().unwrap();
+        let (mut waited, mut faulted) = (false, false);
+        let cur = loop {
+            let mut mm = match t.proc.try_mm() {
+                Some(mm) => mm,
+                None if !waited => {
+                    // A page fault may hold the address space for a while: wait for it
+                    // without the shard, then read again under the shard. If someone
+                    // took it again meanwhile, the read waits for it there, as
+                    // FUTEX_CMP_REQUEUE and the PI calls do.
+                    drop(list);
+                    drop(t.proc.mm());
+                    waited = true;
+                    list = shard.lock().unwrap();
+                    continue;
+                }
+                None => t.proc.mm(),
+            };
+            // A page faulted in and gone again (another thread unmapped it) is read the
+            // old way, under the shard, so that this ends.
+            let cur = if faulted { Some(mm.read_u32(addr)) } else { mm.peek_u32(addr) };
+            if let Some(cur) = cur {
+                break cur;
             }
+            drop(mm);
+            drop(list);
+            if self.page_fault(t, addr, false, false).is_err() {
+                return -EFAULT;
+            }
+            faulted = true;
+            // A shared futex's key is its page's frame, which may be another one now:
+            // worked out again, as that retry gets the key again.
+            if !private {
+                key = self.futex_key(t, addr, false);
+                shard = self.futex.shard(key);
+            }
+            list = shard.lock().unwrap();
         };
         match cur {
             Ok(cur) if cur == val => queue(&mut list, w, key, bitset, 0),

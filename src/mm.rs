@@ -1818,6 +1818,33 @@ impl AddressSpace {
         self.write(va, &v.to_le_bytes())
     }
 
+    /// The aligned word at `va` if its page is mapped already, or None where reading it
+    /// would fault the page in: for a caller holding a lock that a page read mustn't
+    /// wait under, as futex_get_value_locked (kernel/futex/core.c) reads with page
+    /// faults disabled. EFAULT where a read is refused, as `host_ptr` refuses it.
+    pub fn peek_u32(&mut self, va: u64) -> Option<Result<u32, i64>> {
+        let va = crate::arch::untag(va);
+        if !va.is_multiple_of(4) {
+            return Some(Err(EINVAL));
+        }
+        let owner = self.owner();
+        let Some((_, vma)) = find_in(&self.vmas, page_down(va)) else { return Some(Err(EFAULT)) };
+        if vma.prot & (PROT_READ | PROT_WRITE | PROT_EXEC) == 0 {
+            return Some(Err(EFAULT));
+        }
+        let slot = match walk(&self.phys, owner, &mut self.tables, self.root.root, 0, va, false) {
+            Ok(Some(slot)) => slot,
+            Ok(None) => return None,
+            Err(e) => return Some(Err(e)),
+        };
+        let e = self.phys.read_u64(slot);
+        if !paging::is_valid(e) {
+            return None;
+        }
+        let p = unsafe { self.phys.host(paging::addr(e)).add((va % PAGE) as usize) } as *mut u32;
+        Some(Ok(unsafe { std::sync::atomic::AtomicU32::from_ptr(p) }.load(Ordering::SeqCst)))
+    }
+
     /// Atomically replaces the word at `va` with `f(current)` until that
     /// sticks or `f` declines (None). Guest threads on other vCPUs change the
     /// same word with their own atomics (the PI futex fast paths). Returns
@@ -2149,6 +2176,31 @@ mod tests {
         let mut present = 0;
         a.each_resident(&mut |_, _, _, _| present += 1);
         assert_eq!((filled, present), (2, 2), "pages 1 and 3: 2 is the fault's own");
+    }
+
+    /// peek_u32 reads only a page that is in, and refuses what a read would: futex_wait
+    /// reads the word with it under a futex shard, where a page read mustn't happen.
+    #[test]
+    fn peek_reads_only_pages_that_are_in() {
+        let phys = PhysMem::new(Arc::new(crate::hv::NoHv));
+        let kernel = KernelWindow::new(&phys, &[]).unwrap();
+        let obj = SharedObject::new(phys.clone());
+        obj.write(0, &0x1234_5678u32.to_le_bytes()).unwrap();
+        let mut a = AddressSpace::new(phys.clone(), &kernel, 1).unwrap();
+        let file = a.map(Placement::Fixed(1 << 30), PAGE, PROT_READ, Backing::Shared { obj, offset: 0 }).unwrap();
+        let anon = a.map(Placement::Fixed((1 << 30) + (4 << 20)), PAGE * 2, PROT_READ | PROT_WRITE, Backing::Anon).unwrap();
+        let none = a.map(Placement::Fixed((1 << 30) + (8 << 20)), PAGE, 0, Backing::Anon).unwrap();
+        assert_eq!((a.peek_u32(file), a.peek_u32(anon + 8)), (None, None), "nothing is in yet");
+        let mut present = 0;
+        a.each_resident(&mut |_, _, _, _| present += 1);
+        assert_eq!(present, 0, "and peeking mapped nothing");
+        a.fault_reading(file, false, false).unwrap();
+        a.write_u32(anon + 8, 7).unwrap();
+        assert_eq!((a.peek_u32(file), a.peek_u32(anon + 8)), (Some(Ok(0x1234_5678)), Some(Ok(7))));
+        assert_eq!(a.peek_u32(anon + PAGE), None, "a page whose table is there now, but not the page");
+        assert_eq!(a.peek_u32(none), Some(Err(EFAULT)), "PROT_NONE");
+        assert_eq!(a.peek_u32((1 << 30) + (12 << 20)), Some(Err(EFAULT)), "nothing mapped");
+        assert_eq!(a.peek_u32(anon + 2), Some(Err(EINVAL)), "not a word");
     }
 
     /// What a child gets of each mapping, across leaf tables: private pages shared until

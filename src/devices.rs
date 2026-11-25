@@ -120,18 +120,32 @@ pub fn check_ram(mb: u64) -> Result<u64, String> {
     if (1024..=max).contains(&mb) { Ok(mb) } else { Err(format!("memory is from 1024 to {max} MB, not {mb}")) }
 }
 
-/// An IANA time zone name the tz database here has, such as Asia/Kolkata. Android's
-/// own copy of the database (the tzdata APEX) has the same names, give or take a
-/// zone added since the image was built.
+/// An IANA time zone name the tz database here has, such as Asia/Kolkata, exactly:
+/// Android's own copy of the database (the tzdata APEX) has the same names, give or
+/// take a zone added since the image was built, and looks them up with their case
+/// (bionic's localtime.c, libcore's ZoneInfoDb), falling back to GMT for any other.
+/// The Mac's disk ignores case, so each part of the name is matched against the
+/// folder's own names, and the file must be a zone (TZif), not zone.tab or the like.
 pub fn check_time_zone(zone: &str) -> Result<(), String> {
     let bad = || format!("{zone:?} isn't a time zone; they are named as Europe/Berlin and Asia/Kolkata are");
     if zone.is_empty() || zone.starts_with('/') || zone.split('/').any(|p| p.is_empty() || p == "." || p == "..") || zone.chars().any(|c| c.is_whitespace() || c.is_control()) {
         return Err(bad());
     }
-    match zoneinfo_dir() {
-        Some(dir) if !dir.join(zone).is_file() => Err(bad()),
-        _ => Ok(()),
+    let Some(mut path) = zoneinfo_dir() else { return Ok(()) };
+    // posix/ and right/ are copies of the zones with other leap-second rules.
+    if zone.starts_with("posix/") || zone.starts_with("right/") {
+        return Err(bad());
     }
+    for part in zone.split('/') {
+        let named = std::fs::read_dir(&path).into_iter().flatten().flatten().any(|e| e.file_name() == part);
+        if !named {
+            return Err(bad());
+        }
+        path.push(part);
+    }
+    let mut magic = [0u8; 4];
+    let zone_file = std::fs::File::open(&path).and_then(|mut f| std::io::Read::read_exact(&mut f, &mut magic)).is_ok() && &magic == b"TZif";
+    if zone_file { Ok(()) } else { Err(bad()) }
 }
 
 /// The host's copy of the tz database, where it has one.
@@ -983,6 +997,10 @@ mod tests {
         if zoneinfo_dir().is_some() {
             assert!(check_time_zone("Asia/Kolkata").is_ok());
             assert!(check_time_zone("Mars/Olympus").is_err());
+            // Android matches names with their case, and only zones are zones.
+            assert!(check_time_zone("asia/kolkata").is_err());
+            assert!(check_time_zone("zone.tab").is_err());
+            assert!(check_time_zone("posix/Asia/Kolkata").is_err());
             assert!(time_zones().iter().any(|z| z == "Europe/Berlin"));
         }
     }

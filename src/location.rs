@@ -150,7 +150,9 @@ impl Source {
         if s.eq_ignore_ascii_case("off") || s.eq_ignore_ascii_case("none") {
             return Ok(Source::Off);
         }
-        if let Some(p) = PRESETS.iter().find(|p| p.id.eq_ignore_ascii_case(s)) {
+        // By its id, or by its name as Device > Location shows it ("City Run",
+        // "Times Square, New York": before the comma could be read as coordinates).
+        if let Some(p) = PRESETS.iter().find(|p| p.id.eq_ignore_ascii_case(s) || p.name.eq_ignore_ascii_case(s)) {
             return Ok(Source::Preset(p.id));
         }
         let bad = || format!("a location is off, <latitude>,<longitude> in degrees, or a preset such as {}; not {s:?}", PRESETS[0].id);
@@ -810,5 +812,12 @@ mod tests {
         let t = Instant::now();
         wait_for_change(changes, Some(Duration::from_millis(20)));
         assert!(t.elapsed() >= Duration::from_millis(20));
+    }
+
+    #[test]
+    fn presets_are_found_by_the_names_the_menu_shows() {
+        assert_eq!(Source::parse("City Run"), Ok(Source::Preset("city-run")));
+        assert_eq!(Source::parse("times square, new york"), Ok(Source::Preset("times-square")));
+        assert_eq!(Source::parse("googleplex"), Ok(Source::Preset("googleplex")));
     }
 }

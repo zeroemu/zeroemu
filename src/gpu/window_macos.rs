@@ -87,6 +87,7 @@ fn with_pool<R>(f: impl FnOnce() -> R) -> R {
 unsafe extern "C" {
     static NSDefaultRunLoopMode: *mut c_void;
     static NSToolbarFlexibleSpaceItemIdentifier: *mut c_void;
+    fn NSBeep();
 }
 
 fn cls(name: &str) -> *mut c_void {
@@ -1094,7 +1095,7 @@ extern "C" fn device_action(_this: *mut c_void, _cmd: *mut c_void, sender: *mut 
         TAG_HELP => open_url("https://github.com/zeroemu/zeroemu#readme"),
         TAG_GAPS => open_url("https://github.com/zeroemu/zeroemu/blob/main/docs/KNOWN-GAPS.md"),
         TAG_ABOUT => about(),
-        TAG_LIST => crate::app::open_list(),
+        TAG_LIST => show_list(),
         _ => {
             if let Some(a) = Action::from_tag(tag) {
                 super::controls::perform(a);
@@ -1178,6 +1179,32 @@ extern "C" fn toolbar_allowed(_this: *mut c_void, _cmd: *mut c_void, _toolbar: *
 extern "C" fn should_terminate(_this: *mut c_void, _cmd: *mut c_void, _app: *mut c_void) -> u64 {
     quit();
     0
+}
+
+/// File > Show Device List: the list another zeroemu shows already, brought forward
+/// (chosen again, it doesn't open a second), or the list in a zeroemu of its own.
+fn show_list() {
+    match crate::app::list_shown_by() {
+        Some(Some(pid)) => activate_pid(pid),
+        // Just opened, and coming forward by itself.
+        Some(None) => {}
+        None => {
+            if let Err(e) = crate::app::open_list() {
+                eprintln!("zeroemu: the list of devices didn't open: {e}");
+                unsafe { NSBeep() };
+            }
+        }
+    }
+}
+
+/// Brings forward the zeroemu with this process id, all its windows.
+pub(super) fn activate_pid(pid: u32) {
+    with_pool(|| unsafe {
+        let other = msg_i64_id_ret(cls("NSRunningApplication"), sel("runningApplicationWithProcessIdentifier:"), pid as i64);
+        if !other.is_null() {
+            msg_i64(other, sel("activateWithOptions:"), 1); // NSApplicationActivateAllWindows
+        }
+    });
 }
 
 fn open_url(url: &str) {

@@ -50,8 +50,19 @@ fn with_list<R>(f: impl FnOnce(&mut List) -> R) -> Option<R> {
 }
 
 /// The list's window until a device is chosen, which this returns, or None when the
-/// window is closed or zeroemu quit.
+/// window is closed or zeroemu quit, or another zeroemu shows the list already, which
+/// this brings forward instead: one list at a time (app::hold_list).
 pub fn choose() -> Option<String> {
+    // Held while the list shows: let go when this returns, before a chosen device boots.
+    let _shown = match crate::app::hold_list() {
+        Ok(lock) => lock,
+        Err(pid) => {
+            if let Some(pid) = pid {
+                super::activate_pid(pid);
+            }
+            return None;
+        }
+    };
     let Some(store) = Store::open() else {
         super::alert("zeroemu can't keep devices", "HOME isn't set, so there's nowhere to keep them.", false);
         return None;
@@ -353,7 +364,7 @@ fn list_object() -> Id {
             return std::ptr::null_mut();
         }
         let action = "v24@0:8@16";
-        let methods: [(&str, *const c_void, &str); 15] = [
+        let methods: [(&str, *const c_void, &str); 16] = [
             ("numberOfRowsInTableView:", rows as *const c_void, "q24@0:8@16"),
             ("tableView:viewForTableColumn:row:", view_for_row as *const c_void, "@40@0:8@16@24q32"),
             ("startDevice:", start_device as *const c_void, action),
@@ -368,6 +379,7 @@ fn list_object() -> Id {
             ("menuNeedsUpdate:", menu_needs_update as *const c_void, action),
             ("windowWillClose:", window_will_close as *const c_void, action),
             ("windowDidBecomeKey:", became_key as *const c_void, action),
+            ("applicationDidBecomeActive:", became_active as *const c_void, action),
             ("tick:", tick as *const c_void, action),
         ];
         for (selector, imp, types) in methods {
@@ -411,7 +423,8 @@ extern "C" fn start_device(_this: Id, _cmd: Id, sender: Id) {
     start(unsafe { msg_i64_ret(sender, sel("tag")) });
 }
 
-/// A double click, or Start in a row's menu, whose tag is -1: the clicked row's.
+/// A double click (the table's double action): the clicked row's. Start in a row's
+/// menu is startDevice:, its tag the row.
 extern "C" fn start_clicked(_this: Id, _cmd: Id, _sender: Id) {
     if let Some(row) = with_list(|l| unsafe { msg_i64_ret(l.table, sel("clickedRow")) }) {
         start(row);
@@ -425,12 +438,7 @@ fn start(row: i64) {
     let running = running.or_else(|| d.running());
     if let Some(pid) = running {
         if let Some(pid) = pid {
-            unsafe {
-                let other = msg_i64_id_ret(cls("NSRunningApplication"), sel("runningApplicationWithProcessIdentifier:"), pid as i64);
-                if !other.is_null() {
-                    msg_i64(other, sel("activateWithOptions:"), 1); // all its windows
-                }
-            }
+            super::activate_pid(pid);
         }
         return;
     }
@@ -451,19 +459,16 @@ fn choose_device(id: String) {
 
 extern "C" fn new_device(_this: Id, _cmd: Id, _sender: Id) {
     refresh(None);
-    let Some((have_images, any_boots)) = with_list(|l| {
-        let supports = l.supports.get_or_insert_with(|| l.images.iter().map(sdk::classify).collect());
-        (!l.images.is_empty(), supports.iter().any(Support::boots))
-    }) else {
-        return;
-    };
-    if !any_boots {
+    let Some(have_images) = with_list(|l| {
+        l.supports = None;
+        !l.images.is_empty()
+    }) else { return };
+    if !have_images {
         let (title, text, command) = match sdk::require() {
             Err(p) => ("There's no Android SDK".to_string(), p.to_string(), None),
             Ok(s) => {
                 let command = s.sdkmanager(&sdk::tested_package());
-                let title = if have_images { "None of your system images can start" } else { "No system images are installed" };
-                (title.to_string(), format!("Install the one zeroemu is tested with, then make a device again:\n\n{command}"), Some(command))
+                ("No system images are installed".to_string(), format!("Install the one zeroemu is tested with, then make a device again:\n\n{command}"), Some(command))
             }
         };
         let buttons: &[&str] = if command.is_some() { &["Copy Command", "OK"] } else { &["OK"] };
@@ -477,9 +482,19 @@ extern "C" fn new_device(_this: Id, _cmd: Id, _sender: Id) {
     let mut entered: Option<(String, usize)> = None;
     loop {
         let Ok((alert, form)) = (unsafe { form_alert(entered.as_ref()) }) else { return };
-        FORM.with(|f| *f.borrow_mut() = Some(form));
+        let creates = form.is_some();
+        FORM.with(|f| *f.borrow_mut() = form);
         let answer = unsafe { msg_i64_ret(alert, sel("runModal")) };
-        let Some(form) = FORM.with(|f| f.borrow_mut().take()) else { return };
+        let Some(form) = FORM.with(|f| f.borrow_mut().take()) else {
+            // None of them can start: the form showed them, why, and what to install.
+            if !creates
+                && answer == 1000
+                && let Some(c) = install_command()
+            {
+                copy_text(&c);
+            }
+            return;
+        };
         if answer != 1000 {
             return;
         }
@@ -502,19 +517,38 @@ extern "C" fn new_device(_this: Id, _cmd: Id, _sender: Id) {
 
 /// The form making a device, as an alert with Create and Cancel: a name, and the
 /// installed images, those that can't boot shown but not chosen. `entered` is what
-/// was typed and chosen before, when that was refused.
-unsafe fn form_alert(entered: Option<&(String, usize)>) -> Result<(Id, Form), String> {
+/// was typed and chosen before, when that was refused. When none of the images can
+/// boot, no Form: the images all shown but not chosen, why the one shown can't boot,
+/// and what to install, with Copy Command (if there's an SDK to say it for) and OK.
+unsafe fn form_alert(entered: Option<&(String, usize)>) -> Result<(Id, Option<Form>), String> {
     let (images, supports, devices) = with_list(|l| {
         let supports = l.supports.get_or_insert_with(|| l.images.iter().map(sdk::classify).collect()).clone();
         (l.images.clone(), supports, l.devices.clone())
     })
     .ok_or("no list")?;
+    let first = default_image(&supports);
+    // No images at all is said before the form (new_device); drawn (snapshot), the form.
+    let creates = first.is_some() || images.is_empty();
     unsafe {
         let alert = msg0(new_alert(), sel("autorelease"));
-        msg_id(alert, sel("setMessageText:"), ns_str("New Device"));
-        msg_id(alert, sel("setInformativeText:"), ns_str("A device runs one system image from your Android SDK and keeps its own apps and data."));
-        msg_id_ret(alert, sel("addButtonWithTitle:"), ns_str("Create"));
-        msg_id_ret(alert, sel("addButtonWithTitle:"), ns_str("Cancel"));
+        if creates {
+            msg_id(alert, sel("setMessageText:"), ns_str("New Device"));
+            msg_id(alert, sel("setInformativeText:"), ns_str("A device runs one system image from your Android SDK and keeps its own apps and data."));
+            msg_id_ret(alert, sel("addButtonWithTitle:"), ns_str("Create"));
+            msg_id_ret(alert, sel("addButtonWithTitle:"), ns_str("Cancel"));
+        } else {
+            let command = install_command();
+            let tested_why = images.iter().zip(&supports).find(|(i, _)| i.package() == sdk::tested_package()).and_then(|(_, s)| match s {
+                Support::Unsupported(why) => Some(why.as_str()),
+                _ => None,
+            });
+            msg_id(alert, sel("setMessageText:"), ns_str("None of your system images can start"));
+            msg_id(alert, sel("setInformativeText:"), ns_str(&cant_start_text(tested_why, command.as_deref())));
+            if command.is_some() {
+                msg_id_ret(alert, sel("addButtonWithTitle:"), ns_str("Copy Command"));
+            }
+            msg_id_ret(alert, sel("addButtonWithTitle:"), ns_str("OK"));
+        }
 
         let popup = msg_init_popup(msg0(cls("NSPopUpButton"), sel("alloc")), sel("initWithFrame:pullsDown:"), NSRect { origin: NSPoint { x: 0.0, y: 0.0 }, size: NSSize { width: 280.0, height: 26.0 } }, 0);
         msg_bool(popup, sel("setAutoenablesItems:"), 0);
@@ -537,26 +571,47 @@ unsafe fn form_alert(entered: Option<&(String, usize)>) -> Result<(Id, Form), St
             })));
             msg_bool(item, sel("setEnabled:"), support.boots() as i8);
         }
-        // The tested image, or else the first that boots.
-        let first = supports.iter().position(|s| *s == Support::Tested).or_else(|| supports.iter().position(Support::boots));
-        let chosen = entered.map(|e| e.1).or(first).unwrap_or(0);
+        // None boots: the tested image shown, as the text speaks of it, else the first.
+        let tested = || images.iter().position(|i| i.package() == sdk::tested_package());
+        let chosen = entered.map(|e| e.1).or(first).or_else(tested).unwrap_or(0);
         msg_i64(popup, sel("selectItemAtIndex:"), chosen as i64);
+        msg0(popup, sel("autorelease"));
+        pin_const(popup, "widthAnchor", 280.0);
+        let note = |text: &str| {
+            let note = wrapping_label(text);
+            msg_id(note, sel("setFont:"), font(11.0, 0.0));
+            pin_const(note, "widthAnchor", 280.0);
+            [msg0(cls("NSGridCell"), sel("emptyContentView")), note]
+        };
+        if !creates {
+            // Nothing to name or create: the images, and why the one shown can't boot.
+            let mut rows = vec![[label(if images.len() == 1 { "Installed image:" } else { "Installed images:" }), popup]];
+            if let Some(Support::Unsupported(why)) = supports.get(chosen) {
+                rows.push(note(&format!("Can't boot: {why}.")));
+            }
+            set_accessory(alert, &rows);
+            return Ok((alert, None));
+        }
         msg_id(popup, sel("setTarget:"), list_object());
         msg_id(popup, sel("setAction:"), sel("imageChosen:"));
-        msg0(popup, sel("autorelease"));
 
         let suggested = images.get(chosen).map(|i| devices::default_name(i, &devices)).unwrap_or_default();
         let field = msg_id_ret(cls("NSTextField"), sel("textFieldWithString:"), ns_str(entered.map_or(&suggested, |e| &e.0)));
         pin_const(field, "widthAnchor", 280.0);
-        pin_const(popup, "widthAnchor", 280.0);
 
         let mut rows = vec![[label("Name:"), field], [label("System image:"), popup]];
         if supports.contains(&Support::Untested) {
-            let note = wrapping_label("zeroemu is tested with one image; others may not start all the way.");
-            msg_id(note, sel("setFont:"), font(11.0, 0.0));
-            pin_const(note, "widthAnchor", 280.0);
-            rows.push([msg0(cls("NSGridCell"), sel("emptyContentView")), note]);
+            rows.push(note("zeroemu is tested with one image; others may not start all the way."));
         }
+        set_accessory(alert, &rows);
+        msg_id(msg0(alert, sel("window")), sel("setInitialFirstResponder:"), field);
+        Ok((alert, Some(Form { field, popup, suggested })))
+    }
+}
+
+/// The form's rows, a label and its control each, under the alert's text.
+unsafe fn set_accessory(alert: Id, rows: &[[Id; 2]]) {
+    unsafe {
         let rows: Vec<Id> = rows.iter().map(|r| ns_array(r)).collect();
         let grid = msg_id_ret(cls("NSGridView"), sel("gridViewWithViews:"), ns_array(&rows));
         msg_f64(grid, sel("setRowSpacing:"), 10.0);
@@ -567,9 +622,35 @@ unsafe fn form_alert(entered: Option<&(String, usize)>) -> Result<(Id, Form), St
         msg_size(grid, sel("setFrameSize:"), fit);
         msg_id(alert, sel("setAccessoryView:"), grid);
         msg_void(alert, sel("layout"));
-        msg_id(msg0(alert, sel("window")), sel("setInitialFirstResponder:"), field);
-        Ok((alert, Form { field, popup, suggested }))
     }
+}
+
+/// The image the form chooses first: the tested one, or else the first that boots.
+/// None when none of them boots, when there's nothing to create.
+fn default_image(supports: &[Support]) -> Option<usize> {
+    supports.iter().position(|s| *s == Support::Tested).or_else(|| supports.iter().position(Support::boots))
+}
+
+/// The SDK's command installing the tested image, when there's an SDK.
+fn install_command() -> Option<String> {
+    sdk::find().filter(|s| s.exists()).map(|s| s.sdkmanager(&sdk::tested_package()))
+}
+
+/// What the form says when images are installed but none of them can boot: what to
+/// install, and why the tested image can't if it is one of them (then it is to be
+/// installed again). `command` installs it.
+fn cant_start_text(tested_why: Option<&str>, command: Option<&str>) -> String {
+    let mut text = match tested_why {
+        Some(why) => format!(
+            "The image zeroemu is tested with is installed but can't start ({why}). Remove it in SDK Manager, then install it again and make a device"
+        ),
+        None => "Those installed are listed below, with why the one shown can't start. Install the image zeroemu is tested with, then make a device".to_string(),
+    };
+    match command {
+        Some(c) => text += &format!(":\n\n{c}"),
+        None => text += &format!(": {}.", sdk::tested_package()),
+    }
+    text
 }
 
 /// What the form calls each image: its Android version and kind, with its level, then
@@ -700,6 +781,20 @@ extern "C" fn window_will_close(_this: Id, _cmd: Id, _note: Id) {
 
 extern "C" fn became_key(_this: Id, _cmd: Id, _note: Id) {
     refresh(None);
+}
+
+extern "C" fn became_active(_this: Id, _cmd: Id, _note: Id) {
+    if DONE.load(Ordering::Acquire) || background() {
+        return;
+    }
+    if let Some(window) = with_list(|l| l.window) {
+        unsafe {
+            let is_miniaturized: unsafe extern "C" fn(Id, Id) -> i8 = std::mem::transmute(objc_msgSend as *const ());
+            if is_miniaturized(window, sel("isMiniaturized")) != 0 {
+                msg_id(window, sel("deminiaturize:"), std::ptr::null_mut());
+            }
+        }
+    }
 }
 
 /// Every two seconds: shows devices that started or stopped in another zeroemu.
@@ -858,7 +953,7 @@ fn fifo_line(line: &str) {
         "new" => {
             let made = with_list(|l| {
                 let supports = l.supports.get_or_insert_with(|| l.images.iter().map(sdk::classify).collect());
-                let i = supports.iter().position(|s| *s == Support::Tested).or_else(|| supports.iter().position(Support::boots)).ok_or("no image boots")?;
+                let i = default_image(supports).ok_or("no image boots")?;
                 l.store.create(rest, &l.images[i])
             });
             match made {
@@ -1028,5 +1123,25 @@ mod tests {
             "Android 16 · Google APIs · API 36",
         ]);
         let _ = std::fs::remove_dir_all(&sdk);
+    }
+
+    #[test]
+    fn the_form_chooses_the_tested_image_else_the_first_that_boots() {
+        let no = || Support::Unsupported("16 KB page size isn't supported yet".into());
+        assert_eq!(default_image(&[no(), Support::Untested, Support::Tested]), Some(2));
+        assert_eq!(default_image(&[no(), Support::Untested, Support::Untested]), Some(1));
+        // None boots: nothing to create, the form shows them from the first.
+        assert_eq!(default_image(&[no(), no()]), None);
+        assert_eq!(default_image(&[]), None);
+    }
+
+    #[test]
+    fn images_none_of_which_boot_say_what_to_install() {
+        let other = cant_start_text(None, Some("sdkmanager \"x\""));
+        assert!(other.contains("Install the image zeroemu is tested with") && other.ends_with(":\n\nsdkmanager \"x\""));
+        let tested = cant_start_text(Some("not fully installed"), Some("sdkmanager \"x\""));
+        assert!(tested.contains("(not fully installed)") && tested.contains("Remove it in SDK Manager, then install it again"));
+        // No sdkmanager command to give: the package, to install it some other way.
+        assert!(cant_start_text(None, None).ends_with(&format!(": {}.", sdk::tested_package())));
     }
 }

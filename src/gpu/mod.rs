@@ -81,6 +81,15 @@ pub fn choose_device() -> Option<String> {
     None
 }
 
+pub fn activate_device_list(pid: u32) {
+    #[cfg(target_os = "macos")]
+    if !window::background() {
+        window::activate_pid(pid);
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = pid;
+}
+
 /// ZEROEMU_LIST_SNAPSHOT: the list and its form, drawn into PNGs in `dir` unshown.
 pub fn snapshot_list(dir: &std::path::Path) -> Result<(), String> {
     #[cfg(target_os = "macos")]

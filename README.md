@@ -139,13 +139,14 @@ It opens on a list of your devices, as Android Studio's Device Manager does. A d
 a name, a system image from your SDK, and its own `/data`. The first time, the app asks
 you to make one: **New Device** (⌘N) takes a name and one of your installed images. The
 image zeroemu is tested with is chosen first, and images it can't boot are listed but
-can't be chosen.
+can't be chosen; if none of them can, the form says why and what to install.
 
 - **Start** boots a device in the window. Closing its window brings the list back; Quit
   (⌘Q) stops it and quits.
 - A device that is already running says so, and **Show** brings its window forward.
   File > Show Device List (⇧⌘D) opens the list beside a running device, to start
-  another one: each runs in its own zeroemu, with its own adb serial.
+  another one: each runs in its own zeroemu, with its own adb serial. There is one list
+  at a time: chosen again, it brings the open list forward.
 - A device's ⋯ menu, or a right click, renames it, wipes its data, shows its files in
   Finder, or deletes it.
 - What `zeroemu` saved for an image in a terminal (without `--device`) shows up in the

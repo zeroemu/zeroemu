@@ -202,10 +202,10 @@ fn main() -> ExitCode {
             if as_app && booted && let Some(why) = app::stopped_by_itself(code, kernel::reboot_target().as_deref()) {
                 eprintln!("zeroemu: {why}");
                 gpu::alert_failure("Android stopped", &why, log.as_deref());
-            } else if from_list && !gpu::quit_chosen() && !app::list_opened() {
+            } else if from_list && !gpu::quit_chosen() {
                 // The device's window was closed, or Android powered off: back to the
-                // list, in a zeroemu of its own, as this one's VM can't be made again.
-                app::open_list();
+                // list, in a zeroemu of its own, unless one shows it already.
+                app::back_to_list();
             }
             ExitCode::from(code as u8)
         }
@@ -332,16 +332,16 @@ fn run(args: Vec<String>) -> Result<i32, String> {
     if image.is_some() && system.is_some() {
         return Err("--image and --system both name an image; give one".into());
     }
-    let mut device_ini = None;
+    let mut device_found = None;
     if let Some(name) = &device {
         if image.is_some() || system.is_some() || data.is_some() || ephemeral || !argv.is_empty() || inspect.is_some() {
             return Err("--device names an image and its /data: give it without --image, --system, --data, --ephemeral or a program".into());
         }
         let d = find_device(name)?;
         gpu::set_title(&d.name);
-        device_ini = Some(d.ini());
-        image = Some(d.package);
-        data = Some(d.data);
+        image = Some(d.package.clone());
+        data = Some(d.data.clone());
+        device_found = Some(d);
     }
     PROGRAM.store(!boot && inspect.is_none(), Ordering::Relaxed);
     if boot {
@@ -381,7 +381,7 @@ fn run(args: Vec<String>) -> Result<i32, String> {
             path,
             wipe: wipe_data,
             stop_if_in_use: app::opened_as_app(),
-            must_exist: device_ini.clone(),
+            device: device_found.clone(),
         }),
         _ => None,
     };

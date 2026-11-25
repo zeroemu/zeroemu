@@ -319,6 +319,10 @@ What you see:
   screenshots. On a MacBook keyboard, hold Fn for F1 and F2.
 - Rotating turns the phone: Android turns its screen as a phone does, if auto-rotate is
   on and the app allows it, and the window takes the new shape.
+- **Device > Location** sets where the phone's GPS says it is, as Simulator's Features >
+  Location does: None, a latitude and longitude of your own, one of a dozen places
+  round the world, or a route round the Googleplex (a run, a bicycle ride or a drive
+  on US 101) that the phone follows at its pace, over and over.
 - The terminal shows Android's warnings and errors, and the renderer's errors.
   `ZEROEMU_LOG=I` shows more of Android's log, and `ZEROEMU_LOG=S` hides it.
   `ZEROEMU_GPU_LOG=<S|E|W|I|D>` sets how much of the renderer's own log shows.

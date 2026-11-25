@@ -29,6 +29,7 @@ struct NSRect {
 }
 
 pub mod list;
+mod location_menu;
 
 static APP: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
 /// The window's title: the device's name, for the Window menu and Mission Control.
@@ -1068,8 +1069,9 @@ fn controls_object() -> *mut c_void {
             return std::ptr::null_mut();
         }
         // Type encodings as the runtime has them for these selectors' protocols.
-        let methods: [(&str, *const c_void, &str); 5] = [
+        let methods: [(&str, *const c_void, &str); 6] = [
             ("deviceAction:", device_action as *const c_void, "v24@0:8@16"),
+            ("validateMenuItem:", validate_menu_item as *const c_void, "B24@0:8@16"),
             ("toolbar:itemForItemIdentifier:willBeInsertedIntoToolbar:", toolbar_item as *const c_void, "@36@0:8@16@24B32"),
             ("toolbarDefaultItemIdentifiers:", toolbar_default as *const c_void, "@24@0:8@16"),
             ("toolbarAllowedItemIdentifiers:", toolbar_allowed as *const c_void, "@24@0:8@16"),
@@ -1094,12 +1096,23 @@ extern "C" fn device_action(_this: *mut c_void, _cmd: *mut c_void, sender: *mut 
         TAG_GAPS => open_url("https://github.com/zeroemu/zeroemu/blob/main/docs/KNOWN-GAPS.md"),
         TAG_ABOUT => about(),
         TAG_LIST => show_list(),
+        t if location_menu::is_tag(t) => location_menu::chosen(t),
         _ => {
             if let Some(a) = Action::from_tag(tag) {
                 super::controls::perform(a);
             }
         }
     }
+}
+
+/// Before a menu shows one of the items sent to the controls object: all of them can
+/// be chosen, and the Location menu's has a checkmark on the current one.
+extern "C" fn validate_menu_item(_this: *mut c_void, _cmd: *mut c_void, item: *mut c_void) -> bool {
+    let tag = unsafe { msg_i64_ret(item, sel("tag")) };
+    if location_menu::is_tag(tag) {
+        unsafe { location_menu::validate(item, tag) };
+    }
+    true
 }
 
 extern "C" fn toolbar_item(_this: *mut c_void, _cmd: *mut c_void, _toolbar: *mut c_void, ident: *mut c_void, _will_insert: bool) -> *mut c_void {
@@ -1433,6 +1446,8 @@ unsafe fn set_up_menus(app: *mut c_void) {
             }
             device.extend(group.iter().map(|&a| action_item(a)));
         }
+        device.push(none);
+        device.push(location_menu::item(me));
         submenu(bar, "Device", &device);
         let window = submenu(bar, "Window", &[
             menu_item("Minimize", "performMiniaturize:", "m", COMMAND_MASK, 0, none),
@@ -1620,23 +1635,31 @@ fn on_ui_thread(job: Box<dyn FnOnce() + Send>) {
     unsafe { dispatch_async_f(&raw const _dispatch_main_q, Box::into_raw(Box::new(job)) as *mut c_void, run) };
 }
 
-/// `menu Top/Item`: chooses a menu item as a click would, by its menu's and its titles.
+/// `menu Top/Item`: chooses a menu item as a click would, by its menu's and its titles;
+/// `menu Top/Submenu/Item` one of a submenu's, such as Device/Location/City Run.
 pub fn choose_menu_item(path: &str) {
     let path = path.to_string();
     on_ui_thread(Box::new(move || unsafe {
-        let mut parts = path.split('/');
-        let (Some(top), Some(title)) = (parts.next(), parts.next()) else {
+        let parts: Vec<&str> = path.split('/').collect();
+        let [top, within @ .., title] = parts.as_slice() else {
             eprintln!("zeroemu: menu wants Menu/Item, not {path:?}");
             return;
         };
         let bar = msg0(APP.load(Ordering::Acquire), sel("mainMenu"));
         let n = if bar.is_null() { 0 } else { msg_i64_ret(bar, sel("numberOfItems")) };
         for i in 0..n {
-            let menu = msg0(msg_i64_id_ret(bar, sel("itemAtIndex:"), i), sel("submenu"));
-            if menu.is_null() || rust_str(msg0(menu, sel("title"))) != top {
+            let mut menu = msg0(msg_i64_id_ret(bar, sel("itemAtIndex:"), i), sel("submenu"));
+            if menu.is_null() || rust_str(msg0(menu, sel("title"))) != *top {
                 continue;
             }
-            let at = msg_id_i64_ret(menu, sel("indexOfItemWithTitle:"), ns_str(title));
+            for name in within {
+                let at = msg_id_i64_ret(menu, sel("indexOfItemWithTitle:"), ns_str(name));
+                menu = if at >= 0 { msg0(msg_i64_id_ret(menu, sel("itemAtIndex:"), at), sel("submenu")) } else { std::ptr::null_mut() };
+                if menu.is_null() {
+                    break;
+                }
+            }
+            let at = if menu.is_null() { -1 } else { msg_id_i64_ret(menu, sel("indexOfItemWithTitle:"), ns_str(title)) };
             if at >= 0 {
                 msg_i64(menu, sel("performActionForItemAtIndex:"), at);
                 return;

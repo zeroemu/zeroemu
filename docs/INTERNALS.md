@@ -128,6 +128,15 @@ as it draws it (gfxstream's setupSubWindow rotation), and clicks are turned back
 the panel, as Android expects. Quit stops the device as closing the window does, so
 that `/data` is saved.
 
+Device > Location (src/location.rs) is what the GPS reports. The image's GNSS HAL
+(android.hardware.gnss-service.ranchu) opens the qemud `gps` service through
+libqemupipe, as the sensors HAL opens `sensors`, and reads NMEA sentences from it.
+zeroemu sends a `$GPGGA` and a `$GPRMC` each second, with nothing before them, as the
+Android Emulator's gps service is a serial line that qemud doesn't frame. With the
+location None it sends nothing, and Android keeps the last fix it had, as a phone
+with no sky in view does. A route is followed at its speed, heading along the leg it
+is on, and starts again from its beginning when chosen.
+
 ## Saving /data
 
 A device keeps its `/data` and `/metadata` between boots, in one file per system image

@@ -48,6 +48,9 @@ Emulator. [INTERNALS.md](INTERNALS.md) says how each part works.
   Android's assistant on this image; Device > Power Menu gives the power menu instead.
 - Rotation turns the window's picture and what the accelerometer reads. With auto-rotate
   off, Android shows its rotate button rather than turning, as a phone does.
+- Device > Location's GPS reports no height (altitude 0 everywhere), and a route at one
+  speed all the way round, its corners too. The satellites Android lists are made up
+  by the image's GNSS HAL from the count zeroemu sends.
 - Quitting during a logout cancels the logout: zeroemu first saves `/data`, then exits.
 - Restart, in Android's power menu or from `adb reboot`, stops zeroemu as Power off does,
   after saving `/data`, rather than starting Android again.

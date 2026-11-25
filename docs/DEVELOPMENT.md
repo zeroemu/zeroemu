@@ -71,6 +71,8 @@ behind other windows without taking focus, which the boot tests use.
 | `scripts/test-android.sh [system.img]` | End-to-end checks against a real image: runs bionic's dynamic linker, toybox and mksh from it | Apple Silicon and an SDK image: by default the tested one, in the SDK found as zeroemu finds it (`ANDROID_HOME`, `ANDROID_SDK_ROOT`, then `~/Library/Android/sdk`). Its expected outputs are the tested image's |
 | `scripts/test-net.py` | zeroemu's host connections, which adb uses, from the host side | Apple Silicon, a signed `target/release/zeroemu` and the guests |
 | `scripts/test-tcp.py` | Guest sockets against real servers on the host, reached through 10.0.2.2 | Apple Silicon, a signed `target/release/zeroemu` and the guests |
+| `scripts/test-controls.sh` | Boots the tested image (its window behind others, `/data` in a scratch file), does each of the window's device controls through `ZEROEMU_INPUT_FIFO`, and checks with adb what Android did. Some go the way a user's would, as Device menu items, toolbar items, shortcuts and a click on a turned screen. Screenshots are compared with Android's own `screencap`. Ends with Quit, which must save `/data` and exit 0 | The same as `test-adb.sh` |
+| `scripts/test-devices.sh` | Boots two named devices of the same image in a scratch store and uses adb to check that each keeps its own `/data` across boots, and that a wipe clears it | The same as `test-adb.sh` |
 | `scripts/test-adb.sh` | Boots the tested image (ephemeral, its window behind others) and uses real adb against it: shell, logcat, push and pull, shared storage, screencap, input, install, reconnecting, and a key adbd doesn't know being refused | Apple Silicon, a signed `target/release/zeroemu`, and the SDK with `emulator`, `platform-tools` and the image (`IMG` picks another). With build-tools, a platform and a JDK it also installs a small app from `scripts/sdtest` |
 
 `ZEROEMU_TEST_IMAGE=<system.img>` picks the image the unit tests read. Without it, they
@@ -88,8 +90,10 @@ creates a VM runs on a developer's Mac.
 Android log records (`liblog`, i.e. `ALOGI` and friends) print to stderr as
 `<secs since start> <pid> <tid> <prio> <tag>: <message>`; `ZEROEMU_LOG=<V|D|I|W|E|F|S>`
 sets the lowest priority shown (by default `W` for a boot and `I` for a program run;
-`S` silences them). zeroemu's own notes for its developers print only when it is `I`
-or more verbose.
+`S` silences them). zeroemu.app's default is `S`, except for init's `/dev/kmsg` records,
+which print from `W`: its log is a file, and the rest of Android's log would grow it by
+thousands of lines a minute. zeroemu's own notes for its developers print only when it
+is `I` or more verbose.
 
 ## Debugging variables
 
@@ -153,9 +157,37 @@ Behaviour:
   makes `lmkd` say what it decides).
 - `ZEROEMU_INPUT_FIFO=<path>` takes lines from a host FIFO as if from the window,
   for tests that must not touch the host's mouse: `down X Y`, `move X Y`, `up X Y`,
-  `wheel X Y DX DY` (0 to 1 across the display), `key CODE 1|0` (Linux key codes),
-  `resize W H` (the window's content, in points), and `shot PATH`, which writes the frame on
-  show as a BMP.
+  `wheel X Y DX DY` (0 to 1 across the display), `key CODE 1|0` (Linux key codes, on
+  the keyboard), `button CODE 1|0` (on the device's buttons: Back 158, Home 172, recent
+  apps 580, volume up 115 and down 114, mute 113, Power 116, sleep 142, notifications
+  204, screenshot 99), `usage USAGE CODE 1|0` (a button sent with a HID usage in hex:
+  `usage 0x0c019f 579 1` presses Settings), `resize W H` (the window's content, in
+  points), and `shot PATH`, which writes the frame on show as a BMP. For the window's
+  device controls (src/gpu/controls.rs): `action NAME` does what the control does
+  (`back`, `home`, `recents`, `notifications`, `settings`, `volume-up`, `volume-down`,
+  `mute`, `power`, `lock`, `power-menu`, `rotate-left`, `rotate-right`, `screenshot`,
+  `android-screenshot`); `menu Menu/Item` chooses a menu bar item by its titles
+  (`menu Device/Recent Apps`, `menu zeroemu/Quit zeroemu`); `toolbar NAME` clicks a
+  toolbar item, named as the actions are; `keyeq MODS KEYCODE CHARS` types a key into
+  the window with modifiers (`cmd`, `shift`, `alt`, `ctrl` joined by `+`, or `none`),
+  its Mac key code and its character (or `up`, `down`, `left`, `right`), so that a
+  shortcut takes a real key's route; `click U V` clicks the picture in the window at
+  U and V from 0 to 1 from its top left, as shown, so that a click on a turned device
+  takes a real one's route. `toolbar NAME` finds only items in the toolbar as it is,
+  customized or not. The FIFO must exist before zeroemu starts.
+- `ZEROEMU_SCREENSHOTS=<dir>` saves the window's screenshots there rather than where
+  the Mac saves its own.
+- `ZEROEMU_LIST_FIFO=<path>` works zeroemu.app's list of devices
+  (src/gpu/window_macos/list.rs) from a host FIFO, for tests that must not touch the
+  host's mouse: `new NAME` makes a device of the tested image (or the first that
+  boots), `start NAME` starts one as Start does, and `quit` closes the list. With
+  `HOME` set to a scratch folder, the devices are the test's own; with the FIFO, an
+  empty list doesn't open New Device by itself. A list reopened when a device's window
+  closes gets the same variables, so the next lines go to it. The FIFO must exist
+  before the app opens.
+- `ZEROEMU_LIST_SNAPSHOT=<dir>` draws the list of devices and the form making one, in
+  light and dark, into PNGs in that folder without showing them, then exits: for
+  looking at their layout without a screen.
 - `ZEROEMU_BACKGROUND=1` opens the window behind other windows without taking focus.
 - `ZEROEMU_NET=1` gives a program run (not a boot) the network interface;
   `scripts/test-guests.sh` turns it on only for the guest that expects one.

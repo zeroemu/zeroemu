@@ -112,7 +112,18 @@ frame into the window itself, at the screen's real pixel density.
 
 In the window, the mouse is a finger and scrolling drags one (a person's flick
 becomes a fling). F1 is Home, Escape is Back, F2 is recent apps. Other keys go to
-Android as a keyboard's would. There is no menu bar.
+Android as a keyboard's would, except Command shortcuts that the menu bar uses.
+
+The toolbar and the menu bar's Device menu (src/gpu/controls.rs) press a phone's
+buttons on a third input device, keys only, whose name no key layout in the image
+matches, so that Android gives it the stock `Generic.kl`. That layout has the keys
+the image's own `qwerty2.kl` lacks: Mute, Notifications and Android's screenshot,
+and Settings as a HID usage. Rotating turns the phone: the accelerometer that zeroemu
+serves to the image's sensors HAL reads the new way, Android turns its screen as it
+would on a phone, and the window shows the panel turned. The renderer turns the frame
+as it draws it (gfxstream's setupSubWindow rotation), and clicks are turned back onto
+the panel, as Android expects. Quit stops the device as closing the window does, so
+that `/data` is saved.
 
 ## Saving /data
 

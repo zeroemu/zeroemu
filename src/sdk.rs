@@ -89,11 +89,20 @@ pub fn find() -> Option<Sdk> {
 pub fn missing(sdk: Option<&Sdk>) -> crate::Problem {
     let install = format!("install Android Studio, which puts the SDK in {}, or set ANDROID_HOME to the SDK's folder", default_root_shown());
     match sdk {
-        None => crate::Problem::new("no Android SDK found: ANDROID_HOME and ANDROID_SDK_ROOT aren't set", [install]),
         Some(s) if s.found_by.starts_with("ANDROID") => crate::Problem::new(
             format!("{} is {}, which isn't a folder", s.found_by, s.root.display()),
             [format!("set {} to the Android SDK's folder, or unset it to use {}", s.found_by, default_root_shown())],
         ),
+        // zeroemu.app gets launchd's environment, not a shell's: ANDROID_HOME set in
+        // ~/.zshrc never reaches it, but a link at the default location does.
+        _ if crate::app::opened_as_app() => {
+            let root = default_root_shown();
+            crate::Problem::new(
+                format!("no Android SDK in {root}, where zeroemu.app looks: it doesn't see a shell's ANDROID_HOME"),
+                [format!("install Android Studio, which puts the SDK there, or link the SDK you have there: ln -s <its folder> {root}")],
+            )
+        }
+        None => crate::Problem::new("no Android SDK found: ANDROID_HOME and ANDROID_SDK_ROOT aren't set", [install]),
         Some(s) => crate::Problem::new(format!("no Android SDK found: ANDROID_HOME and ANDROID_SDK_ROOT aren't set, and {} doesn't exist", s.root.display()), [install]),
     }
 }

@@ -51,7 +51,7 @@ pub(crate) mod trace;
 mod unix;
 mod vcpus;
 pub(crate) mod vdso;
-mod vsock;
+pub(crate) mod vsock;
 mod wait;
 mod xattr;
 
@@ -235,6 +235,14 @@ pub struct DataImage {
     pub path: std::path::PathBuf,
     /// Start empty, whatever the file holds.
     pub wipe: bool,
+    /// Stop when another zeroemu has the file, rather than boot a /data that won't be
+    /// kept: zeroemu.app, whose user would never see the warning that it isn't.
+    pub stop_if_in_use: bool,
+    /// The device (src/devices.rs) whose /data this is: it must still be there as /data
+    /// is locked, which is done holding its claim (devices::Device::claim), the lock
+    /// zeroemu.app's list holds as it deletes one. Without that, a device deleted as
+    /// this boot started would have its /data saved again when it stopped.
+    pub device: Option<crate::devices::Device>,
 }
 
 /// What a device keeps between boots: its /data and /metadata, in one host file.
@@ -269,11 +277,11 @@ impl Persist {
         // create_dir_all takes and read_dir doesn't.
         let dir = self.path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(std::path::Path::new("."));
         std::fs::create_dir_all(dir)?;
-        let lock = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(self.beside(".lock"))?;
-        match lock.try_lock() {
-            Ok(()) => {}
-            Err(std::fs::TryLockError::WouldBlock) => return Ok(false),
-            Err(std::fs::TryLockError::Error(e)) => return Err(e),
+        let Some(mut lock) = crate::devices::lock_file(&self.beside(".lock"))? else { return Ok(false) };
+        // Who has it, for the list to bring that zeroemu's window forward.
+        {
+            use std::io::{Seek, Write};
+            let _ = lock.set_len(0).and_then(|()| lock.rewind()).and_then(|()| writeln!(lock, "{}", std::process::id()));
         }
         self.lock = Some(lock);
         // Not being able to look is no reason not to keep /data.
@@ -769,10 +777,24 @@ pub fn reserve_exit_signals() {
 }
 
 /// Prints Android's log from W rather than I unless ZEROEMU_LOG says otherwise, and
-/// zeroemu's notes for its developers not at all: for a boot, whose log is long.
-/// Before anything is printed.
-pub fn quiet_logs() {
-    logd::set_default_level(logd::WARN);
+/// zeroemu's notes for its developers not at all: for a boot, whose log is long. For
+/// zeroemu.app, only init's own (/dev/kmsg, a few hundred lines a boot, which say why
+/// init gives up on a crashing service): its output goes to a file that nobody
+/// watches, which the rest would grow by thousands of lines a minute, even at E, and
+/// `adb logcat` has the rest. Before anything is printed.
+pub fn quiet_logs(app: bool) {
+    logd::set_default_level(if app { logd::SILENT } else { logd::WARN }, logd::WARN);
+}
+
+/// What the guest asked reboot(2) to restart into, which ends the boot (zeroemu doesn't
+/// boot again): "" for a plain restart, else RESTART2's argument, such as
+/// "userrequested" for Restart in Android's power menu, or "bootloader" from init's
+/// InitFatalReboot (system/core/init/reboot_utils.cpp) when a critical service keeps
+/// crashing.
+static REBOOT_TARGET: Mutex<Option<String>> = Mutex::new(None);
+
+pub fn reboot_target() -> Option<String> {
+    REBOOT_TARGET.lock().unwrap().clone()
 }
 
 /// Whether zeroemu's notes for its developers print: at ZEROEMU_LOG=I or more
@@ -1116,9 +1138,16 @@ impl Kernel {
             first_stage_mounts(&v, &metadata, &dev, &names);
             if let Some(image) = &extras.data {
                 let mut p = Persist { path: image.path.clone(), trees: vec![("data", data.clone()), ("metadata", metadata)], lock: None };
-                let mut keep = match p.lock() {
+                // Nothing is made for a device that is gone: no folder, no lock file.
+                let claim = image.device.as_ref().map(crate::devices::Device::claim).transpose()?;
+                let locked = p.lock();
+                drop(claim);
+                let mut keep = match locked {
                     Ok(true) => true,
                     // Two can't share a device: the second gets one that lasts as long as it does.
+                    Ok(false) if image.stop_if_in_use => {
+                        return Err(format!("another zeroemu is using this device's /data ({}); quit it, then open zeroemu again", p.path.display()));
+                    }
                     Ok(false) => {
                         eprintln!("zeroemu: {}: in use by another zeroemu; this one's /data won't be kept", p.path.display());
                         false

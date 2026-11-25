@@ -216,10 +216,17 @@ fn saved_devices(r: &mut Report) {
     let Some((dir, legacy)) = crate::data_dirs() else {
         return r.warn("saved devices: can't tell where they go (HOME isn't set)", &["give a boot --data <file>, or --ephemeral".into()]);
     };
-    let count = |d: &std::path::Path| {
-        std::fs::read_dir(d).into_iter().flatten().flatten().filter(|e| e.file_name().to_string_lossy().starts_with("data-") && e.file_name().to_string_lossy().ends_with(".img")).count()
-    };
-    let saved = match count(&dir) {
+    // zeroemu.app's devices, and each per-image /data of terminal boots that isn't
+    // one of them yet (devices::Store::adopt).
+    let made = crate::devices::Store::open().map(|s| s.list()).unwrap_or_default();
+    let per_image = std::fs::read_dir(&dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with("data-") && e.file_name().to_string_lossy().ends_with(".img"))
+        .filter(|e| !made.iter().any(|d| d.data == e.path()))
+        .count();
+    let saved = match made.len() + per_image {
         0 => "none yet".to_string(),
         1 => "1 device".to_string(),
         n => format!("{n} devices"),

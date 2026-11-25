@@ -128,6 +128,51 @@ codesign -s - -f --entitlements entitlements.plist "${CARGO_HOME:-$HOME/.cargo}/
 Without the entitlement, zeroemu can't create its virtual machine and stops with an
 error that names it. `zeroemu doctor` checks for it.
 
+### As a Mac app
+
+From a source checkout, `scripts/build-app.sh` builds `zeroemu.app`, signed as above,
+and `scripts/build-app.sh --install` also copies it into `/Applications` (or
+`~/Applications` if `/Applications` isn't writable). Open it like any other app, from
+Finder, Launchpad, Spotlight or the Dock.
+
+It opens on a list of your devices, as Android Studio's Device Manager does. A device is
+a name, a system image from your SDK, and its own `/data`. The first time, the app asks
+you to make one: **New Device** (⌘N) takes a name and one of your installed images. The
+image zeroemu is tested with is chosen first, and images it can't boot are listed but
+can't be chosen; if none of them can, the form says why and what to install.
+
+- **Start** boots a device in the window. Closing its window brings the list back; Quit
+  (⌘Q) stops it and quits.
+- A device that is already running says so, and **Show** brings its window forward.
+  File > Show Device List (⇧⌘D) opens the list beside a running device, to start
+  another one: each runs in its own zeroemu, with its own adb serial. There is one list
+  at a time: chosen again, it brings the open list forward.
+- A device's ⋯ menu, or a right click, renames it, wipes its data, shows its files in
+  Finder, or deletes it.
+- What `zeroemu` saved for an image in a terminal (without `--device`) shows up in the
+  list as a device of that image, so nothing is lost: the device and `zeroemu` share
+  that `/data`, and it shows as running while the terminal runs it.
+
+Devices are kept in `~/Library/Application Support/zeroemu/devices`. `zeroemu devices`
+lists them in a terminal, with the `/data` a terminal boot keeps for each image, and
+`zeroemu --device <name>` boots one.
+
+The app has no terminal, so:
+
+- What zeroemu would print goes to `~/Library/Logs/zeroemu/zeroemu.log`, with the run
+  before's as `zeroemu.previous.log`. Console opens them. Of Android's own log, only
+  init's is there, a few hundred lines a boot, since the rest adds thousands of lines a
+  minute: `adb logcat` shows it.
+- If Android can't start, stops by itself, or zeroemu crashes, an alert says so, with
+  the fix when there is one, and offers the log.
+- The app looks for the SDK only in its usual place, `~/Library/Android/sdk`: apps don't
+  see your shell's `ANDROID_HOME`. To use an SDK that's somewhere else, link it there:
+  `mkdir -p ~/Library/Android && ln -s "$ANDROID_HOME" ~/Library/Android/sdk`.
+- Only one zeroemu can use a device's `/data` at a time: a running device's Start
+  becomes Show.
+
+Quitting or closing a device's window stops it, and saves its `/data`.
+
 ## The Android SDK pieces
 
 zeroemu brings no part of Android with it. It uses these packages from Google's
@@ -183,6 +228,7 @@ issue; a tested one can be installed by hand from Google's
 ```
 zeroemu [options]       Boot Android in a window. --boot means the same.
 zeroemu images          List the system images installed in the SDK, and whether each can boot
+zeroemu devices         List your devices, and whether each is running
 zeroemu doctor          Check everything a boot needs, and print the exact fix for each problem
 zeroemu --help, -h      Show usage
 zeroemu --version, -V   Print the version
@@ -197,6 +243,7 @@ Boot options:
 |---|---|
 | `--image <name>` | Boot an installed image: `android-36.1`, `android-36.1/google_apis_playstore`, or the SDK package path `system-images;android-36.1;google_apis_playstore;arm64-v8a`. The ABI is always the host's |
 | `--system <path>` | Boot a `system.img` file, or the folder that holds it |
+| `--device <name>` | Boot a device made in zeroemu.app, with its image and its `/data` |
 | `--data <file>` | Keep the device's `/data` in this file instead of the default one |
 | `--ephemeral` | Keep nothing: start with an empty `/data` and throw it away at exit |
 | `--wipe-data` | Start over with an empty `/data` |
@@ -216,9 +263,25 @@ What you see:
 - A window with a 1080x2400 phone display, scaled to fit your screen. Android finishes
   booting about 17 seconds after start on a first boot, and about 12 seconds on later
   boots.
-- The mouse is a finger, and scrolling drags one (a flick becomes a fling). F1 is Home,
-  Escape is Back, and F2 is recent apps; on a MacBook keyboard, hold Fn for F1 and F2.
-  Other keys type into Android.
+- The mouse is a finger, and scrolling drags one (a flick becomes a fling). Other keys
+  type into Android.
+- The toolbar in the title bar has Back, Home, Recents, Screenshot, Rotate and Power.
+  View > Customize Toolbar adds Volume, Mute, Notifications, Settings, Lock and more.
+- The **Device** menu has every control, with shortcuts:
+
+  | Control | Shortcut |
+  |---|---|
+  | Back, Home, Recent Apps | ⌘[, ⇧⌘H, ⇧⌘R (and Escape, F1, F2) |
+  | Notifications, Android Settings | ⌘N, ⌘I |
+  | Volume Up, Volume Down, Mute | ⌘↑, ⌘↓ |
+  | Power Button, Lock Screen, Power Menu | ⇧⌘P, ⌘L |
+  | Rotate Left, Rotate Right | ⌘←, ⌘→ |
+  | Take Screenshot in Android | |
+
+  File > Save Screenshot (⌘S) saves the screen as a PNG where your Mac saves its own
+  screenshots. On a MacBook keyboard, hold Fn for F1 and F2.
+- Rotating turns the phone: Android turns its screen as a phone does, if auto-rotate is
+  on and the app allows it, and the window takes the new shape.
 - The terminal shows Android's warnings and errors, and the renderer's errors.
   `ZEROEMU_LOG=I` shows more of Android's log, and `ZEROEMU_LOG=S` hides it.
   `ZEROEMU_GPU_LOG=<S|E|W|I|D>` sets how much of the renderer's own log shows.
@@ -226,9 +289,9 @@ What you see:
   or the next free pair of ports. adbd keeps its key check, and your own key
   (`~/.android/adbkey.pub`) is already authorized.
 - Each image keeps its own `/data`, in `~/Library/Application Support/zeroemu`. It is
-  saved on a clean exit: closing the window, Ctrl-C in the terminal, or powering off
-  from Android. A crash or `kill -9` loses what happened since the last save. There is
-  no menu bar, so Cmd-Q doesn't quit.
+  saved on a clean exit: quitting (⌘Q), closing the window, Ctrl-C in the terminal, or
+  powering off from Android. A crash or `kill -9` loses what happened since the last
+  save.
 - `ZEROEMU_BACKGROUND=1` opens the window behind your other windows, without taking focus.
 
 ## Supported images

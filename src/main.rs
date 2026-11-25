@@ -392,7 +392,7 @@ fn run(args: Vec<String>) -> Result<i32, String> {
     let time_zone = time_zone.or(saved.time_zone).or_else(devices::host_time_zone);
     let chosen_place = place.or(saved.location);
     // Unset: the main city of the time zone, which the boot line names.
-    let zone_city = chosen_place.is_none().then(|| time_zone.as_deref().and_then(|z| z.rsplit('/').next()).map(|c| c.replace('_', " "))).flatten();
+    let zone_city = chosen_place.is_none().then(|| time_zone.as_deref().and_then(location::zone_city).map(|c| c.0)).flatten();
     let place = chosen_place.unwrap_or_else(|| location::default_for_zone(time_zone.as_deref()));
     PROGRAM.store(!boot && inspect.is_none(), Ordering::Relaxed);
     if boot {

@@ -272,15 +272,35 @@ fn along(points: &[(f64, f64)], speed: f64, elapsed: f64) -> Option<Fix> {
 /// IANA name), as the tz database's zone.tab places it, else the Googleplex, as the
 /// Android Emulator's default.
 pub fn default_for_zone(zone: Option<&str>) -> Source {
-    // zone.tab first: it keeps a city for zones that zone1970.tab folds into another
-    // country's (Europe/Oslo into Europe/Berlin). Windows has neither.
-    let found = zone.and_then(|zone| {
-        ["zone.tab", "zone1970.tab"].iter().find_map(|f| zone_place(&std::fs::read_to_string(format!("/usr/share/zoneinfo/{f}")).ok()?, zone))
-    });
-    match found {
-        Some((lat, lon)) => Source::Point { lat, lon },
+    match zone.and_then(zone_city) {
+        Some((_, lat, lon)) => Source::Point { lat, lon },
         None => Source::Preset(PRESETS[0].id),
     }
+}
+
+/// The tz tables, zone.tab first: it keeps a city for zones that zone1970.tab folds
+/// into another country's (Europe/Oslo into Europe/Berlin). Windows has neither.
+fn zone_tabs() -> Vec<String> {
+    ["zone.tab", "zone1970.tab"].iter().filter_map(|f| std::fs::read_to_string(format!("/usr/share/zoneinfo/{f}")).ok()).collect()
+}
+
+/// The city a time zone is named for, as people write it ("New York"), and where it is.
+/// An alias the tables don't list (US/Eastern, Asia/Calcutta) is the zone whose rules
+/// are the same file: the tz database's backward links.
+pub fn zone_city(zone: &str) -> Option<(String, f64, f64)> {
+    let tabs = zone_tabs();
+    let city = |name: &str| name.rsplit('/').next().unwrap_or(name).replace('_', " ");
+    if let Some((lat, lon)) = tabs.iter().find_map(|t| zone_place(t, zone)) {
+        return Some((city(zone), lat, lon));
+    }
+    let dir = std::path::Path::new("/usr/share/zoneinfo");
+    let rules = std::fs::read(dir.join(zone)).ok()?;
+    tabs.iter().find_map(|t| {
+        t.lines().filter(|l| !l.starts_with('#')).find_map(|line| {
+            let name = line.split('\t').nth(2)?.trim();
+            (std::fs::read(dir.join(name)).ok()? == rules).then(|| zone_place(t, name).map(|(lat, lon)| (city(name), lat, lon))).flatten()
+        })
+    })
 }
 
 /// The place zone.tab or zone1970.tab gives `zone`. Their lines are country codes,
@@ -396,6 +416,14 @@ pub fn set(source: Source) {
     let mut c = CURRENT.lock().unwrap();
     c.source = Some(source);
     c.since = Some(Instant::now());
+    c.changes += 1;
+    CHANGED.notify_all();
+}
+
+/// Has `wait_for_change` look again without a change of place: the last gps pipe
+/// closed, and its sender, which may be asleep while the location is off, can end.
+pub fn wake() {
+    let mut c = CURRENT.lock().unwrap();
     c.changes += 1;
     CHANGED.notify_all();
 }
@@ -819,5 +847,17 @@ mod tests {
         assert_eq!(Source::parse("City Run"), Ok(Source::Preset("city-run")));
         assert_eq!(Source::parse("times square, new york"), Ok(Source::Preset("times-square")));
         assert_eq!(Source::parse("googleplex"), Ok(Source::Preset("googleplex")));
+    }
+
+    #[test]
+    fn an_alias_is_the_city_of_the_zone_it_links_to() {
+        if !std::path::Path::new("/usr/share/zoneinfo/zone.tab").is_file() {
+            return;
+        }
+        let new_york = zone_city("America/New_York").unwrap();
+        assert_eq!(new_york.0, "New York");
+        assert_eq!(zone_city("US/Eastern"), Some(new_york));
+        assert_eq!(zone_city("Asia/Calcutta").map(|c| c.0), Some("Kolkata".into()));
+        assert_eq!(zone_city("Mars/Olympus"), None);
     }
 }

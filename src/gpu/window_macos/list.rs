@@ -797,15 +797,9 @@ extern "C" fn edit_device(_this: Id, _cmd: Id, sender: Id) {
         if answer != 1000 {
             return;
         }
-        // The name first: it is what may be refused (taken), and then nothing has
-        // changed, as the alert says.
-        let saved = raw.to_settings(&d.settings).and_then(|settings| {
-            with_list(|l| {
-                let renamed = if d.name != name.trim() { l.store.rename(&d, &name)? } else { d.clone() };
-                l.store.set_settings(&renamed, &settings).map_err(|e| if renamed.name != d.name { format!("It was renamed, but its settings weren't saved: {e}") } else { e })
-            })
-            .ok_or_else(String::new)?
-        });
+        // The name and the settings in one write: either both change, or neither has,
+        // as the alert says.
+        let saved = raw.to_settings(&d.settings).and_then(|settings| with_list(|l| l.store.edit(&d, &name, &settings)).ok_or_else(String::new)?);
         match saved {
             Ok(_) => return refresh(Some(&d.id)),
             Err(e) if e.is_empty() => return,
@@ -1211,9 +1205,11 @@ extern "C" fn preset_chosen(_this: Id, _cmd: Id, _sender: Id) {
                 msg_id(height, sel("setStringValue:"), ns_str(&d.height.to_string()));
                 msg_id(dpi, sel("setStringValue:"), ns_str(&d.dpi.to_string()));
             }
-            // Custom: its size and density are under Advanced Settings.
+            // Custom: its size and density are under Advanced Settings, and it stays
+            // chosen until a size typed is a preset's (screen_changed would choose the
+            // preset the fields still hold).
             None if !advanced => return toggle_advanced(),
-            None => {}
+            None => return,
         }
     }
     screen_changed();
@@ -1658,7 +1654,7 @@ mod tests {
             network: Some(false),
             time_zone: Some("Asia/Kolkata".into()),
             location: Some(Source::Point { lat: 12.9716, lon: 77.5946 }),
-            others: vec![("future".into(), "yes".into())],
+            others: vec!["future=yes".into()],
         };
         let raw = Raw::from_settings(&all);
         assert_eq!(raw.place, Place::Custom);

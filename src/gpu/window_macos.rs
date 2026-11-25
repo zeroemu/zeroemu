@@ -1527,7 +1527,9 @@ unsafe fn reshape(window: *mut c_void) {
         let vis = (!screen.is_null()).then(|| msg_rect(screen, sel("visibleFrame")));
         // The scale to keep: the window's now, unless it is still the size the last turn
         // gave it, when the screen may have forced it smaller than the one before.
-        let now = cw / shown.1.max(1) as f64;
+        // The scale the picture is drawn at now, before the turn (letterboxed, so the
+        // smaller of the two): `shown` is after it, so the other way round.
+        let now = (cw / shown.1.max(1) as f64).min(ch / shown.0.max(1) as f64);
         let last = *RESHAPED.lock().unwrap_or_else(|p| p.into_inner());
         let untouched = last.is_some_and(|(w, h)| (w - cw).abs() < 1.5 && (h - ch).abs() < 1.5);
         let kept = f64::from_bits(PREFERRED_SCALE.load(Ordering::Relaxed));

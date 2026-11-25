@@ -53,9 +53,10 @@ pub struct Settings {
     pub time_zone: Option<String>,
     /// location=, as location::Source::parse reads it; else the time zone's city.
     pub location: Option<Source>,
-    /// Keys this zeroemu doesn't know, from a newer one: kept, so a rename or an edit
-    /// here doesn't lose them.
-    pub(crate) others: Vec<(String, String)>,
+    /// Lines this zeroemu doesn't know, from a newer one: kept as they were, so a rename
+    /// or an edit here neither loses them nor reads an escape in one (`\n`) as the end
+    /// of a line, which would make what follows a setting of its own.
+    pub(crate) others: Vec<String>,
 }
 
 /// The keys device.ini has.
@@ -63,14 +64,23 @@ const KEYS: [&str; 10] = ["name", "image", "data", "screen", "density", "ram", "
 
 impl Settings {
     /// From device.ini's keys. A value that isn't valid reads as the default.
-    fn read(props: &std::collections::HashMap<String, String>) -> Settings {
+    fn read(props: &std::collections::HashMap<String, String>, text: &str) -> Settings {
         let get = |k: &str| props.get(k).map(|v| v.trim()).filter(|v| !v.is_empty());
         let display = match (get("screen").and_then(|s| Display::parse_size(s).ok()), get("density").and_then(|d| d.parse().ok())) {
             (Some((w, h)), Some(dpi)) => Display::new(w, h, dpi).ok(),
             _ => None,
         };
-        let mut others: Vec<(String, String)> = props.iter().filter(|(k, _)| !KEYS.contains(&k.as_str())).map(|(k, v)| (k.clone(), v.clone())).collect();
-        others.sort();
+        // As sdk::properties reads a line's key: up to the first = or :.
+        let others = text
+            .lines()
+            .map(|l| l.trim_end_matches('\r'))
+            .filter(|l| {
+                let t = l.trim_start();
+                let key = t.find(['=', ':']).map(|at| t[..at].trim());
+                key.is_some_and(|k| !KEYS.contains(&k)) && !t.starts_with('#') && !t.starts_with('!')
+            })
+            .map(str::to_string)
+            .collect();
         Settings {
             display,
             ram_mb: get("ram").and_then(|v| v.parse().ok()).filter(|mb| check_ram(*mb).is_ok()),
@@ -102,13 +112,14 @@ impl Settings {
             out += &format!("network={}\n", if on { "on" } else { "off" });
         }
         if let Some(z) = &self.time_zone {
-            out += &format!("timezone={z}\n");
+            out += &format!("timezone={}\n", escape(z));
         }
         if let Some(l) = &self.location {
-            out += &format!("location={}\n", l.to_ini());
+            out += &format!("location={}\n", escape(&l.to_ini()));
         }
-        for (k, v) in &self.others {
-            out += &format!("{k}={v}\n");
+        for line in &self.others {
+            out += line;
+            out.push('\n');
         }
         out
     }
@@ -459,22 +470,13 @@ impl Store {
             })
     }
 
-    /// Renames `d`, if it is still there.
-    pub fn rename(&self, d: &Device, name: &str) -> Result<Device, String> {
+    /// Edit…: `d`'s name and settings at once, in one write, so that either both change
+    /// or neither does: a name another device has is refused before anything is.
+    pub fn edit(&self, d: &Device, name: &str, settings: &Settings) -> Result<Device, String> {
         let _lock = self.lock()?;
         let now = self.current(d)?;
         let name = check_name(name, &self.list(), Some(&now.id))?;
-        let renamed = Device { name, ..now };
-        write(&renamed)?;
-        Ok(renamed)
-    }
-
-    /// Changes `d`'s settings, if it is still there: for its next boot, so also while it
-    /// runs.
-    pub fn set_settings(&self, d: &Device, settings: &Settings) -> Result<Device, String> {
-        let _lock = self.lock()?;
-        let now = self.current(d)?;
-        let changed = Device { settings: settings.clone(), ..now };
+        let changed = Device { name, settings: settings.clone(), ..now };
         write(&changed)?;
         Ok(changed)
     }
@@ -529,24 +531,29 @@ fn hold(d: &Device) -> Result<std::fs::File, String> {
 
 /// A device's folder, if it holds one.
 fn read(dir: &Path) -> Option<Device> {
-    let props = sdk::properties(&std::fs::read_to_string(dir.join("device.ini")).ok()?);
+    let text = std::fs::read_to_string(dir.join("device.ini")).ok()?;
+    let props = sdk::properties(&text);
     let id = dir.file_name()?.to_str()?.to_string();
     let name = props.get("name").filter(|n| !n.is_empty()).cloned().unwrap_or_else(|| id.clone());
     let package = props.get("image").filter(|p| !p.is_empty())?.clone();
     let data = props.get("data").filter(|d| !d.is_empty()).map(PathBuf::from).unwrap_or_else(|| dir.join("data.img"));
-    Some(Device { id, name, package, data, settings: Settings::read(&props), dir: dir.to_path_buf() })
+    Some(Device { id, name, package, data, settings: Settings::read(&props, &text), dir: dir.to_path_buf() })
+}
+
+/// A value as device.ini holds it: read as a .properties file (sdk::properties), which
+/// takes a backslash as an escape, so a Windows path keeps its own as doubled ones,
+/// and a line break or tab as \n or \t, which read back as the same.
+fn escape(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('\n', "\\n").replace('\t', "\\t")
 }
 
 /// Writes device.ini whole, then puts it in place, so a failure leaves the old one.
 fn write(d: &Device) -> Result<(), String> {
-    // device.ini is read as a .properties file (sdk::properties), which takes a
-    // backslash as an escape: a Windows path keeps its own as doubled ones.
-    let escape = |s: &str| s.replace('\\', "\\\\");
     let mut text = format!("name={}\nimage={}\n", escape(&d.name), escape(&d.package));
     if d.data != d.dir.join("data.img") {
         text += &format!("data={}\n", escape(&d.data.to_string_lossy()));
     }
-    text += &escape(&d.settings.lines());
+    text += &d.settings.lines();
     let path = d.dir.join("device.ini");
     let new = d.dir.join("device.ini.new");
     std::fs::write(&new, text).and_then(|()| std::fs::rename(&new, &path)).map_err(|e| format!("{}: {e}", path.display()))
@@ -682,7 +689,7 @@ mod tests {
         assert!(store.create(" ", &img).is_err());
         let b = store.create("Work", &img).unwrap();
         assert_eq!(store.list(), vec![a.clone(), b.clone()]);
-        let b = store.rename(&b, "A work phone").unwrap();
+        let b = store.edit(&b, "A work phone", &b.settings).unwrap();
         assert_eq!(store.list().iter().map(|d| d.name.as_str()).collect::<Vec<_>>(), ["A work phone", "Android 16 (Google Play)"]);
         assert_eq!(store.find(&b.id).unwrap(), b, "found by its id");
         assert_eq!(store.find("a WORK phone").unwrap(), b);
@@ -715,15 +722,15 @@ mod tests {
         std::fs::write(&new.data, b"kept").unwrap();
         assert!(store.wipe(&stale).is_err());
         assert!(store.delete(&stale).is_err());
-        assert!(store.rename(&stale, "Other").is_err());
+        assert!(store.edit(&stale, "Other", &stale.settings).is_err());
         assert!(stale.claim().is_err(), "a boot of it doesn't start");
         assert!(store.find(&format!("id:{}", stale.id)).is_err(), "nor does the list's Start");
         assert!(!stale.dir.exists(), "and nothing makes its folder again");
         assert_eq!(std::fs::read(&new.data).unwrap(), b"kept");
         assert_eq!(store.list(), vec![new.clone()]);
         // Renamed meanwhile, it is the same device: the request is for it.
-        let renamed = store.rename(&new, "Phone 2").unwrap();
-        let again = store.rename(&new, "Phone 3").unwrap();
+        let renamed = store.edit(&new, "Phone 2", &new.settings).unwrap();
+        let again = store.edit(&new, "Phone 3", &new.settings).unwrap();
         assert_eq!((again.id.as_str(), again.name.as_str()), (renamed.id.as_str(), "Phone 3"));
         // Made of something else in the same folder: no longer the same device.
         let other = image(&root.join("sdk"), "android-35", "google_apis");
@@ -762,7 +769,7 @@ mod tests {
             assert!(store.create(name, &img).is_err(), "{name}");
         }
         let d = store.create("Phone", &img).unwrap();
-        assert!(store.rename(&d, "id:phone").is_err());
+        assert!(store.edit(&d, "id:phone", &d.settings).is_err());
         assert!(store.create("Kid: one", &img).is_ok() && store.create("id", &img).is_ok());
         // One named so before that was refused: id: is still the id alone.
         let target = legacy(&store, "foo", "Foo", &img);
@@ -971,13 +978,13 @@ mod tests {
         let d = store.create_with("Small", &img, &settings).unwrap();
         assert_eq!(store.find("Small").unwrap().settings, settings);
         // A rename keeps them; set_settings changes them; a stale device can't.
-        let d = store.rename(&d, "Small phone").unwrap();
+        let d = store.edit(&d, "Small phone", &d.settings).unwrap();
         assert_eq!(store.find("Small phone").unwrap().settings, settings);
         let fewer = Settings { cpus: Some(2), ..settings.clone() };
-        store.set_settings(&d, &fewer).unwrap();
+        store.edit(&d, &d.name, &fewer).unwrap();
         assert_eq!(store.find("Small phone").unwrap().settings.cpus, Some(2));
         store.delete(&old).unwrap();
-        assert!(store.set_settings(&old, &fewer).is_err());
+        assert!(store.edit(&old, &old.name, &fewer).is_err());
         // Nonsense reads as the default; keys from a newer zeroemu survive a rename.
         let ini = d.ini();
         let text = std::fs::read_to_string(&ini).unwrap() + "screen=7x9\nram=12\ncpus=0\nnetwork=maybe\nlocation=north\nfuture=yes\n";
@@ -985,8 +992,26 @@ mod tests {
         std::fs::write(&ini, text).unwrap();
         let now = store.find("Small phone").unwrap();
         assert_eq!((now.settings.ram_mb, now.settings.network, now.settings.time_zone.as_deref()), (None, None, None));
-        let renamed = store.rename(&now, "Again").unwrap();
+        let renamed = store.edit(&now, "Again", &now.settings).unwrap();
         assert!(std::fs::read_to_string(renamed.ini()).unwrap().contains("future=yes\n"));
+        // A newer zeroemu's line with an escaped line break stays one line: what
+        // follows the \n is no setting of this one's.
+        let ini = renamed.ini();
+        std::fs::write(&ini, std::fs::read_to_string(&ini).unwrap().replace("network=on\n", "") + "notes=first\\nnetwork=off\n").unwrap();
+        let before = store.find("Again").unwrap();
+        assert_eq!(before.settings.network, None);
+        let again = store.edit(&before, "Once more", &before.settings).unwrap();
+        let text = std::fs::read_to_string(again.ini()).unwrap();
+        assert!(text.contains("notes=first\\nnetwork=off\n") && !text.lines().any(|l| l == "network=off"), "{text}");
+        assert_eq!(store.find("Once more").unwrap().settings.network, None);
+        // Edit changes the name and the settings together, or neither.
+        let fewer = Settings { cpus: Some(1), ..again.settings.clone() };
+        let other = store.create("Taken", &img).unwrap();
+        assert!(store.edit(&again, "Taken", &fewer).is_err());
+        assert_eq!(store.find("Once more").unwrap().settings.cpus, again.settings.cpus);
+        let edited = store.edit(&again, "Edited", &fewer).unwrap();
+        assert_eq!((edited.name.as_str(), store.find("Edited").unwrap().settings.cpus), ("Edited", Some(1)));
+        store.delete(&other).unwrap();
         let _ = std::fs::remove_dir_all(&root);
     }
 

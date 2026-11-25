@@ -971,7 +971,10 @@ impl Raw {
         let time_zone = if zone.is_empty() || zone.starts_with(SAME_ZONE) {
             None
         } else {
-            devices::check_time_zone(zone)?;
+            // One saved as it was (perhaps on a newer Mac) stays; one typed is checked.
+            if base.time_zone.as_deref() != Some(zone) {
+                devices::check_time_zone(zone)?;
+            }
             Some(zone.to_string())
         };
         let location = match &self.place {

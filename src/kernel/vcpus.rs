@@ -477,6 +477,8 @@ struct CoresState<R> {
     /// display work's. Under load both lines stay full and the rest's first is always
     /// due, so without turns display work would wait for good in its place.
     rest_went: bool,
+    /// REST_WAIT, but for tests, which need it not to pass while they look.
+    rest_wait: Duration,
 }
 
 impl<R> CoresState<R> {
@@ -485,7 +487,7 @@ impl<R> CoresState<R> {
     /// so who is first and who is due agree.
     fn rest_due(&self, now: Instant) -> bool {
         let display_owed = self.rest_went && !self.display.is_empty();
-        !display_owed && self.rest.front().is_some_and(|w| now.saturating_duration_since(w.since) >= REST_WAIT)
+        !display_owed && self.rest.front().is_some_and(|w| now.saturating_duration_since(w.since) >= self.rest_wait)
     }
 
     fn first(&self, now: Instant) -> Option<&Waiter<R>> {
@@ -497,8 +499,14 @@ impl<R> CoresState<R> {
         !self.rest_due(now) && !self.display.is_empty()
     }
 
+    /// Wakes whoever is first, to stop holders for its turn, and the first of the rest,
+    /// to look at when it is due: either may have changed, and one asleep behind the
+    /// other would otherwise not know until its sleep ends.
     fn wake_first(&self, now: Instant) {
         if let Some(w) = self.first(now) {
+            w.cv.notify_one();
+        }
+        if let Some(w) = self.rest.front() {
             w.cv.notify_one();
         }
     }
@@ -518,9 +526,14 @@ impl<R> CoresState<R> {
 
 impl<R: Runner> Cores<R> {
     fn new(n: usize) -> Self {
+        Self::waiting_rest(n, REST_WAIT)
+    }
+
+    /// A gate whose rest wait `rest_wait` before they go first (REST_WAIT but in tests).
+    fn waiting_rest(n: usize, rest_wait: Duration) -> Self {
         Cores {
             n: n.max(1),
-            st: Mutex::new(CoresState { next: 0, used: 0, holders: HashMap::new(), display: VecDeque::new(), rest: VecDeque::new(), handed: HashMap::new(), rest_went: false }),
+            st: Mutex::new(CoresState { next: 0, used: 0, holders: HashMap::new(), display: VecDeque::new(), rest: VecDeque::new(), handed: HashMap::new(), rest_went: false, rest_wait }),
             waiting: AtomicUsize::new(0),
             waiting_display: AtomicUsize::new(0),
             waits: AtomicU64::new(0),
@@ -539,8 +552,10 @@ impl<R: Runner> Cores<R> {
     /// `vcpu`: it waits keeping its vCPU, which this gives up if the whole pool asks for
     /// it meanwhile, keeping its turn.
     fn take(&self, who: &Arc<R>, spent: bool, mut vcpu: Option<&mut dyn FnMut()>) -> Option<(u64, Instant)> {
-        let display = !spent && who.is_display();
         let mut st = self.st.lock().unwrap();
+        // Read under the lock: an urgency changed after this moves the waiter
+        // (reclassify, which takes the lock); one changed before is seen here.
+        let display = !spent && who.is_display();
         if who.is_dying() {
             return None;
         }
@@ -596,7 +611,7 @@ impl<R: Runner> Cores<R> {
             // The first of the rest, behind display work, looks again when it is due to
             // go first, to stop holders for its turn then. Once due, it is woken when it
             // is first (serve's wake_first), so it doesn't wake meanwhile.
-            let due = st.rest.front().filter(|w| w.ticket == ticket).and_then(|w| REST_WAIT.checked_sub(now.saturating_duration_since(w.since))).filter(|d| !d.is_zero());
+            let due = st.rest.front().filter(|w| w.ticket == ticket).and_then(|w| st.rest_wait.checked_sub(now.saturating_duration_since(w.since))).filter(|d| !d.is_zero());
             st = who.wait_turn(&cv, st, if first { SLICE / 2 } else { due.unwrap_or(super::IDLE) });
         }
     }
@@ -1197,6 +1212,10 @@ impl Vcpu for LazyVcpu {
 mod tests {
     use super::*;
 
+    /// For tests of the order the lines alone give: the rest never come due while they
+    /// look, however slowly the test runs.
+    const NEVER_DUE: Duration = Duration::from_secs(3600);
+
     /// A thread as the cores gate sees it, with no kernel behind it.
     #[derive(Default)]
     struct Fake {
@@ -1294,7 +1313,7 @@ mod tests {
 
     #[test]
     fn places_are_counted() {
-        let gate = Cores::<Fake>::new(2);
+        let gate = Cores::<Fake>::waiting_rest(2, NEVER_DUE);
         let (a, _) = gate.try_take(&Fake::new(false), false).unwrap();
         let (b, _) = gate.try_take(&Fake::new(false), false).unwrap();
         assert_eq!(gate.try_take(&Fake::new(true), false), None);
@@ -1312,7 +1331,7 @@ mod tests {
 
     #[test]
     fn display_work_goes_first_and_the_rest_in_turn() {
-        let gate = Arc::new(Cores::<Fake>::new(1));
+        let gate = Arc::new(Cores::<Fake>::waiting_rest(1, NEVER_DUE));
         let holder = Fake::new(false);
         let (id, _) = gate.try_take(&holder, false).unwrap();
         let order = Arc::new(Mutex::new(Vec::new()));
@@ -1342,7 +1361,7 @@ mod tests {
 
     #[test]
     fn a_core_given_up_goes_straight_to_the_first_in_line() {
-        let gate = Arc::new(Cores::<Fake>::new(1));
+        let gate = Arc::new(Cores::<Fake>::waiting_rest(1, NEVER_DUE));
         let (id, _) = gate.try_take(&Fake::new(false), false).unwrap();
         let first = queue(&gate, &Fake::new(false), false);
         gate.release(id);
@@ -1360,7 +1379,7 @@ mod tests {
 
     #[test]
     fn display_work_that_made_way_for_the_rest_waits_as_the_rest() {
-        let gate = Arc::new(Cores::<Fake>::new(1));
+        let gate = Arc::new(Cores::<Fake>::waiting_rest(1, NEVER_DUE));
         let display = Fake::new(true);
         let (id, _) = gate.try_take(&display, false).unwrap();
         let r = queue(&gate, &Fake::new(false), false);
@@ -1433,7 +1452,8 @@ mod tests {
 
     #[test]
     fn a_waiter_whose_urgency_changes_moves_to_its_new_line_in_its_turn() {
-        let gate = Arc::new(Cores::<Fake>::new(1));
+        // The rest never come due here: the order is the lines' alone.
+        let gate = Arc::new(Cores::<Fake>::waiting_rest(1, NEVER_DUE));
         let (id, _) = gate.try_take(&Fake::new(false), false).unwrap();
         let early = Fake::new(false);
         let r1 = queue(&gate, &early, false);
@@ -1444,6 +1464,7 @@ mod tests {
         gate.reclassify(Arc::as_ptr(&promoted));
         assert_eq!(gate.waiting_display.load(Ordering::Relaxed), 1);
         gate.release(id);
+        until(|| r2.is_finished());
         let (id, _) = r2.join().unwrap().expect("the core");
         assert!(!r1.is_finished());
         // And back: a waiter no longer display work goes back among the rest.
@@ -1454,8 +1475,11 @@ mod tests {
         assert_eq!(gate.waiting_display.load(Ordering::Relaxed), 0);
         // In order of coming: the earlier waiter first.
         gate.release(id);
+        until(|| r1.is_finished());
         let (id, _) = r1.join().unwrap().expect("the core");
+        assert!(!r3.is_finished());
         gate.release(id);
+        until(|| r3.is_finished());
         let (id, _) = r3.join().unwrap().expect("the core");
         gate.release(id);
         assert_eq!(gate.usage().0, 0);
@@ -1463,7 +1487,7 @@ mod tests {
 
     #[test]
     fn sched_yield_lets_the_first_in_line_go_first() {
-        let gate = Arc::new(Cores::<Fake>::new(1));
+        let gate = Arc::new(Cores::<Fake>::waiting_rest(1, NEVER_DUE));
         let (id, _) = gate.try_take(&Fake::new(true), false).unwrap();
         let now = Instant::now();
         assert_eq!(gate.give_way(id, true, now, true), None, "nobody waits");
@@ -1484,7 +1508,7 @@ mod tests {
 
     #[test]
     fn only_holders_in_guest_code_are_stopped() {
-        let gate = Arc::new(Cores::<Fake>::new(2));
+        let gate = Arc::new(Cores::<Fake>::waiting_rest(2, NEVER_DUE));
         // Held longest, but in the kernel: it comes to the door by itself.
         let in_kernel = Fake::new(false);
         in_kernel.in_guest.store(false, Ordering::Relaxed);
@@ -1505,7 +1529,7 @@ mod tests {
 
     #[test]
     fn as_many_holders_make_way_for_display_work_as_wait() {
-        let gate = Arc::new(Cores::<Fake>::new(3));
+        let gate = Arc::new(Cores::<Fake>::waiting_rest(3, NEVER_DUE));
         let held: Vec<u64> = (0..3).map(|_| gate.try_take(&Fake::new(false), false).unwrap().0).collect();
         let waiters = [queue(&gate, &Fake::new(true), false), queue(&gate, &Fake::new(true), false)];
         let now = Instant::now();
@@ -1524,7 +1548,7 @@ mod tests {
 
     #[test]
     fn dying_ends_a_wait() {
-        let gate = Arc::new(Cores::<Fake>::new(1));
+        let gate = Arc::new(Cores::<Fake>::waiting_rest(1, NEVER_DUE));
         let (id, _) = gate.try_take(&Fake::new(false), false).unwrap();
         let dying = Fake::new(false);
         let d = queue(&gate, &dying, false);
@@ -1537,7 +1561,7 @@ mod tests {
 
     #[test]
     fn an_ask_for_the_vcpu_a_waiter_keeps_costs_it_the_vcpu_but_not_its_turn() {
-        let gate = Arc::new(Cores::<Fake>::new(1));
+        let gate = Arc::new(Cores::<Fake>::waiting_rest(1, NEVER_DUE));
         let (id, _) = gate.try_take(&Fake::new(false), false).unwrap();
         let order = Arc::new(Mutex::new(Vec::new()));
         let gave_up = Arc::new(AtomicUsize::new(0));

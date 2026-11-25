@@ -88,7 +88,10 @@ impl Settings {
                 Some("off") => Some(false),
                 _ => None,
             },
-            time_zone: get("timezone").filter(|z| check_time_zone(z).is_ok()).map(str::to_string),
+            // As written, if it looks like one: a zone this host's database hasn't (a
+            // newer one, from a newer Mac) is checked when it is used, at boot, and
+            // isn't lost when the device is edited here.
+            time_zone: get("timezone").filter(|z| zone_name_shape(z)).map(str::to_string),
             location: get("location").and_then(|l| Source::parse(l).ok()),
             others,
         }
@@ -129,49 +132,42 @@ pub fn check_ram(mb: u64) -> Result<u64, String> {
     if (1024..=max).contains(&mb) { Ok(mb) } else { Err(format!("memory is from 1024 to {max} MB, not {mb}")) }
 }
 
-/// An IANA time zone name the tz database here has, such as Asia/Kolkata, exactly:
-/// Android's own copy of the database (the tzdata APEX) has the same names, give or
-/// take a zone added since the image was built, and looks them up with their case
-/// (bionic's localtime.c, libcore's ZoneInfoDb), falling back to GMT for any other.
-/// The Mac's disk ignores case, so each part of the name is matched against the
-/// folder's own names, and the file must be a zone (TZif), not zone.tab or the like.
+/// An IANA time zone name, such as Asia/Kolkata, exactly as the tz database writes it:
+/// Android's copy of the database (the tzdata APEX) looks names up with their case
+/// (bionic's localtime.c, libcore's ZoneInfoDb) and falls back to GMT for any other,
+/// so a name the database hasn't, or a file that is no zone's (posixrules, zone.tab),
+/// is refused. The names are its zones and links: the host database's index
+/// (tzdata.zi), which knows zones newer than zeroemu, else those zeroemu was built
+/// with (tz-names.txt), as where there is no tz database (Windows).
 pub fn check_time_zone(zone: &str) -> Result<(), String> {
-    let bad = || format!("{zone:?} isn't a time zone; they are named as Europe/Berlin and Asia/Kolkata are");
-    if zone.is_empty() || zone.starts_with('/') || zone.split('/').any(|p| p.is_empty() || p == "." || p == "..") || zone.chars().any(|c| c.is_whitespace() || c.is_control()) {
-        return Err(bad());
+    let index = zoneinfo_dir().and_then(|d| std::fs::read_to_string(d.join("tzdata.zi")).ok());
+    if zone_name_shape(zone) && known_zone(zone, index.as_deref()) {
+        Ok(())
+    } else {
+        Err(format!("{zone:?} isn't a time zone; they are named as Europe/Berlin and Asia/Kolkata are"))
     }
-    let Some(mut path) = zoneinfo_dir() else { return Ok(()) };
-    // posix/ and right/ are copies of the zones with other leap-second rules.
-    if zone.starts_with("posix/") || zone.starts_with("right/") {
-        return Err(bad());
-    }
-    for part in zone.split('/') {
-        let named = std::fs::read_dir(&path).into_iter().flatten().flatten().any(|e| e.file_name() == part);
-        if !named {
-            return Err(bad());
-        }
-        path.push(part);
-    }
-    let mut magic = [0u8; 4];
-    let zone_file = std::fs::File::open(&path).and_then(|mut f| std::io::Read::read_exact(&mut f, &mut magic)).is_ok() && &magic == b"TZif";
-    if !zone_file {
-        return Err(bad());
-    }
-    // A zone file isn't always a zone's: posixrules, localtime and the like are copies
-    // of one, with no name Android knows. The database's index (tzdata.zi) names its
-    // zones ("Z name ...") and links ("L target name"), where there is one.
-    let index = zoneinfo_dir().and_then(|d| std::fs::read_to_string(d.join("tzdata.zi")).ok()).unwrap_or_default();
-    let named = index.lines().any(|l| {
-        let mut f = l.split_whitespace();
-        match f.next() {
-            Some("Z") => f.next() == Some(zone),
-            Some("L") => f.nth(1) == Some(zone),
-            _ => false,
-        }
-    });
-    if index.is_empty() || named { Ok(()) } else { Err(bad()) }
 }
 
+/// What a time zone name can look like, whether or not the database has it.
+fn zone_name_shape(zone: &str) -> bool {
+    !zone.is_empty() && !zone.starts_with('/') && !zone.split('/').any(|p| p.is_empty() || p == "." || p == "..") && !zone.chars().any(|c| c.is_whitespace() || c.is_control())
+}
+
+/// Whether `zone` is a zone ("Z name ...") or a link ("L target name") of the tz
+/// database's index `index`, or without one, of those zeroemu was built with.
+fn known_zone(zone: &str, index: Option<&str>) -> bool {
+    match index {
+        Some(index) => index.lines().any(|l| {
+            let mut f = l.split_whitespace();
+            match f.next() {
+                Some("Z") => f.next() == Some(zone),
+                Some("L") => f.nth(1) == Some(zone),
+                _ => false,
+            }
+        }),
+        None => include_str!("tz-names.txt").lines().any(|l| !l.starts_with('#') && l == zone),
+    }
+}
 
 /// The host's copy of the tz database, where it has one.
 fn zoneinfo_dir() -> Option<PathBuf> {
@@ -1008,9 +1004,12 @@ mod tests {
         let text = text.replace("timezone=Asia/Kolkata", "timezone=Mars/Olympus");
         std::fs::write(&ini, text).unwrap();
         let now = store.find("Small phone").unwrap();
-        assert_eq!((now.settings.ram_mb, now.settings.network, now.settings.time_zone.as_deref()), (None, None, None));
+        assert_eq!((now.settings.ram_mb, now.settings.network), (None, None));
+        // A zone this host's database hasn't is kept as written, for a host that has it.
+        assert_eq!(now.settings.time_zone.as_deref(), Some("Mars/Olympus"));
         let renamed = store.edit(&now, "Again", &now.settings).unwrap();
         assert!(std::fs::read_to_string(renamed.ini()).unwrap().contains("future=yes\n"));
+        assert!(std::fs::read_to_string(renamed.ini()).unwrap().contains("timezone=Mars/Olympus\n"));
         // A newer zeroemu's line with an escaped line break stays one line: what
         // follows the \n is no setting of this one's.
         let ini = renamed.ini();
@@ -1052,7 +1051,13 @@ mod tests {
         if zoneinfo_dir().is_some() {
             assert!(check_time_zone("Asia/Kolkata").is_ok());
             assert!(check_time_zone("Mars/Olympus").is_err());
-            // Android matches names with their case, and only zones are zones.
+            // Android matches names with their case, and only zones are zones, with or
+            // without the host's index.
+            for index in [None, Some("Z Asia/Kolkata 5:53:28 - LMT 1854 J 28\nL America/New_York US/Eastern\n")] {
+                assert!(known_zone("Asia/Kolkata", index), "{index:?}");
+                assert!(known_zone("US/Eastern", index), "{index:?}");
+                assert!(!known_zone("asia/kolkata", index) && !known_zone("posixrules", index) && !known_zone("Mars/Olympus", index), "{index:?}");
+            }
             assert!(check_time_zone("asia/kolkata").is_err());
             assert!(check_time_zone("zone.tab").is_err());
             assert!(check_time_zone("posix/Asia/Kolkata").is_err());

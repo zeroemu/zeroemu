@@ -1113,9 +1113,26 @@ impl Thread {
     /// As `sleep` for a thread that can't do anything about a signal until it gets
     /// where it is going, so only dying ends the wait. A signal still wakes it, but then
     /// it goes back to sleep, as it would not if this looked at signals.
-    fn wait_for_turn<'a, T>(&self, cv: &Condvar, g: MutexGuard<'a, T>, timeout: Duration) -> MutexGuard<'a, T> {
+    fn wait_for_turn<'a, T>(&self, cv: &Condvar, mut g: MutexGuard<'a, T>, timeout: Duration) -> MutexGuard<'a, T> {
         *self.sleeping_on.lock().unwrap() = Some(SleepOn(cv));
-        let g = if self.dying.load(Ordering::Acquire) { g } else { cv.wait_timeout(g, timeout).unwrap().0 };
+        // Whoever marks it dying kicks it without the lock `g` guards (exit_group,
+        // a fatal signal), so the kick can come between the look at `dying` and the
+        // wait, and be lost: in slices of DYING_LOOK, a dying thread is gone within one
+        // rather than at the end of `timeout`, while execve waits for it.
+        const DYING_LOOK: Duration = Duration::from_millis(10);
+        let until = Instant::now() + timeout;
+        while !self.dying.load(Ordering::Acquire) {
+            let left = until.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            let (back, waited) = cv.wait_timeout(g, left.min(DYING_LOOK)).unwrap();
+            g = back;
+            // Notified (or woken for no reason, which the callers' loops allow).
+            if !waited.timed_out() {
+                break;
+            }
+        }
         *self.sleeping_on.lock().unwrap() = None;
         g
     }

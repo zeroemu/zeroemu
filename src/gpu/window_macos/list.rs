@@ -897,7 +897,7 @@ extern "C" fn tick(_this: Id, _cmd: Id, _timer: Id) {
 
 /// Memory a device can be given, in MB: as Android Studio offers, up to what zeroemu
 /// maps. The default, 4096, is stored as no setting.
-const RAM_CHOICES: [u64; 7] = [2048, 3072, 4096, 6144, 8192, 12288, 16384];
+const RAM_CHOICES: [u64; 11] = [1024, 1536, 2048, 3072, 4096, 6144, 8192, 12288, 16384, 24576, 32768];
 const RAM_DEFAULT: u64 = 4096;
 
 /// What the form's location popup offers, in order (separators aside).
@@ -1058,7 +1058,7 @@ impl SettingsRows {
                 ram_choices.push(raw.ram_mb);
                 ram_choices.sort();
             }
-            let ram = popup(&ram_choices.iter().map(|mb| Some(if mb % 1024 == 0 { format!("{} GB", mb / 1024) } else { format!("{mb} MB") })).collect::<Vec<_>>());
+            let ram = popup(&ram_choices.iter().map(|mb| Some(ram_shown(*mb))).collect::<Vec<_>>());
             msg_i64(ram, sel("selectItemAtIndex:"), ram_choices.iter().position(|mb| *mb == raw.ram_mb).unwrap_or(0) as i64);
 
             let host = crate::kernel::host_cpus();
@@ -1226,6 +1226,15 @@ fn toggle_advanced() {
     unsafe { msg_i64(msg0(cls("NSApplication"), sel("sharedApplication")), sel("stopModalWithCode:"), TOGGLE_ADVANCED) };
 }
 
+/// Memory as the form shows it: "4 GB", "1.5 GB", or in MB when it isn't a half.
+fn ram_shown(mb: u64) -> String {
+    match mb % 1024 {
+        0 => format!("{} GB", mb / 1024),
+        512 => format!("{}.5 GB", mb / 1024),
+        _ => format!("{mb} MB"),
+    }
+}
+
 /// What Advanced Settings holds that isn't the default, for when it is closed.
 fn advanced_summary(raw: &Raw) -> String {
     let mut parts = Vec::new();
@@ -1234,7 +1243,7 @@ fn advanced_summary(raw: &Raw) -> String {
         parts.push(format!("{} × {} at {} dpi", d.width, d.height, d.dpi));
     }
     if raw.ram_mb != RAM_DEFAULT {
-        parts.push(if raw.ram_mb.is_multiple_of(1024) { format!("{} GB", raw.ram_mb / 1024) } else { format!("{} MB", raw.ram_mb) });
+        parts.push(ram_shown(raw.ram_mb));
     }
     match raw.cpus {
         0 => {}

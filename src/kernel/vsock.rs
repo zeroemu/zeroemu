@@ -251,7 +251,7 @@ fn feed_gps() {
         let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default();
         // Off: nothing new, and what was queued goes, so the HAL never reads a place
         // the device has left.
-        send_gps(&pipes, &fix.as_ref().map(|f| crate::location::nmea(f, now.as_secs())).unwrap_or_default(), seen);
+        send_gps(&pipes, &fix.as_ref().map(|f| crate::location::nmea(f, now.as_secs())).unwrap_or_default(), seen.changes);
         // A closed pipe goes now, not after the sleep.
         drop(pipes);
         let to_next_second = Duration::from_secs(1) - Duration::from_nanos(now.subsec_nanos() as u64);
@@ -290,6 +290,16 @@ fn send_gps(pipes: &[Arc<Vsock>], nmea: &str, changes: u64) {
 fn gps_send(out: &mut VecDeque<u8>, nmea: &str) {
     drop_unread_gps(out);
     out.extend(nmea.bytes());
+}
+
+/// A gps pipe's queue as its reader may see it: a fix queued before the device moved
+/// (or the GPS went off) is of a place it has left, and goes, as it may have been
+/// queued after the change was made, from a fix taken before it. Before every read,
+/// poll and FIONREAD, so that all three agree.
+fn fresh_gps(st: &mut State) {
+    if matches!(st.service, Some(Service::Gps)) && st.gps_changes != crate::location::changes() {
+        drop_unread_gps(&mut st.out);
+    }
 }
 
 /// Drops the sentences on a gps pipe that its reader hasn't begun, keeping the rest of
@@ -360,7 +370,8 @@ impl Vsock {
 
     /// FIONREAD: bytes waiting to be read.
     pub fn unread(&self) -> usize {
-        let st = self.st.lock().unwrap();
+        let mut st = self.st.lock().unwrap();
+        fresh_gps(&mut st);
         match &st.stream {
             Some(io) => io.queued().0,
             None => st.out.len(),
@@ -383,7 +394,8 @@ impl Vsock {
     /// poll(2)'s view.
     pub fn poll(&self) -> u16 {
         use super::hostio::{POLLIN, POLLOUT};
-        let st = self.st.lock().unwrap();
+        let mut st = self.st.lock().unwrap();
+        fresh_gps(&mut st);
         if let Some(backlog) = &st.backlog {
             return if backlog.is_empty() { 0 } else { POLLIN };
         }
@@ -508,12 +520,7 @@ impl Vsock {
                 if !st.connected {
                     return Err(ENOTCONN);
                 }
-                // A fix queued before the device moved (or the GPS went off) is of a place
-                // it has left: the reader never sees it, as it may have been queued after
-                // the change was made, from a fix taken before it.
-                if matches!(st.service, Some(Service::Gps)) && st.gps_changes != crate::location::changes() {
-                    drop_unread_gps(&mut st.out);
-                }
+                fresh_gps(&mut st);
                 if !st.out.is_empty() {
                     let n = count.min(st.out.len());
                     return Ok(st.out.drain(..n).collect());

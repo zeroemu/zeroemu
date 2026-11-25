@@ -1025,6 +1025,8 @@ impl Thread {
         if was == u as u8 {
             return;
         }
+        // Waiting for a core in the old urgency's line, it moves to the new one's.
+        vcpus::urgency_changed(self);
         if sched_tracing() {
             eprintln!("[sched] {} tid {}: {u:?} (nice {}, policy {}, {group:?})", attrs.comm, self.tid, attrs.sched.nice, attrs.sched.policy);
         }

@@ -154,8 +154,24 @@ pub fn check_time_zone(zone: &str) -> Result<(), String> {
     }
     let mut magic = [0u8; 4];
     let zone_file = std::fs::File::open(&path).and_then(|mut f| std::io::Read::read_exact(&mut f, &mut magic)).is_ok() && &magic == b"TZif";
-    if zone_file { Ok(()) } else { Err(bad()) }
+    if !zone_file {
+        return Err(bad());
+    }
+    // A zone file isn't always a zone's: posixrules, localtime and the like are copies
+    // of one, with no name Android knows. The database's index (tzdata.zi) names its
+    // zones ("Z name ...") and links ("L target name"), where there is one.
+    let index = zoneinfo_dir().and_then(|d| std::fs::read_to_string(d.join("tzdata.zi")).ok()).unwrap_or_default();
+    let named = index.lines().any(|l| {
+        let mut f = l.split_whitespace();
+        match f.next() {
+            Some("Z") => f.next() == Some(zone),
+            Some("L") => f.nth(1) == Some(zone),
+            _ => false,
+        }
+    });
+    if index.is_empty() || named { Ok(()) } else { Err(bad()) }
 }
+
 
 /// The host's copy of the tz database, where it has one.
 fn zoneinfo_dir() -> Option<PathBuf> {
@@ -1040,6 +1056,9 @@ mod tests {
             assert!(check_time_zone("asia/kolkata").is_err());
             assert!(check_time_zone("zone.tab").is_err());
             assert!(check_time_zone("posix/Asia/Kolkata").is_err());
+            // A zone file with no zone's name: the database's index doesn't list it.
+            assert!(check_time_zone("posixrules").is_err());
+            assert!(check_time_zone("US/Eastern").is_ok(), "a link is a name");
             assert!(time_zones().iter().any(|z| z == "Europe/Berlin"));
         }
     }

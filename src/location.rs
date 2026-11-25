@@ -423,9 +423,18 @@ struct Current {
     source: Option<Source>,
     since: Option<Instant>,
     changes: u64,
+    /// `wake`s: a waiter looks again, though the place hasn't changed.
+    wakes: u64,
 }
 
-static CURRENT: Mutex<Current> = Mutex::new(Current { source: None, since: None, changes: 0 });
+static CURRENT: Mutex<Current> = Mutex::new(Current { source: None, since: None, changes: 0, wakes: 0 });
+
+/// Where `wait_for_change` waits from: the changes of place, and the wakes, seen.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Seen {
+    pub changes: u64,
+    wakes: u64,
+}
 static CHANGED: Condvar = Condvar::new();
 
 /// Held by the tests that `set`, which would otherwise move each other's devices.
@@ -449,10 +458,11 @@ pub fn changes() -> u64 {
 }
 
 /// Has `wait_for_change` look again without a change of place: the last gps pipe
-/// closed, and its sender, which may be asleep while the location is off, can end.
+/// closed, and its sender, which may be asleep while the location is off, can end. Not
+/// a change: what other pipes hold is still where the device is.
 pub fn wake() {
     let mut c = CURRENT.lock().unwrap();
-    c.changes += 1;
+    c.wakes += 1;
     CHANGED.notify_all();
 }
 
@@ -461,21 +471,22 @@ pub fn current() -> Source {
     CURRENT.lock().unwrap().source.clone().unwrap_or(Source::Off)
 }
 
-/// What the GPS reads now (None while Off), and how many changes there have been, for
-/// `wait_for_change`.
-pub fn fix() -> (Option<Fix>, u64) {
+/// What the GPS reads now (None while Off), and what has been seen, for
+/// `wait_for_change`; its `changes` are the count the fix belongs to.
+pub fn fix() -> (Option<Fix>, Seen) {
     let c = CURRENT.lock().unwrap();
     let elapsed = c.since.map_or(0.0, |t| t.elapsed().as_secs_f64());
-    (c.source.as_ref().and_then(|s| s.fix_at(elapsed)), c.changes)
+    (c.source.as_ref().and_then(|s| s.fix_at(elapsed)), Seen { changes: c.changes, wakes: c.wakes })
 }
 
-/// Sleeps until there have been more than `seen` changes, or `timeout` has passed;
-/// with no timeout, until the change.
-pub fn wait_for_change(seen: u64, timeout: Option<Duration>) {
+/// Sleeps until there has been a change or a `wake` since `seen`, or `timeout` has
+/// passed; with no timeout, until then.
+pub fn wait_for_change(seen: Seen, timeout: Option<Duration>) {
     let c = CURRENT.lock().unwrap();
+    let same = |c: &mut Current| c.changes == seen.changes && c.wakes == seen.wakes;
     match timeout {
-        Some(t) => drop(CHANGED.wait_timeout_while(c, t, |c| c.changes == seen)),
-        None => drop(CHANGED.wait_while(c, |c| c.changes == seen)),
+        Some(t) => drop(CHANGED.wait_timeout_while(c, t, same)),
+        None => drop(CHANGED.wait_while(c, same)),
     }
 }
 
@@ -862,12 +873,18 @@ mod tests {
         set(Source::Preset("freeway-drive"));
         assert!(waiter.join().unwrap() < Duration::from_secs(5));
         assert_eq!(current(), Source::Preset("freeway-drive"));
-        let (f, changes) = fix();
-        assert!(changes > seen && f.is_some_and(|f| f.speed == 28.0));
+        let (f, now) = fix();
+        assert!(now.changes > seen.changes && f.is_some_and(|f| f.speed == 28.0));
         // Nothing changes: the wait ends with its timeout.
         let t = Instant::now();
-        wait_for_change(changes, Some(Duration::from_millis(20)));
+        wait_for_change(now, Some(Duration::from_millis(20)));
         assert!(t.elapsed() >= Duration::from_millis(20));
+        // A wake ends a wait, but isn't a change of place.
+        let waiter = std::thread::spawn(move || wait_for_change(now, Some(Duration::from_secs(10))));
+        std::thread::sleep(Duration::from_millis(20));
+        wake();
+        waiter.join().unwrap();
+        assert_eq!(changes(), now.changes);
     }
 
     #[test]

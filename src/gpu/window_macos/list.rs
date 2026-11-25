@@ -938,6 +938,9 @@ struct Raw {
     zone: String,
     place: Place,
     coords: String,
+    /// Device says Custom, though the size and density may still be a preset's: it
+    /// was chosen, and Advanced Settings opened for them.
+    custom: bool,
 }
 
 impl Raw {
@@ -960,6 +963,7 @@ impl Raw {
             zone: s.time_zone.clone().unwrap_or_default(),
             place,
             coords,
+            custom: d.preset().is_none(),
         }
     }
 
@@ -1114,6 +1118,10 @@ impl SettingsRows {
 
             let rows = SettingsRows { preset, width, height, dpi, dp, ram, ram_choices, cpus, network, zone, place, place_items, coords };
             rows.screen_changed();
+            // Custom chosen stays chosen, until a size typed is a preset's.
+            if raw.custom {
+                msg_i64(preset, sel("selectItemAtIndex:"), Display::PRESETS.len() as i64);
+            }
             // Advanced Settings: a disclosure triangle and its title, which both open
             // and close it, and, closed, what it holds that isn't the default.
             let triangle = msg0(msg0(cls("NSButton"), sel("alloc")), sel("init"));
@@ -1164,6 +1172,7 @@ impl SettingsRows {
                 zone: text(self.zone),
                 place: self.place_items.get(index(self.place)).copied().flatten().and_then(|i| all.get(i).cloned()).unwrap_or(Place::ZoneCity),
                 coords: text(self.coords),
+                custom: index(self.preset) >= Display::PRESETS.len(),
             }
         }
     }

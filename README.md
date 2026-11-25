@@ -160,14 +160,28 @@ you to make one: **New Device** (⌘N) takes a name and one of your installed im
 image zeroemu is tested with is chosen first, and images it can't boot are listed but
 can't be chosen; if none of them can, the form says why and what to install.
 
+The form also sets what the device is like, as Android Studio's device wizard does:
+
+| Setting | Default | |
+|---|---|---|
+| Device | Medium Phone | A preset sets the screen: Medium Phone (1080 × 2400, 420 dpi), Pixel 9 (1080 × 2424, 420 dpi), Small Phone (720 × 1280, 320 dpi) or Pixel Tablet (2560 × 1600, 320 dpi) |
+| Screen, Density | 1080 × 2400, 420 dpi | Any size from 320 to 4096 pixels a side, at 120 to 640 dpi, at least 320 dp across. The form shows the size in dp, as apps see it. Android draws at this size whatever the window's, which scales it to fit |
+| Memory | 4 GB | What Android is told it has, which decides how it caches and closes apps |
+| CPU cores | All of the Mac's | Fewer cores are what Android sees, and at most how many of its threads run at once, which leaves the Mac the rest |
+| Network | Connected | |
+| Time zone | The Mac's | Set again at every start, over a zone chosen inside Android |
+| Location | The main city of its time zone | Where its GPS says it is: none, a place, a moving route, or coordinates |
+
 - **Start** boots a device in the window. Closing its window brings the list back; Quit
   (⌘Q) stops it and quits.
 - A device that is already running says so, and **Show** brings its window forward.
   File > Show Device List (⇧⌘D) opens the list beside a running device, to start
   another one: each runs in its own zeroemu, with its own adb serial. There is one list
   at a time: chosen again, it brings the open list forward.
-- A device's ⋯ menu, or a right click, renames it, wipes its data, shows its files in
-  Finder, or deletes it.
+- A device's ⋯ menu, or a right click, edits it (its name and the settings above, for
+  its next start), wipes its data, shows its files in Finder, or deletes it.
+- Device > Location moves a running device, as Simulator's Features > Location does: to
+  a place, along a moving route, to coordinates you type, or to none.
 - What `zeroemu` saved for an image in a terminal (without `--device`) shows up in the
   list as a device of that image, so nothing is lost: the device and `zeroemu` share
   that `/data`, and it shows as running while the terminal runs it.
@@ -262,7 +276,11 @@ Boot options:
 |---|---|
 | `--image <name>` | Boot an installed image: `android-36.1`, `android-36.1/google_apis_playstore`, or the SDK package path `system-images;android-36.1;google_apis_playstore;arm64-v8a`. The ABI is always the host's |
 | `--system <path>` | Boot a `system.img` file, or the folder that holds it |
-| `--device <name>` | Boot a device made in zeroemu.app, with its image and its `/data` |
+| `--device <name>` | Boot a device made in zeroemu.app, with its image, its `/data` and its settings. The options below override its settings for that boot only |
+| `--screen <w>x<h>`, `--density <dpi>` | The screen Android draws, in pixels and dots per inch: 1080x2400 at 420 by default, as Android Studio's Medium Phone |
+| `--cpus <n>` | How many cores Android sees, and at most how many of its threads run at once: all of the computer's by default |
+| `--timezone <zone>` | A time zone such as `Europe/Berlin`, set at every boot: the computer's by default |
+| `--location <where>` | Where the GPS says the device is: `<latitude>,<longitude>`, a place or route such as `googleplex` (Device > Location lists them), or `off`. By default, the main city of the time zone |
 | `--data <file>` | Keep the device's `/data` in this file instead of the default one |
 | `--ephemeral` | Keep nothing: start with an empty `/data` and throw it away at exit |
 | `--wipe-data` | Start over with an empty `/data` |
@@ -279,7 +297,7 @@ that installs the tested one. Use `--image` to pick an untested image.
 
 What you see:
 
-- A window with a 1080x2400 phone display, scaled to fit your screen. Android finishes
+- A window with the device's screen (1080x2400 by default), scaled to fit yours. Android finishes
   booting about 17 seconds after start on a first boot, and about 12 seconds on later
   boots.
 - The mouse is a finger, and scrolling drags one (a flick becomes a fling). Other keys

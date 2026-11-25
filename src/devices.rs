@@ -15,6 +15,8 @@
 //! a file is listed here as a device too (`adopt`), so what a terminal boot saved shows
 //! in the app, and `zeroemu` and the device share that /data.
 
+use crate::gpu::Display;
+use crate::location::Source;
 use crate::sdk::{self, Image};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -29,7 +31,139 @@ pub struct Device {
     /// Where its /data is kept: data.img in its folder, or the per-image file of
     /// terminal boots that it was made from.
     pub data: PathBuf,
+    pub settings: Settings,
     dir: PathBuf,
+}
+
+/// What a device is like apart from its image, as an AVD's config.ini says
+/// (hw.lcd.width, height and density, hw.ramSize, hw.cpu.ncore). None is zeroemu's
+/// default, which `boot_settings` in main.rs fills in, so that a device made now
+/// follows a better default later.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Settings {
+    /// device.ini's screen= and density=.
+    pub display: Option<Display>,
+    /// ram=, in megabytes.
+    pub ram_mb: Option<u64>,
+    /// cpus=: how many cores Android sees and uses.
+    pub cpus: Option<usize>,
+    /// network=on|off.
+    pub network: Option<bool>,
+    /// timezone=, an IANA name; else the Mac's.
+    pub time_zone: Option<String>,
+    /// location=, as location::Source::parse reads it; else the time zone's city.
+    pub location: Option<Source>,
+    /// Keys this zeroemu doesn't know, from a newer one: kept, so a rename or an edit
+    /// here doesn't lose them.
+    pub(crate) others: Vec<(String, String)>,
+}
+
+/// The keys device.ini has.
+const KEYS: [&str; 10] = ["name", "image", "data", "screen", "density", "ram", "cpus", "network", "timezone", "location"];
+
+impl Settings {
+    /// From device.ini's keys. A value that isn't valid reads as the default.
+    fn read(props: &std::collections::HashMap<String, String>) -> Settings {
+        let get = |k: &str| props.get(k).map(|v| v.trim()).filter(|v| !v.is_empty());
+        let display = match (get("screen").and_then(|s| Display::parse_size(s).ok()), get("density").and_then(|d| d.parse().ok())) {
+            (Some((w, h)), Some(dpi)) => Display::new(w, h, dpi).ok(),
+            _ => None,
+        };
+        let mut others: Vec<(String, String)> = props.iter().filter(|(k, _)| !KEYS.contains(&k.as_str())).map(|(k, v)| (k.clone(), v.clone())).collect();
+        others.sort();
+        Settings {
+            display,
+            ram_mb: get("ram").and_then(|v| v.parse().ok()).filter(|mb| check_ram(*mb).is_ok()),
+            cpus: get("cpus").and_then(|v| v.parse().ok()).filter(|n| (1..=64).contains(n)),
+            network: match get("network") {
+                Some("on") => Some(true),
+                Some("off") => Some(false),
+                _ => None,
+            },
+            time_zone: get("timezone").filter(|z| check_time_zone(z).is_ok()).map(str::to_string),
+            location: get("location").and_then(|l| Source::parse(l).ok()),
+            others,
+        }
+    }
+
+    /// device.ini's lines for what is set.
+    fn lines(&self) -> String {
+        let mut out = String::new();
+        if let Some(d) = self.display {
+            out += &format!("screen={}x{}\ndensity={}\n", d.width, d.height, d.dpi);
+        }
+        if let Some(mb) = self.ram_mb {
+            out += &format!("ram={mb}\n");
+        }
+        if let Some(n) = self.cpus {
+            out += &format!("cpus={n}\n");
+        }
+        if let Some(on) = self.network {
+            out += &format!("network={}\n", if on { "on" } else { "off" });
+        }
+        if let Some(z) = &self.time_zone {
+            out += &format!("timezone={z}\n");
+        }
+        if let Some(l) = &self.location {
+            out += &format!("location={}\n", l.to_ini());
+        }
+        for (k, v) in &self.others {
+            out += &format!("{k}={v}\n");
+        }
+        out
+    }
+}
+
+/// Memory Android may be told it has, in megabytes: from 1 GB to what zeroemu maps.
+pub fn check_ram(mb: u64) -> Result<u64, String> {
+    let max = crate::phys::PHYS_MAX >> 20;
+    if (1024..=max).contains(&mb) { Ok(mb) } else { Err(format!("memory is from 1024 to {max} MB, not {mb}")) }
+}
+
+/// An IANA time zone name the tz database here has, such as Asia/Kolkata. Android's
+/// own copy of the database (the tzdata APEX) has the same names, give or take a
+/// zone added since the image was built.
+pub fn check_time_zone(zone: &str) -> Result<(), String> {
+    let bad = || format!("{zone:?} isn't a time zone; they are named as Europe/Berlin and Asia/Kolkata are");
+    if zone.is_empty() || zone.starts_with('/') || zone.split('/').any(|p| p.is_empty() || p == "." || p == "..") || zone.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err(bad());
+    }
+    match zoneinfo_dir() {
+        Some(dir) if !dir.join(zone).is_file() => Err(bad()),
+        _ => Ok(()),
+    }
+}
+
+/// The host's copy of the tz database, where it has one.
+fn zoneinfo_dir() -> Option<PathBuf> {
+    let dir = PathBuf::from("/usr/share/zoneinfo");
+    dir.is_dir().then_some(dir)
+}
+
+/// The Mac's own time zone, as /etc/localtime links to it (…/zoneinfo/Asia/Kolkata),
+/// or as TZ names it.
+pub fn host_time_zone() -> Option<String> {
+    let named = |z: &str| check_time_zone(z).is_ok().then(|| z.to_string());
+    if let Some(tz) = std::env::var("TZ").ok().map(|t| t.trim_start_matches(':').to_string())
+        && let Some(z) = named(&tz)
+    {
+        return Some(z);
+    }
+    let link = std::fs::read_link("/etc/localtime").ok()?;
+    let link = link.to_string_lossy();
+    let zone = link.split_once("zoneinfo/")?.1;
+    named(zone.strip_prefix("posix/").or_else(|| zone.strip_prefix("right/")).unwrap_or(zone))
+}
+
+/// The tz database's zones, for choosing one: zone1970.tab's (one per region where
+/// clocks have agreed since 1970), by name.
+pub fn time_zones() -> Vec<String> {
+    let Some(dir) = zoneinfo_dir() else { return Vec::new() };
+    let text = std::fs::read_to_string(dir.join("zone1970.tab")).or_else(|_| std::fs::read_to_string(dir.join("zone.tab"))).unwrap_or_default();
+    let mut zones: Vec<String> = text.lines().filter(|l| !l.starts_with('#')).filter_map(|l| l.split('\t').nth(2)).map(str::to_string).collect();
+    zones.sort();
+    zones.dedup();
+    zones
 }
 
 impl Device {
@@ -248,21 +382,26 @@ impl Store {
                 continue;
             }
             let name = default_name(img, &devices);
-            match self.make(&name, img, Some(&data)) {
+            match self.make(&name, img, Some(&data), &Settings::default()) {
                 Ok(d) => devices.push(d),
                 Err(e) => eprintln!("zeroemu: {}: {e}", data.display()),
             }
         }
     }
 
-    /// A new device of `img`, with an empty /data.
+    /// A new device of `img`, with an empty /data and the default settings.
     pub fn create(&self, name: &str, img: &Image) -> Result<Device, String> {
+        self.create_with(name, img, &Settings::default())
+    }
+
+    /// A new device of `img`, with an empty /data.
+    pub fn create_with(&self, name: &str, img: &Image, settings: &Settings) -> Result<Device, String> {
         let _lock = self.lock()?;
-        self.make(name, img, None)
+        self.make(name, img, None, settings)
     }
 
     /// Under `lock`.
-    fn make(&self, name: &str, img: &Image, data: Option<&Path>) -> Result<Device, String> {
+    fn make(&self, name: &str, img: &Image, data: Option<&Path>, settings: &Settings) -> Result<Device, String> {
         let devices = self.list();
         let name = check_name(name, &devices, None)?;
         let base = id_for(&name);
@@ -277,7 +416,7 @@ impl Store {
                 Err(e) => return Err(format!("{}: {e}", dir.display())),
             }
         };
-        let d = Device { data: data.map_or_else(|| dir.join("data.img"), Path::to_path_buf), id, name, package: img.package(), dir };
+        let d = Device { data: data.map_or_else(|| dir.join("data.img"), Path::to_path_buf), id, name, package: img.package(), settings: settings.clone(), dir };
         if let Err(e) = write(&d) {
             let _ = std::fs::remove_dir_all(&d.dir);
             return Err(e);
@@ -312,6 +451,16 @@ impl Store {
         let renamed = Device { name, ..now };
         write(&renamed)?;
         Ok(renamed)
+    }
+
+    /// Changes `d`'s settings, if it is still there: for its next boot, so also while it
+    /// runs.
+    pub fn set_settings(&self, d: &Device, settings: &Settings) -> Result<Device, String> {
+        let _lock = self.lock()?;
+        let now = self.current(d)?;
+        let changed = Device { settings: settings.clone(), ..now };
+        write(&changed)?;
+        Ok(changed)
     }
 
     /// Starts its /data over, at its next boot, if it is still there and not running.
@@ -369,7 +518,7 @@ fn read(dir: &Path) -> Option<Device> {
     let name = props.get("name").filter(|n| !n.is_empty()).cloned().unwrap_or_else(|| id.clone());
     let package = props.get("image").filter(|p| !p.is_empty())?.clone();
     let data = props.get("data").filter(|d| !d.is_empty()).map(PathBuf::from).unwrap_or_else(|| dir.join("data.img"));
-    Some(Device { id, name, package, data, dir: dir.to_path_buf() })
+    Some(Device { id, name, package, data, settings: Settings::read(&props), dir: dir.to_path_buf() })
 }
 
 /// Writes device.ini whole, then puts it in place, so a failure leaves the old one.
@@ -381,6 +530,7 @@ fn write(d: &Device) -> Result<(), String> {
     if d.data != d.dir.join("data.img") {
         text += &format!("data={}\n", escape(&d.data.to_string_lossy()));
     }
+    text += &escape(&d.settings.lines());
     let path = d.dir.join("device.ini");
     let new = d.dir.join("device.ini.new");
     std::fs::write(&new, text).and_then(|()| std::fs::rename(&new, &path)).map_err(|e| format!("{}: {e}", path.display()))
@@ -673,7 +823,7 @@ mod tests {
         let img = image(&root.join("sdk"), "android-36.1", "google_apis_playstore");
         let store = Store::at(&root.join("devices"));
         let file = PathBuf::from(r"C:\Users\tom\AppData\Local\zeroemu\data-1.img");
-        let d = store.make(r"Tom\s phone", &img, Some(&file)).unwrap();
+        let d = store.make(r"Tom\s phone", &img, Some(&file), &Settings::default()).unwrap();
         assert_eq!(store.list(), vec![d.clone()]);
         assert_eq!((d.name.as_str(), d.data.as_path()), (r"Tom\s phone", file.as_path()));
         let _ = std::fs::remove_dir_all(&root);
@@ -783,5 +933,55 @@ mod tests {
         assert!(lock_file(&path).unwrap().is_none());
         drop((old, now));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn settings_are_kept_and_old_devices_get_the_defaults() {
+        let root = scratch("settings");
+        let img = image(&root.join("sdk"), "android-36.1", "google_apis_playstore");
+        let store = Store::at(&root.join("devices"));
+        // Made before settings: name, image, nothing else.
+        let old = store.create("Old", &img).unwrap();
+        assert_eq!(store.find("Old").unwrap().settings, Settings::default());
+        let settings = Settings {
+            display: Some(Display::new(720, 1280, 320).unwrap()),
+            ram_mb: Some(2048),
+            cpus: Some(4),
+            network: Some(false),
+            time_zone: Some("Asia/Kolkata".into()),
+            location: Some(Source::Point { lat: 12.97, lon: 77.59 }),
+            others: Vec::new(),
+        };
+        let d = store.create_with("Small", &img, &settings).unwrap();
+        assert_eq!(store.find("Small").unwrap().settings, settings);
+        // A rename keeps them; set_settings changes them; a stale device can't.
+        let d = store.rename(&d, "Small phone").unwrap();
+        assert_eq!(store.find("Small phone").unwrap().settings, settings);
+        let fewer = Settings { cpus: Some(2), ..settings.clone() };
+        store.set_settings(&d, &fewer).unwrap();
+        assert_eq!(store.find("Small phone").unwrap().settings.cpus, Some(2));
+        store.delete(&old).unwrap();
+        assert!(store.set_settings(&old, &fewer).is_err());
+        // Nonsense reads as the default; keys from a newer zeroemu survive a rename.
+        let ini = d.ini();
+        let text = std::fs::read_to_string(&ini).unwrap() + "screen=7x9\nram=12\ncpus=0\nnetwork=maybe\nlocation=north\nfuture=yes\n";
+        let text = text.replace("timezone=Asia/Kolkata", "timezone=Mars/Olympus");
+        std::fs::write(&ini, text).unwrap();
+        let now = store.find("Small phone").unwrap();
+        assert_eq!((now.settings.ram_mb, now.settings.network, now.settings.time_zone.as_deref()), (None, None, None));
+        let renamed = store.rename(&now, "Again").unwrap();
+        assert!(std::fs::read_to_string(renamed.ini()).unwrap().contains("future=yes\n"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn time_zones_are_checked_against_the_tz_database() {
+        assert!(check_time_zone("../etc/passwd").is_err());
+        assert!(check_time_zone("Asia Kolkata").is_err());
+        if zoneinfo_dir().is_some() {
+            assert!(check_time_zone("Asia/Kolkata").is_ok());
+            assert!(check_time_zone("Mars/Olympus").is_err());
+            assert!(time_zones().iter().any(|z| z == "Europe/Berlin"));
+        }
     }
 }

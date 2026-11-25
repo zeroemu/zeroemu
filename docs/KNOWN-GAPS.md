@@ -27,7 +27,15 @@ Emulator. [INTERNALS.md](INTERNALS.md) says how each part works.
 - zeroemu calls a few of the emulator renderer's internal functions by name, so an
   emulator release other than the tested ones (37.1 and 37.2) can break it. 37.3, on
   Google's preview channel, is untested.
-- The display is one 1080x2400 phone panel, whatever the image expects.
+- There is one display, of the size and density a device is set to (1080x2400 at 420 dpi
+  by default). A size or density set inside Android (Settings > Display size, `wm size`,
+  `wm density`) is saved in its `/data` and still wins over the device's after an Edit.
+- Apps' `DisplayMetrics.xdpi` and `ydpi` come from the renderer's own default, not the
+  device's density; `densityDpi` is right.
+- CPU cores limit the threads of Android's that run at once, not zeroemu's own (the
+  renderer, the network, disk I/O), so a device can use a little more of the Mac.
+- A time zone chosen inside Android lasts until the device next starts, when the
+  device's own is set again.
 - `--headless` gives the guest no GPU, so a headless boot stops at SurfaceFlinger, which
   needs one. It never reaches the home screen.
 

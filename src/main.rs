@@ -73,7 +73,18 @@ Boot options:
                             {package}
                           The ABI is always this computer's.
   --system <path>         a system.img file, or the folder holding it
-  --device <name>         a device zeroemu.app made: its image and its /data
+  --device <name>         a device zeroemu.app made: its image, its /data and
+                          its settings, which the options below override for
+                          one boot
+  --screen <w>x<h>        the screen's size in pixels (default 1080x2400)
+  --density <dpi>         the screen's density (default 420)
+  --cpus <n>              the cores Android sees and uses (default: all of
+                          this computer's)
+  --timezone <zone>       a time zone such as Europe/Berlin, set at every boot
+                          (default: this computer's)
+  --location <where>      where the GPS says the device is: <lat>,<lon>, a
+                          place such as googleplex, a route, or off (default:
+                          the time zone's main city)
   --data <file>           keep /data in this file (by default, a file per image
                           in {data})
   --ephemeral             keep nothing: /data starts empty and is thrown away
@@ -259,6 +270,13 @@ fn run(args: Vec<String>) -> Result<i32, String> {
     let mut adb_port: Option<u16> = None;
     let mut no_adb = false;
     let mut no_net = false;
+    // A device's settings, given for this boot: they win over the device's own.
+    let mut screen: Option<(u32, u32)> = None;
+    let mut density: Option<u32> = None;
+    let mut ram_mb: Option<u64> = None;
+    let mut cpus: Option<usize> = None;
+    let mut time_zone: Option<String> = None;
+    let mut place: Option<location::Source> = None;
     let wants = |flag: &str| format!("{flag} wants a value\n{USAGE}");
     while let Some(flag) = args.peek().filter(|a| a.starts_with('-')).cloned() {
         args.next();
@@ -311,10 +329,26 @@ fn run(args: Vec<String>) -> Result<i32, String> {
             // As hw.ramSize says in an AVD: what the guest believes it has.
             "--ram" => {
                 let v = value()?;
-                let max = phys::PHYS_MAX >> 20;
-                let mb = v.parse::<u64>().ok().filter(|mb| (1024..=max).contains(mb)).ok_or(format!("--ram wants megabytes from 1024 to {max}, got {v}"))?;
-                phys::set_ram(mb << 20);
+                let mb = v.parse::<u64>().map_err(|_| format!("--ram wants megabytes, got {v}"))?;
+                ram_mb = Some(devices::check_ram(mb).map_err(|e| format!("--ram: {e}"))?);
             }
+            // As hw.lcd.width/height and hw.lcd.density do: the screen Android draws.
+            "--screen" => screen = Some(gpu::Display::parse_size(&value()?).map_err(|e| format!("--screen: {e}"))?),
+            "--density" => {
+                let v = value()?;
+                density = Some(v.parse().map_err(|_| format!("--density wants dots per inch, such as 420, got {v}"))?);
+            }
+            // As hw.cpu.ncore does: the cores Android sees, and at most uses at once.
+            "--cpus" => {
+                let v = value()?;
+                cpus = Some(v.parse().ok().filter(|n| (1..=64).contains(n)).ok_or(format!("--cpus wants a number from 1 to 64, got {v}"))?);
+            }
+            "--timezone" => {
+                let v = value()?;
+                devices::check_time_zone(&v).map_err(|e| format!("--timezone: {e}"))?;
+                time_zone = Some(v);
+            }
+            "--location" => place = Some(location::Source::parse(&value()?).map_err(|e| format!("--location: {e}"))?),
             "--display" => display = true,
             "--headless" => headless = true,
             "--gpu-selftest" => gpu_selftest = true,
@@ -345,6 +379,18 @@ fn run(args: Vec<String>) -> Result<i32, String> {
         data = Some(d.data.clone());
         device_found = Some(d);
     }
+    // The settings: a flag's, else the device's, else the default.
+    let saved = device_found.as_ref().map(|d| d.settings.clone()).unwrap_or_default();
+    let screen = boot_display(screen, density, saved.display)?;
+    if let Some(mb) = ram_mb.or(saved.ram_mb) {
+        phys::set_ram(mb << 20);
+    }
+    if let Some(n) = cpus.or(saved.cpus) {
+        kernel::set_cpus(n);
+    }
+    let network = !no_net && saved.network != Some(false);
+    let time_zone = time_zone.or(saved.time_zone).or_else(devices::host_time_zone);
+    let place = place.or(saved.location).unwrap_or_else(|| location::default_for_zone(time_zone.as_deref()));
     PROGRAM.store(!boot && inspect.is_none(), Ordering::Relaxed);
     if boot {
         kernel::quiet_logs(app::opened_as_app());
@@ -392,15 +438,29 @@ fn run(args: Vec<String>) -> Result<i32, String> {
         kernel::reserve_exit_signals();
     }
     let data_path = data.as_ref().map(|d| d.path.clone());
-    let extras = boot.then_some(kernel::BootExtras { push, run, data, network: !no_net, time_zone: None });
+    if boot {
+        location::set(place.clone());
+    }
+    let extras = boot.then_some(kernel::BootExtras { push, run, data, network, time_zone: time_zone.clone() });
     let adb = if (boot && !no_adb) || adb_port.is_some() { kernel::adb::start(adb_port) } else { None };
     if boot && let Some(c) = &chosen {
         print_status(c, data_path.as_deref(), adb, show);
+        let net = if network { "network" } else { "no network" };
+        let zone = time_zone.as_deref().unwrap_or("Android's own time zone");
+        eprintln!(
+            "zeroemu: {} at {} dpi{}, {} MB, {} cores, {net}, {zone}, location {}",
+            format_args!("{}x{}", screen.width, screen.height),
+            screen.dpi,
+            screen.preset().map(|p| format!(" ({})", p.1)).unwrap_or_default(),
+            phys::ram() >> 20,
+            kernel::cpus(),
+            place.shown()
+        );
     }
     let gpu: Option<Arc<dyn gpu::GpuBackend>> = if fake {
         Some(gpu::fake())
     } else if show {
-        Some(gpu::open(gpu::Display::DEFAULT)?)
+        Some(gpu::open(screen)?)
     } else {
         None
     };
@@ -622,6 +682,17 @@ fn app_data() -> Option<PathBuf> {
 pub fn data_dirs() -> Option<(PathBuf, PathBuf)> {
     let base = app_data()?;
     Some((base.join("zeroemu"), base.join("droidrt")))
+}
+
+/// The screen a boot gives Android: --screen and --density over the device's, over
+/// the default. Either flag alone changes only its half.
+fn boot_display(screen: Option<(u32, u32)>, density: Option<u32>, saved: Option<gpu::Display>) -> Result<gpu::Display, String> {
+    let base = saved.unwrap_or(gpu::Display::DEFAULT);
+    if screen.is_none() && density.is_none() {
+        return Ok(base);
+    }
+    let (w, h) = screen.unwrap_or((base.width, base.height));
+    gpu::Display::new(w, h, density.unwrap_or(base.dpi)).map_err(|e| format!("{e} (--screen and --density set it)"))
 }
 
 /// The device `name` names, with its image installed.

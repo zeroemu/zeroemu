@@ -1489,6 +1489,22 @@ pub fn turned() {
 /// middle, and on its screen. A window already that shape, or full screen, stays.
 /// The shape is the panel's own turned, so a tablet's window, wide to begin with,
 /// goes tall on its side.
+/// Points per device pixel the picture is meant to be shown at, as f64 bits (0 for not
+/// yet known): the window's when it is first turned, or after the user resized it.
+/// Turning keeps it where the screen has room, so that a window turned and turned
+/// back, which a landscape tablet's may have to shrink for, is the size it was.
+static PREFERRED_SCALE: AtomicU64 = AtomicU64::new(0);
+/// The content size the last turn gave the window.
+static RESHAPED: Mutex<Option<(f64, f64)>> = Mutex::new(None);
+
+/// The window's content size for a picture now `shown` (device pixels) at `preferred`
+/// points per pixel, or smaller to fit `room` (points).
+fn turned_size(shown: (u32, u32), preferred: f64, room: (f64, f64)) -> (f64, f64) {
+    let (w, h) = (shown.0.max(1) as f64, shown.1.max(1) as f64);
+    let scale = preferred.min(room.0 / w).min(room.1 / h);
+    ((w * scale).floor().max(1.0), (h * scale).floor().max(1.0))
+}
+
 unsafe fn reshape(window: *mut c_void) {
     const FULL_SCREEN: i64 = 1 << 14;
     unsafe {
@@ -1509,8 +1525,17 @@ unsafe fn reshape(window: *mut c_void) {
             screen = msg0(cls("NSScreen"), sel("mainScreen"));
         }
         let vis = (!screen.is_null()).then(|| msg_rect(screen, sel("visibleFrame")));
-        let scale = vis.map_or(1.0, |v| ((v.size.width - 16.0) / ch).min((v.size.height - chrome - 16.0) / cw).min(1.0));
-        let (w, h) = ((ch * scale).floor(), (cw * scale).floor());
+        // The scale to keep: the window's now, unless it is still the size the last turn
+        // gave it, when the screen may have forced it smaller than the one before.
+        let now = cw / shown.1.max(1) as f64;
+        let last = *RESHAPED.lock().unwrap_or_else(|p| p.into_inner());
+        let untouched = last.is_some_and(|(w, h)| (w - cw).abs() < 1.5 && (h - ch).abs() < 1.5);
+        let kept = f64::from_bits(PREFERRED_SCALE.load(Ordering::Relaxed));
+        let preferred = if untouched && kept > 0.0 { kept } else { now };
+        PREFERRED_SCALE.store(preferred.to_bits(), Ordering::Relaxed);
+        let room = vis.map_or((f64::MAX, f64::MAX), |v| (v.size.width - 16.0, v.size.height - chrome - 16.0));
+        let (w, h) = turned_size(shown, preferred, room);
+        *RESHAPED.lock().unwrap_or_else(|p| p.into_inner()) = Some((w, h));
         let mut r = msg_rect_rect(window, sel("frameRectForContentRect:"), NSRect { origin: NSPoint { x: 0.0, y: 0.0 }, size: NSSize { width: w, height: h } });
         r.origin.x = frame.origin.x + (frame.size.width - r.size.width) / 2.0;
         r.origin.y = frame.origin.y + (frame.size.height - r.size.height) / 2.0;
@@ -1760,7 +1785,7 @@ pub fn post_key(mods: &str, keycode: u16, chars: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::first_size;
+    use super::{first_size, turned_size};
     use crate::gpu::Display;
 
     /// The first window: the device's shape fitted to the screen, never more than one
@@ -1776,6 +1801,12 @@ mod tests {
         assert_eq!(first_size(phone, (2512.0, 1370.0), 2.0), (540.0, 1200.0));
         assert_eq!(first_size(small, (2512.0, 1370.0), 2.0), (360.0, 640.0));
         assert_eq!(first_size(tablet, (1422.0, 888.0), 2.0), (1280.0, 800.0));
+        // Turned on that screen it has to shrink; turned back, it is as it was.
+        let tall = turned_size((1600, 2560), 0.5, (1496.0, 876.0));
+        assert_eq!(tall, (547.0, 876.0));
+        assert_eq!(turned_size((2560, 1600), 0.5, (1496.0, 876.0)), (1280.0, 800.0));
+        // A phone turned keeps its scale where there's room.
+        assert_eq!(turned_size((2400, 1080), 0.25, (1496.0, 876.0)), (600.0, 270.0));
         // A screen at one pixel a point.
         assert_eq!(first_size(small, (1872.0, 1350.0), 1.0), (720.0, 1280.0));
         // A tablet on a small screen fits it, keeping its shape.

@@ -37,8 +37,8 @@ pub struct Device {
 
 /// What a device is like apart from its image, as an AVD's config.ini says
 /// (hw.lcd.width, height and density, hw.ramSize, hw.cpu.ncore). None is zeroemu's
-/// default, which `boot_settings` in main.rs fills in, so that a device made now
-/// follows a better default later.
+/// default, which `run` in main.rs fills in (the screen by `boot_display`), so that a
+/// device made now follows a better default later.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Settings {
     /// device.ini's screen= and density=.

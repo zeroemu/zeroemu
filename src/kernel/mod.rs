@@ -745,12 +745,23 @@ pub fn wakeup_stats(over: Duration) -> String {
     static MADE_LAST: AtomicU64 = AtomicU64::new(0);
     static WAITED_LAST: AtomicU64 = AtomicU64::new(0);
     let (made, waited) = (vcpus::MADE.load(Ordering::Relaxed), vcpus::WAITED.load(Ordering::Relaxed));
-    let (used, asleep, max) = vcpus::MAIN.get().and_then(|p| p.upgrade()).map_or((0, 0, 0), |p| p.usage());
+    let pool = vcpus::MAIN.get().and_then(|p| p.upgrade());
+    let (used, asleep, max) = pool.as_ref().map_or((0, 0, 0), |p| p.usage());
     let s = format!(
         "{s}, {:.0} vCPUs made/s, {used} of {max} in use ({asleep} asleep), {:.0} waits for one/s",
         (made - MADE_LAST.swap(made, Ordering::Relaxed)) as f64 / secs,
         (waited - WAITED_LAST.swap(waited, Ordering::Relaxed)) as f64 / secs
     );
+    // Only when Android has fewer cores than the host, as only then are they gated.
+    static CORE_WAITS_LAST: AtomicU64 = AtomicU64::new(0);
+    let s = match pool.and_then(|p| p.cores_usage()) {
+        Some((used, line, n, waits)) => format!(
+            "{s}, cores {used} of {n} in use ({line} in line), {:.0} waits for one/s",
+            // Saturating: the count is the pool's, and a new boot's pool starts again.
+            waits.saturating_sub(CORE_WAITS_LAST.swap(waits, Ordering::Relaxed)) as f64 / secs
+        ),
+        None => s,
+    };
     let top = wait::top_wakers(4);
     if top.is_empty() {
         return s;

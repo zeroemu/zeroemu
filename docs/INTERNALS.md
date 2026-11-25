@@ -194,8 +194,20 @@ on a device; `/data`'s tmpfs keeps ext4's inode flags and quota project ids
 Guest threads take their host priority from what Android says about them: real-time
 policies and nice -4 or better count as display work, the `top-app` cgroup as
 foreground, nice 10 or worse and the `background` and `dex2oat` cgroups as
-background. Background threads take turns on half the host's cores, as a phone
-would keep them to its little ones.
+background. Background threads take turns on half the cores Android is given, as a
+phone would keep them to its little ones.
+
+Android is given all of the host's cores unless a device asks for fewer. macOS cannot
+keep a thread to some of the cores, so then zeroemu lets no more guest threads run at
+once than the device has cores. A thread takes a core on its way into the guest and
+keeps it through its syscalls, as on Linux, until it blocks in the kernel, calls
+`sched_yield`, or has had a 10 ms turn while others wait. Display work is served
+first and stops a thread of other work to get a core at once; once it has run 50 ms,
+it lets the others in, as Linux's real-time throttling does. A thread waiting for a
+core keeps its vCPU, which costs far less than destroying it and making another,
+unless the hypervisor's vCPUs run short. Every thread takes a background place, a core
+and a vCPU in that order, and waits for them only on its way into the guest, where it
+holds no kernel lock, so threads cannot deadlock over them. See `src/kernel/vcpus.rs`.
 
 zeroemu tells macOS its work is user-initiated, so App Nap doesn't throttle it while
 its window is covered: a device keeps running in the background, as a phone's apps do

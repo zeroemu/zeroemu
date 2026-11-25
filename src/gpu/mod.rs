@@ -205,7 +205,9 @@ fn save_screenshot(_turns: u8) -> std::io::Result<std::path::PathBuf> {
 /// `action NAME` does what a toolbar item or Device menu item does
 /// (controls::Action::name); `menu Menu/Item` chooses a menu item by its titles;
 /// `toolbar NAME` clicks a toolbar item; `keyeq MODS KEYCODE CHARS` types a key with
-/// modifiers into the window, for its shortcut; `click U V` clicks the shown picture.
+/// modifiers into the window, for its shortcut; `click U V` clicks the shown picture;
+/// `location off|LAT,LON|PRESET` moves the device as Device > Location does
+/// (crate::location::Source::parse).
 pub fn control_line(line: &str) {
     let line = line.trim();
     let (word, rest) = line.split_once(' ').unwrap_or((line, ""));
@@ -214,6 +216,10 @@ pub fn control_line(line: &str) {
         "action" => match controls::Action::from_name(rest) {
             Some(a) => controls::perform(a),
             None => eprintln!("zeroemu: no action {rest:?}"),
+        },
+        "location" => match crate::location::Source::parse(rest) {
+            Ok(source) => crate::location::set(source),
+            Err(e) => eprintln!("zeroemu: {e}"),
         },
         #[cfg(target_os = "macos")]
         "menu" => window::choose_menu_item(rest),

@@ -4,9 +4,9 @@
 //! and its NUL). zeroemu is that host. Services it does not provide close
 //! the connection, as the emulator does.
 //!
-//! qemud services frame each message with its length in four hex digits.
-//! The clipboard pipe has binary framing, but zeroemu has nothing to say on
-//! it and drops what it hears.
+//! qemud services frame each message with its length in four hex digits, all but
+//! gps, whose NMEA sentences go as they are (gps_send). The clipboard pipe has binary
+//! framing, but zeroemu has nothing to say on it and drops what it hears.
 //!
 //! A guest can also listen, which is how host adb reaches adbd: the host side
 //! offers connections to a port here (adb.rs).
@@ -20,6 +20,7 @@ use crate::errno::*;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, Weak};
+use std::time::{Duration, SystemTime};
 
 pub const AF_VSOCK: u64 = 40;
 const VMADDR_CID_HOST: u32 = 2;
@@ -77,6 +78,9 @@ impl Drop for Vsock {
         if matches!(st.service, Some(Service::Sensors(_))) {
             SENSOR_PIPES.lock().unwrap().retain(|w| w.strong_count() > 0);
         }
+        if matches!(st.service, Some(Service::Gps)) {
+            GPS.lock().unwrap().pipes.retain(|w| w.strong_count() > 0);
+        }
     }
 }
 
@@ -98,6 +102,9 @@ const MAX_MESSAGE: usize = 64 << 10;
 
 enum Service {
     Sensors(Sensors),
+    /// The GNSS HAL's: where the device is, each second (feed_gps). What the HAL says
+    /// on it is dropped.
+    Gps,
     /// Answers a list request with an empty list.
     BootProperties,
     /// QemuMiscPipe: each message, a length and then its bytes, gets "OK" the same way.
@@ -194,6 +201,84 @@ pub fn posture() -> Option<u8> {
         FLAT => None,
         q => Some(q),
     }
+}
+
+/// The open gps pipes, and whether a thread is feeding them. The HAL keeps one open
+/// from its start, and opens another only if that one breaks.
+struct GpsPipes {
+    pipes: Vec<Weak<Vsock>>,
+    feeding: bool,
+}
+
+static GPS: Mutex<GpsPipes> = Mutex::new(GpsPipes { pipes: Vec::new(), feeding: false });
+
+/// What a gps pipe may hold that its reader hasn't read: a reader that stopped would
+/// otherwise have the sentences pile up. A second of them is under 150 bytes, and
+/// newer ones are what matter, so the second that finds it full is dropped.
+const GPS_BACKLOG: usize = 4096;
+
+/// A gps pipe was opened: the feeding thread sends it what the others get, and starts
+/// if none runs.
+fn listen_gps(pipe: &Arc<Vsock>) {
+    let mut gps = GPS.lock().unwrap();
+    gps.pipes.push(Arc::downgrade(pipe));
+    if !gps.feeding {
+        gps.feeding = std::thread::Builder::new().name("gps".into()).spawn(feed_gps).is_ok();
+    }
+}
+
+/// Sends the gps pipes where the device is (crate::location), once a second at each
+/// second of UTC, as a receiver reports, a device standing still too, and at once
+/// when the device is moved. While the location is off it sends nothing and sleeps
+/// until it changes, as a receiver with no sky in view has nothing to say. Ends when
+/// the last pipe has closed.
+fn feed_gps() {
+    loop {
+        let (fix, seen) = crate::location::fix();
+        let pipes: Vec<Arc<Vsock>> = {
+            let mut gps = GPS.lock().unwrap();
+            gps.pipes.retain(|w| w.strong_count() > 0);
+            if gps.pipes.is_empty() {
+                gps.feeding = false;
+                return;
+            }
+            gps.pipes.iter().filter_map(Weak::upgrade).collect()
+        };
+        let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default();
+        if let Some(fix) = &fix {
+            send_gps(&pipes, &crate::location::nmea(fix, now.as_secs()));
+        }
+        // A closed pipe goes now, not after the sleep.
+        drop(pipes);
+        let to_next_second = Duration::from_secs(1) - Duration::from_nanos(now.subsec_nanos() as u64);
+        crate::location::wait_for_change(seen, fix.map(|_| to_next_second));
+    }
+}
+
+/// Queues `nmea` on each of `pipes` and wakes their readers.
+fn send_gps(pipes: &[Arc<Vsock>], nmea: &str) {
+    for pipe in pipes {
+        let mut st = pipe.st.lock().unwrap();
+        let State { service: Some(Service::Gps), out, closed: false, .. } = &mut *st else { continue };
+        if out.len() > GPS_BACKLOG {
+            continue;
+        }
+        gps_send(out, nmea);
+        drop(st);
+        EVENTS.bump_key(Arc::as_ptr(pipe) as usize);
+    }
+}
+
+/// How sentences go on a gps pipe: as they are, lines from '$' to CR LF, with none of
+/// the four hex digits of length that the sensors service puts before each message.
+/// The Android Emulator's gps service is a qemud serial line, whose clients get bytes
+/// unframed (android-emu's android_qemud.cpp, its char services), and the HAL reads
+/// what comes, 64 bytes at a time, a byte at a time into a line that starts at a '$'
+/// and ends at a '\n' (GnssHwConn.cpp, GnssHwListener.cpp in device/generic/goldfish).
+/// It would skip lengths before each '$' as noise, so `frame(out, line)` for each line
+/// would work too, should a HAL ever want it: this is the one place to change.
+fn gps_send(out: &mut VecDeque<u8>, nmea: &str) {
+    out.extend(nmea.bytes());
 }
 
 /// A phone held still in `posture` (POSES), so not spinning, in a lit room at
@@ -317,6 +402,10 @@ impl Vsock {
                     st.service = Some(Service::Sensors(Sensors { delay_ms: 200, ..Default::default() }));
                     SENSOR_PIPES.lock().unwrap().push(Arc::downgrade(self));
                 }
+                "pipe:qemud:gps" => {
+                    st.service = Some(Service::Gps);
+                    listen_gps(self);
+                }
                 "pipe:qemud:boot-properties" => st.service = Some(Service::BootProperties),
                 "pipe:QemuMiscPipe" => st.service = Some(Service::Misc),
                 "pipe:clipboard" | "pipe:qemud:fingerprintlisten" => st.service = Some(Service::Silent),
@@ -330,7 +419,7 @@ impl Vsock {
                 }
             }
         }
-        if matches!(st.service, Some(Service::Silent)) {
+        if matches!(st.service, Some(Service::Silent | Service::Gps)) {
             return Ok(data.len());
         }
         st.inbuf.extend_from_slice(rest);
@@ -731,6 +820,84 @@ mod tests {
         assert!(out.is_empty(), "on already");
         sensors_message(&mut s, &mut out, "set:magnetic-field:1", None);
         assert_eq!(messages(&out)[0], "magnetic:0.00:5.90:-48.40");
+    }
+
+    #[test]
+    fn the_gps_gets_bare_nmea_lines() {
+        // A gps pipe as write() leaves it once the HAL has named the service.
+        let pipe = |service| {
+            let v = Vsock::new();
+            {
+                let mut st = v.st.lock().unwrap();
+                st.connected = true;
+                st.service = Some(service);
+            }
+            v
+        };
+        let gps = pipe(Service::Gps);
+        let sensors = pipe(Service::Sensors(Sensors::default()));
+        let fix = crate::location::Source::Preset("googleplex").fix_at(0.0).unwrap();
+        let nmea = crate::location::nmea(&fix, 1_700_000_000);
+        send_gps(&[gps.clone(), sensors.clone()], &nmea);
+        let got: Vec<u8> = gps.st.lock().unwrap().out.iter().copied().collect();
+        assert_eq!(got, nmea.as_bytes(), "no lengths before them");
+        assert!(got.starts_with(b"$GPGGA,") && got.ends_with(b"\r\n"));
+        assert!(sensors.st.lock().unwrap().out.is_empty(), "only gps pipes");
+        // A reader that stopped reading gets no more once a few seconds' worth wait.
+        for _ in 0..100 {
+            send_gps(std::slice::from_ref(&gps), &nmea);
+        }
+        let held = gps.st.lock().unwrap().out.len();
+        assert!(held <= GPS_BACKLOG + nmea.len() && held > GPS_BACKLOG, "{held}");
+        // A pipe the host closed gets nothing.
+        let closed = pipe(Service::Gps);
+        closed.st.lock().unwrap().closed = true;
+        send_gps(std::slice::from_ref(&closed), &nmea);
+        assert!(closed.st.lock().unwrap().out.is_empty());
+    }
+
+    #[test]
+    fn the_gps_hears_each_second_while_there_is_a_location() {
+        use crate::location::{self, Source};
+        use std::time::Instant;
+        let _one = location::TESTS_THAT_SET.lock().unwrap_or_else(|p| p.into_inner());
+        let heard = |v: &Arc<Vsock>, within: Duration| {
+            let start = Instant::now();
+            while v.st.lock().unwrap().out.is_empty() && start.elapsed() < within {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            !v.st.lock().unwrap().out.is_empty()
+        };
+        location::set(Source::Preset("city-run"));
+        let v = Vsock::new();
+        {
+            let mut st = v.st.lock().unwrap();
+            st.connected = true;
+            st.service = Some(Service::Gps);
+        }
+        listen_gps(&v);
+        assert!(heard(&v, Duration::from_secs(3)), "a fix at once");
+        assert!(v.st.lock().unwrap().out.iter().copied().collect::<Vec<u8>>().starts_with(b"$GPGGA,"));
+        v.st.lock().unwrap().out.clear();
+        assert!(heard(&v, Duration::from_millis(1500)), "and another the next second");
+        // Off: nothing, not even each second.
+        location::set(Source::Off);
+        std::thread::sleep(Duration::from_millis(100));
+        v.st.lock().unwrap().out.clear();
+        assert!(!heard(&v, Duration::from_millis(1200)), "nothing while off");
+        // A move shows at once, without waiting for the next second.
+        location::set(Source::Point { lat: -33.9249, lon: 18.4241 });
+        assert!(heard(&v, Duration::from_millis(500)));
+        let text = String::from_utf8(v.st.lock().unwrap().out.iter().copied().collect()).unwrap();
+        assert!(text.contains(",3355.4940,S,01825.4460,E,"), "{text}");
+        // The last pipe gone, the thread ends at its next wake.
+        drop(v);
+        location::set(Source::Off);
+        let start = Instant::now();
+        while GPS.lock().unwrap().feeding && start.elapsed() < Duration::from_secs(3) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!GPS.lock().unwrap().feeding);
     }
 
     #[test]

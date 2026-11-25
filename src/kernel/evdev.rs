@@ -14,7 +14,7 @@
 //! `usage USAGE CODE 1|0` for a button sent with a HID usage in hex (0x0c019f is
 //! Settings), `resize W H` for the window's content in points, and `shot PATH`, which
 //! writes the frame on show. Lines that start with `action`, `menu`, `toolbar`,
-//! `keyeq` or `click` go to the window's controls (gpu::control_line).
+//! `keyeq`, `click` or `location` go to the window's controls (gpu::control_line).
 
 use super::wait::EVENTS;
 use super::{ERESTARTSYS, IDLE, Thread};
@@ -517,7 +517,7 @@ fn input_line(line: &str) {
             }
         }
         // The window's toolbar and menu, which it owns: a test drives the same table.
-        ["action" | "menu" | "toolbar" | "keyeq" | "click", ..] => crate::gpu::control_line(line),
+        ["action" | "menu" | "toolbar" | "keyeq" | "click" | "location", ..] => crate::gpu::control_line(line),
         _ => eprintln!("zeroemu: bad input line {line:?}"),
     }
 }

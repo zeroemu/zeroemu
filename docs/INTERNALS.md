@@ -201,13 +201,20 @@ Android is given all of the host's cores unless a device asks for fewer. macOS c
 keep a thread to some of the cores, so then zeroemu lets no more guest threads run at
 once than the device has cores. A thread takes a core on its way into the guest and
 keeps it through its syscalls, as on Linux, until it blocks in the kernel, calls
-`sched_yield`, or has had a 10 ms turn while others wait. Display work is served
-first and stops a thread of other work to get a core at once; once it has run 50 ms,
-it lets the others in, as Linux's real-time throttling does. A thread waiting for a
-core keeps its vCPU, which costs far less than destroying it and making another,
-unless the hypervisor's vCPUs run short. Every thread takes a background place, a core
-and a vCPU in that order, and waits for them only on its way into the guest, where it
-holds no kernel lock, so threads cannot deadlock over them. See `src/kernel/vcpus.rs`.
+`sched_yield` while others wait, or has had a 10 ms turn while others wait. A core
+given up goes straight to the first thread in line, so one that comes for a core
+meanwhile cannot take it. Display work is served first: for each display thread in
+line, one thread of other work gives its core up at once, and only threads running
+guest code are kicked to make way, as one in the kernel makes way when it comes back.
+A display thread that has held its core 50 ms while only other work waits, or calls
+`sched_yield` then, takes 10 ms turns with the others until it next blocks, so a
+display thread that spins cannot shut them out, as Linux's real-time throttling
+ensures; one that blocks now and then is display work again each time it wakes. A
+thread waiting for a core keeps its vCPU, which costs far less than destroying it and
+making another, unless the hypervisor's vCPUs run short. Every thread takes a
+background place, a core and a vCPU in that order, and waits for them only on its way
+into the guest, where it holds no kernel lock, so threads cannot deadlock over them.
+See `src/kernel/vcpus.rs`.
 
 zeroemu tells macOS its work is user-initiated, so App Nap doesn't throttle it while
 its window is covered: a device keeps running in the background, as a phone's apps do

@@ -30,11 +30,21 @@
 //! affinity to keep threads to some of the cores, so letting no more than that many
 //! run at once is the only way to leave the Mac the rest. A thread holds a core from
 //! its way into the guest until it next blocks in the kernel, as a Linux thread keeps
-//! its CPU through its syscalls; it gives it up when it blocks, at sched_yield, and at
-//! the door once others wait and its turn is up. Display work goes first, as Linux
-//! runs real-time threads before the rest. A thread waiting for a core keeps its vCPU,
-//! marked asleep so the whole pool can still ask for it: destroying and making one
-//! costs far more than the wait. With as many cores as the host, there is no gate.
+//! its CPU through its syscalls; it gives it up when it blocks, at sched_yield while
+//! others wait, and at the door once others wait and its turn is up. A core given up
+//! goes straight to the first in line, so a thread that comes for one meanwhile cannot
+//! take it from someone who waited.
+//!
+//! Display work goes first, as Linux runs real-time threads before the rest: each
+//! display thread in line has one thread of other work give its core up at its next
+//! door, and the first in line kicks that many out of guest code to get them there.
+//! Display work that has held its core for DISPLAY_SLICE while only the rest wait, or
+//! yields to them, waits and runs as the rest until it next blocks, so it cannot take
+//! its core straight back. The first in line kicks only holders in guest code: one in
+//! the kernel comes to the door by itself, and one waiting for a vCPU has none to stop.
+//! A thread waiting for a core keeps its vCPU, marked asleep so the whole pool can still
+//! ask for it: destroying and making one costs far more than the wait. With as many
+//! cores as the host, there is no gate.
 //!
 //! Every thread takes its places in one order, background, then core, then vCPU, and
 //! waits for one only at the door, holding no kernel lock, and never holding a later
@@ -70,10 +80,12 @@ const SLICE: Duration = Duration::from_millis(10);
 /// How often free places are topped up, at most.
 const TOP_UP: Duration = Duration::from_millis(1);
 
-/// How long display work keeps a core while only other work waits for one. Linux's
+/// How long display work keeps a core while only other work waits for one; then it
+/// waits and runs as other work, a slice at a time, until it next blocks. Linux's
 /// real-time throttling keeps a share of every second for the rest
 /// (sched_rt_runtime_us, kernel/sched/rt.c) so that a real-time thread that spins
-/// cannot shut them out; this does the same for a display thread.
+/// cannot shut them out; this does as much for a display thread that spins without
+/// blocking. One that blocks now and then is display work again each time it wakes.
 const DISPLAY_SLICE: Duration = Duration::from_millis(50);
 
 pub struct Pool {
@@ -338,12 +350,14 @@ fn makes_way(holder_display: bool, held: Duration, first_display: bool) -> bool 
         (false, true) => true,
         // Turns among their like, a slice each, as SCHED_RR's and CFS's.
         (true, true) | (false, false) => held >= SLICE,
+        // Then it waits and runs as the rest until it next blocks (Held::spent).
         (true, false) => held >= DISPLAY_SLICE,
     }
 }
 
 /// Which holders, as (id, display work, held for), the first in line stops so that they
 /// come to the door and make way: those that would, longest held first, `n` at most.
+/// Only holders in guest code are given: a kick hurries no other to the door.
 fn to_kick(mut holders: Vec<(u64, bool, Duration)>, first_display: bool, n: usize) -> Vec<u64> {
     holders.retain(|&(_, display, held)| makes_way(display, held, first_display));
     holders.sort_unstable_by_key(|&(_, _, held)| std::cmp::Reverse(held));
@@ -357,6 +371,8 @@ trait Runner {
     fn is_dying(&self) -> bool;
     /// Asked by the whole pool for its vCPU (Pool::reclaim).
     fn asked_for_vcpu(&self) -> bool;
+    /// In guest code now: only then does stop_in_guest bring it to the door sooner.
+    fn in_guest(&self) -> bool;
     /// Stops it if it runs guest code, so that it comes to the door.
     fn stop_in_guest(&self);
     /// Sleeps on `cv` until it is notified, the thread is kicked or nudged, or `timeout`
@@ -374,6 +390,9 @@ impl Runner for Thread {
     fn asked_for_vcpu(&self) -> bool {
         self.give_back.load(Ordering::Relaxed)
     }
+    fn in_guest(&self) -> bool {
+        self.in_guest.load(Ordering::Relaxed)
+    }
     fn stop_in_guest(&self) {
         // Only the vCPU: a holder that sleeps without giving its core up waits for a
         // vCPU or a kernel lock, which waking it would not hurry.
@@ -390,32 +409,58 @@ impl Runner for Thread {
 struct Cores<R: Runner = Thread> {
     n: usize,
     st: Mutex<CoresState<R>>,
-    /// Threads in line, and how many of them are display work: read without the lock on
-    /// every way into the guest.
+    /// Threads in line, and how many of them in display work's: read without the lock on
+    /// every way into the guest. A thread leaves the count as it is handed a core.
     waiting: AtomicUsize,
     waiting_display: AtomicUsize,
     /// Times a thread waited in line, for wakeup_stats.
     waits: AtomicU64,
 }
 
+/// A thread holding a core.
+struct Held<R> {
+    who: Arc<R>,
+    /// Since when, for the first in line to stop those that have held theirs longest.
+    since: Instant,
+    /// Display work that made way for the rest or yielded to them: it counts as the rest
+    /// until it next blocks.
+    spent: bool,
+}
+
+impl<R: Runner> Held<R> {
+    fn display(&self) -> bool {
+        !self.spent && self.who.is_display()
+    }
+}
+
+/// A thread in line for a core.
+struct Waiter<R> {
+    ticket: u64,
+    cv: Arc<Condvar>,
+    who: Arc<R>,
+    spent: bool,
+}
+
 struct CoresState<R> {
     next: u64,
     used: usize,
-    /// Who holds a place, and since when, for the first in line to stop them.
-    holders: HashMap<u64, (Arc<R>, Instant)>,
+    holders: HashMap<u64, Held<R>>,
     /// Two lines, each served in order: display work's goes first.
-    display: VecDeque<(u64, Arc<Condvar>)>,
-    rest: VecDeque<(u64, Arc<Condvar>)>,
+    display: VecDeque<Waiter<R>>,
+    rest: VecDeque<Waiter<R>>,
+    /// Cores handed to threads that were in line, by ticket, as (place id, since): each
+    /// finds its own here when it wakes.
+    handed: HashMap<u64, (u64, Instant)>,
 }
 
 impl<R> CoresState<R> {
-    fn first(&self) -> Option<&(u64, Arc<Condvar>)> {
+    fn first(&self) -> Option<&Waiter<R>> {
         self.display.front().or(self.rest.front())
     }
 
     fn wake_first(&self) {
-        if let Some((_, cv)) = self.first() {
-            cv.notify_one();
+        if let Some(w) = self.first() {
+            w.cv.notify_one();
         }
     }
 
@@ -423,11 +468,12 @@ impl<R> CoresState<R> {
         self.used < n
     }
 
-    fn hold(&mut self, who: &Arc<R>) -> u64 {
+    fn hold(&mut self, who: &Arc<R>, spent: bool) -> (u64, Instant) {
         self.next += 1;
         self.used += 1;
-        self.holders.insert(self.next, (who.clone(), Instant::now()));
-        self.next
+        let since = Instant::now();
+        self.holders.insert(self.next, Held { who: who.clone(), since, spent });
+        (self.next, since)
     }
 }
 
@@ -435,45 +481,56 @@ impl<R: Runner> Cores<R> {
     fn new(n: usize) -> Self {
         Cores {
             n: n.max(1),
-            st: Mutex::new(CoresState { next: 0, used: 0, holders: HashMap::new(), display: VecDeque::new(), rest: VecDeque::new() }),
+            st: Mutex::new(CoresState { next: 0, used: 0, holders: HashMap::new(), display: VecDeque::new(), rest: VecDeque::new(), handed: HashMap::new() }),
             waiting: AtomicUsize::new(0),
             waiting_display: AtomicUsize::new(0),
             waits: AtomicU64::new(0),
         }
     }
 
-    /// Takes a place now if one is free and nobody is in line for it.
-    fn try_take(&self, who: &Arc<R>) -> Option<u64> {
+    /// Takes a place now if one is free and nobody is in line for it: its id, and since
+    /// when. `spent`: display work that is to count as the rest (Held::spent).
+    fn try_take(&self, who: &Arc<R>, spent: bool) -> Option<(u64, Instant)> {
         let mut st = self.st.lock().unwrap();
-        (st.free(self.n) && st.first().is_none()).then(|| st.hold(who))
+        (st.free(self.n) && st.first().is_none()).then(|| st.hold(who, spent))
     }
 
-    /// Takes a place, waiting in line for one: its id, or None if the thread is dying.
+    /// Takes a place, waiting in line for one: its id and since when, or None if the
+    /// thread is dying. `spent`: display work that is to wait and count as the rest.
     /// `vcpu`: it waits keeping its vCPU, which this gives up if the whole pool asks for
     /// it meanwhile, keeping its turn.
-    fn take(&self, who: &Arc<R>, mut vcpu: Option<&mut dyn FnMut()>) -> Option<u64> {
-        let display = who.is_display();
+    fn take(&self, who: &Arc<R>, spent: bool, mut vcpu: Option<&mut dyn FnMut()>) -> Option<(u64, Instant)> {
+        let display = !spent && who.is_display();
         let mut st = self.st.lock().unwrap();
         if who.is_dying() {
             return None;
         }
         if st.free(self.n) && st.first().is_none() {
-            return Some(st.hold(who));
+            return Some(st.hold(who, spent));
         }
         st.next += 1;
         let ticket = st.next;
         let cv = Arc::new(Condvar::new());
+        let w = Waiter { ticket, cv: cv.clone(), who: who.clone(), spent };
         if display {
-            st.display.push_back((ticket, cv.clone()));
+            st.display.push_back(w);
             self.waiting_display.fetch_add(1, Ordering::Relaxed);
         } else {
-            st.rest.push_back((ticket, cv.clone()));
+            st.rest.push_back(w);
         }
         self.waiting.fetch_add(1, Ordering::Relaxed);
         self.waits.fetch_add(1, Ordering::Relaxed);
-        let took = loop {
+        loop {
             if who.is_dying() {
-                break None;
+                match st.handed.remove(&ticket) {
+                    // Handed one as it died: on to the next in line.
+                    Some((id, _)) => self.give_up(&mut st, id),
+                    None => self.leave_line(&mut st, ticket, display),
+                }
+                return None;
+            }
+            if let Some(got) = st.handed.remove(&ticket) {
+                return Some(got);
             }
             if who.asked_for_vcpu()
                 && let Some(give_up) = vcpu.take()
@@ -484,49 +541,99 @@ impl<R: Runner> Cores<R> {
                 st = self.st.lock().unwrap();
                 continue;
             }
-            let first = st.first().is_some_and(|(x, _)| *x == ticket);
-            if first && st.free(self.n) {
-                break Some(st.hold(who));
-            }
+            let first = st.first().is_some_and(|w| w.ticket == ticket);
             if first {
                 // Holders that run guest code without exits would never come to the
                 // door: stop as many as there are in line of its kind, of those that
-                // should make way for it. Those in the kernel get there by themselves.
+                // should make way for it.
                 let first_display = !st.display.is_empty();
                 let n = if first_display { st.display.len() } else { st.rest.len() };
                 let now = Instant::now();
-                let holders = st.holders.iter().map(|(id, (r, since))| (*id, r.is_display(), now.saturating_duration_since(*since))).collect();
+                let holders = st.holders.iter().filter(|(_, h)| h.who.in_guest()).map(|(id, h)| (*id, h.display(), now.saturating_duration_since(h.since))).collect();
                 for id in to_kick(holders, first_display, n) {
-                    st.holders[&id].0.stop_in_guest();
+                    st.holders[&id].who.stop_in_guest();
                 }
             }
             st = who.wait_turn(&cv, st, if first { SLICE / 2 } else { super::IDLE });
-        };
+        }
+    }
+
+    /// Takes the thread with `ticket` out of its line, unserved.
+    fn leave_line(&self, st: &mut CoresState<R>, ticket: u64, display: bool) {
+        let line = if display { &mut st.display } else { &mut st.rest };
+        let Some(at) = line.iter().position(|w| w.ticket == ticket) else { return };
+        line.remove(at);
         if display {
-            st.display.retain(|(x, _)| *x != ticket);
             self.waiting_display.fetch_sub(1, Ordering::Relaxed);
-        } else {
-            st.rest.retain(|(x, _)| *x != ticket);
         }
         self.waiting.fetch_sub(1, Ordering::Relaxed);
-        // It is first now, and there may be room for it too.
+        // Someone else may be first now, to stop holders for its turn.
         st.wake_first();
-        took
+    }
+
+    /// Hands free places to the first in line, display work's first. Handed rather than
+    /// left free for the first to take when it wakes: meanwhile a thread that comes for
+    /// one would find it free, and display work would take it, even display work that
+    /// had just given it up.
+    fn serve(&self, st: &mut CoresState<R>) {
+        let mut served = false;
+        while st.free(self.n) {
+            let display = st.display.pop_front();
+            if display.is_some() {
+                self.waiting_display.fetch_sub(1, Ordering::Relaxed);
+            }
+            let Some(w) = display.or_else(|| st.rest.pop_front()) else { break };
+            self.waiting.fetch_sub(1, Ordering::Relaxed);
+            let got = st.hold(&w.who, w.spent);
+            st.handed.insert(w.ticket, got);
+            w.cv.notify_one();
+            served = true;
+        }
+        if served {
+            // Someone else is first now, to stop holders for its turn: at once, not when
+            // the one served gets round to waking.
+            st.wake_first();
+        }
+    }
+
+    /// Gives up place `id`, under the lock: to the first in line, if anyone is.
+    fn give_up(&self, st: &mut CoresState<R>, id: u64) {
+        if st.holders.remove(&id).is_some() {
+            st.used -= 1;
+            self.serve(st);
+        }
     }
 
     fn release(&self, id: u64) {
-        let mut st = self.st.lock().unwrap();
-        if st.holders.remove(&id).is_some() {
-            st.used -= 1;
-        }
-        st.wake_first();
+        self.give_up(&mut self.st.lock().unwrap(), id);
     }
 
-    /// Whether a holder that has held its core since `since` should give it up now, at
-    /// the door, for those in line. Read on every way into the guest: the clock only
-    /// when someone waits.
+    /// Whether a holder that has held its core since `since` may have to give it up now,
+    /// at the door, for those in line: give_way decides, under the lock. Read on every
+    /// way into the guest: the clock only when someone waits.
     fn should_yield(&self, display: bool, since: Instant) -> bool {
         self.waiting.load(Ordering::Relaxed) > 0 && makes_way(display, since.elapsed(), self.waiting_display.load(Ordering::Relaxed) > 0)
+    }
+
+    /// At the door, or at sched_yield if `yielding`: gives up place `id`, held since
+    /// `since` by display work or not, to the first in line if it should. Then the holder
+    /// waits in line itself: Some(true) if as the rest, being display work that gave way
+    /// to the rest only (Held::spent). None: it keeps its place.
+    /// Decided under the lock, with the core handed over at once: each thread in line is
+    /// owed one holder's place, so holders that come to the door after it was served
+    /// keep theirs.
+    fn give_way(&self, id: u64, display: bool, since: Instant, yielding: bool) -> Option<bool> {
+        let maybe = if yielding { self.waiting.load(Ordering::Relaxed) > 0 } else { self.should_yield(display, since) };
+        if !maybe {
+            return None;
+        }
+        let mut st = self.st.lock().unwrap();
+        let first_display = !st.display.is_empty();
+        if st.first().is_none() || !(yielding || makes_way(display, since.elapsed(), first_display)) {
+            return None;
+        }
+        self.give_up(&mut st, id);
+        Some(display && !first_display)
     }
 
     fn usage(&self) -> (usize, usize, usize, u64) {
@@ -546,6 +653,9 @@ struct Inner {
     gated: Option<u64>,
     /// Its place in the cores gate, and when it took it, while it has one.
     core: Option<(u64, Instant)>,
+    /// Display work that gave its core up to the rest (Held::spent): it waits and runs as
+    /// the rest until it next blocks.
+    spent: bool,
     /// What the host was last told about this thread.
     told: Option<Urgency>,
     /// A TLB flush asked for with no vCPU to ask: the next one does it. A new vCPU
@@ -643,22 +753,33 @@ impl Slot {
     /// or asks for it. True if it waited.
     fn take_core(&self) -> Result<bool, String> {
         let Some(c) = &self.pool.cores else { return Ok(false) };
-        let since = self.inner.borrow().core.map(|(_, since)| since);
-        match since {
-            Some(since) if !c.should_yield(self.thread.urgency() == Urgency::Display, since) => return Ok(false),
-            // To the back of its line. Here at the door it holds no kernel lock.
-            Some(_) => self.leave_core(),
+        let (core, spent) = {
+            let i = self.inner.borrow();
+            (i.core, i.spent)
+        };
+        match core {
+            Some((id, since)) => match c.give_way(id, !spent && self.thread.urgency() == Urgency::Display, since, false) {
+                None => return Ok(false),
+                // The first in line has its core now: to the back of its own line. Here
+                // at the door it holds no kernel lock.
+                Some(gave) => {
+                    let mut i = self.inner.borrow_mut();
+                    i.core = None;
+                    i.spent |= gave;
+                }
+            },
             None => {
-                if let Some(id) = c.try_take(&self.thread) {
-                    self.inner.borrow_mut().core = Some((id, Instant::now()));
+                if let Some(got) = c.try_take(&self.thread, spent) {
+                    self.inner.borrow_mut().core = Some(got);
                     return Ok(false);
                 }
             }
         }
+        let spent = self.inner.borrow().spent;
         let kept = self.idle();
         let mut give_up = || self.park_vcpu();
-        let Some(id) = c.take(&self.thread, if kept { Some(&mut give_up) } else { None }) else { return Err("dying".into()) };
-        self.inner.borrow_mut().core = Some((id, Instant::now()));
+        let Some(got) = c.take(&self.thread, spent, if kept { Some(&mut give_up) } else { None }) else { return Err("dying".into()) };
+        self.inner.borrow_mut().core = Some(got);
         // Awake again, if it kept its vCPU: an ask `reclaim` made of it as it got its
         // core no longer stands.
         self.running();
@@ -674,9 +795,15 @@ impl Slot {
     /// sched_yield: lets one in line for a core go first, as Linux runs another runnable
     /// thread first (do_sched_yield, kernel/sched/syscalls.c). A thread that spins on
     /// sched_yield waiting for one in line would otherwise hold its core a whole slice.
+    /// Display work that yields to the rest only waits as the rest: in its own line it
+    /// would be served first and take the core straight back.
     fn yield_core(&self) {
-        if self.pool.cores.as_ref().is_some_and(|c| c.waiting.load(Ordering::Relaxed) > 0) {
-            self.leave_core();
+        let Some(c) = &self.pool.cores else { return };
+        let mut i = self.inner.borrow_mut();
+        let Some((id, since)) = i.core else { return };
+        if let Some(gave) = c.give_way(id, !i.spent && self.thread.urgency() == Urgency::Display, since, true) {
+            i.core = None;
+            i.spent |= gave;
         }
     }
 
@@ -712,6 +839,8 @@ impl Slot {
         // Asleep, it uses no core.
         self.leave_gate();
         self.leave_core();
+        // Display work that gave way to the rest is display work again when it wakes.
+        self.inner.borrow_mut().spent = false;
         self.idle();
     }
 
@@ -797,7 +926,7 @@ pub struct LazyVcpu(Rc<Slot>);
 
 impl LazyVcpu {
     pub fn new(hv: Arc<dyn Hypervisor>, pool: Arc<Pool>, thread: Arc<Thread>, root: PageTableRoot, state: CpuState) -> LazyVcpu {
-        let slot = Rc::new(Slot { hv, pool, thread, inner: RefCell::new(Inner { vcpu: None, state, root, held: None, gated: None, core: None, told: None, flush_wanted: false, flush_asked: false }) });
+        let slot = Rc::new(Slot { hv, pool, thread, inner: RefCell::new(Inner { vcpu: None, state, root, held: None, gated: None, core: None, spent: false, told: None, flush_wanted: false, flush_asked: false }) });
         CURRENT.with(|c| *c.borrow_mut() = Some(slot.clone()));
         LazyVcpu(slot)
     }
@@ -866,9 +995,17 @@ impl Vcpu for LazyVcpu {
             Ok(false) => {}
         }
         self.0.running();
+        // Only the cores gate reads it, for whom to kick: with no gate, nothing changes.
+        let gated = self.0.pool.cores.is_some();
         let exit = {
             let mut i = self.0.inner.borrow_mut();
+            if gated {
+                self.0.thread.in_guest.store(true, Ordering::Relaxed);
+            }
             let exit = i.vcpu.as_mut().unwrap().run();
+            if gated {
+                self.0.thread.in_guest.store(false, Ordering::Relaxed);
+            }
             // It went in, and through any flush asked for.
             if !matches!(exit, Exit::Interrupted) {
                 i.flush_asked = false;
@@ -970,12 +1107,14 @@ mod tests {
         display: bool,
         dying: AtomicBool,
         asked: AtomicBool,
+        /// Running guest code: a holder spins there unless a test says otherwise.
+        in_guest: AtomicBool,
         kicks: AtomicUsize,
     }
 
     impl Fake {
         fn new(display: bool) -> Arc<Fake> {
-            Arc::new(Fake { display, ..Default::default() })
+            Arc::new(Fake { display, in_guest: AtomicBool::new(true), ..Default::default() })
         }
     }
 
@@ -988,6 +1127,9 @@ mod tests {
         }
         fn asked_for_vcpu(&self) -> bool {
             self.asked.load(Ordering::Relaxed)
+        }
+        fn in_guest(&self) -> bool {
+            self.in_guest.load(Ordering::Relaxed)
         }
         fn stop_in_guest(&self) {
             self.kicks.fetch_add(1, Ordering::Relaxed);
@@ -1005,6 +1147,16 @@ mod tests {
             assert!(start.elapsed() < Duration::from_secs(10), "timed out");
             std::thread::sleep(Duration::from_millis(1));
         }
+    }
+
+    /// Puts `who` in line for a core on a thread of its own, once no core is free:
+    /// returns when it is in line. The thread ends with the place it gets.
+    fn queue(gate: &Arc<Cores<Fake>>, who: &Arc<Fake>, spent: bool) -> std::thread::JoinHandle<Option<(u64, Instant)>> {
+        let before = gate.waits.load(Ordering::Relaxed);
+        let (g, who) = (gate.clone(), who.clone());
+        let j = std::thread::spawn(move || g.take(&who, spent, None));
+        until(|| gate.waits.load(Ordering::Relaxed) > before);
+        j
     }
 
     #[test]
@@ -1043,12 +1195,15 @@ mod tests {
     #[test]
     fn places_are_counted() {
         let gate = Cores::<Fake>::new(2);
-        let a = gate.try_take(&Fake::new(false)).unwrap();
-        let _b = gate.try_take(&Fake::new(false)).unwrap();
-        assert_eq!(gate.try_take(&Fake::new(true)), None);
-        assert!(!gate.should_yield(false, Instant::now() - Duration::from_secs(1)), "nobody waits");
+        let (a, _) = gate.try_take(&Fake::new(false), false).unwrap();
+        let (b, _) = gate.try_take(&Fake::new(false), false).unwrap();
+        assert_eq!(gate.try_take(&Fake::new(true), false), None);
+        let long_ago = Instant::now() - Duration::from_secs(1);
+        assert!(!gate.should_yield(false, long_ago), "nobody waits");
+        assert_eq!(gate.give_way(b, false, long_ago, false), None);
+        assert_eq!(gate.give_way(b, true, long_ago, true), None);
         gate.release(a);
-        assert!(gate.try_take(&Fake::new(false)).is_some());
+        assert!(gate.try_take(&Fake::new(false), false).is_some());
         assert_eq!(gate.usage().0, 2);
         // A place given back twice is given back once.
         gate.release(a);
@@ -1059,24 +1214,24 @@ mod tests {
     fn display_work_goes_first_and_the_rest_in_turn() {
         let gate = Arc::new(Cores::<Fake>::new(1));
         let holder = Fake::new(false);
-        let id = gate.try_take(&holder).unwrap();
+        let (id, _) = gate.try_take(&holder, false).unwrap();
         let order = Arc::new(Mutex::new(Vec::new()));
         let mut joins = Vec::new();
         for (name, display) in [("a", false), ("b", false), ("c", true)] {
             let (g, order) = (gate.clone(), order.clone());
-            let before = gate.waiting.load(Ordering::Relaxed);
+            let before = gate.waits.load(Ordering::Relaxed);
             joins.push(std::thread::spawn(move || {
-                let id = g.take(&Fake::new(display), None).expect("a place");
+                let (id, _) = g.take(&Fake::new(display), false, None).expect("a place");
                 order.lock().unwrap().push(name);
                 g.release(id);
             }));
-            until(|| gate.waiting.load(Ordering::Relaxed) == before + 1);
+            until(|| gate.waits.load(Ordering::Relaxed) == before + 1);
         }
         // Display work in line: the holder is stopped, and makes way at its door.
         until(|| holder.kicks.load(Ordering::Relaxed) > 0);
         assert!(gate.should_yield(false, Instant::now()));
         assert!(!gate.should_yield(true, Instant::now()));
-        gate.release(id);
+        assert_eq!(gate.give_way(id, false, Instant::now(), false), Some(false));
         for j in joins {
             j.join().unwrap();
         }
@@ -1086,26 +1241,124 @@ mod tests {
     }
 
     #[test]
+    fn a_core_given_up_goes_straight_to_the_first_in_line() {
+        let gate = Arc::new(Cores::<Fake>::new(1));
+        let (id, _) = gate.try_take(&Fake::new(false), false).unwrap();
+        let first = queue(&gate, &Fake::new(false), false);
+        gate.release(id);
+        // Display work that comes for it before the one in line has woken waits too,
+        // though it would go first.
+        let late = queue(&gate, &Fake::new(true), false);
+        until(|| first.is_finished());
+        let (got, _) = first.join().unwrap().expect("the core");
+        assert_eq!(gate.waiting_display.load(Ordering::Relaxed), 1, "still in line");
+        gate.release(got);
+        let (got, _) = late.join().unwrap().expect("the core next");
+        gate.release(got);
+        assert_eq!(gate.usage().0, 0);
+    }
+
+    #[test]
+    fn display_work_that_made_way_for_the_rest_waits_as_the_rest() {
+        let gate = Arc::new(Cores::<Fake>::new(1));
+        let display = Fake::new(true);
+        let (id, _) = gate.try_take(&display, false).unwrap();
+        let r = queue(&gate, &Fake::new(false), false);
+        // Only the rest wait: display work keeps its core a long slice, then makes way.
+        assert_eq!(gate.give_way(id, true, Instant::now(), false), None);
+        assert_eq!(gate.give_way(id, true, Instant::now() - DISPLAY_SLICE, false), Some(true));
+        until(|| r.is_finished());
+        let (got, _) = r.join().unwrap().expect("the core");
+        // Spent, it waits in the rest's line, so the holder keeps its core a slice: had
+        // it gone first, the holder would make way at once.
+        let d = queue(&gate, &display, true);
+        assert_eq!(gate.waiting_display.load(Ordering::Relaxed), 0);
+        assert!(!gate.should_yield(false, Instant::now()));
+        assert_eq!(gate.give_way(got, false, Instant::now(), false), None);
+        assert_eq!(gate.give_way(got, false, Instant::now() - SLICE, false), Some(false));
+        let (got, _) = d.join().unwrap().expect("the core");
+        gate.release(got);
+        assert_eq!(gate.usage().0, 0);
+    }
+
+    #[test]
+    fn sched_yield_lets_the_first_in_line_go_first() {
+        let gate = Arc::new(Cores::<Fake>::new(1));
+        let (id, _) = gate.try_take(&Fake::new(true), false).unwrap();
+        let now = Instant::now();
+        assert_eq!(gate.give_way(id, true, now, true), None, "nobody waits");
+        // Display work that yields to the rest only waits as the rest.
+        let r = queue(&gate, &Fake::new(false), false);
+        assert_eq!(gate.give_way(id, true, now, true), Some(true));
+        let (id, _) = r.join().unwrap().expect("the core");
+        // To display work, the rest yields, and display work stays display work.
+        let d = queue(&gate, &Fake::new(true), false);
+        assert_eq!(gate.give_way(id, false, now, true), Some(false));
+        let (id, _) = d.join().unwrap().expect("the core");
+        let d = queue(&gate, &Fake::new(true), false);
+        assert_eq!(gate.give_way(id, true, now, true), Some(false));
+        let (id, _) = d.join().unwrap().expect("the core");
+        gate.release(id);
+        assert_eq!(gate.usage().0, 0);
+    }
+
+    #[test]
+    fn only_holders_in_guest_code_are_stopped() {
+        let gate = Arc::new(Cores::<Fake>::new(2));
+        // Held longest, but in the kernel: it comes to the door by itself.
+        let in_kernel = Fake::new(false);
+        in_kernel.in_guest.store(false, Ordering::Relaxed);
+        let (a, _) = gate.try_take(&in_kernel, false).unwrap();
+        std::thread::sleep(Duration::from_millis(2));
+        let spinning = Fake::new(false);
+        let (b, _) = gate.try_take(&spinning, false).unwrap();
+        // One kick for one in line: the holder in guest code gets it.
+        let w = queue(&gate, &Fake::new(true), false);
+        until(|| spinning.kicks.load(Ordering::Relaxed) > 0);
+        assert_eq!(in_kernel.kicks.load(Ordering::Relaxed), 0);
+        assert_eq!(gate.give_way(b, false, Instant::now(), false), Some(false));
+        let (got, _) = w.join().unwrap().expect("the core");
+        gate.release(got);
+        gate.release(a);
+        assert_eq!(gate.usage().0, 0);
+    }
+
+    #[test]
+    fn as_many_holders_make_way_for_display_work_as_wait() {
+        let gate = Arc::new(Cores::<Fake>::new(3));
+        let held: Vec<u64> = (0..3).map(|_| gate.try_take(&Fake::new(false), false).unwrap().0).collect();
+        let waiters = [queue(&gate, &Fake::new(true), false), queue(&gate, &Fake::new(true), false)];
+        let now = Instant::now();
+        // Each holder that comes to the door serves one in line: the third finds nobody
+        // left and keeps its core.
+        assert_eq!(gate.give_way(held[0], false, now, false), Some(false));
+        assert_eq!(gate.give_way(held[1], false, now, false), Some(false));
+        assert!(!gate.should_yield(false, now));
+        assert_eq!(gate.give_way(held[2], false, now, false), None);
+        for w in waiters {
+            gate.release(w.join().unwrap().expect("a core").0);
+        }
+        gate.release(held[2]);
+        assert_eq!(gate.usage().0, 0);
+    }
+
+    #[test]
     fn dying_ends_a_wait() {
         let gate = Arc::new(Cores::<Fake>::new(1));
-        let id = gate.try_take(&Fake::new(false)).unwrap();
+        let (id, _) = gate.try_take(&Fake::new(false), false).unwrap();
         let dying = Fake::new(false);
-        let d = {
-            let (g, who) = (gate.clone(), dying.clone());
-            std::thread::spawn(move || g.take(&who, None))
-        };
-        until(|| gate.waiting.load(Ordering::Relaxed) == 1);
+        let d = queue(&gate, &dying, false);
         dying.dying.store(true, Ordering::Relaxed);
         assert_eq!(d.join().unwrap(), None);
         assert_eq!(gate.waiting.load(Ordering::Relaxed), 0);
         gate.release(id);
-        assert!(gate.try_take(&Fake::new(false)).is_some(), "nobody left in line");
+        assert!(gate.try_take(&Fake::new(false), false).is_some(), "nobody left in line");
     }
 
     #[test]
     fn an_ask_for_the_vcpu_a_waiter_keeps_costs_it_the_vcpu_but_not_its_turn() {
         let gate = Arc::new(Cores::<Fake>::new(1));
-        let id = gate.try_take(&Fake::new(false)).unwrap();
+        let (id, _) = gate.try_take(&Fake::new(false), false).unwrap();
         let order = Arc::new(Mutex::new(Vec::new()));
         let gave_up = Arc::new(AtomicUsize::new(0));
         let (first, second) = (Fake::new(false), Fake::new(false));
@@ -1117,7 +1370,7 @@ mod tests {
                 let mut give_up = || {
                     gave_up.fetch_add(1, Ordering::Relaxed);
                 };
-                let id = g.take(&who, if with_vcpu { Some(&mut give_up) } else { None }).expect("a place");
+                let (id, _) = g.take(&who, false, if with_vcpu { Some(&mut give_up) } else { None }).expect("a place");
                 order.lock().unwrap().push(name);
                 g.release(id);
             }));

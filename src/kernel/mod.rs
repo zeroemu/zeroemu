@@ -618,6 +618,10 @@ pub struct Thread {
     host: std::sync::OnceLock<crate::hv::HostThread>,
     /// Asked to give its vCPU back the next time it blocks (vcpus::Pool::reclaim).
     give_back: AtomicBool,
+    /// In guest code on its vCPU, kept only while cores are gated (vcpus::Cores): the
+    /// first in line for a core stops only holders that are, as a kick hurries no other
+    /// to the door.
+    in_guest: AtomicBool,
     /// Its place on the futex queues, where a kick finds it asleep in a futex wait.
     futex: Arc<futex::Waiter>,
     /// A descriptor table of its own: cloned without CLONE_FILES. Bionic's
@@ -988,6 +992,7 @@ impl Thread {
             in_syscall: Default::default(),
             host: std::sync::OnceLock::new(),
             give_back: AtomicBool::new(false),
+            in_guest: AtomicBool::new(false),
             futex: futex::Waiter::new(),
         })
     }

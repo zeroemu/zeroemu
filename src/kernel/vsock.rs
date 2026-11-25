@@ -67,6 +67,9 @@ struct State {
     stream: Option<Arc<Io>>,
     /// The port it was accepted on.
     local_port: u32,
+    /// A gps pipe: location::changes() when what `out` holds was queued. Read at a later
+    /// count, it may be a place the device has left, and goes unread.
+    gps_changes: u64,
 }
 
 impl Drop for Vsock {
@@ -248,7 +251,7 @@ fn feed_gps() {
         let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default();
         // Off: nothing new, and what was queued goes, so the HAL never reads a place
         // the device has left.
-        send_gps(&pipes, &fix.as_ref().map(|f| crate::location::nmea(f, now.as_secs())).unwrap_or_default());
+        send_gps(&pipes, &fix.as_ref().map(|f| crate::location::nmea(f, now.as_secs())).unwrap_or_default(), seen);
         // A closed pipe goes now, not after the sleep.
         drop(pipes);
         let to_next_second = Duration::from_secs(1) - Duration::from_nanos(now.subsec_nanos() as u64);
@@ -258,11 +261,12 @@ fn feed_gps() {
 
 /// Queues `nmea` on each of `pipes` in place of what they haven't read, and wakes their
 /// readers; with nothing to send, only clears.
-fn send_gps(pipes: &[Arc<Vsock>], nmea: &str) {
+fn send_gps(pipes: &[Arc<Vsock>], nmea: &str, changes: u64) {
     for pipe in pipes {
         let mut st = pipe.st.lock().unwrap();
-        let State { service: Some(Service::Gps), out, closed: false, .. } = &mut *st else { continue };
+        let State { service: Some(Service::Gps), out, closed: false, gps_changes, .. } = &mut *st else { continue };
         gps_send(out, nmea);
+        *gps_changes = changes;
         drop(st);
         if !nmea.is_empty() {
             EVENTS.bump_key(Arc::as_ptr(pipe) as usize);
@@ -284,10 +288,16 @@ fn send_gps(pipes: &[Arc<Vsock>], nmea: &str) {
 /// one's middle. So a reader that stalls finds one fix waiting, never a backlog, nor a
 /// place the device has left.
 fn gps_send(out: &mut VecDeque<u8>, nmea: &str) {
+    drop_unread_gps(out);
+    out.extend(nmea.bytes());
+}
+
+/// Drops the sentences on a gps pipe that its reader hasn't begun, keeping the rest of
+/// one it has, which would otherwise end in the next one's middle.
+fn drop_unread_gps(out: &mut VecDeque<u8>) {
     let begun = out.front().is_some_and(|&b| b != b'$');
     let keep = if begun { out.iter().position(|&b| b == b'\n').map_or(out.len(), |i| i + 1) } else { 0 };
     out.truncate(keep);
-    out.extend(nmea.bytes());
 }
 
 /// A phone held still in `posture` (POSES), so not spinning, in a lit room at
@@ -497,6 +507,12 @@ impl Vsock {
                 let mut st = self.st.lock().unwrap();
                 if !st.connected {
                     return Err(ENOTCONN);
+                }
+                // A fix queued before the device moved (or the GPS went off) is of a place
+                // it has left: the reader never sees it, as it may have been queued after
+                // the change was made, from a fix taken before it.
+                if matches!(st.service, Some(Service::Gps)) && st.gps_changes != crate::location::changes() {
+                    drop_unread_gps(&mut st.out);
                 }
                 if !st.out.is_empty() {
                     let n = count.min(st.out.len());
@@ -847,31 +863,31 @@ mod tests {
         let sensors = pipe(Service::Sensors(Sensors::default()));
         let fix = crate::location::Source::Preset("googleplex").fix_at(0.0).unwrap();
         let nmea = crate::location::nmea(&fix, 1_700_000_000);
-        send_gps(&[gps.clone(), sensors.clone()], &nmea);
+        send_gps(&[gps.clone(), sensors.clone()], &nmea, 0);
         let got: Vec<u8> = gps.st.lock().unwrap().out.iter().copied().collect();
         assert_eq!(got, nmea.as_bytes(), "no lengths before them");
         assert!(got.starts_with(b"$GPGGA,") && got.ends_with(b"\r\n"));
         assert!(sensors.st.lock().unwrap().out.is_empty(), "only gps pipes");
         // A reader that stopped reading finds only the newest fix waiting.
         for _ in 0..100 {
-            send_gps(std::slice::from_ref(&gps), &nmea);
+            send_gps(std::slice::from_ref(&gps), &nmea, 0);
         }
         assert_eq!(gps.st.lock().unwrap().out.len(), nmea.len());
         // One that has read part of a sentence gets the rest of it, then the new fix.
         gps.st.lock().unwrap().out.drain(..10);
         let rest_of_first = nmea.find('\n').unwrap() + 1 - 10;
-        send_gps(std::slice::from_ref(&gps), &nmea);
+        send_gps(std::slice::from_ref(&gps), &nmea, 0);
         let got: Vec<u8> = gps.st.lock().unwrap().out.iter().copied().collect();
         assert_eq!(got.len(), rest_of_first + nmea.len());
         assert!(got[rest_of_first..].starts_with(b"$GPGGA,"));
         // Off: once the reader has finished the sentence it began, what was queued goes.
         gps.st.lock().unwrap().out.drain(..rest_of_first);
-        send_gps(std::slice::from_ref(&gps), "");
+        send_gps(std::slice::from_ref(&gps), "", 0);
         assert!(gps.st.lock().unwrap().out.is_empty());
         // A pipe the host closed gets nothing.
         let closed = pipe(Service::Gps);
         closed.st.lock().unwrap().closed = true;
-        send_gps(std::slice::from_ref(&closed), &nmea);
+        send_gps(std::slice::from_ref(&closed), &nmea, 0);
         assert!(closed.st.lock().unwrap().out.is_empty());
     }
 

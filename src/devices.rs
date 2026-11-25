@@ -70,15 +70,13 @@ impl Settings {
             (Some((w, h)), Some(dpi)) => Display::new(w, h, dpi).ok(),
             _ => None,
         };
-        // As sdk::properties reads a line's key: up to the first = or :.
+        // A line's key as sdk::properties reads it, escapes and all (net\work is
+        // network): a known key's line is never kept, as it would win over the setting
+        // written before it.
         let others = text
             .lines()
             .map(|l| l.trim_end_matches('\r'))
-            .filter(|l| {
-                let t = l.trim_start();
-                let key = t.find(['=', ':']).map(|at| t[..at].trim());
-                key.is_some_and(|k| !KEYS.contains(&k)) && !t.starts_with('#') && !t.starts_with('!')
-            })
+            .filter(|l| sdk::properties(l).keys().next().is_some_and(|k| !KEYS.contains(&k.as_str())))
             .map(str::to_string)
             .collect();
         Settings {
@@ -476,7 +474,10 @@ impl Store {
         let _lock = self.lock()?;
         let now = self.current(d)?;
         let name = check_name(name, &self.list(), Some(&now.id))?;
-        let changed = Device { name, settings: settings.clone(), ..now };
+        // What the form doesn't show comes from the file as it is now: a line added
+        // since the form opened stays.
+        let settings = Settings { others: now.settings.others.clone(), ..settings.clone() };
+        let changed = Device { name, settings, ..now };
         write(&changed)?;
         Ok(changed)
     }
@@ -1004,6 +1005,19 @@ mod tests {
         let text = std::fs::read_to_string(again.ini()).unwrap();
         assert!(text.contains("notes=first\\nnetwork=off\n") && !text.lines().any(|l| l == "network=off"), "{text}");
         assert_eq!(store.find("Once more").unwrap().settings.network, None);
+        // A known key spelled with an escape is the known key: not kept as a line of
+        // its own, where it would win over the setting written before it.
+        let ini = again.ini();
+        std::fs::write(&ini, std::fs::read_to_string(&ini).unwrap() + "net\\work=off\n").unwrap();
+        let spelled = store.find("Once more").unwrap();
+        assert_eq!(spelled.settings.network, Some(false));
+        let on = store.edit(&spelled, "Once more", &Settings { network: None, ..spelled.settings.clone() }).unwrap();
+        assert_eq!(store.find("Once more").unwrap().settings.network, None, "{:?}", std::fs::read_to_string(on.ini()));
+        // A line added while the form was open stays when it saves.
+        std::fs::write(&ini, std::fs::read_to_string(&ini).unwrap() + "added=later\n").unwrap();
+        store.edit(&on, "Once more", &on.settings).unwrap();
+        assert!(std::fs::read_to_string(&ini).unwrap().contains("added=later\n"));
+        let again = store.find("Once more").unwrap();
         // Edit changes the name and the settings together, or neither.
         let fewer = Settings { cpus: Some(1), ..again.settings.clone() };
         let other = store.create("Taken", &img).unwrap();

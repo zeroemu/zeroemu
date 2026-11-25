@@ -294,13 +294,35 @@ pub fn zone_city(zone: &str) -> Option<(String, f64, f64)> {
         return Some((city(zone), lat, lon));
     }
     let dir = std::path::Path::new("/usr/share/zoneinfo");
+    // The database's own links (tzdata.zi's "L target alias" lines), followed to a zone.
+    let links = std::fs::read_to_string(dir.join("tzdata.zi")).unwrap_or_default();
+    let mut name = zone.to_string();
+    for _ in 0..8 {
+        let Some(target) = links.lines().find_map(|l| l.strip_prefix("L ").and_then(|l| l.split_once(' ')).filter(|(_, alias)| alias.trim() == name).map(|(t, _)| t.trim().to_string())) else {
+            break;
+        };
+        if let Some((lat, lon)) = tabs.iter().find_map(|t| zone_place(t, &target)) {
+            return Some((city(&target), lat, lon));
+        }
+        name = target;
+    }
+    // Without them, the zone whose rules are the same file, if only one is: several
+    // can be (US/Arizona, America/Phoenix and America/Creston), and then which city
+    // is meant isn't known.
     let rules = std::fs::read(dir.join(zone)).ok()?;
-    tabs.iter().find_map(|t| {
-        t.lines().filter(|l| !l.starts_with('#')).find_map(|line| {
-            let name = line.split('\t').nth(2)?.trim();
-            (std::fs::read(dir.join(name)).ok()? == rules).then(|| zone_place(t, name).map(|(lat, lon)| (city(name), lat, lon))).flatten()
-        })
-    })
+    let mut same: Vec<(String, f64, f64)> = Vec::new();
+    for t in &tabs {
+        for line in t.lines().filter(|l| !l.starts_with('#')) {
+            let Some(name) = line.split('\t').nth(2).map(str::trim) else { continue };
+            if std::fs::read(dir.join(name)).ok().as_ref() == Some(&rules)
+                && let Some((lat, lon)) = zone_place(t, name)
+                && !same.iter().any(|s| s.0 == city(name))
+            {
+                same.push((city(name), lat, lon));
+            }
+        }
+    }
+    if same.len() == 1 { same.pop() } else { None }
 }
 
 /// The place zone.tab or zone1970.tab gives `zone`. Their lines are country codes,
@@ -418,6 +440,12 @@ pub fn set(source: Source) {
     c.since = Some(Instant::now());
     c.changes += 1;
     CHANGED.notify_all();
+}
+
+/// How many changes there have been: a fix queued at an older count may be of a place
+/// the device has left (src/kernel/vsock.rs drops it unread).
+pub fn changes() -> u64 {
+    CURRENT.lock().unwrap().changes
 }
 
 /// Has `wait_for_change` look again without a change of place: the last gps pipe
@@ -858,6 +886,8 @@ mod tests {
         assert_eq!(new_york.0, "New York");
         assert_eq!(zone_city("US/Eastern"), Some(new_york));
         assert_eq!(zone_city("Asia/Calcutta").map(|c| c.0), Some("Kolkata".into()));
+        // Several zones share Arizona's rules: the database's link says which.
+        assert_eq!(zone_city("US/Arizona").map(|c| c.0), Some("Phoenix".into()));
         assert_eq!(zone_city("Mars/Olympus"), None);
     }
 }

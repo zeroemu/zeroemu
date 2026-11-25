@@ -42,7 +42,8 @@
 //! yields to them, waits and runs as the rest until it next blocks, so it cannot take
 //! its core straight back. Display threads taking turns could still keep the rest out
 //! for good, so the first of the rest goes first once it has waited REST_WAIT, and
-//! display work makes way for it after its DISPLAY_SLICE. The first in line kicks only
+//! display work makes way for it after its DISPLAY_SLICE; while both lines wait, they
+//! take turns, so neither waits for good. The first in line kicks only
 //! holders in guest code: one in
 //! the kernel comes to the door by itself, and one waiting for a vCPU has none to stop.
 //! A thread waiting for a core keeps its vCPU, marked asleep so the whole pool can still
@@ -462,12 +463,17 @@ struct CoresState<R> {
     /// Cores handed to threads that were in line, by ticket, as (place id, since): each
     /// finds its own here when it wakes.
     handed: HashMap<u64, (u64, Instant)>,
+    /// The rest went first, being due, while display work waited: the next core is
+    /// display work's. Under load both lines stay full and the rest's first is always
+    /// due, so without turns display work would wait for good in its place.
+    rest_went: bool,
 }
 
 impl<R> CoresState<R> {
     /// The first of the rest has waited REST_WAIT behind display work: it goes first.
     fn rest_due(&self) -> bool {
-        self.rest.front().is_some_and(|w| w.since.elapsed() >= REST_WAIT)
+        let display_owed = self.rest_went && !self.display.is_empty();
+        !display_owed && self.rest.front().is_some_and(|w| w.since.elapsed() >= REST_WAIT)
     }
 
     fn first(&self) -> Option<&Waiter<R>> {
@@ -502,7 +508,7 @@ impl<R: Runner> Cores<R> {
     fn new(n: usize) -> Self {
         Cores {
             n: n.max(1),
-            st: Mutex::new(CoresState { next: 0, used: 0, holders: HashMap::new(), display: VecDeque::new(), rest: VecDeque::new(), handed: HashMap::new() }),
+            st: Mutex::new(CoresState { next: 0, used: 0, holders: HashMap::new(), display: VecDeque::new(), rest: VecDeque::new(), handed: HashMap::new(), rest_went: false }),
             waiting: AtomicUsize::new(0),
             waiting_display: AtomicUsize::new(0),
             waits: AtomicU64::new(0),
@@ -576,8 +582,9 @@ impl<R: Runner> Cores<R> {
                 }
             }
             // The first of the rest, behind display work, looks again when it is due to
-            // go first, to stop holders for its turn then.
-            let due = st.rest.front().filter(|w| w.ticket == ticket).map(|w| REST_WAIT.saturating_sub(w.since.elapsed()).max(Duration::from_millis(1)));
+            // go first, to stop holders for its turn then. Once due, it is woken when it
+            // is first (serve's wake_first), so it doesn't wake meanwhile.
+            let due = st.rest.front().filter(|w| w.ticket == ticket).and_then(|w| REST_WAIT.checked_sub(w.since.elapsed())).map(|d| d.max(Duration::from_millis(1)));
             st = who.wait_turn(&cv, st, if first { SLICE / 2 } else { due.unwrap_or(super::IDLE) });
         }
     }
@@ -602,10 +609,14 @@ impl<R: Runner> Cores<R> {
     fn serve(&self, st: &mut CoresState<R>) {
         let mut served = false;
         while st.free(self.n) {
-            let display = if st.rest_due() { None } else { st.display.pop_front() };
+            let due = st.rest_due();
+            let display = if due { None } else { st.display.pop_front() };
             if display.is_some() {
                 self.waiting_display.fetch_sub(1, Ordering::Relaxed);
             }
+            // Display work served: the rest may go first again when due. The rest, being
+            // due, ahead of display work: display work's turn next.
+            st.rest_went = if display.is_some() { false } else { due && !st.display.is_empty() };
             let Some(w) = display.or_else(|| st.rest.pop_front()).or_else(|| {
                 // The rest due first, but none left: display work, then.
                 let w = st.display.pop_front();
@@ -1336,6 +1347,30 @@ mod tests {
         assert!(!d.is_finished());
         gate.release(id);
         let (id, _) = d.join().unwrap().expect("the core");
+        gate.release(id);
+        assert_eq!(gate.usage().0, 0);
+    }
+
+    #[test]
+    fn the_rest_due_and_display_work_take_turns_when_both_wait() {
+        // One core, the rest always due (they waited REST_WAIT), display work waiting too:
+        // the core goes to each in turn, so neither waits for good.
+        let gate = Arc::new(Cores::<Fake>::new(1));
+        let (mut id, _) = gate.try_take(&Fake::new(false), false).unwrap();
+        let r1 = queue(&gate, &Fake::new(false), false);
+        let r2 = queue(&gate, &Fake::new(false), false);
+        std::thread::sleep(REST_WAIT + Duration::from_millis(5));
+        let d = queue(&gate, &Fake::new(true), false);
+        // The rest's first is due: it goes first, ahead of display work.
+        gate.release(id);
+        (id, _) = r1.join().unwrap().expect("the core");
+        assert!(!d.is_finished());
+        // Then display work, though the rest's next is due as well.
+        gate.release(id);
+        (id, _) = d.join().unwrap().expect("the core");
+        assert!(!r2.is_finished());
+        gate.release(id);
+        let (id, _) = r2.join().unwrap().expect("the core");
         gate.release(id);
         assert_eq!(gate.usage().0, 0);
     }

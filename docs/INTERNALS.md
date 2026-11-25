@@ -224,7 +224,7 @@ display thread that spins cannot shut them out, as Linux's real-time throttling
 ensures; one that blocks now and then is display work again each time it wakes.
 Display threads taking turns among themselves could still keep other work out, so a
 thread of other work that has waited 50 ms goes first, and display work makes way
-for it after its own 50 ms. A thread waiting for a core keeps its vCPU, which costs far less than destroying it and
+for it after its own 50 ms; while both kinds wait that long, they take turns. A thread waiting for a core keeps its vCPU, which costs far less than destroying it and
 making another, unless the hypervisor's vCPUs run short. Every thread takes a
 background place, a core and a vCPU in that order, and waits for them only on its way
 into the guest, where it holds no kernel lock, so threads cannot deadlock over them.

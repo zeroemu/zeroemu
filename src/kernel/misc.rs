@@ -124,7 +124,11 @@ impl Kernel {
                 t.proc.mm().write(a[0], &buf)?;
                 Ok(buf.len() as i64)
             }
-            sched_yield | sched_setaffinity => Ok(0),
+            sched_yield => {
+                super::vcpus::yielding();
+                Ok(0)
+            }
+            sched_setaffinity => Ok(0),
             sched_getaffinity => {
                 // One CPU per vCPU slot would be truthful; report the host's
                 // core count so thread pools size themselves sensibly.

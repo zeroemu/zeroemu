@@ -7,12 +7,19 @@ name: Release
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing version tag to build and publish
+        type: string
+        required: true
 
 permissions:
   contents: read
 
 env:
   CARGO_TERM_COLOR: always
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
 
 jobs:
   release:
@@ -23,7 +30,16 @@ jobs:
       id-token: write      # sign the provenance attestation
       attestations: write  # store it
     steps:
+      - name: Validate the release tag
+        run: |
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::expected a release tag of the form vX.Y.Z"
+            exit 1
+          fi
+
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', env.RELEASE_TAG) || github.sha }}
 
       - name: Install Rust
         run: |
@@ -33,10 +49,10 @@ jobs:
 
       - name: Check that the tag matches Cargo.toml
         run: |
-          version="${GITHUB_REF_NAME#v}"
+          version="${RELEASE_TAG#v}"
           crate=$(cargo metadata --no-deps --locked --format-version 1 | jq -r '.packages[] | select(.name == "zeroemu") | .version')
           if [ "$version" != "$crate" ]; then
-            echo "::error::tag $GITHUB_REF_NAME doesn't match the version in Cargo.toml ($crate)"
+            echo "::error::tag $RELEASE_TAG doesn't match the version in Cargo.toml ($crate)"
             exit 1
           fi
           echo "VERSION=$version" >> "$GITHUB_ENV"
@@ -91,14 +107,23 @@ jobs:
             dist/${{ env.NAME }}.tar.gz
             stage/zeroemu
 
-      - name: Create the release
+      - name: Publish the release assets
         # Every release is a pre-release while zeroemu is a developer preview.
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          sed -e "s|@REPO@|$GITHUB_REPOSITORY|g" -e "s|@TAG@|$GITHUB_REF_NAME|g" -e "s|@VERSION@|$VERSION|g" \
+          if assets=$(gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name'); then
+            if grep -Fxq -e "$NAME.tar.gz" -e SHA256SUMS <<< "$assets"; then
+              echo "::error::release $RELEASE_TAG already has a build asset; refusing to replace it"
+              exit 1
+            fi
+            gh release upload "$RELEASE_TAG" "dist/$NAME.tar.gz" dist/SHA256SUMS
+            exit
+          fi
+
+          sed -e "s|@REPO@|$GITHUB_REPOSITORY|g" -e "s|@TAG@|$RELEASE_TAG|g" -e "s|@VERSION@|$VERSION|g" \
             .github/release-notes.md > notes.md
-          gh release create "$GITHUB_REF_NAME" \
+          gh release create "$RELEASE_TAG" \
             --verify-tag --prerelease \
             --title "zeroemu $VERSION" \
             --notes-file notes.md --generate-notes \

@@ -91,6 +91,11 @@ the README already say 0.1.0, so start at step 3.
    `zeroemu-X.Y.Z-aarch64-apple-darwin.tar.gz` and `SHA256SUMS`. Its notes are
    `.github/release-notes.md` followed by GitHub's generated list of changes.
 
+   If the release was already created without its files, run the Release workflow
+   from `main` with the existing tag (for example, `gh workflow run release.yml
+   --ref main -f tag=vX.Y.Z`). It builds that tag and attaches the files without
+   changing the release's notes or replacing any existing build files.
+
 7. **Check the release as a user would:** in a new folder, follow the README's checked
    install (`shasum -a 256 -c SHA256SUMS`, then `gh attestation verify`), then run
    `./zeroemu doctor`.

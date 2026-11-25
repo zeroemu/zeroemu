@@ -156,7 +156,9 @@ pub fn host_time_zone() -> Option<String> {
 }
 
 /// The tz database's zones, for choosing one: zone1970.tab's (one per region where
-/// clocks have agreed since 1970), by name.
+/// clocks have agreed since 1970), by name. For zeroemu.app's form, which other
+/// systems don't have yet.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn time_zones() -> Vec<String> {
     let Some(dir) = zoneinfo_dir() else { return Vec::new() };
     let text = std::fs::read_to_string(dir.join("zone1970.tab")).or_else(|_| std::fs::read_to_string(dir.join("zone.tab"))).unwrap_or_default();

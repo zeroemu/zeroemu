@@ -460,8 +460,8 @@ pub fn open(display: Display) -> Result<Arc<dyn GpuBackend>, String> {
 }
 
 /// In-memory backend (`ZEROEMU_GPU=fake`): no renderer, no window.
-pub fn fake() -> Arc<dyn GpuBackend> {
-    fake::Fake::new()
+pub fn fake(display: Display) -> Arc<dyn GpuBackend> {
+    fake::Fake::with_display(display)
 }
 
 /// Block the main thread in the native event loop until `done` is set.

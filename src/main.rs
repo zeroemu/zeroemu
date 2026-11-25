@@ -458,7 +458,7 @@ fn run(args: Vec<String>) -> Result<i32, String> {
         );
     }
     let gpu: Option<Arc<dyn gpu::GpuBackend>> = if fake {
-        Some(gpu::fake())
+        Some(gpu::fake(screen))
     } else if show {
         Some(gpu::open(screen)?)
     } else {

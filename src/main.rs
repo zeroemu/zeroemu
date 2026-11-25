@@ -74,8 +74,9 @@ Boot options:
                           The ABI is always this computer's.
   --system <path>         a system.img file, or the folder holding it
   --device <name>         a device zeroemu.app made: its image, its /data and
-                          its settings, which the options below override for
-                          one boot
+                          its settings, which --screen, --density, --ram,
+                          --cpus, --no-net, --timezone and --location override
+                          for one boot
   --screen <w>x<h>        the screen's size in pixels (default 1080x2400)
   --density <dpi>         the screen's density (default 420)
   --cpus <n>              the cores Android sees and uses (default: all of

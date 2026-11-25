@@ -131,8 +131,10 @@ that `/data` is saved.
 Device > Location (src/location.rs) is what the GPS reports. The image's GNSS HAL
 (android.hardware.gnss-service.ranchu) opens the qemud `gps` service through
 libqemupipe, as the sensors HAL opens `sensors`, and reads NMEA sentences from it.
-zeroemu sends a `$GPGGA` and a `$GPRMC` each second, with nothing before them, as the
-Android Emulator's gps service is a serial line that qemud doesn't frame. With the
+zeroemu sends a `$GPGGA` and a `$GPRMC` four times a second, with nothing before them,
+as the Android Emulator's gps service is a serial line that qemud doesn't frame. Not
+once a second: the HAL passes a fix on only when the interval an app asked for has
+passed since the last, so fixes a second apart that arrive a little early are dropped. With the
 location None it sends nothing, and Android keeps the last fix it had, as a phone
 with no sky in view does. A route is followed at its speed, heading along the leg it
 is on, and starts again from its beginning when chosen.
@@ -206,7 +208,8 @@ on a device; `/data`'s tmpfs keeps ext4's inode flags and quota project ids
 Guest threads take their host priority from what Android says about them: real-time
 policies and nice -4 or better count as display work, the `top-app` cgroup as
 foreground, nice 10 or worse and the `background` and `dex2oat` cgroups as
-background. Background threads take turns on half the cores Android is given, as a
+background. Background threads take turns on half the cores Android is given (one
+of one), as a
 phone would keep them to its little ones.
 
 Android is given all of the host's cores unless a device asks for fewer. macOS cannot

@@ -151,7 +151,9 @@ impl Pool {
     pub fn new(max: usize, cpus: usize) -> Arc<Pool> {
         let host = super::host_cpus();
         let cores = cpus.min(host);
-        let background = Pool::sized((cores / 2).max(2), None, None);
+        // Half the cores, at least one: with a device given two or three, at least two
+        // would let background work (dex2oat after an install) take them all.
+        let background = Pool::sized((cores / 2).max(1), None, None);
         // Not sized to `cpus`: this counts vCPUs, most of them held by threads asleep in
         // the kernel, not cores; so few would have every thread that blocks destroy its
         // vCPU and make another when it wakes (docs/PERFORMANCE.md).

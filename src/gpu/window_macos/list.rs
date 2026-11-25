@@ -1039,6 +1039,9 @@ struct SettingsRows {
     coords: Id,
     /// Raw::mine.
     mine: String,
+    /// Advanced Settings' note on what isn't the default, while it is closed (else
+    /// null): it follows Device, the one of its settings shown.
+    summary: Id,
 }
 
 impl SettingsRows {
@@ -1128,7 +1131,7 @@ impl SettingsRows {
             pin_const(coords, "widthAnchor", 280.0);
             msg_bool(coords, sel("setEnabled:"), (raw.place == Place::Custom) as i8);
 
-            let rows = SettingsRows { preset, width, height, dpi, dp, ram, ram_choices, cpus, network, zone, place, place_items, coords, mine };
+            let mut rows = SettingsRows { preset, width, height, dpi, dp, ram, ram_choices, cpus, network, zone, place, place_items, coords, mine, summary: std::ptr::null_mut() };
             rows.screen_changed();
             // Custom chosen stays chosen, until a size typed is a preset's.
             if raw.custom {
@@ -1150,6 +1153,9 @@ impl SettingsRows {
             msg_id(summary, sel("setTextColor:"), msg0(cls("NSColor"), sel("secondaryLabelColor")));
             msg_i64(summary, sel("setLineBreakMode:"), 4);
             squeeze(summary);
+            if !advanced {
+                rows.summary = summary;
+            }
             let disclosure = row_stack(&[triangle, title, summary], 4.0);
             let lines = vec![
                 [label("Device:"), preset],
@@ -1202,6 +1208,10 @@ impl SettingsRows {
                 None => "not a screen Android can have".to_string(),
             };
             msg_id(self.dp, sel("setStringValue:"), ns_str(&text));
+            // Closed, its note says the screen chosen now.
+            if !self.summary.is_null() {
+                msg_id(self.summary, sel("setStringValue:"), ns_str(&advanced_summary(&self.read())));
+            }
         }
     }
 }
@@ -1258,7 +1268,9 @@ fn ram_shown(mb: u64) -> String {
 fn advanced_summary(raw: &Raw) -> String {
     let mut parts = Vec::new();
     let screen = (|| Display::new(raw.width.trim().parse().ok()?, raw.height.trim().parse().ok()?, raw.dpi.trim().parse().ok()?).ok())();
-    if let Some(d) = screen.filter(|d| d.preset().is_none()) {
+    // A preset's screen shows in Device; one chosen as Custom, though it is a preset's
+    // size, is said here, as Device says only Custom.
+    if let Some(d) = screen.filter(|d| raw.custom || d.preset().is_none()) {
         parts.push(format!("{} × {} at {} dpi", d.width, d.height, d.dpi));
     }
     if raw.ram_mb != RAM_DEFAULT {
@@ -1706,6 +1718,9 @@ mod tests {
         // A preset screen shows in Device, so isn't repeated.
         let tablet = Raw { width: "2560".into(), height: "1600".into(), dpi: "320".into(), ..defaults.clone() };
         assert_eq!(advanced_summary(&tablet), "(defaults)");
+        // Custom, though a preset's size: said, as Device says only Custom.
+        let custom = Raw { width: "1080".into(), height: "2424".into(), dpi: "420".into(), custom: true, ..defaults.clone() };
+        assert_eq!(advanced_summary(&custom), "(1080 × 2424 at 420 dpi)");
         let changed = Raw {
             width: "1440".into(),
             height: "3120".into(),

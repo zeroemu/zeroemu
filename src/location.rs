@@ -3,7 +3,7 @@
 //! route, as Simulator's Features > Location does. The image's GNSS HAL
 //! (device/generic/goldfish's android.hardware.gnss-service.ranchu) reads NMEA
 //! sentences from the host on the qemud "gps" pipe (src/kernel/vsock.rs), which sends
-//! `nmea` of `fix` once a second.
+//! `nmea` of `fix` four times a second.
 
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};

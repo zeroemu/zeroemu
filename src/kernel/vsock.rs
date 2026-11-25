@@ -108,8 +108,8 @@ const MAX_MESSAGE: usize = 64 << 10;
 
 enum Service {
     Sensors(Sensors),
-    /// The GNSS HAL's: where the device is, each second (feed_gps). What the HAL says
-    /// on it is dropped.
+    /// The GNSS HAL's: where the device is, four times a second (feed_gps). What the
+    /// HAL says on it is dropped.
     Gps,
     /// Answers a list request with an empty list.
     BootProperties,
@@ -211,8 +211,11 @@ pub fn posture() -> Option<u8> {
     }
 }
 
-/// The open gps pipes, and whether a thread is feeding them. The HAL keeps one open
-/// from its start, and opens another only if that one breaks.
+/// The open gps pipes, and whether a thread is feeding them. The HAL opens one when
+/// Android starts a GNSS session (Gnss::start, which makes its GnssHwConn) and closes
+/// it when the session stops, so pipes and their feeding thread come and go. It aborts
+/// if its pipe ever reports EPOLLHUP or EPOLLERR (GnssHwConn.cpp), so a gps pipe never
+/// hangs up while it is open.
 struct GpsPipes {
     pipes: Vec<Weak<Vsock>>,
     feeding: bool,
@@ -231,9 +234,13 @@ fn listen_gps(pipe: &Arc<Vsock>) {
     }
 }
 
-/// Sends the gps pipes where the device is (crate::location), once a second at each
-/// second of UTC, as a receiver reports, a device standing still too, and at once
-/// when the device is moved. While the location is off it sends nothing and sleeps
+/// Sends the gps pipes where the device is (crate::location), four times a second (at
+/// each quarter of a second of UTC), a device standing still too, and at once when the
+/// device is moved. Not once a second, as a receiver reports: the HAL passes a fix on
+/// only when its interval has passed since the last it passed on (Gnss.cpp's
+/// onGnssLocationCb, `mLastFix + mMinInterval`), so with an app asking for one a
+/// second, fixes a second apart arrive a little early about half the time, and are
+/// dropped. Four a second, one is waiting within a quarter second of each interval. While the location is off it sends nothing and sleeps
 /// until it changes, as a receiver with no sky in view has nothing to say. Ends when
 /// the last pipe has closed.
 fn feed_gps() {
@@ -254,10 +261,13 @@ fn feed_gps() {
         send_gps(&pipes, &fix.as_ref().map(|f| crate::location::nmea(f, now.as_secs())).unwrap_or_default(), seen.changes);
         // A closed pipe goes now, not after the sleep.
         drop(pipes);
-        let to_next_second = Duration::from_secs(1) - Duration::from_nanos(now.subsec_nanos() as u64);
-        crate::location::wait_for_change(seen, fix.map(|_| to_next_second));
+        let to_next = GPS_PERIOD - Duration::from_nanos(now.as_nanos() as u64 % GPS_PERIOD.as_nanos() as u64);
+        crate::location::wait_for_change(seen, fix.map(|_| to_next));
     }
 }
+
+/// How often the gps pipes hear where the device is (feed_gps).
+const GPS_PERIOD: Duration = Duration::from_millis(250);
 
 /// Queues `nmea` on each of `pipes` in place of what they haven't read, and wakes their
 /// readers; with nothing to send, only clears.

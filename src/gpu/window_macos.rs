@@ -28,19 +28,6 @@ struct NSRect {
     size: NSSize,
 }
 
-pub struct NativeWindow {
-    pub handle: *mut c_void,
-    /// Content size in points. `setupWindow` uses this as the NSView frame;
-    /// a pixel size is placed in point coordinates and hangs off the window
-    /// (on a 2x display, 810x1800 at y=-900, so only a quarter of it shows).
-    pub width: i32,
-    pub height: i32,
-    /// Same content size in pixels. The guest display matches the view's
-    /// backing store, so a Retina window is 1:1 with what Android renders.
-    pub px_width: i32,
-    pub px_height: i32,
-}
-
 pub mod list;
 
 static APP: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
@@ -203,7 +190,26 @@ pub fn background() -> bool {
     std::env::var_os("ZEROEMU_BACKGROUND").is_some_and(|v| !v.is_empty() && v != "0")
 }
 
-pub fn open(fb_w: u32, fb_h: u32) -> Result<NativeWindow, String> {
+/// How big the first window's content is, in points, for a device screen of `display`
+/// on a Mac screen with `room` points to spare (width, height) at `dpr` pixels a
+/// point: the device's shape, as large as fits, but with no more than one of the Mac
+/// screen's pixels to each of the device's, as more only blurs the picture. Except
+/// that one of Android's dp is never shown smaller than a point, the unit Mac apps
+/// are drawn in, as Android's text gets hard to read below that: for a device of low
+/// density on a Retina screen, that wins over sharpness, but never over fitting.
+fn first_size(display: super::Display, room: (f64, f64), dpr: f64) -> (f64, f64) {
+    let (w, h) = (display.width as f64, display.height as f64);
+    let fits = (room.0 / w).min(room.1 / h);
+    let sharp = 1.0 / dpr.max(1.0);
+    // Points to a pixel when a dp (dpi / 160 pixels) is a point.
+    let readable = 160.0 / display.dpi.max(1) as f64;
+    let scale = fits.min(sharp.max(readable));
+    ((w * scale).floor().max(1.0), (h * scale).floor().max(1.0))
+}
+
+/// Opens the window for a device screen of `display`, fitted to the Mac's.
+pub fn open(display: super::Display) -> Result<(), String> {
+    let (fb_w, fb_h) = (display.width, display.height);
     if unsafe { libc::pthread_main_np() } == 0 {
         return Err("gfxstream window must be created on the main thread".into());
     }
@@ -242,11 +248,8 @@ pub fn open(fb_w: u32, fb_h: u32) -> Result<NativeWindow, String> {
         // Fitted to the screen with the title bar and toolbar, which take whatever
         // height they take: measured, as adding the toolbar doesn't keep the content's.
         let chrome = msg_rect(window, sel("frame")).size.height - msg_rect(msg0(window, sel("contentView")), sel("bounds")).size.height;
-        let max_w = (vis.size.width - 48.0).max(320.0);
-        let max_h = (vis.size.height - chrome - 16.0).max(320.0);
-        let fit = (max_w / fb_w as f64).min(max_h / fb_h as f64).min(1.0);
-        let win_w = (fb_w as f64 * fit).floor().max(1.0);
-        let win_h = (fb_h as f64 * fit).floor().max(1.0);
+        let room = ((vis.size.width - 48.0).max(320.0), (vis.size.height - chrome - 16.0).max(320.0));
+        let (win_w, win_h) = first_size(display, room, dpr);
         msg_size(window, sel("setContentSize:"), NSSize { width: win_w, height: win_h });
         msg_void(window, sel("center"));
         set_up_menus(app);
@@ -284,18 +287,10 @@ pub fn open(fb_w: u32, fb_h: u32) -> Result<NativeWindow, String> {
         if number > 0 {
             WINDOW_ID.store(number as u64, Ordering::Release);
         }
-        let px_w = (win_w * dpr).round().max(1.0);
-        let px_h = (win_h * dpr).round().max(1.0);
         if crate::kernel::verbose() {
-            eprintln!("zeroemu: window {win_w:.0}x{win_h:.0} points ({px_w:.0}x{px_h:.0} px, dpr {dpr}) for {fb_w}x{fb_h} (id {number})");
+            eprintln!("zeroemu: window {win_w:.0}x{win_h:.0} points (dpr {dpr}) for a {fb_w}x{fb_h} screen at {} dpi (id {number})", display.dpi);
         }
-        Ok(NativeWindow {
-            handle: window,
-            width: win_w as i32,
-            height: win_h as i32,
-            px_width: px_w as i32,
-            px_height: px_h as i32,
-        })
+        Ok(())
     }
 }
 
@@ -882,14 +877,17 @@ impl ShownRect {
     }
 }
 
+/// The frame's own size, the panel's: (width, height).
+fn panel_size() -> (u32, u32) {
+    let size = SHOWN_SIZE.load(Ordering::Relaxed);
+    ((size >> 32) as u32, size as u32)
+}
+
 fn shown_rect(bounds: NSRect) -> ShownRect {
     let (bw, bh) = (bounds.size.width, bounds.size.height);
     let turns = super::controls::turns();
-    let size = SHOWN_SIZE.load(Ordering::Relaxed);
-    let (mut fw, mut fh) = ((size >> 32) as f64, (size & 0xffff_ffff) as f64);
-    if turns % 2 == 1 {
-        (fw, fh) = (fh, fw);
-    }
+    let (fw, fh) = super::controls::shown_size(panel_size(), turns);
+    let (fw, fh) = (fw as f64, fh as f64);
     if fw == 0.0 || fh == 0.0 {
         return ShownRect { x: 0.0, y: 0.0, w: bw, h: bh, turns };
     }
@@ -1474,6 +1472,8 @@ pub fn turned() {
 
 /// Gives the window the turned panel's shape, at the same scale, about the same
 /// middle, and on its screen. A window already that shape, or full screen, stays.
+/// The shape is the panel's own turned, so a tablet's window, wide to begin with,
+/// goes tall on its side.
 unsafe fn reshape(window: *mut c_void) {
     const FULL_SCREEN: i64 = 1 << 14;
     unsafe {
@@ -1483,8 +1483,8 @@ unsafe fn reshape(window: *mut c_void) {
         let frame = msg_rect(window, sel("frame"));
         let content = msg_rect_rect(window, sel("contentRectForFrameRect:"), frame);
         let (cw, ch) = (content.size.width, content.size.height);
-        let landscape = super::controls::turns() % 2 == 1;
-        if (cw > ch) == landscape {
+        let shown = super::controls::shown_size(panel_size(), super::controls::turns());
+        if !super::controls::other_way_round((cw, ch), shown) {
             return;
         }
         let chrome = frame.size.height - ch;
@@ -1733,4 +1733,37 @@ pub fn post_key(mods: &str, keycode: u16, chars: &str) {
             }
         }
     }));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::first_size;
+    use crate::gpu::Display;
+
+    /// The first window: the device's shape fitted to the screen, never more than one
+    /// screen pixel to a device pixel, unless a dp would then be under a point.
+    #[test]
+    fn first_window_fits_and_stays_sharp() {
+        let phone = Display::DEFAULT;
+        let small = Display { width: 720, height: 1280, dpi: 320 };
+        let tablet = Display { width: 2560, height: 1600, dpi: 320 };
+        // A laptop's Retina screen: the phone fits its height, as before.
+        assert_eq!(first_size(phone, (1422.0, 888.0), 2.0), (399.0, 888.0));
+        // A big Retina screen: a device pixel to a screen pixel, not more.
+        assert_eq!(first_size(phone, (2512.0, 1370.0), 2.0), (540.0, 1200.0));
+        assert_eq!(first_size(small, (2512.0, 1370.0), 2.0), (360.0, 640.0));
+        assert_eq!(first_size(tablet, (1422.0, 888.0), 2.0), (1280.0, 800.0));
+        // A screen at one pixel a point.
+        assert_eq!(first_size(small, (1872.0, 1350.0), 1.0), (720.0, 1280.0));
+        // A tablet on a small screen fits it, keeping its shape.
+        let (w, h) = first_size(tablet, (1232.0, 732.0), 1.0);
+        assert_eq!(h, 732.0);
+        assert!((w / h - 1.6).abs() < 0.01);
+        // At 160 dpi, a dp is a pixel: shown at a pixel a point, though that's two
+        // screen pixels to each on a Retina screen, so as to be readable.
+        let low = Display { width: 720, height: 1280, dpi: 160 };
+        assert_eq!(first_size(low, (2512.0, 1370.0), 2.0), (720.0, 1280.0));
+        // But still within the screen.
+        assert_eq!(first_size(low, (1422.0, 888.0), 2.0), (499.0, 888.0));
+    }
 }

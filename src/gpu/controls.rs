@@ -293,6 +293,23 @@ fn rotate(by: u8) {
     super::turned();
 }
 
+/// The panel's shape as the window shows it, turned `turns` quarter turns: its own
+/// width and height, swapped while it's on its side. A turn swaps whatever shape the
+/// panel has: a tablet's is wide to begin with (its natural orientation is
+/// landscape), so on its side it's tall.
+pub fn shown_size(panel: (u32, u32), turns: u8) -> (u32, u32) {
+    if turns % 2 == 1 { (panel.1, panel.0) } else { panel }
+}
+
+/// Whether a window `window` points in size is the other way round from the picture
+/// it shows, of shape `shown`: wide where the picture is tall, or tall where it's
+/// wide. Turning the device gives such a window the picture's shape; a square window
+/// or picture keeps its own.
+pub fn other_way_round(window: (f64, f64), shown: (u32, u32)) -> bool {
+    let (w, h) = (shown.0 as f64, shown.1 as f64);
+    (window.0 > window.1 && w < h) || (window.0 < window.1 && w > h)
+}
+
 /// Where a point shown on the Mac lands on the panel: (u, v) from the shown picture's
 /// top left, as fractions of its width and height, to (x, y) on the panel, from its
 /// top left. The picture is the panel turned `turns` quarter turns counterclockwise.
@@ -391,6 +408,33 @@ mod tests {
             let (dx, dy) = delta_to_panel(t, 0.1, -0.2);
             assert!((x1 - x0 - dx).abs() < 1e-9 && (y1 - y0 - dy).abs() < 1e-9, "turn {t}");
         }
+    }
+
+    /// A turn swaps the panel's own shape, a phone's tall one or a tablet's wide one,
+    /// and a window the other way round from what it shows is turned to match.
+    #[test]
+    fn turns_swap_the_panels_own_shape() {
+        let phone = (1080, 2400);
+        let tablet = (2560, 1600);
+        assert_eq!(shown_size(phone, 0), (1080, 2400));
+        assert_eq!(shown_size(phone, 1), (2400, 1080));
+        assert_eq!(shown_size(phone, 2), (1080, 2400));
+        assert_eq!(shown_size(tablet, 0), (2560, 1600));
+        assert_eq!(shown_size(tablet, 3), (1600, 2560));
+        assert_eq!(shown_size(tablet, 6), (2560, 1600));
+        // The first window has the unturned panel's shape: nothing to change.
+        assert!(!other_way_round((405.0, 900.0), shown_size(phone, 0)));
+        assert!(!other_way_round((1280.0, 800.0), shown_size(tablet, 0)));
+        // A quarter turn: the phone's window becomes wide, the tablet's tall.
+        assert!(other_way_round((405.0, 900.0), shown_size(phone, 1)));
+        assert!(other_way_round((1280.0, 800.0), shown_size(tablet, 1)));
+        // Upside down is the panel's own shape again.
+        assert!(!other_way_round((1280.0, 800.0), shown_size(tablet, 2)));
+        // A turned window turning back.
+        assert!(other_way_round((800.0, 1280.0), shown_size(tablet, 0)));
+        // Square: nothing to swap.
+        assert!(!other_way_round((600.0, 600.0), shown_size(tablet, 1)));
+        assert!(!other_way_round((900.0, 405.0), shown_size((1600, 1600), 1)));
     }
 
     /// Pixels move as points do, and four turns are none.

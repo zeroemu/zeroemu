@@ -3,20 +3,12 @@
 //! TODO: CreateWindowExW, pump a message loop, pass the HWND to
 //! gfxstream_backend_setup_window.
 
-use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-pub struct NativeWindow {
-    pub handle: *mut c_void,
-    pub width: i32,
-    pub height: i32,
-    pub px_width: i32,
-    pub px_height: i32,
-}
-
-pub fn open(fb_w: u32, fb_h: u32) -> Result<NativeWindow, String> {
-    let _ = (fb_w, fb_h);
+/// TODO: a window for a device screen of `display`, scaled to fit, as on macOS.
+pub fn open(display: super::Display) -> Result<(), String> {
+    let _ = display;
     Err("gfxstream: Win32 window is not implemented (CreateWindowExW)".into())
 }
 

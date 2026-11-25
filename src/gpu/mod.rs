@@ -450,7 +450,7 @@ pub trait GpuBackend: Send + Sync {
 /// Load gfxstream and show a window for a guest screen of `display`. Must run on the
 /// main thread.
 pub fn open(display: Display) -> Result<Arc<dyn GpuBackend>, String> {
-    gfxstream::open(display.width, display.height)
+    gfxstream::open(display)
 }
 
 /// In-memory backend (`ZEROEMU_GPU=fake`): no renderer, no window.

@@ -160,11 +160,14 @@ you to make one: **New Device** (⌘N) takes a name and one of your installed im
 image zeroemu is tested with is chosen first, and images it can't boot are listed but
 can't be chosen; if none of them can, the form says why and what to install.
 
-The form also sets what the device is like, as Android Studio's device wizard does:
+A name, an image and a **Device** (a preset screen) are all a device needs. The rest is
+under **Advanced Settings**, closed at first, with these defaults, as in Android Studio's
+device wizard; closed, it says which aren't the default. Choosing Custom for the Device
+opens it.
 
 | Setting | Default | |
 |---|---|---|
-| Device | Medium Phone | A preset sets the screen: Medium Phone (1080 × 2400, 420 dpi), Pixel 9 (1080 × 2424, 420 dpi), Small Phone (720 × 1280, 320 dpi) or Pixel Tablet (2560 × 1600, 320 dpi) |
+| Device | Medium Phone | Shown always. A preset sets the screen: Medium Phone (1080 × 2400, 420 dpi), Pixel 9 (1080 × 2424, 420 dpi), Small Phone (720 × 1280, 320 dpi) or Pixel Tablet (2560 × 1600, 320 dpi) |
 | Screen, Density | 1080 × 2400, 420 dpi | Any even number of pixels from 320 to 4096 a side, at 120 to 640 dpi, at least 320 dp across. The form shows the size in dp, as apps see it. Android draws at this size whatever the window's, which scales it to fit |
 | Memory | 4 GB | What Android is told it has, which decides how it caches and closes apps |
 | CPU cores | All of the Mac's | Fewer cores are what Android sees, and at most how many of its threads run at once, which leaves the Mac the rest |

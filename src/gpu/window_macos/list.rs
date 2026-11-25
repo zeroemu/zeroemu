@@ -762,10 +762,12 @@ extern "C" fn edit_device(_this: Id, _cmd: Id, sender: Id) {
         }
         let name = unsafe { rust_str(msg0(form.field, sel("stringValue"))) };
         let raw = unsafe { form.settings.read() };
+        // The name first: it is what may be refused (taken), and then nothing has
+        // changed, as the alert says.
         let saved = raw.to_settings(&d.settings).and_then(|settings| {
             with_list(|l| {
-                let changed = l.store.set_settings(&d, &settings)?;
-                if changed.name != name.trim() { l.store.rename(&changed, &name) } else { Ok(changed) }
+                let renamed = if d.name != name.trim() { l.store.rename(&d, &name)? } else { d.clone() };
+                l.store.set_settings(&renamed, &settings).map_err(|e| if renamed.name != d.name { format!("It was renamed, but its settings weren't saved: {e}") } else { e })
             })
             .ok_or_else(String::new)?
         });
@@ -908,10 +910,9 @@ impl Raw {
         let d = s.display.unwrap_or(Display::DEFAULT);
         let (place, coords) = match &s.location {
             None => (Place::ZoneCity, String::new()),
-            Some(p @ Source::Point { lat, lon }) => {
-                let _ = p;
-                (Place::Custom, format!("{lat:.4}, {lon:.4}"))
-            }
+            // As saved (to_ini's six decimals), so that an edit that doesn't touch
+            // them doesn't move the device.
+            Some(Source::Point { lat, lon }) => (Place::Custom, format!("{}, {}", trim_decimals(*lat), trim_decimals(*lon))),
             Some(other) => (Place::Fixed(other.clone()), String::new()),
         };
         Raw {
@@ -958,6 +959,12 @@ impl Raw {
             others: base.others.clone(),
         })
     }
+}
+
+/// A coordinate to six decimals (about 10 cm), without the zeros at the end.
+fn trim_decimals(v: f64) -> String {
+    let s = format!("{v:.6}");
+    s.trim_end_matches('0').trim_end_matches('.').to_string()
 }
 
 /// What the time zone box says for no setting, before the Mac's zone.

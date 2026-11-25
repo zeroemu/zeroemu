@@ -96,8 +96,8 @@ const DISPLAY_SLICE: Duration = Duration::from_millis(50);
 /// out for good, where Linux's real-time throttling leaves fair threads 5% of each
 /// second (sched_rt_runtime_us). Then display work that has held its core for
 /// DISPLAY_SLICE makes way for it, so the rest wait for no more than about the two.
-/// Only time with display work in line ahead counts: the rest waiting behind each other
-/// is no reason for display work that has just come to wait too.
+/// Only time while display work holds a core or waits for one counts: the rest waiting
+/// behind each other is no reason for display work that has just come to wait too.
 const REST_WAIT: Duration = DISPLAY_SLICE;
 
 pub struct Pool {
@@ -480,9 +480,9 @@ struct CoresState<R> {
     /// due, so without turns display work would wait for good in its place.
     rest_went: bool,
     /// How long the first of the rest has waited behind display work: `behind` in
-    /// earlier stretches, and since `display_since` if display work is in line now
-    /// (None while its line is empty). Counted for the waiter with ticket `behind_for`,
-    /// and kept by `track` as the lines change.
+    /// earlier stretches, and since `display_since` if display work holds a core or is in
+    /// line now (None while neither). Counted for the waiter with ticket `behind_for`,
+    /// and kept by `track` as the lines and holders change.
     behind: Duration,
     display_since: Option<Instant>,
     behind_for: Option<u64>,
@@ -490,7 +490,7 @@ struct CoresState<R> {
     rest_wait: Duration,
 }
 
-impl<R> CoresState<R> {
+impl<R: Runner> CoresState<R> {
     /// How long display work has kept the first of the rest waiting, at `now`.
     fn behind(&self, now: Instant) -> Duration {
         self.behind + self.display_since.map_or(Duration::ZERO, |since| now.saturating_duration_since(since))
@@ -505,10 +505,11 @@ impl<R> CoresState<R> {
     }
 
     /// Keeps count of how long the first of the rest has waited behind display work:
-    /// called under the lock whenever either line changes. The count stops while display
-    /// work's line is empty and goes on when it fills again, so the moment between one
-    /// display thread giving its core to another and getting back in line, as two that
-    /// spin do, doesn't start it again; a new first of the rest starts from nothing.
+    /// called under the lock whenever a line or the holders change, or a holder's
+    /// urgency. Display work holding a core keeps the rest out as much as display work
+    /// in line ahead of them: a display thread that spins while another visits it each
+    /// frame has its line empty most of the time. The count stops while neither, and
+    /// goes on when either is back; a new first of the rest starts from nothing.
     fn track(&mut self, now: Instant) {
         let front = self.rest.front().map(|w| w.ticket);
         if front != self.behind_for {
@@ -518,9 +519,10 @@ impl<R> CoresState<R> {
                 self.display_since = Some(now);
             }
         }
-        match (self.display.is_empty(), self.display_since) {
-            (false, None) => self.display_since = Some(now),
-            (true, Some(since)) => {
+        let ahead = !self.display.is_empty() || self.holders.values().any(Held::display);
+        match (ahead, self.display_since) {
+            (true, None) => self.display_since = Some(now),
+            (false, Some(since)) => {
                 self.behind += now.saturating_duration_since(since);
                 self.display_since = None;
             }
@@ -553,12 +555,12 @@ impl<R> CoresState<R> {
         self.used < n
     }
 
-    fn hold(&mut self, who: &Arc<R>, spent: bool) -> (u64, Instant) {
+    fn hold(&mut self, who: &Arc<R>, spent: bool, now: Instant) -> (u64, Instant) {
         self.next += 1;
         self.used += 1;
-        let since = Instant::now();
-        self.holders.insert(self.next, Held { who: who.clone(), since, spent });
-        (self.next, since)
+        self.holders.insert(self.next, Held { who: who.clone(), since: now, spent });
+        self.track(now);
+        (self.next, now)
     }
 }
 
@@ -588,7 +590,8 @@ impl<R: Runner> Cores<R> {
     /// when. `spent`: display work that is to count as the rest (Held::spent).
     fn try_take(&self, who: &Arc<R>, spent: bool) -> Option<(u64, Instant)> {
         let mut st = self.st.lock().unwrap();
-        (st.free(self.n) && st.first(Instant::now()).is_none()).then(|| st.hold(who, spent))
+        let now = Instant::now();
+        (st.free(self.n) && st.first(now).is_none()).then(|| st.hold(who, spent, now))
     }
 
     /// Takes a place, waiting in line for one: its id and since when, or None if the
@@ -603,8 +606,9 @@ impl<R: Runner> Cores<R> {
         if who.is_dying() {
             return None;
         }
-        if st.free(self.n) && st.first(Instant::now()).is_none() {
-            return Some(st.hold(who, spent));
+        let now = Instant::now();
+        if st.free(self.n) && st.first(now).is_none() {
+            return Some(st.hold(who, spent, now));
         }
         st.next += 1;
         let ticket = st.next;
@@ -688,6 +692,9 @@ impl<R: Runner> Cores<R> {
     /// Display work that made way for the rest stays with the rest (Held::spent).
     fn reclassify(&self, who: *const R) {
         let mut st = self.st.lock().unwrap();
+        let now = Instant::now();
+        // A holder's change starts or stops the rest's count.
+        st.track(now);
         let in_display = st.display.iter().position(|w| Arc::as_ptr(&w.who) == who);
         let in_rest = st.rest.iter().position(|w| Arc::as_ptr(&w.who) == who);
         let w = match (in_display, in_rest) {
@@ -712,7 +719,6 @@ impl<R: Runner> Cores<R> {
         let to = if in_display.is_some() { &mut st.rest } else { &mut st.display };
         let at = to.iter().position(|x| x.ticket > w.ticket).unwrap_or(to.len());
         to.insert(at, w);
-        let now = Instant::now();
         st.track(now);
         // Who is first may have changed: it stops holders for its turn.
         st.wake_first(now);
@@ -743,9 +749,9 @@ impl<R: Runner> Cores<R> {
             }) else {
                 break;
             };
-            st.track(now);
             self.waiting.fetch_sub(1, Ordering::Relaxed);
-            let got = st.hold(&w.who, w.spent);
+            // Counts the line's change and the new holder together (track).
+            let got = st.hold(&w.who, w.spent, now);
             st.handed.insert(w.ticket, got);
             w.cv.notify_one();
             served = true;
@@ -761,6 +767,7 @@ impl<R: Runner> Cores<R> {
     fn give_up(&self, st: &mut CoresState<R>, id: u64, now: Instant) {
         if st.holders.remove(&id).is_some() {
             st.used -= 1;
+            st.track(now);
             self.serve(st, now);
         }
     }
@@ -1461,7 +1468,6 @@ mod tests {
         let (id, _) = gate.try_take(&one, false).unwrap();
         let d = queue(&gate, &two, false);
         let r = queue(&gate, &Fake::new(false), false);
-        let came = gate.st.lock().unwrap().display_since.expect("display work in line");
         std::thread::sleep(Duration::from_millis(2));
         // At first display work goes first: the core goes to the other display thread.
         assert_eq!(gate.give_way(id, true, Instant::now() - SLICE, false), Some(false));
@@ -1469,11 +1475,11 @@ mod tests {
         let d = queue(&gate, &one, false);
         assert!(!r.is_finished());
         {
-            // The moment display work's line was empty, between the hand-over and the
-            // first getting back in line, doesn't start the rest's count again.
+            // The hand-over from one display thread to the other doesn't start the rest's
+            // count again.
             let st = gate.st.lock().unwrap();
-            assert!(st.behind >= Duration::from_millis(2), "the stretch before the hand-over counts");
-            assert!(st.display_since.is_some_and(|since| since > came), "and the count goes on");
+            assert!(st.behind(Instant::now()) >= Duration::from_millis(2), "the stretch before the hand-over counts");
+            assert!(st.display_since.is_some(), "and the count goes on");
         }
         // Once the rest have waited REST_WAIT, they go first: display work that has held
         // its core for DISPLAY_SLICE makes way for them, not for the display thread.
@@ -1510,12 +1516,8 @@ mod tests {
         gate.release(id);
         let (id, _) = d.join().unwrap().expect("the core");
         assert!(!r.is_finished());
-        {
-            // Display work's line is empty: the rest are not behind it, so not due.
-            let st = gate.st.lock().unwrap();
-            assert!(st.display_since.is_none());
-            assert!(!st.rest_due(Instant::now() + NEVER_DUE * 2));
-        }
+        // Display work holding the core keeps the rest waiting behind it: the count goes on.
+        assert!(gate.st.lock().unwrap().display_since.is_some());
         gate.release(id);
         let (id, _) = r.join().unwrap().expect("the core");
         {
@@ -1524,6 +1526,49 @@ mod tests {
             assert_eq!((st.behind_for, st.behind), (None, Duration::ZERO));
         }
         gate.release(id);
+        assert_eq!(gate.usage().0, 0);
+    }
+
+    #[test]
+    fn display_work_holding_the_core_keeps_the_rest_counting() {
+        // One core, a display thread that spins on it, and another that visits it each
+        // frame: display work's line is empty between visits, but the spinner holds the
+        // core then, so the rest's count goes on and they come due as behind two that
+        // spin.
+        let gate = Arc::new(Cores::<Fake>::waiting_rest(1, NEVER_DUE));
+        let (spinner, visitor) = (Fake::new(true), Fake::new(true));
+        let (mut id, _) = gate.try_take(&spinner, false).unwrap();
+        let r = queue(&gate, &Fake::new(false), false);
+        for _ in 0..3 {
+            // A frame: the visitor comes, the spinner makes way for it and gets back in
+            // line, and has the core again when the visitor blocks.
+            let v = queue(&gate, &visitor, false);
+            assert_eq!(gate.give_way(id, true, Instant::now() - SLICE, false), Some(false));
+            let (got, _) = v.join().unwrap().expect("the core");
+            let s = queue(&gate, &spinner, false);
+            gate.release(got);
+            (id, _) = s.join().unwrap().expect("the core");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(!r.is_finished());
+        {
+            let st = gate.st.lock().unwrap();
+            assert!(st.display.is_empty());
+            assert!(st.display_since.is_some(), "the spinner holding the core keeps the count going");
+            assert!(st.behind(Instant::now()) >= Duration::from_millis(6));
+        }
+        // Due now: the rest go ahead of the next visit, and the spinner makes way for them
+        // after its DISPLAY_SLICE.
+        gate.set_rest_wait(Duration::from_millis(6));
+        let v = queue(&gate, &visitor, false);
+        assert_eq!(gate.give_way(id, true, Instant::now() - SLICE, false), None, "not before its long slice");
+        assert_eq!(gate.give_way(id, true, Instant::now() - DISPLAY_SLICE, false), Some(true));
+        let (got, _) = r.join().unwrap().expect("the core");
+        assert!(!v.is_finished());
+        // Then the visitor: display work's turn after the rest went first.
+        gate.release(got);
+        let (got, _) = v.join().unwrap().expect("the core");
+        gate.release(got);
         assert_eq!(gate.usage().0, 0);
     }
 

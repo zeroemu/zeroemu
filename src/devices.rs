@@ -195,9 +195,10 @@ pub fn host_time_zone() -> Option<String> {
     named(zone.strip_prefix("posix/").or_else(|| zone.strip_prefix("right/")).unwrap_or(zone))
 }
 
-/// The tz database's zones, for choosing one: zone1970.tab's (one per region where
-/// clocks have agreed since 1970), by name. For zeroemu.app's form, which other
-/// systems don't have yet.
+/// The tz database's zones, for choosing one, by name: zone1970.tab's (one per region
+/// where clocks have agreed since 1970) where the host has it, else zone.tab's (one or
+/// more per country), as on macOS. For zeroemu.app's form, which other systems don't
+/// have yet.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn time_zones() -> Vec<String> {
     let Some(dir) = zoneinfo_dir() else { return Vec::new() };

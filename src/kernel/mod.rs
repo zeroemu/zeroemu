@@ -439,7 +439,9 @@ fn first_stage_mounts(v: &Vfs, metadata: &Arc<crate::tmpfs::Tmpfs>, dev: &crate:
 
 /// Adds BOOT_PROPS and `props` (lines of name=value) to the ODM partition's build.prop,
 /// which init reads after the vendor's so they override it, and `init_rc` as an init
-/// script of the ODM's, which init reads last of all. The image is read-only, so a
+/// script of the ODM's, which init reads after init.rc and the system's, system_ext's
+/// and vendor's (LoadBootScripts, system/core/init/init.cpp), so its actions for a
+/// trigger run after theirs; the product's come later still. The image is read-only, so a
 /// copy of that (small) directory goes over it. /odm/etc is a link to here.
 fn add_boot_props(v: &mut Vfs, phys: &Arc<PhysMem>, props: &str, init_rc: Option<&str>) {
     const DIR: &str = "/vendor/odm/etc";

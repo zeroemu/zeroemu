@@ -1,8 +1,7 @@
 name: Release
 
-# Builds, signs and publishes zeroemu-<version>-aarch64-apple-darwin.tar.gz when a
-# tag such as v0.1.0 is pushed. Written by hand rather than with cargo-dist, which
-# can't sign with entitlements.
+# Builds, signs and publishes the command-line archive and the Mac app when a
+# version tag is pushed.
 
 on:
   push:
@@ -100,24 +99,56 @@ jobs:
           codesign -d --entitlements - unpacked/zeroemu 2>&1 | grep -q com.apple.security.hypervisor
           (cd dist && shasum -a 256 -c SHA256SUMS)
 
+      - name: Package and check the Mac app
+        run: |
+          scripts/build-app.sh
+          app=${CARGO_TARGET_DIR:-target}/release/zeroemu.app
+          if [ ! -f "$app/Contents/Resources/NOTICE" ]; then
+            cp LICENSE NOTICE "$app/Contents/Resources/"
+            codesign -s - -f --entitlements entitlements.plist "$app"
+          fi
+          ditto -c -k --norsrc --keepParent "$app" "dist/$NAME.app.zip"
+          (cd dist && shasum -a 256 "$NAME.app.zip" > "$NAME.app.zip.sha256")
+
+          ditto -x -k "dist/$NAME.app.zip" unpacked-app
+          app=unpacked-app/zeroemu.app
+          codesign --verify --strict "$app"
+          codesign -d --entitlements - "$app/Contents/MacOS/zeroemu" 2>&1 | grep -q com.apple.security.hypervisor
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app/Contents/Info.plist")" = "$VERSION"
+          test "$("$app/Contents/MacOS/zeroemu" --version)" = "zeroemu $VERSION"
+          test -f "$app/Contents/Resources/LICENSE"
+          test -f "$app/Contents/Resources/NOTICE"
+          (cd dist && shasum -a 256 -c "$NAME.app.zip.sha256")
+
       - name: Attest build provenance
         uses: actions/attest@v4
         with:
           subject-path: |
             dist/${{ env.NAME }}.tar.gz
+            dist/${{ env.NAME }}.app.zip
             stage/zeroemu
 
       - name: Publish the release assets
-        # Every release is a pre-release while zeroemu is a developer preview.
+        # New releases are pre-releases while zeroemu is a developer preview.
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           if assets=$(gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name'); then
-            if grep -Fxq -e "$NAME.tar.gz" -e SHA256SUMS <<< "$assets"; then
-              echo "::error::release $RELEASE_TAG already has a build asset; refusing to replace it"
-              exit 1
-            fi
-            gh release upload "$RELEASE_TAG" "dist/$NAME.tar.gz" dist/SHA256SUMS
+            uploads=()
+            add_missing_pair() {
+              local package="$1" checksum="$2"
+              if grep -Fxq -- "$package" <<< "$assets"; then
+                if grep -Fxq -- "$checksum" <<< "$assets"; then return; fi
+              elif ! grep -Fxq -- "$checksum" <<< "$assets"; then
+                uploads+=("dist/$package" "dist/$checksum")
+                return
+              fi
+              echo "::error::release $RELEASE_TAG has only one of $package and $checksum"
+              return 1
+            }
+            add_missing_pair "$NAME.tar.gz" SHA256SUMS
+            add_missing_pair "$NAME.app.zip" "$NAME.app.zip.sha256"
+            if (( ${#uploads[@]} )); then gh release upload "$RELEASE_TAG" "${uploads[@]}"; fi
             exit
           fi
 
@@ -127,4 +158,4 @@ jobs:
             --verify-tag --prerelease \
             --title "zeroemu $VERSION" \
             --notes-file notes.md --generate-notes \
-            "dist/$NAME.tar.gz" dist/SHA256SUMS
+            "dist/$NAME.tar.gz" dist/SHA256SUMS "dist/$NAME.app.zip" "dist/$NAME.app.zip.sha256"

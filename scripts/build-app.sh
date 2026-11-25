@@ -1,8 +1,8 @@
 #!/bin/sh
 # Builds zeroemu.app: the release binary in a Mac app bundle with its icon and
 # Info.plist (packaging/macos), signed ad hoc with the hypervisor entitlement, as
-# target/release/zeroemu.app. Opened from Finder, the Dock or Launchpad, it shows its
-# list of devices and boots the one started there; its output goes to
+# target/release/zeroemu.app (under CARGO_TARGET_DIR when set). Opened from Finder,
+# the Dock or Launchpad, it shows its list of devices; its output goes to
 # ~/Library/Logs/zeroemu/zeroemu.log.
 # With --install, it is copied to /Applications, or to ~/Applications when
 # /Applications can't be written.
@@ -16,13 +16,14 @@ case "${1:-}" in
 esac
 [ "$(uname -s)" = Darwin ] || { echo "zeroemu.app is for macOS" >&2; exit 1; }
 
-cargo build --release
+cargo build --release --locked
 version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
-rm -rf target/release/zeroemu.app
-app=target/release/zeroemu.app
+release=${CARGO_TARGET_DIR:-target}/release
+app=$release/zeroemu.app
+rm -rf "$app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
-cp target/release/zeroemu "$app/Contents/MacOS/zeroemu"
-cp packaging/macos/zeroemu.icns "$app/Contents/Resources/zeroemu.icns"
+cp "$release/zeroemu" "$app/Contents/MacOS/zeroemu"
+cp packaging/macos/zeroemu.icns LICENSE NOTICE "$app/Contents/Resources/"
 sed "s/@VERSION@/$version/g" packaging/macos/Info.plist > "$app/Contents/Info.plist"
 plutil -lint -s "$app/Contents/Info.plist"
 # The bundle's signature covers the binary inside, which the entitlement is for:

@@ -3,7 +3,14 @@ tested: `system-images;android-36.1;google_apis_playstore;arm64-v8a` (Android 16
 with Google Play), with Android Emulator 37.1.11 and 37.2.13. The README says what works
 and what doesn't.
 
-Install, in an empty folder. This short form checks nothing:
+For the Mac app, install the `zeroemu/tap/zeroemu-app` Homebrew cask or download the
+[Mac app ZIP](https://github.com/@REPO@/releases/download/@TAG@/zeroemu-@VERSION@-aarch64-apple-darwin.app.zip).
+The ZIP includes `zeroemu.app`, signed
+ad hoc but not notarized. Check it against the `.app.zip.sha256` file and verify its
+provenance with `gh attestation verify` as shown for the command-line archive below.
+The Homebrew formula `zeroemu/tap/zeroemu` installs only the command-line program.
+
+To install the command-line program in an empty folder, this short form checks nothing:
 
 ```sh
 curl -L https://github.com/@REPO@/releases/download/@TAG@/zeroemu-@VERSION@-aarch64-apple-darwin.tar.gz | tar xz

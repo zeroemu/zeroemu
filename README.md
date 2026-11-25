@@ -10,7 +10,7 @@ Android's own `init`, system services, ART and apps run unmodified. They draw th
 the Android Emulator's GPU renderer, which zeroemu loads from the emulator package in
 your SDK, into a window on your Mac.
 
-> **Developer preview (v0.3.0).** zeroemu runs on Apple Silicon Macs only. One system
+> **Developer preview (v0.3.1).** zeroemu runs on Apple Silicon Macs only. One system
 > image is tested: Android 16 QPR2 with Google Play
 > (`system-images;android-36.1;google_apis_playstore;arm64-v8a`), with Android Emulator
 > 37.1.11 and 37.2.13. A Windows backend is in progress: it compiles but has never run.
@@ -23,7 +23,7 @@ your SDK, into a window on your Mac.
 # 1. Install zeroemu, in a new folder. This short form checks nothing; see Install
 #    for a checked download, Homebrew and source builds.
 mkdir zeroemu && cd zeroemu
-curl -L https://github.com/zeroemu/zeroemu/releases/download/v0.3.0/zeroemu-0.3.0-aarch64-apple-darwin.tar.gz | tar xz
+curl -L https://github.com/zeroemu/zeroemu/releases/download/v0.3.1/zeroemu-0.3.1-aarch64-apple-darwin.tar.gz | tar xz
 
 # 2. Install the Android SDK pieces (or use Android Studio's SDK Manager; see below).
 #    If you installed the Command-line Tools from Android Studio (SDK Tools tab),
@@ -40,7 +40,7 @@ sdkmanager "emulator" "platform-tools" "system-images;android-36.1;google_apis_p
 
 ## Install
 
-zeroemu is one command-line program. macOS lets a program create a virtual machine only
+zeroemu comes as a command-line program and a Mac app. macOS lets a program create a virtual machine only
 if it is signed with the `com.apple.security.hypervisor` entitlement. An ad-hoc
 signature can carry it, so no Apple developer account is needed. The release binary and
 the Homebrew build are signed already; if you build zeroemu yourself, you sign it.
@@ -54,7 +54,7 @@ The short form downloads and unpacks in one step, and checks nothing:
 
 ```sh
 mkdir zeroemu && cd zeroemu
-curl -L https://github.com/zeroemu/zeroemu/releases/download/v0.3.0/zeroemu-0.3.0-aarch64-apple-darwin.tar.gz | tar xz
+curl -L https://github.com/zeroemu/zeroemu/releases/download/v0.3.1/zeroemu-0.3.1-aarch64-apple-darwin.tar.gz | tar xz
 ./zeroemu --version
 ```
 
@@ -63,11 +63,11 @@ To check the download before you unpack it, keep the archive and the release's
 
 ```sh
 mkdir zeroemu && cd zeroemu
-curl -LO https://github.com/zeroemu/zeroemu/releases/download/v0.3.0/zeroemu-0.3.0-aarch64-apple-darwin.tar.gz
-curl -LO https://github.com/zeroemu/zeroemu/releases/download/v0.3.0/SHA256SUMS
+curl -LO https://github.com/zeroemu/zeroemu/releases/download/v0.3.1/zeroemu-0.3.1-aarch64-apple-darwin.tar.gz
+curl -LO https://github.com/zeroemu/zeroemu/releases/download/v0.3.1/SHA256SUMS
 shasum -a 256 -c SHA256SUMS
-gh attestation verify zeroemu-0.3.0-aarch64-apple-darwin.tar.gz --repo zeroemu/zeroemu
-tar xzf zeroemu-0.3.0-aarch64-apple-darwin.tar.gz
+gh attestation verify zeroemu-0.3.1-aarch64-apple-darwin.tar.gz --repo zeroemu/zeroemu
+tar xzf zeroemu-0.3.1-aarch64-apple-darwin.tar.gz
 ./zeroemu --version
 ```
 
@@ -120,8 +120,8 @@ each build. `cargo run` signs it for you, through the runner in `.cargo/config.t
 binary yourself:
 
 ```sh
-cargo install --git https://github.com/zeroemu/zeroemu --tag v0.3.0 --locked
-curl -LO https://raw.githubusercontent.com/zeroemu/zeroemu/v0.3.0/entitlements.plist
+cargo install --git https://github.com/zeroemu/zeroemu --tag v0.3.1 --locked
+curl -LO https://raw.githubusercontent.com/zeroemu/zeroemu/v0.3.1/entitlements.plist
 codesign -s - -f --entitlements entitlements.plist "${CARGO_HOME:-$HOME/.cargo}/bin/zeroemu"
 ```
 
@@ -130,10 +130,29 @@ error that names it. `zeroemu doctor` checks for it.
 
 ### As a Mac app
 
-From a source checkout, `scripts/build-app.sh` builds `zeroemu.app`, signed as above,
-and `scripts/build-app.sh --install` also copies it into `/Applications` (or
-`~/Applications` if `/Applications` isn't writable). Open it like any other app, from
-Finder, Launchpad, Spotlight or the Dock.
+Starting with v0.3.1, use the Homebrew cask to install `zeroemu.app` in Applications
+and keep it up to date:
+
+```sh
+brew install --cask zeroemu/tap/zeroemu-app
+# Quit zeroemu before an upgrade so running devices save their data.
+brew update && brew upgrade --cask zeroemu/tap/zeroemu-app
+```
+
+The `zeroemu/tap/zeroemu` formula updates only the command-line program. If you
+already built or installed the app yourself, quit it, move the old bundle out of
+Applications if it is there, and install the cask once. Open the Applications copy
+from then on, and replace any Dock shortcut that pointed to the old copy. Your saved
+devices are kept outside the bundle and don't need to be moved.
+
+The app is signed ad hoc and isn't notarized. If macOS blocks it, review
+[Apple's guidance on opening downloaded apps](https://support.apple.com/en-us/102445).
+You can check the ZIP's checksum and provenance on the GitHub release before opening it.
+
+From a source checkout, `scripts/build-app.sh` still builds `zeroemu.app`, signed as
+above. `scripts/build-app.sh --install` also copies it into `/Applications` (or
+`~/Applications` if `/Applications` isn't writable). Use either that copy or the cask,
+not both.
 
 It opens on a list of your devices, as Android Studio's Device Manager does. A device is
 a name, a system image from your SDK, and its own `/data`. The first time, the app asks

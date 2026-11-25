@@ -130,7 +130,9 @@ fn now_ns() -> u64 {
 
 /// The one mode, `struct drm_mode_modeinfo`: the display's size at 60 Hz. Its
 /// refresh rate is clock * 1000 / (htotal * vtotal), as drm_mode_vrefresh
-/// (drm_modes.c) and composer3-ranchu (DrmConnector::getRefreshRate) work it out,
+/// (drm_modes.c) and a DRM-mode composer (composer3-ranchu's
+/// DrmConnector::getRefreshRate; the tested image's takes its rate from the
+/// renderer) work it out,
 /// with the clock in whole kHz. So a few lines of vertical blanking, where the size
 /// needs them, make htotal * vtotal a multiple of 50 and the rate exactly 60: the
 /// 1080x2400 panel needs none.
@@ -1330,8 +1332,11 @@ fn mode_connector(o: &Open, arg: u64, io: &mut dyn Io) -> Result<i64, i64> {
     wu32(&mut b, 52, 15); // VIRTUAL
     wu32(&mut b, 56, 1);
     wu32(&mut b, 60, 1); // CONNECTED
-    // Its size in mm, from which composer3-ranchu works out the xdpi and ydpi apps
-    // see (DrmConnector::getDpiX): the display's density.
+    // Its size in mm at the display's density, as a DRM-mode composer works out xdpi
+    // from it (composer3-ranchu's DrmConnector::getDpiX, with
+    // androidboot.hardware.hwcomposer.display_finder_mode=drm). The tested image's
+    // composer uses its goldfish finder instead, which takes the size, xdpi and rate
+    // from the renderer (rcGetFBParam): see docs/KNOWN-GAPS.md.
     let (mm_w, mm_h) = o.dev.display.mm();
     wu32(&mut b, 64, mm_w);
     wu32(&mut b, 68, mm_h);

@@ -968,7 +968,7 @@ impl Raw {
         let num = |what: &str, v: &str| v.trim().parse::<u32>().map_err(|_| format!("the screen's {what} is a number, not {:?}", v.trim()));
         let display = Display::new(num("width", &self.width)?, num("height", &self.height)?, num("density", &self.dpi)?)?;
         let zone = self.zone.trim();
-        let time_zone = if zone.is_empty() || zone.starts_with(SAME_ZONE) {
+        let time_zone = if zone.is_empty() || zone == same_zone_label() {
             None
         } else {
             // One saved as it was (perhaps on a newer Mac) stays; one typed is checked.
@@ -1005,6 +1005,12 @@ fn trim_decimals(v: f64) -> String {
 
 /// What the time zone box says for no setting, before the Mac's zone.
 const SAME_ZONE: &str = "Same as this Mac";
+
+/// The time zone box's entry for no setting, exactly: only it means the Mac's (text
+/// that merely starts the same is a zone, and checked as one).
+fn same_zone_label() -> String {
+    format!("{SAME_ZONE} ({})", devices::host_time_zone().unwrap_or_else(|| "unknown".into()))
+}
 
 /// The form's rows for a device's settings, as Android Studio's device wizard has
 /// them: the screen (a preset, or a size and density), memory, cores, network, time
@@ -1073,7 +1079,7 @@ impl SettingsRows {
             msg_i64(network, sel("setState:"), raw.network as i64);
 
             let zone = msg0(msg0(cls("NSComboBox"), sel("alloc")), sel("init"));
-            let mine = format!("{SAME_ZONE} ({})", devices::host_time_zone().unwrap_or_else(|| "unknown".into()));
+            let mine = same_zone_label();
             let zones: Vec<Id> = std::iter::once(mine.clone()).chain(devices::time_zones()).map(|z| ns_str(&z)).collect();
             msg_id(zone, sel("addItemsWithObjectValues:"), ns_array(&zones));
             msg_bool(zone, sel("setCompletes:"), 1);
@@ -1257,7 +1263,7 @@ fn advanced_summary(raw: &Raw) -> String {
         parts.push("no network".into());
     }
     let zone = raw.zone.trim();
-    if !zone.is_empty() && !zone.starts_with(SAME_ZONE) {
+    if !zone.is_empty() && zone != same_zone_label() {
         parts.push(zone.to_string());
     }
     match &raw.place {
@@ -1676,9 +1682,11 @@ mod tests {
         assert!(bad.to_settings(&all).is_err());
         let bad = Raw { coords: "north".into(), ..raw.clone() };
         assert!(bad.to_settings(&all).is_err());
-        let mine = Raw { zone: format!("{SAME_ZONE} (Asia/Kolkata)"), place: Place::Fixed(Source::Off), ..raw };
+        let mine = Raw { zone: same_zone_label(), place: Place::Fixed(Source::Off), ..raw.clone() };
         let s = mine.to_settings(&all).unwrap();
         assert_eq!((s.time_zone, s.location), (None, Some(Source::Off)));
+        let typo = Raw { zone: format!("{SAME_ZONE} typo"), ..raw };
+        assert!(typo.to_settings(&all).is_err(), "not the Mac's: a zone, and none");
     }
 
     #[test]

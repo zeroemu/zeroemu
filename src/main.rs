@@ -389,16 +389,23 @@ fn run(args: Vec<String>) -> Result<i32, String> {
         kernel::set_cpus(n);
     }
     let network = !no_net && saved.network != Some(false);
-    // The device's, if this computer's tz database knows it: one saved on a newer Mac
-    // may not be, and Android would fall back to GMT.
-    let saved_zone = saved.time_zone.filter(|z| match devices::check_time_zone(z) {
-        Ok(()) => true,
-        Err(e) => {
-            eprintln!("zeroemu: the device's time zone: {e}; this computer's is used");
-            false
-        }
-    });
-    let time_zone = time_zone.or(saved_zone).or_else(devices::host_time_zone);
+    // --timezone, else the device's, if this computer's tz database knows it (one saved
+    // on a newer Mac may not be, and Android would fall back to GMT), else this
+    // computer's.
+    let zone_given = time_zone.is_some();
+    let time_zone = match time_zone {
+        Some(z) => Some(z),
+        None => saved
+            .time_zone
+            .filter(|z| match devices::check_time_zone(z) {
+                Ok(()) => true,
+                Err(e) => {
+                    eprintln!("zeroemu: the device's time zone: {e}; this computer's is used");
+                    false
+                }
+            })
+            .or_else(devices::host_time_zone),
+    };
     let chosen_place = place.or(saved.location);
     // Unset: the main city of the time zone, which the boot line names.
     let zone_city = chosen_place.is_none().then(|| time_zone.as_deref().and_then(location::zone_city).map(|c| c.0)).flatten();
@@ -416,6 +423,18 @@ fn run(args: Vec<String>) -> Result<i32, String> {
     let vfs = match &chosen {
         Some(c) => Some(android::open_system_image(&c.path, !boot).map_err(|e| format!("{}: {e}", c.path.display()))?),
         None => None,
+    };
+    // A zone this image's Android hasn't (one newer than its tzdata, or one it leaves
+    // out) would quietly be GMT: refused when given, else Android keeps its own.
+    let time_zone = match (time_zone, vfs.as_ref().filter(|_| boot).and_then(android::time_zones)) {
+        (Some(z), Some(known)) if !known.contains(&z) => {
+            if zone_given {
+                return Err(format!("--timezone: this image's Android has no time zone {z:?}"));
+            }
+            eprintln!("zeroemu: this image's Android has no time zone {z:?}; it keeps its own");
+            None
+        }
+        (z, _) => z,
     };
     if let Some((cmd, path)) = inspect {
         return inspect_image(vfs.as_ref().ok_or("--ls and --cat need --system or --image")?, &cmd, &path);

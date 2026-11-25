@@ -1113,26 +1113,16 @@ impl Thread {
     /// As `sleep` for a thread that can't do anything about a signal until it gets
     /// where it is going, so only dying ends the wait. A signal still wakes it, but then
     /// it goes back to sleep, as it would not if this looked at signals.
-    fn wait_for_turn<'a, T>(&self, cv: &Condvar, mut g: MutexGuard<'a, T>, timeout: Duration) -> MutexGuard<'a, T> {
+    fn wait_for_turn<'a, T>(&self, cv: &Condvar, g: MutexGuard<'a, T>, timeout: Duration) -> MutexGuard<'a, T> {
         *self.sleeping_on.lock().unwrap() = Some(SleepOn(cv));
         // Whoever marks it dying kicks it without the lock `g` guards (exit_group,
         // a fatal signal), so the kick can come between the look at `dying` and the
-        // wait, and be lost: in slices of DYING_LOOK, a dying thread is gone within one
-        // rather than at the end of `timeout`, while execve waits for it.
+        // wait, and be lost: waiting DYING_LOOK at most, a dying thread is gone within
+        // one rather than at the end of `timeout`, while execve waits for it. It goes
+        // back to its caller after each, which looks again at what it waits for: what
+        // came between two waits would be missed by waiting again here.
         const DYING_LOOK: Duration = Duration::from_millis(10);
-        let until = Instant::now() + timeout;
-        while !self.dying.load(Ordering::Acquire) {
-            let left = until.saturating_duration_since(Instant::now());
-            if left.is_zero() {
-                break;
-            }
-            let (back, waited) = cv.wait_timeout(g, left.min(DYING_LOOK)).unwrap();
-            g = back;
-            // Notified (or woken for no reason, which the callers' loops allow).
-            if !waited.timed_out() {
-                break;
-            }
-        }
+        let g = if self.dying.load(Ordering::Acquire) { g } else { cv.wait_timeout(g, timeout.min(DYING_LOOK)).unwrap().0 };
         *self.sleeping_on.lock().unwrap() = None;
         g
     }
@@ -1181,11 +1171,14 @@ impl Kernel {
             v.mount("/oem", oem);
             // The screen's density: unset, SurfaceFlinger falls back to 213 (tvdpi).
             let props = gpu.as_ref().map(|g| format!("ro.sf.lcd_density={}\n", g.display().dpi)).unwrap_or_default();
-            // The device's time zone, over the one Android saved: after init has read
-            // the saved properties, which its load_persist_props waits for, as this
-            // script is read after init.rc.
+            // The device's time zone, over the one Android saved: in post-fs-data, whose
+            // action in init.rc loads the saved properties (load_persist_props, which
+            // init waits for), and which runs this script's after it, as it reads this
+            // script later; and before zygote-start, which late-init queued after it,
+            // so that no Java process starts with the saved zone. Not in
+            // load_persist_props_action: post-fs-data queues it after zygote-start.
             let init_rc = extras.as_ref().and_then(|e| e.time_zone.as_deref()).map(|tz| {
-                format!("# zeroemu: the device's time zone, at every boot.\non load_persist_props_action\n    setprop persist.sys.timezone {tz}\n")
+                format!("# zeroemu: the device's time zone, at every boot.\non post-fs-data\n    setprop persist.sys.timezone {tz}\n")
             });
             add_boot_props(&mut v, &phys, &props, init_rc.as_deref());
         }

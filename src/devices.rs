@@ -156,6 +156,11 @@ fn zone_name_shape(zone: &str) -> bool {
 /// Whether `zone` is a zone ("Z name ...") or a link ("L target name") of the tz
 /// database's index `index`, or without one, of those zeroemu was built with.
 fn known_zone(zone: &str, index: Option<&str>) -> bool {
+    // A zone for testing tz software, which Android's tzdata leaves out
+    // (system/timezone's tzdata), so a device set to it would run on GMT.
+    if zone == "Factory" {
+        return false;
+    }
     match index {
         Some(index) => index.lines().any(|l| {
             let mut f = l.split_whitespace();
@@ -481,14 +486,26 @@ impl Store {
     }
 
     /// Edit…: `d`'s name and settings at once, in one write, so that either both change
-    /// or neither does: a name another device has is refused before anything is.
+    /// or neither does: a name another device has is refused before anything is. `d` is
+    /// the device as the form showed it: only what the form changed from that changes,
+    /// and the rest is the file's as it is now, which may have changed meanwhile.
     pub fn edit(&self, d: &Device, name: &str, settings: &Settings) -> Result<Device, String> {
         let _lock = self.lock()?;
         let now = self.current(d)?;
-        let name = check_name(name, &self.list(), Some(&now.id))?;
-        // What the form doesn't show comes from the file as it is now: a line added
-        // since the form opened stays.
-        let settings = Settings { others: now.settings.others.clone(), ..settings.clone() };
+        let name = if name.trim() == d.name { now.name.clone() } else { check_name(name, &self.list(), Some(&now.id))? };
+        let (was, now_s) = (&d.settings, &now.settings);
+        fn pick<T: Clone + PartialEq>(form: &T, was: &T, file: &T) -> T {
+            if form != was { form.clone() } else { file.clone() }
+        }
+        let settings = Settings {
+            display: pick(&settings.display, &was.display, &now_s.display),
+            ram_mb: pick(&settings.ram_mb, &was.ram_mb, &now_s.ram_mb),
+            cpus: pick(&settings.cpus, &was.cpus, &now_s.cpus),
+            network: pick(&settings.network, &was.network, &now_s.network),
+            time_zone: pick(&settings.time_zone, &was.time_zone, &now_s.time_zone),
+            location: pick(&settings.location, &was.location, &now_s.location),
+            others: now_s.others.clone(),
+        };
         let changed = Device { name, settings, ..now };
         write(&changed)?;
         Ok(changed)
@@ -1028,6 +1045,13 @@ mod tests {
         assert_eq!(spelled.settings.network, Some(false));
         let on = store.edit(&spelled, "Once more", &Settings { network: None, ..spelled.settings.clone() }).unwrap();
         assert_eq!(store.find("Once more").unwrap().settings.network, None, "{:?}", std::fs::read_to_string(on.ini()));
+        // A setting changed in the file while the form was open stays, unless the form
+        // changed it too.
+        let opened = store.find("Once more").unwrap();
+        std::fs::write(&ini, std::fs::read_to_string(&ini).unwrap() + "cpus=3\n").unwrap();
+        let saved = store.edit(&opened, "Once more", &Settings { ram_mb: Some(2048), ..opened.settings.clone() }).unwrap();
+        assert_eq!((saved.settings.cpus, saved.settings.ram_mb), (Some(3), Some(2048)));
+        let on = saved;
         // A line added while the form was open stays when it saves.
         std::fs::write(&ini, std::fs::read_to_string(&ini).unwrap() + "added=later\n").unwrap();
         store.edit(&on, "Once more", &on.settings).unwrap();
@@ -1057,6 +1081,7 @@ mod tests {
                 assert!(known_zone("Asia/Kolkata", index), "{index:?}");
                 assert!(known_zone("US/Eastern", index), "{index:?}");
                 assert!(!known_zone("asia/kolkata", index) && !known_zone("posixrules", index) && !known_zone("Mars/Olympus", index), "{index:?}");
+                assert!(!known_zone("Factory", index), "Android hasn't it");
             }
             assert!(check_time_zone("asia/kolkata").is_err());
             assert!(check_time_zone("zone.tab").is_err());

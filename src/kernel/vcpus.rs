@@ -529,6 +529,12 @@ impl<R: Runner> Cores<R> {
         Self::waiting_rest(n, REST_WAIT)
     }
 
+    /// Tests: the rest come due after `wait` from now on, as if the clock had moved.
+    #[cfg(test)]
+    fn set_rest_wait(&self, wait: Duration) {
+        self.st.lock().unwrap().rest_wait = wait;
+    }
+
     /// A gate whose rest wait `rest_wait` before they go first (REST_WAIT but in tests).
     fn waiting_rest(n: usize, rest_wait: Duration) -> Self {
         Cores {
@@ -1403,7 +1409,7 @@ mod tests {
     #[test]
     fn the_rest_go_first_once_they_have_waited_behind_display_work() {
         // One core, and two display threads that would hand it to and fro.
-        let gate = Arc::new(Cores::<Fake>::new(1));
+        let gate = Arc::new(Cores::<Fake>::waiting_rest(1, NEVER_DUE));
         let (one, two) = (Fake::new(true), Fake::new(true));
         let (id, _) = gate.try_take(&one, false).unwrap();
         let d = queue(&gate, &two, false);
@@ -1415,7 +1421,7 @@ mod tests {
         assert!(!r.is_finished());
         // Once the rest have waited REST_WAIT, they go first: display work that has held
         // its core for DISPLAY_SLICE makes way for them, not for the display thread.
-        std::thread::sleep(REST_WAIT + Duration::from_millis(5));
+        gate.set_rest_wait(Duration::ZERO);
         assert_eq!(gate.give_way(id, true, Instant::now(), false), None, "not before its long slice");
         assert_eq!(gate.give_way(id, true, Instant::now() - DISPLAY_SLICE, false), Some(true));
         let (id, _) = r.join().unwrap().expect("the core");
@@ -1430,11 +1436,11 @@ mod tests {
     fn the_rest_due_and_display_work_take_turns_when_both_wait() {
         // One core, the rest always due (they waited REST_WAIT), display work waiting too:
         // the core goes to each in turn, so neither waits for good.
-        let gate = Arc::new(Cores::<Fake>::new(1));
+        let gate = Arc::new(Cores::<Fake>::waiting_rest(1, NEVER_DUE));
         let (mut id, _) = gate.try_take(&Fake::new(false), false).unwrap();
         let r1 = queue(&gate, &Fake::new(false), false);
         let r2 = queue(&gate, &Fake::new(false), false);
-        std::thread::sleep(REST_WAIT + Duration::from_millis(5));
+        gate.set_rest_wait(Duration::ZERO);
         let d = queue(&gate, &Fake::new(true), false);
         // The rest's first is due: it goes first, ahead of display work.
         gate.release(id);

@@ -2,7 +2,7 @@
 //! unit tests) use it so guest ioctl tests run headless. Host blobs are
 //! ordinary 16 KiB-aligned allocations; fences complete inline.
 
-use super::{Blob, Fence, GpuBackend, Iov, Resource3d, ResourceInfo, Transfer, BLOB_FLAG_USE_MAPPABLE, BLOB_MEM_GUEST, BLOB_MEM_HOST3D, BLOB_MEM_HOST3D_GUEST, CAPSET_GFXSTREAM_COMPOSER, CAPSET_GFXSTREAM_GLES, CAPSET_GFXSTREAM_VULKAN, CAPSET_VIRGL, CAPSET_VIRGL2};
+use super::{Blob, Display, Fence, GpuBackend, Iov, Resource3d, ResourceInfo, Transfer, BLOB_FLAG_USE_MAPPABLE, BLOB_MEM_GUEST, BLOB_MEM_HOST3D, BLOB_MEM_HOST3D_GUEST, CAPSET_GFXSTREAM_COMPOSER, CAPSET_GFXSTREAM_GLES, CAPSET_GFXSTREAM_VULKAN, CAPSET_VIRGL, CAPSET_VIRGL2};
 use std::alloc::{Layout, alloc, dealloc};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -39,12 +39,19 @@ struct State {
 
 pub struct Fake {
     st: Mutex<State>,
+    /// The screen it says Android has, for the DRM mode, though nothing is drawn.
+    display: Display,
 }
 
 impl Fake {
     pub fn new() -> Arc<Fake> {
+        Fake::with_display(Display::DEFAULT)
+    }
+
+    pub fn with_display(display: Display) -> Arc<Fake> {
         Arc::new(Fake {
             st: Mutex::new(State { res: HashMap::new(), ctx: HashMap::new(), handler: None, flushed: Vec::new(), attaches: Vec::new() }),
+            display,
         })
     }
 
@@ -72,6 +79,10 @@ fn host_buf(size: u64) -> Result<HostBuf, i64> {
 }
 
 impl GpuBackend for Fake {
+    fn display(&self) -> Display {
+        self.display
+    }
+
     fn capset_info(&self, id: u32) -> Option<(u32, u32)> {
         match id {
             CAPSET_VIRGL | CAPSET_VIRGL2 => Some((1, 64)),

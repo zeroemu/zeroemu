@@ -5,8 +5,8 @@
 //! are safe to call from the guest's vCPU threads. `stream_renderer_init` and
 //! `gfxstream_backend_setup_window` run on the thread that owns the window.
 
-use super::window::{self, NativeWindow};
-use super::{Blob, Box3, Fence, GpuBackend, Iov, Resource3d, ResourceInfo, Transfer};
+use super::window;
+use super::{Blob, Box3, Display, Fence, GpuBackend, Iov, Resource3d, ResourceInfo, Transfer};
 use std::ffi::{CStr, CString, c_void};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -294,6 +294,8 @@ pub struct Gfxstream {
     maps: MapsLock,
     /// The renderer's subwindow is (or was) up: teardown must remove it first.
     subwindow: AtomicBool,
+    /// The screen Android is given, whatever the window's size.
+    display: Display,
     // Kept mapped for the process lifetime. dlclose races the renderer's threads.
     _lib: *mut c_void,
 }
@@ -491,10 +493,10 @@ fn c_box(b: &Box3) -> CBox {
     CBox { x: b.x, y: b.y, z: b.z, w: b.w, h: b.h, d: b.d }
 }
 
-pub fn open(width: u32, height: u32) -> Result<Arc<dyn GpuBackend>, String> {
+pub fn open(display: Display) -> Result<Arc<dyn GpuBackend>, String> {
     // Before the window: a missing renderer is an error with no window to show.
     let path = backend_path()?;
-    let win = window::open(width, height)?;
+    window::open(display)?;
     let lib = load_backend(&path)?;
     let api = load_api(lib)?;
     let gfx = Arc::new(Gfxstream {
@@ -509,14 +511,15 @@ pub fn open(width: u32, height: u32) -> Result<Arc<dyn GpuBackend>, String> {
         pipe_ctx: Mutex::new(std::collections::HashMap::new()),
         maps: MapsLock::default(),
         subwindow: AtomicBool::new(false),
+        display,
         _lib: lib,
     });
-    gfx.start(width, height, &win)?;
+    gfx.start()?;
     Ok(gfx)
 }
 
 impl Gfxstream {
-    fn start(self: &Arc<Self>, fb_w: u32, fb_h: u32, win: &NativeWindow) -> Result<(), String> {
+    fn start(self: &Arc<Self>) -> Result<(), String> {
         LOG_MAX.store(log_max_from_env(), Ordering::Relaxed);
         // This build's internal shaders are `#version 300 es` when it thinks the
         // host is GLES, and desktop GL rejects those, so the window stays black.
@@ -544,10 +547,11 @@ impl Gfxstream {
             Param { key: PARAM_USER_DATA, value: user },
             Param { key: PARAM_RENDERER_FLAGS, value: RENDERER_FLAGS },
             Param { key: PARAM_FENCE_CALLBACK, value: on_fence as *const () as usize as u64 },
-            // Guest display size is the view's pixel backing. The NSView frame
-            // below is in points, so the same image fills the window.
-            Param { key: PARAM_WIN0_WIDTH, value: win.px_width as u64 },
-            Param { key: PARAM_WIN0_HEIGHT, value: win.px_height as u64 },
+            // The framebuffer's size, which is the display Android finds
+            // (FrameBuffer::initialize): the device's screen, not the window's. The
+            // window shows it scaled, as the Android Emulator does (attach_window).
+            Param { key: PARAM_WIN0_WIDTH, value: self.display.width as u64 },
+            Param { key: PARAM_WIN0_HEIGHT, value: self.display.height as u64 },
             Param { key: PARAM_DEBUG_CALLBACK, value: on_debug as *const () as usize as u64 },
             Param { key: PARAM_RENDERER_FEATURES, value: features.as_ptr() as usize as u64 },
         ];
@@ -560,7 +564,6 @@ impl Gfxstream {
         install_window_ops(self._lib);
         #[cfg(target_os = "macos")]
         self.attach_window();
-        let _ = (win, fb_w, fb_h);
         Ok(())
     }
 }
@@ -587,9 +590,13 @@ impl Gfxstream {
             if !fb.is_null() {
                 g.subwindow.store(true, Ordering::Release);
             }
-            // A turned panel fills the rectangle turned: the rectangle is the turned
-            // shape, and so is the frame size given here, as the renderer stretches
-            // the turned frame over the whole viewport (texture_draw.cpp).
+            // The frame size given here is the rectangle's, not the display's: the
+            // renderer stretches the display's frame over that many points at p.dpr,
+            // which scales the device's screen into the window as the Android Emulator
+            // does. The display's own size there is the emulator's zoom, which shows
+            // a magnified corner. A turned panel fills the rectangle turned: the
+            // rectangle is the turned shape, as the renderer stretches the turned
+            // frame over the whole viewport (texture_draw.cpp).
             let up = !fb.is_null() && unsafe { setup(fb, win, p.x, p.y, p.w, p.h, p.w, p.h, p.dpr, p.z_rotation(), false, false) };
             g.direct.store(up, Ordering::Release);
             window::set_drawing(up);
@@ -625,6 +632,10 @@ impl Drop for Gfxstream {
 }
 
 impl GpuBackend for Gfxstream {
+    fn display(&self) -> Display {
+        self.display
+    }
+
     fn capset_info(&self, id: u32) -> Option<(u32, u32)> {
         let mut ver = 0u32;
         let mut size = 0u32;

@@ -163,9 +163,11 @@ const POSES: [[&str; 3]; 5] = [
     ["acceleration:-9.81:0.00:0.00", "magnetic:48.40:0.00:-5.90", "orientation:90.00:0.00:-90.00"],
 ];
 
-/// Turns the phone: `turns` quarter turns counterclockwise from upright portrait,
-/// as the user looking at the screen sees it. 1 is on its side with its top to
-/// the left, 2 upside down, 3 top to the right; more than 3 goes round again.
+/// Turns the phone: `turns` quarter turns counterclockwise from upright, as the user
+/// looking at the screen sees it. Upright is the panel's natural orientation, which
+/// for a tablet is landscape: the sensors' axes are the panel's own (SensorEvent.java),
+/// whatever its shape. 1 is on its side with its top to the left, 2 upside down, 3
+/// top to the right; more than 3 goes round again.
 /// Android turns its screen to match when auto-rotate is on, as a phone does.
 /// Until this is first called the phone lies flat, as it always did.
 pub fn set_posture(turns: u8) {

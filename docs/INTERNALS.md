@@ -107,8 +107,11 @@ SurfaceFlinger, which needs one: it never reaches the home screen.
 Android's graphics stack runs unmodified on a virtio-gpu device, as in the Android
 Emulator's virtio-gpu mode: the guest's gralloc is minigbm, and its GLES and Vulkan
 calls are encoded by the image's own gfxstream guest libraries and decoded by the
-renderer on the host. The display is one 1080x2400 panel. The renderer draws each
-frame into the window itself, at the screen's real pixel density.
+renderer on the host. The display is one panel of a fixed size and density
+(gpu::Display, 1080x2400 at 420 dpi by default), whatever the window's size: the KMS
+mode and the renderer's framebuffer are that size. The renderer draws each frame into
+the window itself, scaled to fit as the Android Emulator does, at the screen's real
+pixel density.
 
 In the window, the mouse is a finger and scrolling drags one (a person's flick
 becomes a fling). F1 is Home, Escape is Back, F2 is recent apps. Other keys go to

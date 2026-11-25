@@ -406,10 +406,6 @@ fn run(args: Vec<String>) -> Result<i32, String> {
             })
             .or_else(devices::host_time_zone),
     };
-    let chosen_place = place.or(saved.location);
-    // Unset: the main city of the time zone, which the boot line names.
-    let zone_city = chosen_place.is_none().then(|| time_zone.as_deref().and_then(location::zone_city).map(|c| c.0)).flatten();
-    let place = chosen_place.unwrap_or_else(|| location::default_for_zone(time_zone.as_deref()));
     PROGRAM.store(!boot && inspect.is_none(), Ordering::Relaxed);
     if boot {
         kernel::quiet_logs(app::opened_as_app());
@@ -436,6 +432,11 @@ fn run(args: Vec<String>) -> Result<i32, String> {
         }
         (z, _) => z,
     };
+    // Where the GPS starts: unset, the main city of the zone the boot uses, which the
+    // boot line names; with Android keeping its own zone, the fallback.
+    let chosen_place = place.or(saved.location);
+    let zone_city = chosen_place.is_none().then(|| time_zone.as_deref().and_then(location::zone_city).map(|c| c.0)).flatten();
+    let place = chosen_place.unwrap_or_else(|| location::default_for_zone(time_zone.as_deref()));
     if let Some((cmd, path)) = inspect {
         return inspect_image(vfs.as_ref().ok_or("--ls and --cat need --system or --image")?, &cmd, &path);
     }

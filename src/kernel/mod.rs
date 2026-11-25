@@ -1170,7 +1170,13 @@ impl Kernel {
             oem.write_file("etc/sysconfig/zeroemu.xml", 0o644, &format!("<config>\n{NO_BLUETOOTH}{}</config>\n", if network { ETHERNET } else { "" }));
             v.mount("/oem", oem);
             // The screen's density: unset, SurfaceFlinger falls back to 213 (tvdpi).
-            let props = gpu.as_ref().map(|g| format!("ro.sf.lcd_density={}\n", g.display().dpi)).unwrap_or_default();
+            let mut props = gpu.as_ref().map(|g| format!("ro.sf.lcd_density={}\n", g.display().dpi)).unwrap_or_default();
+            // The emulator's own way in for the zone (init.ranchu.rc sets the saved
+            // zone from vendor.qemu.timezone when that is set, later than the script
+            // below): the same zone, so the two can't disagree.
+            if let Some(tz) = extras.as_ref().and_then(|e| e.time_zone.as_deref()) {
+                props += &format!("vendor.qemu.timezone={tz}\n");
+            }
             // The device's time zone, over the one Android saved: in post-fs-data, whose
             // action in init.rc loads the saved properties (load_persist_props, which
             // init waits for), and which runs this script's after it, as it reads this

@@ -22,6 +22,10 @@ pub fn entries(zip: &Dev) -> io::Result<Vec<Entry>> {
     let len = zip.len();
     let tail_len = len.min(65536 + 22) as usize;
     let tail = zip.read_vec(len - tail_len as u64, tail_len)?;
+    // Shorter than the end record: no zip, and no index to count back from.
+    if tail.len() < 22 {
+        return Err(invalid("zip: too short for one"));
+    }
     let eocd = (0..=tail.len() - 22)
         .rev()
         .find(|&i| tail[i..i + 4] == *b"PK\x05\x06")
@@ -136,6 +140,12 @@ impl Crc32 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_file_too_short_for_a_zip_is_an_error() {
+        let short: super::Dev = std::sync::Arc::new(super::MemDev(vec![b'P', b'K', 5, 6].into()));
+        assert!(super::entries(&short).is_err());
+    }
+
     #[test]
     fn crc32_known_value() {
         let mut c = super::Crc32::new();

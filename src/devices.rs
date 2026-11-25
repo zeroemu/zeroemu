@@ -209,6 +209,14 @@ pub fn time_zones() -> Vec<String> {
 }
 
 impl Device {
+    /// The same device with `settings`: as Edit's form showed it, its defaults made
+    /// none, for Store::edit to tell what the form changed. zeroemu.app's, which other
+    /// systems don't have yet.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub fn shown_as(&self, settings: Settings) -> Device {
+        Device { settings, ..self.clone() }
+    }
+
     /// Its device.ini, which is gone once it is deleted.
     pub fn ini(&self) -> PathBuf {
         self.dir.join("device.ini")
@@ -1051,7 +1059,17 @@ mod tests {
         std::fs::write(&ini, std::fs::read_to_string(&ini).unwrap() + "cpus=3\n").unwrap();
         let saved = store.edit(&opened, "Once more", &Settings { ram_mb: Some(2048), ..opened.settings.clone() }).unwrap();
         assert_eq!((saved.settings.cpus, saved.settings.ram_mb), (Some(3), Some(2048)));
-        let on = saved;
+        // Shown with its defaults made none (network=on as no setting), a field the form
+        // left alone is unchanged though the file says it explicitly: a change made in
+        // the file meanwhile stays.
+        std::fs::write(&ini, std::fs::read_to_string(&ini).unwrap() + "network=on\n").unwrap();
+        let explicit = store.find("Once more").unwrap();
+        assert_eq!(explicit.settings.network, Some(true));
+        let shown = explicit.shown_as(Settings { network: None, ..explicit.settings.clone() });
+        std::fs::write(&ini, std::fs::read_to_string(&ini).unwrap() + "network=off\n").unwrap();
+        let kept = store.edit(&shown, "Once more", &shown.settings).unwrap();
+        assert_eq!(kept.settings.network, Some(false));
+        let on = kept;
         // A line added while the form was open stays when it saves.
         std::fs::write(&ini, std::fs::read_to_string(&ini).unwrap() + "added=later\n").unwrap();
         store.edit(&on, "Once more", &on.settings).unwrap();

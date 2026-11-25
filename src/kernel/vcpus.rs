@@ -1422,7 +1422,8 @@ mod tests {
         // Once the rest have waited REST_WAIT, they go first: display work that has held
         // its core for DISPLAY_SLICE makes way for them, not for the display thread.
         gate.set_rest_wait(Duration::ZERO);
-        assert_eq!(gate.give_way(id, true, Instant::now(), false), None, "not before its long slice");
+        // Taken "from now on" so that no pause of this test ages it past its slice.
+        assert_eq!(gate.give_way(id, true, Instant::now() + Duration::from_secs(60), false), None, "not before its long slice");
         assert_eq!(gate.give_way(id, true, Instant::now() - DISPLAY_SLICE, false), Some(true));
         let (id, _) = r.join().unwrap().expect("the core");
         assert!(!d.is_finished());

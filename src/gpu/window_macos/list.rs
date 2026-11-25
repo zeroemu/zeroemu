@@ -799,7 +799,10 @@ extern "C" fn edit_device(_this: Id, _cmd: Id, sender: Id) {
         }
         // The name and the settings in one write: either both change, or neither has,
         // as the alert says.
-        let saved = raw.to_settings(&d.settings).and_then(|settings| with_list(|l| l.store.edit(&d, &name, &settings)).ok_or_else(String::new)?);
+        // What the form showed: the device's settings as the form reads them back, its
+        // defaults made none, so a field left alone counts as unchanged.
+        let shown = d.shown_as(Raw::from_settings(&d.settings).to_settings(&d.settings).unwrap_or_else(|_| d.settings.clone()));
+        let saved = raw.to_settings(&d.settings).and_then(|settings| with_list(|l| l.store.edit(&shown, &name, &settings)).ok_or_else(String::new)?);
         match saved {
             Ok(_) => return refresh(Some(&d.id)),
             Err(e) if e.is_empty() => return,
@@ -932,6 +935,9 @@ struct Raw {
     zone: String,
     place: Place,
     coords: String,
+    /// The time zone box's entry for the Mac's, as the form showed it: the Mac's zone
+    /// may change while it shows.
+    mine: String,
     /// Device says Custom, though the size and density may still be a preset's: it
     /// was chosen, and Advanced Settings opened for them.
     custom: bool,
@@ -957,6 +963,7 @@ impl Raw {
             zone: s.time_zone.clone().unwrap_or_default(),
             place,
             coords,
+            mine: same_zone_label(),
             custom: d.preset().is_none(),
         }
     }
@@ -968,7 +975,7 @@ impl Raw {
         let num = |what: &str, v: &str| v.trim().parse::<u32>().map_err(|_| format!("the screen's {what} is a number, not {:?}", v.trim()));
         let display = Display::new(num("width", &self.width)?, num("height", &self.height)?, num("density", &self.dpi)?)?;
         let zone = self.zone.trim();
-        let time_zone = if zone.is_empty() || zone == same_zone_label() {
+        let time_zone = if zone.is_empty() || zone == self.mine {
             None
         } else {
             // One saved as it was (perhaps on a newer Mac) stays; one typed is checked.
@@ -1030,6 +1037,8 @@ struct SettingsRows {
     /// The place popup's items: Some(index into `places()`), None for a separator.
     place_items: Vec<Option<usize>>,
     coords: Id,
+    /// Raw::mine.
+    mine: String,
 }
 
 impl SettingsRows {
@@ -1079,7 +1088,7 @@ impl SettingsRows {
             msg_i64(network, sel("setState:"), raw.network as i64);
 
             let zone = msg0(msg0(cls("NSComboBox"), sel("alloc")), sel("init"));
-            let mine = same_zone_label();
+            let mine = raw.mine.clone();
             let zones: Vec<Id> = std::iter::once(mine.clone()).chain(devices::time_zones()).map(|z| ns_str(&z)).collect();
             msg_id(zone, sel("addItemsWithObjectValues:"), ns_array(&zones));
             msg_bool(zone, sel("setCompletes:"), 1);
@@ -1119,7 +1128,7 @@ impl SettingsRows {
             pin_const(coords, "widthAnchor", 280.0);
             msg_bool(coords, sel("setEnabled:"), (raw.place == Place::Custom) as i8);
 
-            let rows = SettingsRows { preset, width, height, dpi, dp, ram, ram_choices, cpus, network, zone, place, place_items, coords };
+            let rows = SettingsRows { preset, width, height, dpi, dp, ram, ram_choices, cpus, network, zone, place, place_items, coords, mine };
             rows.screen_changed();
             // Custom chosen stays chosen, until a size typed is a preset's.
             if raw.custom {
@@ -1175,6 +1184,7 @@ impl SettingsRows {
                 zone: text(self.zone),
                 place: self.place_items.get(index(self.place)).copied().flatten().and_then(|i| all.get(i).cloned()).unwrap_or(Place::ZoneCity),
                 coords: text(self.coords),
+                mine: self.mine.clone(),
                 custom: index(self.preset) >= Display::PRESETS.len(),
             }
         }
@@ -1263,7 +1273,7 @@ fn advanced_summary(raw: &Raw) -> String {
         parts.push("no network".into());
     }
     let zone = raw.zone.trim();
-    if !zone.is_empty() && zone != same_zone_label() {
+    if !zone.is_empty() && zone != raw.mine {
         parts.push(zone.to_string());
     }
     match &raw.place {
@@ -1315,7 +1325,7 @@ struct SettingsRowsIds(SettingsRows);
 
 impl SettingsRowsIds {
     fn of(r: &SettingsRows) -> SettingsRowsIds {
-        SettingsRowsIds(SettingsRows { ram_choices: r.ram_choices.clone(), place_items: r.place_items.clone(), ..*r })
+        SettingsRowsIds(SettingsRows { ram_choices: r.ram_choices.clone(), place_items: r.place_items.clone(), mine: r.mine.clone(), ..*r })
     }
 
     unsafe fn with(&self, f: impl FnOnce(&SettingsRows)) {

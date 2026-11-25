@@ -590,7 +590,7 @@ impl ProcFs {
                     K::PStatus => {
                         let groups: Vec<String> = c.groups.iter().map(|g| g.to_string()).collect();
                         text(format!(
-                            "Name:\t{name}\nUmask:\t{:04o}\nState:\t{} ({})\nTgid:\t{pid}\nNgid:\t0\nPid:\t{shown}\nPPid:\t{ppid}\nTracerPid:\t0\nUid:\t{}\t{}\t{}\t{}\nGid:\t{}\t{}\t{}\t{}\nFDSize:\t64\nGroups:\t{}\n{vm}Threads:\t{threads}\nSigQ:\t0/0\nSigPnd:\t0000000000000000\nShdPnd:\t0000000000000000\nCapInh:\t{:016x}\nCapPrm:\t{:016x}\nCapEff:\t{:016x}\nCapBnd:\t{:016x}\nCapAmb:\t{:016x}\nNoNewPrivs:\t{}\nSeccomp:\t{}\nSeccomp_filters:\t{}\nCpus_allowed_list:\t0-{}\n",
+                            "Name:\t{name}\nUmask:\t{:04o}\nState:\t{} ({})\nTgid:\t{pid}\nNgid:\t0\nPid:\t{shown}\nPPid:\t{ppid}\nTracerPid:\t0\nUid:\t{}\t{}\t{}\t{}\nGid:\t{}\t{}\t{}\t{}\nFDSize:\t64\nGroups:\t{}\n{vm}Threads:\t{threads}\nSigQ:\t0/0\nSigPnd:\t0000000000000000\nShdPnd:\t0000000000000000\nCapInh:\t{:016x}\nCapPrm:\t{:016x}\nCapEff:\t{:016x}\nCapBnd:\t{:016x}\nCapAmb:\t{:016x}\nNoNewPrivs:\t{}\nSeccomp:\t{}\nSeccomp_filters:\t{}\nCpus_allowed_list:\t{}\n",
                             p.umask.load(Ordering::Relaxed),
                             state.0,
                             state.1,
@@ -598,7 +598,7 @@ impl ProcFs {
                             groups.join(" "),
                             c.inh, c.prm, c.eff, c.bnd, c.amb,
                             ta.no_new_privs as u32, ta.seccomp, ta.filters,
-                            cpus() - 1
+                            super::cpu_list()
                         ))
                     }
                     K::PStat => {
@@ -698,7 +698,7 @@ fn parse_int(data: &[u8]) -> Result<i64, i64> {
 }
 
 fn cpus() -> usize {
-    std::thread::available_parallelism().map_or(1, |n| n.get()).min(64)
+    super::cpus()
 }
 
 fn cpuinfo() -> String {

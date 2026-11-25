@@ -269,11 +269,9 @@ impl Kernel {
     }
 }
 
-/// The CPUs Android sees: as many as the host has, up to 64 (sched_getaffinity,
-/// /proc/cpuinfo, /sys/devices/system/cpu).
+/// The CPUs Android sees (sched_getaffinity, getcpu): kernel::cpus.
 fn cpus() -> usize {
-    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *N.get_or_init(|| std::thread::available_parallelism().map_or(1, |n| n.get()).min(64))
+    super::cpus()
 }
 
 /// struct rusage: ru_utime then ru_stime (timevals), then ru_maxrss in KB and the rest.

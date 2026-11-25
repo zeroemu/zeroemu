@@ -100,8 +100,9 @@ impl PoolState {
 }
 
 impl Pool {
-    pub fn new(max: usize) -> Arc<Pool> {
-        let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
+    /// `max` vCPUs at most, for a guest given `cpus` cores.
+    pub fn new(max: usize, cpus: usize) -> Arc<Pool> {
+        let cores = cpus.min(super::host_cpus());
         let background = Pool::sized((cores / 2).max(2), None);
         let pool = Pool::sized(max, Some(background));
         let _ = MAIN.set(Arc::downgrade(&pool));

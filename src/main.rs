@@ -13,6 +13,8 @@ mod gpu;
 mod hv;
 mod image;
 mod kernel;
+#[allow(dead_code)] // the GPS (src/kernel/vsock.rs) and Device > Location use it
+mod location;
 mod mm;
 mod pagecache;
 mod paging;
@@ -390,7 +392,7 @@ fn run(args: Vec<String>) -> Result<i32, String> {
         kernel::reserve_exit_signals();
     }
     let data_path = data.as_ref().map(|d| d.path.clone());
-    let extras = boot.then_some(kernel::BootExtras { push, run, data, network: !no_net });
+    let extras = boot.then_some(kernel::BootExtras { push, run, data, network: !no_net, time_zone: None });
     let adb = if (boot && !no_adb) || adb_port.is_some() { kernel::adb::start(adb_port) } else { None };
     if boot && let Some(c) = &chosen {
         print_status(c, data_path.as_deref(), adb, show);
@@ -398,7 +400,7 @@ fn run(args: Vec<String>) -> Result<i32, String> {
     let gpu: Option<Arc<dyn gpu::GpuBackend>> = if fake {
         Some(gpu::fake())
     } else if show {
-        Some(gpu::open(1080, 2400)?)
+        Some(gpu::open(gpu::Display::DEFAULT)?)
     } else {
         None
     };

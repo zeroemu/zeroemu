@@ -229,6 +229,9 @@ pub struct BootExtras {
     pub data: Option<DataImage>,
     /// The device has a network.
     pub network: bool,
+    /// The IANA time zone Android is set to at every boot, over the one it saved (an
+    /// AVD's, the Android Emulator's host zone): None leaves Android's own.
+    pub time_zone: Option<String>,
 }
 
 pub struct DataImage {
@@ -434,12 +437,13 @@ fn first_stage_mounts(v: &Vfs, metadata: &Arc<crate::tmpfs::Tmpfs>, dev: &crate:
     }
 }
 
-/// Adds BOOT_PROPS to the ODM partition's build.prop, which init reads after the
-/// vendor's so they override it. The image is read-only, so a copy of that (small)
-/// directory goes over it. /odm/etc is a link to here.
-fn add_boot_props(v: &mut Vfs, phys: &Arc<PhysMem>) {
+/// Adds BOOT_PROPS and `props` (lines of name=value) to the ODM partition's build.prop,
+/// which init reads after the vendor's so they override it, and `init_rc` as an init
+/// script of the ODM's, which init reads last of all. The image is read-only, so a
+/// copy of that (small) directory goes over it. /odm/etc is a link to here.
+fn add_boot_props(v: &mut Vfs, phys: &Arc<PhysMem>, props: &str, init_rc: Option<&str>) {
     const DIR: &str = "/vendor/odm/etc";
-    fn copy(v: &Vfs, to: &crate::tmpfs::Tmpfs, from: &str, rel: &str) -> Result<(), i64> {
+    fn copy(v: &Vfs, to: &crate::tmpfs::Tmpfs, from: &str, rel: &str, props: &str) -> Result<(), i64> {
         let dir = v.resolve("/", from, true)?;
         for e in v.readdir(&dir)? {
             if e.name == "." || e.name == ".." {
@@ -450,12 +454,13 @@ fn add_boot_props(v: &mut Vfs, phys: &Arc<PhysMem>) {
             let st = v.stat(&node)?;
             if st.mode & crate::vfs::S_IFMT == crate::vfs::S_IFDIR {
                 to.mkdir_p(&rel, st.mode & 0o7777);
-                copy(v, to, &path, &format!("{rel}/"))?;
+                copy(v, to, &path, &format!("{rel}/"), props)?;
             } else {
                 let content = v.read_all(&node)?;
                 let mut text = String::from_utf8_lossy(&content).into_owned();
                 if rel == "build.prop" {
                     text.push_str(BOOT_PROPS);
+                    text.push_str(props);
                     // For debugging: ZEROEMU_PROPS="ro.lmk.debug=true other=1".
                     for prop in std::env::var("ZEROEMU_PROPS").unwrap_or_default().split_whitespace() {
                         text.push_str(prop);
@@ -468,8 +473,14 @@ fn add_boot_props(v: &mut Vfs, phys: &Arc<PhysMem>) {
         Ok(())
     }
     let etc = crate::tmpfs::Tmpfs::new(phys.clone(), 0o755);
-    match copy(v, &etc, DIR, "") {
-        Ok(()) => v.mount(DIR, etc),
+    match copy(v, &etc, DIR, "", props) {
+        Ok(()) => {
+            if let Some(rc) = init_rc {
+                etc.mkdir_p("init", 0o755);
+                etc.write_file("init/zeroemu.rc", 0o644, rc);
+            }
+            v.mount(DIR, etc)
+        }
         Err(e) => eprintln!("zeroemu: {DIR}: errno {e}: boot properties not set"),
     }
 }
@@ -512,9 +523,8 @@ fn mount_tmpfs(vfs: &mut Vfs, phys: &Arc<PhysMem>) -> (Arc<crate::tmpfs::Tmpfs>,
     // sysfs: what bionic's sysconf and friends read. (selinuxfs is mounted
     // over /sys/fs/selinux once the kernel exists: it reads the policy lazily.)
     let sys = Tmpfs::with_type(phys.clone(), 0o755, "sysfs");
-    let n = std::thread::available_parallelism().map_or(1, |n| n.get()).min(64);
     for f in ["online", "possible", "present"] {
-        sys.write_file(&format!("devices/system/cpu/{f}"), 0o444, &format!("0-{}\n", n - 1));
+        sys.write_file(&format!("devices/system/cpu/{f}"), 0o444, &format!("{}\n", cpu_list()));
     }
     sys.write_file("devices/system/cpu/kernel_max", 0o444, "63\n");
     for d in ["fs/cgroup", "fs/bpf", "fs/pstore", "fs/fuse/connections", "kernel/tracing", "kernel/debug", "kernel/config", "class", "bus", "block", "dev/char", "dev/block", "module"] {
@@ -795,6 +805,37 @@ static REBOOT_TARGET: Mutex<Option<String>> = Mutex::new(None);
 
 pub fn reboot_target() -> Option<String> {
     REBOOT_TARGET.lock().unwrap().clone()
+}
+
+/// How many CPU cores Android is given (`set_cpus`), 0 for the host's.
+static CPUS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The host's cores, as many as a 64-bit affinity mask holds (sched_getaffinity's).
+pub fn host_cpus() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::thread::available_parallelism().map_or(1, |n| n.get()).min(64))
+}
+
+/// Gives Android `n` cores, as an AVD's hw.cpu.ncore does; before the boot, as sysfs,
+/// cgroups and per-CPU BPF maps are sized from it once.
+pub fn set_cpus(n: usize) {
+    CPUS.store(n.clamp(1, 64), Ordering::Relaxed);
+}
+
+/// How many cores Android sees: /sys/devices/system/cpu, sched_getaffinity, /proc.
+pub fn cpus() -> usize {
+    match CPUS.load(Ordering::Relaxed) {
+        0 => host_cpus(),
+        n => n,
+    }
+}
+
+/// The cores as Linux lists them: "0" for one, else "0-<n-1>".
+pub fn cpu_list() -> String {
+    match cpus() {
+        1 => "0".into(),
+        n => format!("0-{}", n - 1),
+    }
 }
 
 /// Whether zeroemu's notes for its developers print: at ZEROEMU_LOG=I or more
@@ -1103,7 +1144,15 @@ impl Kernel {
             let network = extras.as_ref().is_some_and(|e| e.network);
             oem.write_file("etc/sysconfig/zeroemu.xml", 0o644, &format!("<config>\n{NO_BLUETOOTH}{}</config>\n", if network { ETHERNET } else { "" }));
             v.mount("/oem", oem);
-            add_boot_props(&mut v, &phys);
+            // The screen's density: unset, SurfaceFlinger falls back to 213 (tvdpi).
+            let props = gpu.as_ref().map(|g| format!("ro.sf.lcd_density={}\n", g.display().dpi)).unwrap_or_default();
+            // The device's time zone, over the one Android saved: after init has read
+            // the saved properties, which its load_persist_props waits for, as this
+            // script is read after init.rc.
+            let init_rc = extras.as_ref().and_then(|e| e.time_zone.as_deref()).map(|tz| {
+                format!("# zeroemu: the device's time zone, at every boot.\non load_persist_props_action\n    setprop persist.sys.timezone {tz}\n")
+            });
+            add_boot_props(&mut v, &phys, &props, init_rc.as_deref());
         }
         let sys = v.resolve("/", "/sys", true).map(|n| v.fs_arc(&n)).map_err(|e| format!("/sys: errno {e}"))?;
         let blocks = block::Blocks::new(dev.clone(), sys.clone());
@@ -1226,7 +1275,7 @@ impl Kernel {
             next_id: AtomicI32::new(1),
             id_wrapped: Mutex::new(false),
             live_threads: AtomicUsize::new(0),
-            vcpus: vcpus::Pool::new(max_vcpus),
+            vcpus: vcpus::Pool::new(max_vcpus, cpus()),
             persist,
             pressure: pressure::Pressure::default(),
             sigpage,

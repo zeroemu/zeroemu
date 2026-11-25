@@ -198,8 +198,7 @@ fn now() -> u64 {
 }
 
 fn cpus() -> String {
-    let n = std::thread::available_parallelism().map_or(1, |n| n.get()).min(64);
-    if n == 1 { "0".into() } else { format!("0-{}", n - 1) }
+    super::cpu_list()
 }
 
 impl CgroupFs {

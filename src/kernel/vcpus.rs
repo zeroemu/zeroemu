@@ -108,9 +108,9 @@ const DISPLAY_SLICE: Duration = Duration::from_millis(50);
 /// come to wait too. The rest's running pays it off (REST_PAYS).
 const REST_WAIT: Duration = DISPLAY_SLICE;
 
-/// How much of display work's time keeping the rest out each moment of theirs on a core
-/// pays for: a slice pays for REST_WAIT. Paid for what they run, not for being handed a
-/// core: display threads that hand one to and fro through blocks of a few microseconds
+/// How much of display work's time keeping the rest out each moment of theirs on a core,
+/// as the rest (Held::rest_time), pays for: a slice pays for REST_WAIT. Paid for what
+/// they run, not for being handed a core: display threads that hand one to and fro through blocks of a few microseconds
 /// (a binder call and its reply, a futex) hand it the rest at each, and take it back at
 /// once (makes_way). Had being handed it paid for everything, the rest would never come
 /// due however long that went on, and would run next to nothing.
@@ -474,11 +474,34 @@ struct Held<R> {
     /// had only blocked for a moment is back in line by then. No more of the rest are
     /// due while it lasts (CoresState::rest_due).
     due: bool,
+    /// How long it has held its core as the rest, for what that pays (CoresState::pay):
+    /// `rest_held`, and since `rest_since` too while it is of the rest now. A binder
+    /// thread is lent its caller's urgency for a call and is the rest again before it
+    /// blocks (binder_read's settle_urgency): its time serving display work pays nothing.
+    rest_held: Duration,
+    rest_since: Option<Instant>,
 }
 
 impl<R: Runner> Held<R> {
     fn display(&self) -> bool {
         !self.spent && self.who.is_display()
+    }
+
+    /// How long it has held its core as the rest, at `now`.
+    fn rest_time(&self, now: Instant) -> Duration {
+        self.rest_held + self.rest_since.map_or(Duration::ZERO, |since| now.saturating_duration_since(since))
+    }
+
+    /// Its urgency may have changed (reclassify): starts or ends a stretch as the rest.
+    fn restretch(&mut self, now: Instant) {
+        match (self.display(), self.rest_since) {
+            (true, Some(since)) => {
+                self.rest_held += now.saturating_duration_since(since);
+                self.rest_since = None;
+            }
+            (false, None) => self.rest_since = Some(now),
+            _ => {}
+        }
     }
 
     /// On the rest's due turn, and still of the rest: one made display work meanwhile
@@ -519,7 +542,8 @@ struct CoresState<R> {
     /// How much of display_time the rest have paid for by running (REST_PAYS): what it
     /// has run beyond this is how long display work has kept them out unpaid. Not time
     /// behind other work alone, which doesn't run it. What is owed stays owed while none
-    /// of the rest wait, and their running pays it off then too.
+    /// of the rest wait, and their running pays it off then too; going into a due turn
+    /// it is REST_WAIT at most (serve).
     rest_turn_at: Duration,
     /// How many cores there are: Cores::n.
     cores: usize,
@@ -606,7 +630,8 @@ impl<R: Runner> CoresState<R> {
         }
         self.next += 1;
         self.used += 1;
-        self.holders.insert(self.next, Held { who: who.clone(), since: now, spent, due });
+        let rest_since = (spent || !who.is_display()).then_some(now);
+        self.holders.insert(self.next, Held { who: who.clone(), since: now, spent, due, rest_held: Duration::ZERO, rest_since });
         self.track(now);
         (self.next, now)
     }
@@ -744,7 +769,10 @@ impl<R: Runner> Cores<R> {
     fn reclassify(&self, who: *const R) {
         let mut st = self.st.lock().unwrap();
         let now = Instant::now();
-        // A holder's change starts or stops the rest's count.
+        // A holder's change starts or stops its time as the rest, and the rest's count.
+        if let Some(h) = st.holders.values_mut().find(|h| Arc::as_ptr(&h.who) == who) {
+            h.restretch(now);
+        }
         st.track(now);
         let in_display = st.display.iter().position(|w| Arc::as_ptr(&w.who) == who);
         let in_rest = st.rest.iter().position(|w| Arc::as_ptr(&w.who) == who);
@@ -798,6 +826,13 @@ impl<R: Runner> Cores<R> {
                 },
             };
             self.waiting.fetch_sub(1, Ordering::Relaxed);
+            if due {
+                // Owed REST_WAIT at most going into the turn: due turns that end in a
+                // moment pay little, and what a long stretch of display work piled up
+                // would otherwise make the rest due after its every hold for as long
+                // again.
+                st.rest_turn_at = st.rest_turn_at.max(st.display_time(now).saturating_sub(st.rest_wait));
+            }
             // Counts the line's change and the new holder together (track). Being due, the
             // rest's first has its turn (Held::due), and display work the next core.
             let got = st.hold(&w.who, w.spent, due, now);
@@ -819,11 +854,9 @@ impl<R: Runner> Cores<R> {
     fn give_up(&self, st: &mut CoresState<R>, id: u64, now: Instant) {
         if let Some(h) = st.holders.remove(&id) {
             st.used -= 1;
-            // However it ends, a turn of the rest's pays for as long as it was held: one
+            // However it ends, a turn pays for as long as it was held as the rest: one
             // display work cut short at once pays next to nothing.
-            if h.due || !h.display() {
-                st.pay(now.saturating_duration_since(h.since), now);
-            }
+            st.pay(h.rest_time(now), now);
             st.track(now);
             self.serve(st, now);
         }
@@ -1417,10 +1450,15 @@ mod tests {
         }
     }
 
-    /// Makes holder `id` have held its core since `at`, for what its turn pays: returns
-    /// `at`, for give_way.
+    /// Makes holder `id` have held its core since `at`, for what its turn pays, as the
+    /// rest if it is of them now: returns `at`, for give_way.
     fn held_since(gate: &Cores<Fake>, id: u64, at: Instant) -> Instant {
-        gate.st.lock().unwrap().holders.get_mut(&id).expect("a holder").since = at;
+        let mut st = gate.st.lock().unwrap();
+        let h = st.holders.get_mut(&id).expect("a holder");
+        h.since = at;
+        if h.rest_since.is_some() {
+            h.rest_since = Some(at);
+        }
         at
     }
 
@@ -1785,7 +1823,7 @@ mod tests {
         let (d1, d2, r) = (Fake::new(true), Fake::new(true), Fake::new(false));
         let (id, _) = gate.try_take(&d1, false).unwrap();
         let w = queue(&gate, &r, false);
-        std::thread::sleep(Duration::from_millis(20));
+        std::thread::sleep(Duration::from_millis(60));
         // d1 blocks: the rest's first has the core, not being due.
         gate.release(id);
         let (id, _) = w.join().unwrap().expect("the core");
@@ -1818,6 +1856,53 @@ mod tests {
         }
         gate.release(id);
         let (id, _) = w.join().unwrap().expect("the core");
+        gate.release(id);
+        assert_eq!(gate.usage().0, 0);
+    }
+
+    #[test]
+    fn only_time_on_a_core_as_the_rest_pays() {
+        // A binder thread lent display work's urgency for a call holds its core as display
+        // work, and is the rest again before it blocks: the call's time pays nothing.
+        let gate = Arc::new(Cores::<Fake>::waiting_rest(1, NEVER_DUE));
+        let server = Fake::new(true);
+        let (id, _) = gate.try_take(&server, false).unwrap();
+        let r1 = queue(&gate, &Fake::new(false), false);
+        let r2 = queue(&gate, &Fake::new(false), false);
+        std::thread::sleep(Duration::from_millis(60));
+        // Serving display work for a second, as far as the pay goes.
+        held_since(&gate, id, Instant::now() - Duration::from_secs(1));
+        server.set_display(false);
+        gate.reclassify(Arc::as_ptr(&server));
+        gate.release(id);
+        let (id, _) = r1.join().unwrap().expect("the core");
+        assert!(gate.st.lock().unwrap().rest_waited(Instant::now()).unwrap() >= Duration::from_millis(50), "its time as display work paid nothing");
+        gate.release(id);
+        let (id, _) = r2.join().unwrap().expect("the core");
+        gate.release(id);
+        assert_eq!(gate.usage().0, 0);
+    }
+
+    #[test]
+    fn the_rest_are_owed_rest_wait_at_most_going_into_a_due_turn() {
+        // Due turns that end in a moment pay little: what a long stretch of display work
+        // piled up beyond REST_WAIT is let go as one starts, or the rest would be due
+        // after display work's every hold for as long again.
+        let gate = Arc::new(Cores::<Fake>::waiting_rest(1, NEVER_DUE));
+        let (id, _) = gate.try_take(&Fake::new(true), false).unwrap();
+        let (r1, r2) = (queue(&gate, &Fake::new(false), false), queue(&gate, &Fake::new(false), false));
+        std::thread::sleep(Duration::from_millis(40));
+        gate.set_rest_wait(Duration::from_millis(10));
+        gate.release(id);
+        let (id, _) = r1.join().unwrap().expect("the core");
+        {
+            let st = gate.st.lock().unwrap();
+            assert!(st.holders[&id].due);
+            // The clock is stopped: r2 waits, but no display work.
+            assert!(st.rest_waited(Instant::now()).unwrap() <= Duration::from_millis(10));
+        }
+        gate.release(id);
+        let (id, _) = r2.join().unwrap().expect("the core");
         gate.release(id);
         assert_eq!(gate.usage().0, 0);
     }

@@ -1485,10 +1485,6 @@ pub fn turned() {
     unsafe { dispatch_async_f(&raw const _dispatch_main_q, std::ptr::null_mut(), on_main) };
 }
 
-/// Gives the window the turned panel's shape, at the same scale, about the same
-/// middle, and on its screen. A window already that shape, or full screen, stays.
-/// The shape is the panel's own turned, so a tablet's window, wide to begin with,
-/// goes tall on its side.
 /// Points per device pixel the picture is meant to be shown at, as f64 bits (0 for not
 /// yet known): the window's when it is first turned, or after the user resized it.
 /// Turning keeps it where the screen has room, so that a window turned and turned
@@ -1505,6 +1501,12 @@ fn turned_size(shown: (u32, u32), preferred: f64, room: (f64, f64)) -> (f64, f64
     ((w * scale).floor().max(1.0), (h * scale).floor().max(1.0))
 }
 
+/// Gives the window the turned panel's shape, about the same middle, and on its
+/// screen: at the scale its picture is drawn at, or, while the window is still the size
+/// the last turn gave it, at PREFERRED_SCALE, so that a window the screen made smaller
+/// grows back; smaller still if the screen has no room. A window already that shape, or
+/// full screen, stays. The shape is the panel's own turned, so a tablet's window, wide
+/// to begin with, goes tall on its side.
 unsafe fn reshape(window: *mut c_void) {
     const FULL_SCREEN: i64 = 1 << 14;
     unsafe {

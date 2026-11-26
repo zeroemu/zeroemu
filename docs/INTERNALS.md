@@ -208,9 +208,9 @@ on a device; `/data`'s tmpfs keeps ext4's inode flags and quota project ids
 Guest threads take their host priority from what Android says about them: real-time
 policies and nice -4 or better count as display work, the `top-app` cgroup as
 foreground, nice 10 or worse and the `background` and `dex2oat` cgroups as
-background. Background threads take turns on half the cores Android is given (one
-of one), as a
-phone would keep them to its little ones.
+background. Background threads take turns on half the cores Android is given or the
+Mac has, whichever is fewer (one of one), as a phone would keep them to its little
+ones.
 
 Android is given all of the host's cores unless a device asks for fewer. macOS cannot
 keep a thread to some of the cores, so then zeroemu lets no more guest threads run at

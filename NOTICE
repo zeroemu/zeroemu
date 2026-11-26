@@ -13,3 +13,7 @@ testdata/sepolicy_mini.cil, used only by unit tests, holds declarations taken
 from the SELinux policy in an Android SDK system image. That policy comes from
 the Android Open Source Project (system/sepolicy and the emulator's device
 policy), which publishes it as open source.
+
+The Location menu's routes (src/location.rs) follow paths and roads traced from
+OpenStreetMap: © OpenStreetMap contributors. That data is available under the
+Open Database License (ODbL); see https://www.openstreetmap.org/copyright.

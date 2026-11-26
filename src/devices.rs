@@ -382,7 +382,9 @@ impl Followed {
 }
 
 /// The device followed, held: found first, if it hasn't been yet and this zeroemu
-/// keeps its /data, at the location its device.ini has then.
+/// keeps its /data. A --device boot's is at the location it booted with, so that one
+/// saved in device.ini since moves it; one the list made of a terminal boot's /data is
+/// at the location its device.ini has when found, as the boot didn't start there.
 fn followed() -> MutexGuard<'static, Option<Followed>> {
     let mut f = FOLLOWED.lock().unwrap_or_else(|p| p.into_inner());
     if f.is_none()

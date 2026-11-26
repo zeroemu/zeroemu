@@ -144,8 +144,17 @@ ini=$devices/$A_ID/device.ini
 saved_location() { grep -qx "location=$1" "$ini"; }
 gps_at() { A shell dumpsys location | grep -q "last location=Location\[gps $1"; }
 FIFO=$TMP/in boot "Phone A"
+# The toolbar's Location button; but a toolbar customized before it was one of the
+# defaults keeps the items it had (View > Customize Toolbar adds it), and then
+# Device > Location, which does the same, is chosen instead.
 send toolbar "location/Times Square, New York"
-check "the toolbar's Location button saves the place chosen in device.ini" settle 10 saved_location times-square
+via="the toolbar's Location button"
+if ! settle 5 saved_location times-square && grep -q 'no toolbar item "location/' "$log"; then
+    echo "note no Location in your customized toolbar: Device > Location instead"
+    send menu "Device/Location/Times Square, New York"
+    via="Device > Location"
+fi
+check "$via saves the place chosen in device.ini" settle 10 saved_location times-square
 A shell pm grant com.google.android.apps.maps android.permission.ACCESS_FINE_LOCATION
 A shell am start -n com.google.android.apps.maps/com.google.android.maps.MapsActivity >/dev/null
 check "and Android's GPS reports it" settle 60 gps_at 40.758000,-73.985500
@@ -163,6 +172,6 @@ z --no-net --device "id:$gone" > "$TMP/gone.log" 2>&1
 check "a device that isn't there doesn't boot" grep -q "there is no device" "$TMP/gone.log"
 check "and nothing is made for it" test ! -e "$devices/$gone"
 
-errors=$(cat "$TMP"/boot*.log | grep -E "panicked|^\[zeroemu\] internal error|won't be kept|starting with an empty /data|no toolbar item|location wasn't saved" | head -5)
+errors=$(cat "$TMP"/boot*.log | grep -E "panicked|^\[zeroemu\] internal error|won't be kept|starting with an empty /data|no toolbar item|location wasn't saved" | grep -v 'no toolbar item "location/' | head -5)
 [ -z "$errors" ] || { echo "$errors" | sed 's/^/FAIL zeroemu: /'; bad=$((bad + 1)); }
 [ "$bad" -eq 0 ] && echo "all device checks passed" || { echo "$bad device checks failed"; exit 1; }

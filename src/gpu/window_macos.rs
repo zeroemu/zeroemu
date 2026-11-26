@@ -253,7 +253,8 @@ pub fn open(display: super::Display) -> Result<(), String> {
         let (win_w, win_h) = first_size(display, room, dpr);
         msg_size(window, sel("setContentSize:"), NSSize { width: win_w, height: win_h });
         keep_shape(window, super::controls::shown_size((fb_w, fb_h), super::controls::turns()));
-        // For Zoom's size (windowWillUseStandardFrame:defaultFrame:).
+        // For Zoom's size (windowWillUseStandardFrame:defaultFrame:), and to turn the
+        // window as it leaves full screen (windowDidExitFullScreen:).
         msg_id(window, sel("setDelegate:"), controls_object());
         msg_void(window, sel("center"));
         set_up_menus(app);
@@ -1074,7 +1075,7 @@ fn controls_object() -> *mut c_void {
             return std::ptr::null_mut();
         }
         // Type encodings as the runtime has them for these selectors' protocols.
-        let methods: [(&str, *const c_void, &str); 7] = [
+        let methods: [(&str, *const c_void, &str); 8] = [
             ("deviceAction:", device_action as *const c_void, "v24@0:8@16"),
             ("validateMenuItem:", validate_menu_item as *const c_void, "B24@0:8@16"),
             ("toolbar:itemForItemIdentifier:willBeInsertedIntoToolbar:", toolbar_item as *const c_void, "@36@0:8@16@24B32"),
@@ -1082,6 +1083,7 @@ fn controls_object() -> *mut c_void {
             ("toolbarAllowedItemIdentifiers:", toolbar_allowed as *const c_void, "@24@0:8@16"),
             ("applicationShouldTerminate:", should_terminate as *const c_void, "Q24@0:8@16"),
             ("windowWillUseStandardFrame:defaultFrame:", standard_frame as *const c_void, "{CGRect={CGPoint=dd}{CGSize=dd}}56@0:8@16{CGRect={CGPoint=dd}{CGSize=dd}}24"),
+            ("windowDidExitFullScreen:", left_full_screen as *const c_void, "v24@0:8@16"),
         ];
         for (selector, imp, types) in methods {
             let types = CString::new(types).unwrap();
@@ -1523,7 +1525,8 @@ unsafe fn reshape(window: *mut c_void) {
     const FULL_SCREEN: i64 = 1 << 14;
     unsafe {
         let shown = super::controls::shown_size(panel_size(), super::controls::turns());
-        // Full screen too, for the window it leaves full screen as.
+        // Full screen too, for the window it leaves full screen as, which this then
+        // turns (left_full_screen).
         keep_shape(window, shown);
         if msg_i64_ret(window, sel("styleMask")) & FULL_SCREEN != 0 {
             return;
@@ -1573,6 +1576,16 @@ unsafe fn reshape(window: *mut c_void) {
 unsafe fn keep_shape(window: *mut c_void, shown: (u32, u32)) {
     let ratio = NSSize { width: shown.0.max(1) as f64, height: shown.1.max(1) as f64 };
     unsafe { msg_size(window, sel("setContentAspectRatio:"), ratio) };
+}
+
+/// The window left full screen, as it was when it entered: if the device turned
+/// meanwhile, the window turns now, as reshape skips a full-screen window.
+extern "C" fn left_full_screen(_this: *mut c_void, _cmd: *mut c_void, _note: *mut c_void) {
+    let window = WINDOW.load(Ordering::Acquire);
+    if !window.is_null() {
+        unsafe { reshape(window) };
+        relayout();
+    }
 }
 
 /// Zoom's window (Window > Zoom, an Option-click on the green button, whose plain click

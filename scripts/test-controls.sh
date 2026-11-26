@@ -187,7 +187,12 @@ touch_at() { # the shown U and V, then the panel's X and Y it must land on, as f
 }
 check "a click on the turned screen lands where it's shown" touch_at 0.25 0.1 0.9 0.25
 # It may have opened something (Settings' search bar is there): back to Settings.
-send action back; settle 10 focus_is com.android.settings/
+# Search opens with the keyboard up, and the first Back only closes the keyboard; left
+# open, the search comes back on top of Settings for the menu bar's checks below.
+for _ in 1 2 3; do
+    focus_is com.android.settings/ && break
+    send action back; settle 5 focus_is com.android.settings/
+done
 send action rotate-right
 check "Rotate Right turns it back" settle 10 rotation 0
 send action rotate-right

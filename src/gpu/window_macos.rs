@@ -1018,9 +1018,11 @@ pub fn pump_for(secs: f64) {
 
 use super::controls::{Action, Key, Shortcut};
 
-/// The one object that every toolbar item and zeroemu's own menu items send their
-/// action to, that the toolbar asks for its items, and that the application asks
-/// before it quits. AppKit holds it weakly in all three roles, so it is never let go.
+/// The one object that zeroemu's toolbar items and menu items send their action to
+/// (the Location button's by its menu's items), that the toolbar asks for its items,
+/// that the window asks for Zoom's frame and tells it left full screen, and that the
+/// application asks before it quits. AppKit holds it weakly in each role, so it is
+/// never let go.
 static CONTROLS: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
 
 /// Tags of the menu's own commands, after the device's (`Action::tag`).

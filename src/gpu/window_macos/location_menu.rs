@@ -1,8 +1,10 @@
-//! Device > Location: where the device's GPS says it is (src/location.rs), chosen as
-//! in Simulator's Features > Location: None, Custom Location…, then zeroemu's places,
-//! then its routes, with a checkmark on the one the GPS reports. The items send
-//! deviceAction: to the controls object, as the Device menu's others do, and it
-//! hands them here by their tags.
+//! Device > Location, and the toolbar's Location button, which opens the same menu:
+//! where the device's GPS says it is (src/location.rs), chosen as in Simulator's
+//! Features > Location: None, Custom Location…, then zeroemu's places, then its routes,
+//! with a checkmark on the one the GPS reports. The items send deviceAction: to the
+//! controls object, as the Device menu's others do, and it hands them here by their
+//! tags. What is chosen is the device's location from then on: saved in its
+//! device.ini (devices::choose_location), so that it starts there next time.
 
 use super::*;
 use crate::location::{self, Kind, PRESETS, Source};
@@ -20,8 +22,12 @@ pub(super) fn is_tag(tag: i64) -> bool {
     tag == TAG_OFF || tag == TAG_CUSTOM || (TAG_PRESET..TAG_PRESET + PRESETS.len() as i64).contains(&tag)
 }
 
-/// The Device menu's Location item and its submenu (UI thread).
-pub(super) unsafe fn item(target: Id) -> Id {
+/// The toolbar item's identifier, which the test FIFO's `toolbar` names it by.
+pub(super) const TOOLBAR_ITEM: &str = "location";
+
+/// The menu of places, autoreleased: one for the Device menu, and one for each toolbar
+/// item, as a menu can be in one place only (UI thread).
+unsafe fn menu(target: Id) -> Id {
     unsafe {
         let choice = |title: &str, tag: i64| menu_item(title, "deviceAction:", "", 0, tag, target);
         let mut items = vec![choice("None", TAG_OFF), choice("Custom Location…", TAG_CUSTOM), std::ptr::null_mut()];
@@ -31,14 +37,46 @@ pub(super) unsafe fn item(target: Id) -> Id {
         items.extend(tagged().filter(|(p, _)| matches!(p.kind, Kind::Route { .. })).map(|(p, tag)| choice(p.name, tag)));
         let menu = msg_id_ret(msg0(cls("NSMenu"), sel("alloc")), sel("initWithTitle:"), ns_str("Location"));
         for item in items {
-            let item = if item.is_null() { msg0(cls("NSMenuItem"), sel("separatorItem")) } else { item };
-            msg_id(menu, sel("addItem:"), item);
+            if item.is_null() {
+                msg_id(menu, sel("addItem:"), msg0(cls("NSMenuItem"), sel("separatorItem")));
+            } else {
+                // The menu keeps it.
+                msg_id(menu, sel("addItem:"), item);
+                msg_void(item, sel("release"));
+            }
         }
+        msg0(menu, sel("autorelease"))
+    }
+}
+
+/// The Device menu's Location item and its submenu (UI thread).
+pub(super) unsafe fn item(target: Id) -> Id {
+    unsafe {
         let top = menu_item("Location", "", "", 0, 0, std::ptr::null_mut());
         // No action of its own: it only opens the submenu.
         msg_id(top, sel("setAction:"), std::ptr::null_mut());
-        msg_id(top, sel("setSubmenu:"), menu);
+        msg_id(top, sel("setSubmenu:"), menu(target));
         top
+    }
+}
+
+/// The toolbar's Location button, `ident` (TOOLBAR_ITEM): a click opens the menu,
+/// autoreleased, as the toolbar keeps what it gets (UI thread).
+pub(super) unsafe fn toolbar_item(ident: Id, target: Id) -> Id {
+    unsafe {
+        let item = msg_id_ret(msg0(cls("NSMenuToolbarItem"), sel("alloc")), sel("initWithItemIdentifier:"), ident);
+        if item.is_null() {
+            return item;
+        }
+        msg_id(item, sel("setLabel:"), ns_str("Location"));
+        msg_id(item, sel("setPaletteLabel:"), ns_str("Location"));
+        msg_id(item, sel("setToolTip:"), ns_str("Where the device's GPS says it is"));
+        let image = toolbar_symbol("location", "Location");
+        if !image.is_null() {
+            msg_id(item, sel("setImage:"), image);
+        }
+        msg_id(item, sel("setMenu:"), menu(target));
+        msg0(item, sel("autorelease"))
     }
 }
 
@@ -59,20 +97,18 @@ pub(super) unsafe fn validate(item: Id, tag: i64) {
     unsafe { msg_i64(item, sel("setState:"), on as i64) };
 }
 
-/// A Location item was chosen (UI thread).
+/// A Location item was chosen (UI thread): the device goes there, and that is saved
+/// as its location.
 pub(super) fn chosen(tag: i64) {
-    match tag {
-        TAG_OFF => location::set(Source::Off),
-        TAG_CUSTOM => {
-            if let Some(source) = ask_custom() {
-                location::set(source);
-            }
-        }
-        _ => {
-            if let Some(p) = usize::try_from(tag - TAG_PRESET).ok().and_then(|i| PRESETS.get(i)) {
-                location::set(Source::Preset(p.id));
-            }
-        }
+    let source = match tag {
+        TAG_OFF => Some(Source::Off),
+        TAG_CUSTOM => ask_custom(),
+        _ => usize::try_from(tag - TAG_PRESET).ok().and_then(|i| PRESETS.get(i)).map(|p| Source::Preset(p.id)),
+    };
+    if let Some(source) = source
+        && let Err(e) = crate::devices::choose_location(source)
+    {
+        eprintln!("zeroemu: the location wasn't saved: {e}");
     }
 }
 

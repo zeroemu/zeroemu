@@ -168,13 +168,16 @@ Behaviour:
   `mute`, `power`, `lock`, `power-menu`, `rotate-left`, `rotate-right`, `screenshot`,
   `android-screenshot`); `menu Menu/Item` chooses a menu bar item by its titles
   (`menu Device/Recent Apps`, `menu zeroemu/Quit zeroemu`, and in a submenu
-  `menu Device/Location/City Run`); `location off|LAT,LON|PRESET` moves the device as
-  Device > Location does (`location 28.6129,77.2295`, `location freeway-drive`; the
-  presets' ids are in src/location.rs); `toolbar NAME` clicks a
-  toolbar item, named as the actions are; `keyeq MODS KEYCODE CHARS` types a key into
-  the window with modifiers (`cmd`, `shift`, `alt`, `ctrl` joined by `+`, or `none`),
-  its Mac key code and its character (or `up`, `down`, `left`, `right`), so that a
-  shortcut takes a real key's route; `click U V` clicks the picture in the window at
+  `menu Device/Location/City Run`), one for the key window (`menu Window/Zoom`) going
+  to the device's window, which behind other windows isn't key;
+  `location off|LAT,LON|PRESET` moves the device as Device > Location does, but
+  without saving it in device.ini (`location 28.6129,77.2295`, `location
+  freeway-drive`; the presets' ids are in src/location.rs); `toolbar NAME` clicks a
+  toolbar item, named as the actions are, and `toolbar NAME/Item` chooses an item of a
+  toolbar item's menu (`toolbar location/City Run`); `keyeq MODS KEYCODE CHARS` types a
+  key into the window with modifiers (`cmd`, `shift`, `alt`, `ctrl` joined by `+`, or
+  `none`), its Mac key code and its character (or `up`, `down`, `left`, `right`), so
+  that a shortcut takes a real key's route; `click U V` clicks the picture in the window at
   U and V from 0 to 1 from its top left, as shown, so that a click on a turned device
   takes a real one's route. `toolbar NAME` finds only items in the toolbar as it is,
   customized or not. The FIFO must exist before zeroemu starts.

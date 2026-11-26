@@ -49,6 +49,10 @@ struct Form {
 /// again at its new size, as an alert can't change size while it shows.
 const TOGGLE_ADVANCED: i64 = 1100;
 
+/// The settings' rows shown with Advanced Settings closed: Device, Location and
+/// Coordinates, and Advanced Settings itself (SettingsRows::new).
+const SHOWN_ROWS: usize = 4;
+
 thread_local! {
     /// Whether the form, shown again, has Advanced Settings open.
     static ADVANCED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -792,7 +796,9 @@ extern "C" fn menu_needs_update(_this: Id, _cmd: Id, menu: Id) {
 }
 
 /// Edit…: the device's name and settings, in the form New Device has, its image shown
-/// but kept. What changes applies at its next start.
+/// but kept. What changes applies at its next start, but for the location, which a
+/// running device's zeroemu reads from device.ini and goes to at once
+/// (devices::follow_location).
 extern "C" fn edit_device(_this: Id, _cmd: Id, sender: Id) {
     let Some((d, running)) = device_at(unsafe { msg_i64_ret(sender, sel("tag")) }) else { return };
     let shown = with_list(|l| d.image_shown(&l.images)).unwrap_or_default();
@@ -835,7 +841,7 @@ unsafe fn edit_alert(d: &Device, image: &str, running: bool, entered: &(String, 
     unsafe {
         let alert = msg0(new_alert(), sel("autorelease"));
         msg_id(alert, sel("setMessageText:"), ns_str(&format!("Edit “{}”", d.name)));
-        let when = if running { "It's running: changes apply when it next starts." } else { "Changes apply when it next starts." };
+        let when = if running { "It's running: a new location moves it at once, and the rest applies when it next starts." } else { "Changes apply when it next starts." };
         msg_id(alert, sel("setInformativeText:"), ns_str(when));
         msg_id_ret(alert, sel("addButtonWithTitle:"), ns_str("Save"));
         msg_id_ret(alert, sel("addButtonWithTitle:"), ns_str("Cancel"));
@@ -1056,15 +1062,15 @@ struct SettingsRows {
     /// Raw::mine.
     mine: String,
     /// Advanced Settings' note on what isn't the default, while it is closed (else
-    /// null): it follows Device, the one of its settings shown.
+    /// null): the screen chosen with Device may be one.
     summary: Id,
 }
 
 impl SettingsRows {
-    /// The controls, filled from `raw`, and their rows: Device, then Advanced Settings
-    /// and the rows under it, which are the last of them, and how many those are when
-    /// `advanced` is closed (to hide), else 0. Closed, they keep what `raw` has: the
-    /// defaults, for a new device, unless they were changed before.
+    /// The controls, filled from `raw`, and their rows: Device, Location, Coordinates
+    /// and Advanced Settings (SHOWN_ROWS), then the rows under Advanced Settings, and
+    /// how many those are when `advanced` is closed (to hide), else 0. Closed, they keep
+    /// what `raw` has: the defaults, for a new device, unless they were changed before.
     unsafe fn new(raw: &Raw, advanced: bool) -> (SettingsRows, Vec<[Id; 2]>, usize) {
         unsafe {
             let me = list_object();
@@ -1173,8 +1179,12 @@ impl SettingsRows {
                 rows.summary = summary;
             }
             let disclosure = row_stack(&[triangle, title, summary], 4.0);
+            // Location shown always, as Device is: it is changed more than the rest,
+            // while the device runs too (Edit… moves a running device at once).
             let lines = vec![
                 [label("Device:"), preset],
+                [label("Location:"), place],
+                [label("Coordinates:"), coords],
                 [msg0(cls("NSGridCell"), sel("emptyContentView")), disclosure],
                 [label("Screen:"), size_row],
                 [label("Density:"), dpi_row],
@@ -1182,10 +1192,8 @@ impl SettingsRows {
                 [label("CPU cores:"), cpus],
                 [label("Network:"), network],
                 [label("Time zone:"), zone],
-                [label("Location:"), place],
-                [label("Coordinates:"), coords],
             ];
-            let hidden = if advanced { 0 } else { lines.len() - 2 };
+            let hidden = if advanced { 0 } else { lines.len() - SHOWN_ROWS };
             (rows, lines, hidden)
         }
     }
@@ -1298,6 +1306,7 @@ fn ram_shown(mb: u64) -> String {
 }
 
 /// What Advanced Settings holds that isn't the default, for when it is closed.
+/// Location is shown always, so not said here.
 fn advanced_summary(raw: &Raw) -> String {
     let mut parts = Vec::new();
     let screen = (|| Display::new(raw.width.trim().parse().ok()?, raw.height.trim().parse().ok()?, raw.dpi.trim().parse().ok()?).ok())();
@@ -1318,12 +1327,6 @@ fn advanced_summary(raw: &Raw) -> String {
     let zone = raw.zone.trim();
     if !zone.is_empty() && zone != raw.mine {
         parts.push(zone.to_string());
-    }
-    match &raw.place {
-        Place::ZoneCity => {}
-        Place::Fixed(Source::Off) => parts.push("no location".into()),
-        Place::Fixed(s) => parts.push(s.shown()),
-        Place::Custom => parts.push(raw.coords.trim().to_string()),
     }
     if parts.is_empty() { "(defaults)".into() } else { format!("({})", parts.join(", ")) }
 }
@@ -1776,7 +1779,8 @@ mod tests {
             place: Place::Fixed(Source::Preset("city-run")),
             ..defaults
         };
-        assert_eq!(advanced_summary(&changed), "(1440 × 3120 at 560 dpi, 2 GB, 2 cores, no network, Europe/Berlin, City Run)");
+        // The location isn't: it shows with Device, outside Advanced Settings.
+        assert_eq!(advanced_summary(&changed), "(1440 × 3120 at 560 dpi, 2 GB, 2 cores, no network, Europe/Berlin)");
     }
 
     #[test]

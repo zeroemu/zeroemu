@@ -111,7 +111,10 @@ renderer on the host. The display is one panel of a fixed size and density
 (gpu::Display, 1080x2400 at 420 dpi by default), whatever the window's size: the KMS
 mode and the renderer's framebuffer are that size. The renderer draws each frame into
 the window itself, scaled to fit as the Android Emulator does, at the screen's real
-pixel density.
+pixel density. The window keeps the panel's shape, turned as the device is, as its
+edges are dragged (NSWindow's contentAspectRatio), and Zoom makes it as large as the
+screen holds in that shape, about where it was; full screen, the picture has bars
+beside it.
 
 In the window, the mouse is a finger and scrolling drags one (a person's flick
 becomes a fling). F1 is Home, Escape is Back, F2 is recent apps. Other keys go to
@@ -138,6 +141,14 @@ passed since the last, so fixes a second apart that arrive a little early are dr
 location None it sends nothing, and Android keeps the last fix it had, as a phone
 with no sky in view does. A route is followed at its speed, heading along the leg it
 is on, and starts again from its beginning when chosen.
+
+A device's location is its device.ini's `location=` (src/devices.rs), and stays with
+it while it runs, both ways (devices::follow_location). What the Location menu, or the
+toolbar's Location button that opens it, chooses is saved there, so the device starts
+there next time. zeroemu reads device.ini once a second, and when its location is not
+the one it last read or wrote there, which is what Edit… in zeroemu.app's list does
+while the device runs, the device goes there. The device moves and device.ini is read
+or written under one lock, so that the two can't cross.
 
 ## Saving /data
 

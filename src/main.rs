@@ -85,7 +85,8 @@ Boot options:
                           (default: this computer's)
   --location <where>      where the GPS says the device is: <lat>,<lon>, a
                           place such as googleplex, a route, or off (default:
-                          the time zone's main city)
+                          the time zone's main city, or the Googleplex for a
+                          zone with none, such as UTC)
   --data <file>           keep /data in this file (by default, a file per image
                           in {data})
   --ephemeral             keep nothing: /data starts empty and is thrown away

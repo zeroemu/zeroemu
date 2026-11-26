@@ -173,7 +173,7 @@ opens it.
 | CPU cores | All of the Mac's | Fewer cores are what Android sees, and at most how many of its threads run at once, which leaves the Mac the rest |
 | Network | Connected | |
 | Time zone | The Mac's | Set again at every start, over a zone chosen inside Android |
-| Location | The main city of its time zone | Where its GPS says it is: none, a place, a moving route, or coordinates |
+| Location | The main city of its time zone (the Googleplex for a zone with none, such as UTC) | Where its GPS says it is: none, a place, a moving route, or coordinates |
 
 - **Start** boots a device in the window. Closing its window brings the list back; Quit
   (⌘Q) stops it and quits.
@@ -283,7 +283,7 @@ Boot options:
 | `--screen <w>x<h>`, `--density <dpi>` | The screen Android draws, in pixels and dots per inch: 1080x2400 at 420 by default, as Android Studio's Medium Phone |
 | `--cpus <n>` | How many cores Android sees, and at most how many of its threads run at once: all of the computer's by default |
 | `--timezone <zone>` | A time zone such as `Europe/Berlin`, set at every boot: the computer's by default |
-| `--location <where>` | Where the GPS says the device is: `<latitude>,<longitude>`, a place or route by its name in Device > Location (`"City Run"`) or its id (`city-run`, `googleplex`), or `off`. By default, the main city of the time zone |
+| `--location <where>` | Where the GPS says the device is: `<latitude>,<longitude>`, a place or route by its name in Device > Location (`"City Run"`) or its id (`city-run`, `googleplex`), or `off`. By default, the main city of the time zone, or the Googleplex for a zone with none, such as UTC |
 | `--data <file>` | Keep the device's `/data` in this file instead of the default one |
 | `--ephemeral` | Keep nothing: start with an empty `/data` and throw it away at exit |
 | `--wipe-data` | Start over with an empty `/data` |

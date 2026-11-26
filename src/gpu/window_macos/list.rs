@@ -10,6 +10,7 @@ use crate::gpu::Display;
 use crate::location::{self, Source};
 use crate::sdk::{self, Image, Support};
 use std::cell::RefCell;
+use std::path::PathBuf;
 
 type Id = *mut c_void;
 
@@ -500,7 +501,10 @@ extern "C" fn new_device(_this: Id, _cmd: Id, _sender: Id) {
         }
         return;
     }
-    let mut entered: Option<(String, usize, Raw)> = None;
+    // The image by its folder, not its place in the popup: the list may be scanned again
+    // before the form is shown again (refresh, as the list window becomes key once the
+    // form orders out), and an image installed or removed meanwhile moves the others.
+    let mut entered: Option<(String, Option<PathBuf>, Raw)> = None;
     ADVANCED.with(|a| a.set(false));
     loop {
         let Ok((alert, form)) = (unsafe { form_alert(entered.as_ref(), ADVANCED.with(|a| a.get())) }) else { return };
@@ -520,9 +524,10 @@ extern "C" fn new_device(_this: Id, _cmd: Id, _sender: Id) {
         let name = unsafe { rust_str(msg0(form.field, sel("stringValue"))) };
         let index = unsafe { msg_i64_ret(form.popup, sel("indexOfSelectedItem")) }.max(0) as usize;
         let raw = unsafe { form.settings.read() };
+        let image = with_list(|l| l.images.get(index).map(|i| i.dir.clone())).flatten();
         if answer == TOGGLE_ADVANCED {
             unsafe { msg_id(msg0(alert, sel("window")), sel("orderOut:"), std::ptr::null_mut()) };
-            entered = Some((name, index, raw));
+            entered = Some((name, image, raw));
             continue;
         }
         if answer != 1000 {
@@ -540,7 +545,7 @@ extern "C" fn new_device(_this: Id, _cmd: Id, _sender: Id) {
             Err(e) if e.is_empty() => return,
             Err(e) => {
                 show_alert("The device wasn't made", &e, &["OK"]);
-                entered = Some((name, index, raw));
+                entered = Some((name, image, raw));
             }
         }
     }
@@ -551,7 +556,7 @@ extern "C" fn new_device(_this: Id, _cmd: Id, _sender: Id) {
 /// was typed and chosen before, when that was refused. When none of the images can
 /// boot, no Form: the images all shown but not chosen, why the one shown can't boot,
 /// and what to install, with Copy Command (if there's an SDK to say it for) and OK.
-unsafe fn form_alert(entered: Option<&(String, usize, Raw)>, advanced: bool) -> Result<(Id, Option<Form>), String> {
+unsafe fn form_alert(entered: Option<&(String, Option<PathBuf>, Raw)>, advanced: bool) -> Result<(Id, Option<Form>), String> {
     let (images, supports, devices) = with_list(|l| {
         let supports = l.supports.get_or_insert_with(|| l.images.iter().map(sdk::classify).collect()).clone();
         (l.images.clone(), supports, l.devices.clone())
@@ -604,7 +609,9 @@ unsafe fn form_alert(entered: Option<&(String, usize, Raw)>, advanced: bool) -> 
         }
         // None boots: the tested image shown, as the text speaks of it, else the first.
         let tested = || images.iter().position(|i| i.package() == sdk::tested_package());
-        let chosen = entered.map(|e| e.1).or(first).or_else(tested).unwrap_or(0);
+        // The one chosen before, if it is still there.
+        let before = entered.and_then(|e| e.1.as_ref()).and_then(|dir| images.iter().position(|i| &i.dir == dir));
+        let chosen = before.or(first).or_else(tested).unwrap_or(0);
         msg_i64(popup, sel("selectItemAtIndex:"), chosen as i64);
         msg0(popup, sel("autorelease"));
         pin_const(popup, "widthAnchor", 280.0);

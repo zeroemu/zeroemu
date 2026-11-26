@@ -97,8 +97,10 @@ const DISPLAY_SLICE: Duration = Duration::from_millis(50);
 /// second (sched_rt_runtime_us). Then display work that has held its core for
 /// DISPLAY_SLICE makes way for it, so the first of the rest waits for no more than
 /// about the two, and those behind it, having waited too, take turns with display work.
-/// Only time while display work holds a core or waits for one counts: the rest waiting
-/// behind each other is no reason for display work that has just come to wait too.
+/// Only time while display work waits for a core or holds them all counts, as Linux
+/// throttles real-time threads only once they take a whole CPU's time: display work
+/// on some of the cores leaves the rest the others, and the rest waiting behind each
+/// other there is no reason for display work that has just come to wait too.
 const REST_WAIT: Duration = DISPLAY_SLICE;
 
 pub struct Pool {
@@ -416,7 +418,8 @@ impl Runner for Thread {
         self.give_back.load(Ordering::Relaxed)
     }
     fn in_guest(&self) -> bool {
-        self.in_guest.load(Ordering::Relaxed)
+        // SeqCst: see Cores::take.
+        self.in_guest.load(Ordering::SeqCst)
     }
     fn stop_in_guest(&self) {
         // Only the vCPU: a holder that sleeps without giving its core up waits for a
@@ -483,20 +486,22 @@ struct CoresState<R> {
     /// display work's. Under load both lines stay full and the rest's first is always
     /// due, so without turns display work would wait for good in its place.
     rest_went: bool,
-    /// How long display work has held a core or waited for one, in all: `ahead`, and
-    /// since `ahead_since` too while it does now (None while it doesn't). Kept by
-    /// `track` as the lines and holders change. Each of the rest notes it as it gets in
-    /// line (Waiter::ahead_at), so it counts only time that display work kept it
-    /// waiting: not time behind other work alone, but all such time, first in line or
-    /// further back.
+    /// How long display work has kept the rest out, in all: waited for a core, or held
+    /// every one. `ahead`, and since `ahead_since` too while it does now (None while it
+    /// doesn't). Kept by `track` as the lines and holders change. Each of the rest notes
+    /// it as it gets in line (Waiter::ahead_at), so it counts only time that display
+    /// work kept it waiting: not time behind other work alone, but all such time, first
+    /// in line or further back.
     ahead: Duration,
     ahead_since: Option<Instant>,
+    /// How many cores there are: Cores::n.
+    cores: usize,
     /// REST_WAIT, but for tests, which need it not to pass while they look.
     rest_wait: Duration,
 }
 
 impl<R: Runner> CoresState<R> {
-    /// How long display work has held a core or waited for one, in all, at `now`.
+    /// How long display work has kept the rest out, in all, at `now`.
     fn display_time(&self, now: Instant) -> Duration {
         self.ahead + self.ahead_since.map_or(Duration::ZERO, |since| now.saturating_duration_since(since))
     }
@@ -515,12 +520,13 @@ impl<R: Runner> CoresState<R> {
     }
 
     /// Keeps display_time: called under the lock whenever a line or the holders change,
-    /// or a holder's urgency. Display work holding a core keeps the rest out as much as
-    /// display work in line ahead of them: a display thread that spins while another
-    /// visits it each frame has its line empty most of the time. The clock stops while
-    /// neither, and goes on when either is back.
+    /// or a holder's urgency. Display work holding every core keeps the rest out as much
+    /// as display work in line ahead of them: a display thread that spins on the one
+    /// core while another visits it each frame has its line empty most of the time. The
+    /// clock stops while neither, and goes on when either is back.
     fn track(&mut self, now: Instant) {
-        let ahead = !self.display.is_empty() || self.holders.values().any(Held::display);
+        let all_display = self.used >= self.cores && self.holders.values().all(Held::display);
+        let ahead = !self.display.is_empty() || all_display;
         match (ahead, self.ahead_since) {
             (true, None) => self.ahead_since = Some(now),
             (false, Some(since)) => {
@@ -580,7 +586,7 @@ impl<R: Runner> Cores<R> {
     fn waiting_rest(n: usize, rest_wait: Duration) -> Self {
         Cores {
             n: n.max(1),
-            st: Mutex::new(CoresState { next: 0, used: 0, holders: HashMap::new(), display: VecDeque::new(), rest: VecDeque::new(), handed: HashMap::new(), rest_went: false, ahead: Duration::ZERO, ahead_since: None, rest_wait }),
+            st: Mutex::new(CoresState { next: 0, used: 0, holders: HashMap::new(), display: VecDeque::new(), rest: VecDeque::new(), handed: HashMap::new(), rest_went: false, ahead: Duration::ZERO, ahead_since: None, cores: n.max(1), rest_wait }),
             waiting: AtomicUsize::new(0),
             waiting_display: AtomicUsize::new(0),
             waits: AtomicU64::new(0),
@@ -622,7 +628,10 @@ impl<R: Runner> Cores<R> {
             st.rest.push_back(w);
         }
         st.track(now);
-        self.waiting.fetch_add(1, Ordering::Relaxed);
+        // SeqCst, as is the load of in_guest when it stops holders: a holder handed its
+        // core sets in_guest and then looks at this (Slot::give_way_on_entry), so either
+        // it sees this thread in line or this one sees it in guest code.
+        self.waiting.fetch_add(1, Ordering::SeqCst);
         self.waits.fetch_add(1, Ordering::Relaxed);
         loop {
             if who.is_dying() {
@@ -983,6 +992,25 @@ impl Slot {
         }
     }
 
+    /// On its way into the guest, in_guest set: gives its core up if one in line is owed
+    /// it, as at the door. A thread handed its core is past the door: display work that
+    /// came for one before it got here found it not in guest code, so stopped nobody
+    /// (to_kick), and it would keep the core until it next comes back to the door. True
+    /// if it gave it up. A kick sent once in_guest is set stops the vCPU's next run.
+    fn give_way_on_entry(&self) -> bool {
+        let Some(c) = &self.pool.cores else { return false };
+        // SeqCst, after in_guest's SeqCst store: see Cores::take.
+        if c.waiting.load(Ordering::SeqCst) == 0 {
+            return false;
+        }
+        let mut i = self.inner.borrow_mut();
+        let Some((id, since)) = i.core else { return false };
+        let Some(gave) = c.give_way(id, !i.spent && self.thread.urgency() == Urgency::Display, since, false) else { return false };
+        i.core = None;
+        i.spent |= gave;
+        true
+    }
+
     /// Tells the host how urgent this thread is now.
     fn tell_host(&self) -> Urgency {
         let want = self.thread.urgency();
@@ -1155,29 +1183,39 @@ impl Vcpu for LazyVcpu {
                 std::thread::sleep(Duration::from_millis(50));
             }
         }
-        self.0.follow_urgency();
-        match self.0.ensure() {
-            Err(e) => return if e == "dying" { Exit::Interrupted } else { Exit::Fault { pc: 0, addr: 0, detail: e } },
-            Ok(true) => {
-                // It may have waited: for a new urgency to take effect, or for a signal
-                // or exit that was sent when there was no vCPU to kick. Any sent from
-                // here on find this one.
-                self.0.tell_host();
-                let t = &self.0.thread;
-                if t.interrupted() || self.0.pool.frozen.load(Ordering::Acquire) {
-                    return Exit::Interrupted;
-                }
-            }
-            Ok(false) => {}
-        }
-        self.0.running();
-        // Only the cores gate reads it, for whom to kick: with no gate, nothing changes.
+        // Only the cores gate reads in_guest, for whom to kick: with no gate, nothing
+        // changes.
         let gated = self.0.pool.cores.is_some();
+        loop {
+            self.0.follow_urgency();
+            match self.0.ensure() {
+                Err(e) => return if e == "dying" { Exit::Interrupted } else { Exit::Fault { pc: 0, addr: 0, detail: e } },
+                Ok(true) => {
+                    // It may have waited: for a new urgency to take effect, or for a signal
+                    // or exit that was sent when there was no vCPU to kick. Any sent from
+                    // here on find this one.
+                    self.0.tell_host();
+                    let t = &self.0.thread;
+                    if t.interrupted() || self.0.pool.frozen.load(Ordering::Acquire) {
+                        return Exit::Interrupted;
+                    }
+                }
+                Ok(false) => {}
+            }
+            self.0.running();
+            if !gated {
+                break;
+            }
+            // SeqCst: see Cores::take.
+            self.0.thread.in_guest.store(true, Ordering::SeqCst);
+            if !self.0.give_way_on_entry() {
+                break;
+            }
+            // In line again for a core, through ensure.
+            self.0.thread.in_guest.store(false, Ordering::Relaxed);
+        }
         let exit = {
             let mut i = self.0.inner.borrow_mut();
-            if gated {
-                self.0.thread.in_guest.store(true, Ordering::Relaxed);
-            }
             let exit = i.vcpu.as_mut().unwrap().run();
             if gated {
                 self.0.thread.in_guest.store(false, Ordering::Relaxed);
@@ -1569,6 +1607,39 @@ mod tests {
         gate.release(got);
         let (got, _) = v.join().unwrap().expect("the core");
         gate.release(got);
+        assert_eq!(gate.usage().0, 0);
+    }
+
+    #[test]
+    fn display_work_on_some_of_the_cores_keeps_nobody_waiting() {
+        // Two cores, display work on one: the rest take turns on the other, and waiting
+        // behind each other there doesn't count, as display work leaves them that core.
+        let gate = Arc::new(Cores::<Fake>::waiting_rest(2, NEVER_DUE));
+        let (d, _) = gate.try_take(&Fake::new(true), false).unwrap();
+        let (r, _) = gate.try_take(&Fake::new(false), false).unwrap();
+        let w = queue(&gate, &Fake::new(false), false);
+        std::thread::sleep(Duration::from_millis(2));
+        {
+            let st = gate.st.lock().unwrap();
+            assert!(st.ahead_since.is_none(), "display work holds one of the two");
+            assert_eq!(st.rest_waited(Instant::now()), Some(Duration::ZERO));
+        }
+        // Display work that comes takes the other core at once, and then holds both: it
+        // keeps the rest out.
+        let v = queue(&gate, &Fake::new(true), false);
+        assert_eq!(gate.give_way(r, false, Instant::now(), false), Some(false));
+        let (r, _) = v.join().unwrap().expect("the core");
+        {
+            let st = gate.st.lock().unwrap();
+            assert!(st.display.is_empty());
+            assert!(st.ahead_since.is_some(), "display work holds both");
+        }
+        // One of the two again: the clock stops.
+        gate.release(d);
+        let (d, _) = w.join().unwrap().expect("the core");
+        assert!(gate.st.lock().unwrap().ahead_since.is_none());
+        gate.release(d);
+        gate.release(r);
         assert_eq!(gate.usage().0, 0);
     }
 

@@ -1,5 +1,6 @@
 # The tz database's zone and link names, from tzdata 2026f's tzdata.zi:
-#   awk '/^Z /{print $2} /^L /{print $3}' /usr/share/zoneinfo/tzdata.zi | sort -u
+#   awk '/^Z /{print $2} /^L /{print $3}' /usr/share/zoneinfo/tzdata.zi | grep -vx Factory | sort -u
+# Factory is left out: Android's tzdata has no such zone.
 # zeroemu checks a time zone against these where the host has no tz database.
 Africa/Abidjan
 Africa/Accra

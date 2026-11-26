@@ -225,14 +225,16 @@ A display thread that has held its core 50 ms while only other work waits, or ca
 `sched_yield` then, takes 10 ms turns with the others until it next blocks, so a
 display thread that spins cannot shut them out, as Linux's real-time throttling
 ensures; one that blocks now and then is display work again each time it wakes.
-Display threads taking turns among themselves could still keep other work out, so a
-thread of other work that display work has kept waiting for 50 ms goes first, and
-display work makes way for it after its own 50 ms; while both kinds wait that long,
-they take turns. Only time while display work waits for a core or holds them all
-counts: display work on some of the cores leaves other work the rest, as Linux
-throttles real-time threads only once they take a whole CPU. A thread handed a core
-looks again on its way into the guest, as display work that came meanwhile could not
-stop it there. A thread waiting for a core keeps its vCPU, which costs far less than destroying it and
+Display threads taking turns among themselves could still keep other work out, so
+once display work has kept other work out for 50 ms since it last had a core, its
+first thread goes first, display work making way after its own 50 ms, and keeps that
+core for a 10 ms turn: however busy display work is, other work has a turn in every
+50 ms or so, as Linux's real-time throttling leaves fair threads a share of each
+second, and display work has the rest of the time. Only time while display work waits
+for a core or holds them all counts: display work on some of the cores leaves other
+work the others, as Linux throttles real-time threads only once they take a whole
+CPU. A thread handed a core looks again on its way into the guest, as display work
+that came meanwhile could not stop it there. A thread waiting for a core keeps its vCPU, which costs far less than destroying it and
 making another, unless the hypervisor's vCPUs run short. Every thread takes a
 background place, a core and a vCPU in that order, and waits for them only on its way
 into the guest, where it holds no kernel lock, so threads cannot deadlock over them.

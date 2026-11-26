@@ -35,6 +35,9 @@ struct Form {
     field: Id,
     /// The image popup; null when editing, as a device keeps its image.
     popup: Id,
+    /// The folders of the images in the popup, in its order: the list's own may be
+    /// scanned again before runModal returns (new_device).
+    images: Vec<PathBuf>,
     suggested: String,
     settings: SettingsRows,
     /// Advanced Settings is open.
@@ -501,9 +504,10 @@ extern "C" fn new_device(_this: Id, _cmd: Id, _sender: Id) {
         }
         return;
     }
-    // The image by its folder, not its place in the popup: the list may be scanned again
-    // before the form is shown again (refresh, as the list window becomes key once the
-    // form orders out), and an image installed or removed meanwhile moves the others.
+    // The image by its folder, not its place in the popup: runModal orders the form out
+    // before it returns, the list window becomes key, and refresh scans the images
+    // again, so an image installed or removed meanwhile moves the others in the list's.
+    // The popup's place is read against the images the form showed (Form::images).
     let mut entered: Option<(String, Option<PathBuf>, Raw)> = None;
     ADVANCED.with(|a| a.set(false));
     loop {
@@ -524,7 +528,7 @@ extern "C" fn new_device(_this: Id, _cmd: Id, _sender: Id) {
         let name = unsafe { rust_str(msg0(form.field, sel("stringValue"))) };
         let index = unsafe { msg_i64_ret(form.popup, sel("indexOfSelectedItem")) }.max(0) as usize;
         let raw = unsafe { form.settings.read() };
-        let image = with_list(|l| l.images.get(index).map(|i| i.dir.clone())).flatten();
+        let image = form.images.get(index).cloned();
         if answer == TOGGLE_ADVANCED {
             unsafe { msg_id(msg0(alert, sel("window")), sel("orderOut:"), std::ptr::null_mut()) };
             entered = Some((name, image, raw));
@@ -534,9 +538,12 @@ extern "C" fn new_device(_this: Id, _cmd: Id, _sender: Id) {
             return;
         }
         let made = raw.to_settings(&Settings::default()).and_then(|settings| {
-            with_list(|l| match (l.images.get(index), l.supports.as_ref().and_then(|s| s.get(index))) {
-                (Some(img), Some(support)) if support.boots() => l.store.create_with(&name, img, &settings),
-                _ => Err("choose a system image that can start".into()),
+            with_list(|l| {
+                let Some(at) = image.as_ref().and_then(|dir| l.images.iter().position(|i| &i.dir == dir)) else {
+                    return Err("the system image chosen isn't installed any more: choose another".into());
+                };
+                let boots = l.supports.get_or_insert_with(|| l.images.iter().map(sdk::classify).collect()).get(at).is_some_and(Support::boots);
+                if boots { l.store.create_with(&name, &l.images[at], &settings) } else { Err("choose a system image that can start".into()) }
             })
             .ok_or_else(String::new)?
         });
@@ -646,7 +653,8 @@ unsafe fn form_alert(entered: Option<&(String, Option<PathBuf>, Raw)>, advanced:
         rows.extend(more);
         set_accessory_hiding(alert, &rows, hidden);
         msg_id(msg0(alert, sel("window")), sel("setInitialFirstResponder:"), field);
-        Ok((alert, Some(Form { field, popup, suggested, settings, advanced })))
+        let images = images.iter().map(|i| i.dir.clone()).collect();
+        Ok((alert, Some(Form { field, popup, images, suggested, settings, advanced })))
     }
 }
 
@@ -837,7 +845,7 @@ unsafe fn edit_alert(d: &Device, image: &str, running: bool, entered: &(String, 
         rows.extend(more);
         set_accessory_hiding(alert, &rows, hidden);
         msg_id(msg0(alert, sel("window")), sel("setInitialFirstResponder:"), field);
-        (alert, Form { field, popup: std::ptr::null_mut(), suggested: String::new(), settings, advanced })
+        (alert, Form { field, popup: std::ptr::null_mut(), images: Vec::new(), suggested: String::new(), settings, advanced })
     }
 }
 

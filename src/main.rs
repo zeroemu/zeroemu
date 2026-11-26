@@ -79,8 +79,8 @@ Boot options:
                           for one boot
   --screen <w>x<h>        the screen's size in pixels (default 1080x2400)
   --density <dpi>         the screen's density (default 420)
-  --cpus <n>              the cores Android sees and uses (default: all of
-                          this computer's)
+  --cpus <n>              the cores Android sees and uses, 2 to 64 (default:
+                          all of this computer's)
   --timezone <zone>       a time zone such as Europe/Berlin, set at every boot
                           (default: this computer's)
   --location <where>      where the GPS says the device is: <lat>,<lon>, a
@@ -343,7 +343,7 @@ fn run(args: Vec<String>) -> Result<i32, String> {
             // As hw.cpu.ncore does: the cores Android sees, and at most uses at once.
             "--cpus" => {
                 let v = value()?;
-                cpus = Some(v.parse().ok().filter(|n| (1..=64).contains(n)).ok_or(format!("--cpus wants a number from 1 to 64, got {v}"))?);
+                cpus = Some(v.parse().ok().filter(|n| (kernel::MIN_CPUS..=64).contains(n)).ok_or(format!("--cpus wants a number from {} to 64, got {v}", kernel::MIN_CPUS))?);
             }
             "--timezone" => {
                 let v = value()?;

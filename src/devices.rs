@@ -45,7 +45,8 @@ pub struct Settings {
     pub display: Option<Display>,
     /// ram=, in megabytes.
     pub ram_mb: Option<u64>,
-    /// cpus=: how many cores Android sees and uses.
+    /// cpus=: how many cores Android sees and uses, kernel::MIN_CPUS at least. A device
+    /// saved with fewer, as zeroemu once allowed, has that many.
     pub cpus: Option<usize>,
     /// network=on|off.
     pub network: Option<bool>,
@@ -82,7 +83,7 @@ impl Settings {
         Settings {
             display,
             ram_mb: get("ram").and_then(|v| v.parse().ok()).filter(|mb| check_ram(*mb).is_ok()),
-            cpus: get("cpus").and_then(|v| v.parse().ok()).filter(|n| (1..=64).contains(n)),
+            cpus: get("cpus").and_then(|v| v.parse().ok()).filter(|n| (1..=64).contains(n)).map(|n: usize| n.max(crate::kernel::MIN_CPUS)),
             network: match get("network") {
                 Some("on") => Some(true),
                 Some("off") => Some(false),
@@ -1077,12 +1078,15 @@ mod tests {
         assert!(std::fs::read_to_string(&ini).unwrap().contains("added=later\n"));
         let again = store.find("Once more").unwrap();
         // Edit changes the name and the settings together, or neither.
-        let fewer = Settings { cpus: Some(1), ..again.settings.clone() };
+        let fewer = Settings { cpus: Some(2), ..again.settings.clone() };
         let other = store.create("Taken", &img).unwrap();
         assert!(store.edit(&again, "Taken", &fewer).is_err());
         assert_eq!(store.find("Once more").unwrap().settings.cpus, again.settings.cpus);
         let edited = store.edit(&again, "Edited", &fewer).unwrap();
-        assert_eq!((edited.name.as_str(), store.find("Edited").unwrap().settings.cpus), ("Edited", Some(1)));
+        assert_eq!((edited.name.as_str(), store.find("Edited").unwrap().settings.cpus), ("Edited", Some(2)));
+        // A device saved with one core, as zeroemu once allowed, has the fewest it can.
+        std::fs::write(edited.ini(), std::fs::read_to_string(edited.ini()).unwrap().replace("cpus=2\n", "cpus=1\n")).unwrap();
+        assert_eq!(store.find("Edited").unwrap().settings.cpus, Some(crate::kernel::MIN_CPUS));
         store.delete(&other).unwrap();
         let _ = std::fs::remove_dir_all(&root);
     }

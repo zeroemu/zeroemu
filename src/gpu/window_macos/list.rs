@@ -7,6 +7,7 @@
 use super::*;
 use crate::devices::{self, Device, Settings, Store};
 use crate::gpu::Display;
+use crate::kernel::MIN_CPUS;
 use crate::location::{self, Source};
 use crate::sdk::{self, Image, Support};
 use std::cell::RefCell;
@@ -1098,9 +1099,9 @@ impl SettingsRows {
             msg_i64(ram, sel("selectItemAtIndex:"), ram_choices.iter().position(|mb| *mb == raw.ram_mb).unwrap_or(0) as i64);
 
             let host = crate::kernel::host_cpus();
-            let most = host.max(raw.cpus);
-            let cpus = popup(&std::iter::once(format!("All of this Mac's ({host})")).chain((1..=most).map(|n| n.to_string())).map(Some).collect::<Vec<_>>());
-            msg_i64(cpus, sel("selectItemAtIndex:"), raw.cpus.min(most) as i64);
+            let most = host.max(raw.cpus).max(MIN_CPUS);
+            let cpus = popup(&std::iter::once(format!("All of this Mac's ({host})")).chain((MIN_CPUS..=most).map(|n| n.to_string())).map(Some).collect::<Vec<_>>());
+            msg_i64(cpus, sel("selectItemAtIndex:"), cpus_item(raw.cpus, most) as i64);
 
             let network = msg_id_id_ret_sel(cls("NSButton"), sel("checkboxWithTitle:target:action:"), ns_str("Connected to the internet"), std::ptr::null_mut(), std::ptr::null_mut());
             msg_i64(network, sel("setState:"), raw.network as i64);
@@ -1200,7 +1201,7 @@ impl SettingsRows {
                 height: text(self.height),
                 dpi: text(self.dpi),
                 ram_mb: self.ram_choices.get(index(self.ram)).copied().unwrap_or(RAM_DEFAULT),
-                cpus: index(self.cpus),
+                cpus: item_cpus(index(self.cpus)),
                 network: msg_i64_ret(self.network, sel("state")) != 0,
                 zone: text(self.zone),
                 place: self.place_items.get(index(self.place)).copied().flatten().and_then(|i| all.get(i).cloned()).unwrap_or(Place::ZoneCity),
@@ -1271,6 +1272,23 @@ fn toggle_advanced() {
 }
 
 /// Memory as the form shows it: "4 GB", "1.5 GB", or in MB when it isn't a half.
+/// The cores popup's item for `cpus` (0 for all of the Mac's), whose last item is
+/// `most`: the first is all of the Mac's, then MIN_CPUS and up.
+fn cpus_item(cpus: usize, most: usize) -> usize {
+    match cpus {
+        0 => 0,
+        n => n.clamp(MIN_CPUS, most) - MIN_CPUS + 1,
+    }
+}
+
+/// The cores the popup's item `i` stands for: cpus_item's other way round.
+fn item_cpus(i: usize) -> usize {
+    match i {
+        0 => 0,
+        i => i + MIN_CPUS - 1,
+    }
+}
+
 fn ram_shown(mb: u64) -> String {
     match mb % 1024 {
         0 => format!("{} GB", mb / 1024),
@@ -1291,10 +1309,8 @@ fn advanced_summary(raw: &Raw) -> String {
     if raw.ram_mb != RAM_DEFAULT {
         parts.push(ram_shown(raw.ram_mb));
     }
-    match raw.cpus {
-        0 => {}
-        1 => parts.push("1 core".into()),
-        n => parts.push(format!("{n} cores")),
+    if raw.cpus != 0 {
+        parts.push(format!("{} cores", raw.cpus));
     }
     if !raw.network {
         parts.push("no network".into());
@@ -1693,6 +1709,19 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("build.prop"), format!("ro.build.version.release={release}\n")).unwrap();
         Image::from_dir(&dir)
+    }
+
+    #[test]
+    fn the_cores_popup_starts_at_the_fewest_a_device_can_have() {
+        // All of the Mac's, then 2, 3, ... up to the Mac's.
+        assert_eq!((cpus_item(0, 10), item_cpus(0)), (0, 0));
+        assert_eq!((cpus_item(MIN_CPUS, 10), item_cpus(1)), (1, MIN_CPUS));
+        assert_eq!((cpus_item(10, 10), item_cpus(10 - MIN_CPUS + 1)), (10 - MIN_CPUS + 1, 10));
+        for n in MIN_CPUS..=10 {
+            assert_eq!(item_cpus(cpus_item(n, 10)), n);
+        }
+        // Fewer than it can have shows as the fewest, more than the list as its last.
+        assert_eq!((cpus_item(1, 10), cpus_item(12, 10)), (1, 10 - MIN_CPUS + 1));
     }
 
     #[test]

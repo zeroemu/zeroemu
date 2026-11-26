@@ -209,7 +209,7 @@ Guest threads take their host priority from what Android says about them: real-t
 policies and nice -4 or better count as display work, the `top-app` cgroup as
 foreground, nice 10 or worse and the `background` and `dex2oat` cgroups as
 background. Background threads take turns on half the cores Android is given or the
-Mac has, whichever is fewer (one of one), as a phone would keep them to its little
+Mac has, whichever is fewer (one of two), as a phone would keep them to its little
 ones.
 
 Android is given all of the host's cores unless a device asks for fewer. macOS cannot

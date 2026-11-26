@@ -833,10 +833,15 @@ pub fn host_cpus() -> usize {
     *N.get_or_init(|| std::thread::available_parallelism().map_or(1, |n| n.get()).min(64))
 }
 
+/// The fewest cores a device can have. With one, Google Play services' and
+/// system_server's work after boot fills it, and an app opened in the first minute or
+/// two can take a minute to show (docs/KNOWN-GAPS.md).
+pub const MIN_CPUS: usize = 2;
+
 /// Gives Android `n` cores, as an AVD's hw.cpu.ncore does; before the boot, as sysfs,
 /// cgroups and per-CPU BPF maps are sized from it once.
 pub fn set_cpus(n: usize) {
-    CPUS.store(n.clamp(1, 64), Ordering::Relaxed);
+    CPUS.store(n.clamp(MIN_CPUS, 64), Ordering::Relaxed);
 }
 
 /// How many cores Android sees: /sys/devices/system/cpu, sched_getaffinity, /proc.

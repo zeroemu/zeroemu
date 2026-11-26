@@ -34,9 +34,11 @@ Emulator. [INTERNALS.md](INTERNALS.md) says how each part works.
   device's density; `densityDpi` is right.
 - CPU cores limit the threads of Android's that run at once, not zeroemu's own (the
   renderer, the network, disk I/O), so a device can use a little more of the Mac.
-- A device with one core is slow for a minute or two after it starts: Google Play
-  services' and system_server's work after boot fills the core, and an app opened then
-  can take a minute to show. Two cores are enough to open one in about a second.
+- A device with two cores can be slow for a minute or two after it starts: Google
+  Play services' and system_server's work after boot fills the cores, and an app opened
+  then can take a minute to show. Settings, for one, waits on Digital Wellbeing's
+  settings provider, whose calls time out after 5 s each then. It did in about one
+  start in four. One core nearly always did, so a device has two at least.
 - A time zone chosen inside Android lasts until the device next starts, when the
   device's own is set again.
 - `--headless` gives the guest no GPU, so a headless boot stops at SurfaceFlinger, which

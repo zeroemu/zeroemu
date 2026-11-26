@@ -170,7 +170,7 @@ opens it.
 | Device | Medium Phone | Shown always. A preset sets the screen: Medium Phone (1080 × 2400, 420 dpi), Pixel 9 (1080 × 2424, 420 dpi), Small Phone (720 × 1280, 320 dpi) or Pixel Tablet (2560 × 1600, 320 dpi) |
 | Screen, Density | 1080 × 2400, 420 dpi | Any even number of pixels from 320 to 4096 a side, at 120 to 640 dpi, at least 320 dp across. The form shows the size in dp, as apps see it. Android draws at this size whatever the window's, which scales it to fit |
 | Memory | 4 GB | What Android is told it has, which decides how it caches and closes apps |
-| CPU cores | All of the Mac's | Fewer cores are what Android sees, and at most how many of its threads run at once, which leaves the Mac the rest |
+| CPU cores | All of the Mac's | Fewer cores, two at least, are what Android sees, and at most how many of its threads run at once, which leaves the Mac the rest |
 | Network | Connected | |
 | Time zone | The Mac's | Set again at every start, over a zone chosen inside Android |
 | Location | The main city of its time zone (the Googleplex for a zone with none, such as UTC) | Where its GPS says it is: none, a place, a moving route, or coordinates |
@@ -281,7 +281,7 @@ Boot options:
 | `--system <path>` | Boot a `system.img` file, or the folder that holds it |
 | `--device <name>` | Boot a device made in zeroemu.app, with its image, its `/data` and its settings. `--screen`, `--density`, `--ram`, `--cpus`, `--no-net`, `--timezone` and `--location` override its settings for that boot only |
 | `--screen <w>x<h>`, `--density <dpi>` | The screen Android draws, in pixels and dots per inch: 1080x2400 at 420 by default, as Android Studio's Medium Phone |
-| `--cpus <n>` | How many cores Android sees, and at most how many of its threads run at once: all of the computer's by default |
+| `--cpus <n>` | How many cores Android sees, and at most how many of its threads run at once: 2 to 64, all of the computer's by default |
 | `--timezone <zone>` | A time zone such as `Europe/Berlin`, set at every boot: the computer's by default |
 | `--location <where>` | Where the GPS says the device is: `<latitude>,<longitude>`, a place or route by its name in Device > Location (`"City Run"`) or its id (`city-run`, `googleplex`), or `off`. By default, the main city of the time zone, or the Googleplex for a zone with none, such as UTC |
 | `--data <file>` | Keep the device's `/data` in this file instead of the default one |

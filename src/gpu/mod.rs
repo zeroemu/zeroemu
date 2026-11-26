@@ -205,7 +205,9 @@ fn save_screenshot(_turns: u8) -> std::io::Result<std::path::PathBuf> {
 /// `action NAME` does what a toolbar item or Device menu item does
 /// (controls::Action::name); `menu Menu/Item` chooses a menu item by its titles;
 /// `toolbar NAME` clicks a toolbar item; `keyeq MODS KEYCODE CHARS` types a key with
-/// modifiers into the window, for its shortcut; `click U V` clicks the shown picture.
+/// modifiers into the window, for its shortcut; `click U V` clicks the shown picture;
+/// `location off|LAT,LON|PRESET` moves the device as Device > Location does
+/// (crate::location::Source::parse).
 pub fn control_line(line: &str) {
     let line = line.trim();
     let (word, rest) = line.split_once(' ').unwrap_or((line, ""));
@@ -214,6 +216,10 @@ pub fn control_line(line: &str) {
         "action" => match controls::Action::from_name(rest) {
             Some(a) => controls::perform(a),
             None => eprintln!("zeroemu: no action {rest:?}"),
+        },
+        "location" => match crate::location::Source::parse(rest) {
+            Ok(source) => crate::location::set(source),
+            Err(e) => eprintln!("zeroemu: {e}"),
         },
         #[cfg(target_os = "macos")]
         "menu" => window::choose_menu_item(rest),
@@ -327,8 +333,80 @@ pub struct Fence {
 /// given as host addresses (stable for the resource's lifetime).
 pub type Iov = Vec<(*mut u8, usize)>;
 
+/// The screen Android is given: its size in pixels and its density, as an AVD's
+/// hw.lcd.width, hw.lcd.height and hw.lcd.density say. The window shows it scaled to
+/// fit; Android draws at this size whatever the window's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Display {
+    pub width: u32,
+    pub height: u32,
+    pub dpi: u32,
+}
+
+impl Display {
+    /// Android Studio's Medium Phone: a 411 dp wide phone, as the tested image's own
+    /// AVD config has it.
+    pub const DEFAULT: Display = Display { width: 1080, height: 2400, dpi: 420 };
+
+    /// Android Studio's hardware profiles that zeroemu offers: (id, name, screen).
+    pub const PRESETS: &'static [(&'static str, &'static str, Display)] = &[
+        ("medium-phone", "Medium Phone", Display::DEFAULT),
+        ("pixel-9", "Pixel 9", Display { width: 1080, height: 2424, dpi: 420 }),
+        ("small-phone", "Small Phone", Display { width: 720, height: 1280, dpi: 320 }),
+        ("pixel-tablet", "Pixel Tablet", Display { width: 2560, height: 1600, dpi: 320 }),
+    ];
+
+    /// A screen of this size and density, if Android and zeroemu can show it: each side
+    /// from 320 to 4096 pixels and even (MediaCodec, and so screenrecord, want even
+    /// sizes; the KMS mode holds 16 bits), a density from 120 to 640, and at least
+    /// 320 dp across, under which apps lay themselves out badly.
+    pub fn new(width: u32, height: u32, dpi: u32) -> Result<Display, String> {
+        for (what, v) in [("width", width), ("height", height)] {
+            if !(320..=4096).contains(&v) || v % 2 != 0 {
+                return Err(format!("a screen's {what} is an even number of pixels from 320 to 4096, not {v}"));
+            }
+        }
+        if !(120..=640).contains(&dpi) {
+            return Err(format!("a screen's density is from 120 to 640 dpi, not {dpi}"));
+        }
+        let d = Display { width, height, dpi };
+        if d.dp().0.min(d.dp().1) < 320 {
+            return Err(format!("{width}x{height} at {dpi} dpi is {} dp across; apps want at least 320", d.dp().0.min(d.dp().1)));
+        }
+        Ok(d)
+    }
+
+    /// "1080x2400" (or with ×) as (width, height).
+    pub fn parse_size(s: &str) -> Result<(u32, u32), String> {
+        let bad = || format!("a screen size is <width>x<height> in pixels, such as 1080x2400, not {s:?}");
+        let (w, h) = s.trim().split_once(['x', 'X', '×']).ok_or_else(bad)?;
+        Ok((w.trim().parse().map_err(|_| bad())?, h.trim().parse().map_err(|_| bad())?))
+    }
+
+    /// Its size in density-independent pixels, as apps lay out: (width, height).
+    pub fn dp(&self) -> (u32, u32) {
+        (self.width * 160 / self.dpi, self.height * 160 / self.dpi)
+    }
+
+    /// Its size in millimetres at its density, for the KMS connector.
+    pub fn mm(&self) -> (u32, u32) {
+        let mm = |px: u32| (px as f64 * 25.4 / self.dpi as f64).round() as u32;
+        (mm(self.width), mm(self.height))
+    }
+
+    /// The preset it is, if it is one: (id, name).
+    pub fn preset(&self) -> Option<(&'static str, &'static str)> {
+        Display::PRESETS.iter().find(|p| p.2 == *self).map(|p| (p.0, p.1))
+    }
+}
+
 /// Errors are Linux errnos, as everywhere in the kernel.
 pub trait GpuBackend: Send + Sync {
+    /// The screen Android is given.
+    fn display(&self) -> Display {
+        Display::DEFAULT
+    }
+
     /// (max_version, size) of a capability set, None if unsupported.
     fn capset_info(&self, id: u32) -> Option<(u32, u32)>;
     fn capset(&self, id: u32, version: u32) -> Vec<u8>;
@@ -375,15 +453,15 @@ pub trait GpuBackend: Send + Sync {
     fn set_fence_handler(&self, handler: Arc<dyn Fn(Fence) + Send + Sync>);
 }
 
-/// Load gfxstream and show a window of `width` x `height` guest pixels.
-/// Must run on the main thread.
-pub fn open(width: u32, height: u32) -> Result<Arc<dyn GpuBackend>, String> {
-    gfxstream::open(width, height)
+/// Load gfxstream and show a window for a guest screen of `display`. Must run on the
+/// main thread.
+pub fn open(display: Display) -> Result<Arc<dyn GpuBackend>, String> {
+    gfxstream::open(display)
 }
 
 /// In-memory backend (`ZEROEMU_GPU=fake`): no renderer, no window.
-pub fn fake() -> Arc<dyn GpuBackend> {
-    fake::Fake::new()
+pub fn fake(display: Display) -> Arc<dyn GpuBackend> {
+    fake::Fake::with_display(display)
 }
 
 /// Block the main thread in the native event loop until `done` is set.
@@ -405,7 +483,7 @@ const BIND_SCANOUT: u32 = 1 << 18;
 /// Opens the renderer and window, uploads a colored 1080x2400 scanout, and
 /// holds it on screen. Exit status is 0 when that path succeeds.
 pub fn selftest() -> Result<i32, String> {
-    let gpu = open(FB_W, FB_H)?;
+    let gpu = open(Display::DEFAULT)?;
     let main_tok = thread_token();
     let cb_tok = Arc::new(AtomicU64::new(0));
     let cb = cb_tok.clone();

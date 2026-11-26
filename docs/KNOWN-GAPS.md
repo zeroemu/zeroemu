@@ -27,7 +27,18 @@ Emulator. [INTERNALS.md](INTERNALS.md) says how each part works.
 - zeroemu calls a few of the emulator renderer's internal functions by name, so an
   emulator release other than the tested ones (37.1 and 37.2) can break it. 37.3, on
   Google's preview channel, is untested.
-- The display is one 1080x2400 phone panel, whatever the image expects.
+- There is one display, of the size and density a device is set to (1080x2400 at 420 dpi
+  by default). A size or density set inside Android (Settings > Display size, `wm size`,
+  `wm density`) is saved in its `/data` and still wins over the device's after an Edit.
+- Apps' `DisplayMetrics.xdpi` and `ydpi` come from the renderer's own default, not the
+  device's density; `densityDpi` is right.
+- CPU cores limit the threads of Android's that run at once, not zeroemu's own (the
+  renderer, the network, disk I/O), so a device can use a little more of the Mac.
+- A device with one core is slow for a minute or two after it starts: Google Play
+  services' and system_server's work after boot fills the core, and an app opened then
+  can take a minute to show. Two cores are enough to open one in about a second.
+- A time zone chosen inside Android lasts until the device next starts, when the
+  device's own is set again.
 - `--headless` gives the guest no GPU, so a headless boot stops at SurfaceFlinger, which
   needs one. It never reaches the home screen.
 
@@ -40,6 +51,9 @@ Emulator. [INTERNALS.md](INTERNALS.md) says how each part works.
   Android's assistant on this image; Device > Power Menu gives the power menu instead.
 - Rotation turns the window's picture and what the accelerometer reads. With auto-rotate
   off, Android shows its rotate button rather than turning, as a phone does.
+- Device > Location's GPS reports no height (altitude 0 everywhere), and a route at one
+  speed all the way round, its corners too. The satellites Android lists are made up
+  by the image's GNSS HAL from the count zeroemu sends.
 - Quitting during a logout cancels the logout: zeroemu first saves `/data`, then exits.
 - Restart, in Android's power menu or from `adb reboot`, stops zeroemu as Power off does,
   after saving `/data`, rather than starting Android again.

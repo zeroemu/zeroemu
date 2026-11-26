@@ -1,7 +1,7 @@
 //! virtio-gpu as a Linux DRM device: /dev/dri/card0 and renderD128, the
 //! virtgpu ioctls minigbm and gfxstream's guest issue, dma-buf and sync_file
-//! fds, and a single 1080x2400 KMS pipeline for composer3-ranchu. The host
-//! renderer sits behind `GpuBackend`; nothing here calls a host API.
+//! fds, and a single KMS pipeline for composer3-ranchu, the size of the backend's
+//! display. The host renderer sits behind `GpuBackend`; nothing here calls a host API.
 
 use super::block::{self, makedev};
 use super::wait::EVENTS;
@@ -20,8 +20,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 const DRM_MAJOR: u32 = 226;
-const FB_W: u32 = 1080;
-const FB_H: u32 = 2400;
 
 const ID_CONN: u32 = 1;
 const ID_ENC: u32 = 2;
@@ -130,21 +128,32 @@ fn now_ns() -> u64 {
     super::monotonic_ns()
 }
 
-fn modeinfo() -> [u8; 68] {
+/// The one mode, `struct drm_mode_modeinfo`: the display's size at 60 Hz. Its
+/// refresh rate is clock * 1000 / (htotal * vtotal), as drm_mode_vrefresh
+/// (drm_modes.c) and a DRM-mode composer (composer3-ranchu's
+/// DrmConnector::getRefreshRate; the tested image's takes its rate from the
+/// renderer) work it out,
+/// with the clock in whole kHz. So a few lines of vertical blanking, where the size
+/// needs them, make htotal * vtotal a multiple of 50 and the rate exactly 60: the
+/// 1080x2400 panel needs none.
+fn modeinfo(d: gpu::Display) -> [u8; 68] {
+    let (w, h) = (d.width, d.height);
+    let vtotal = (h..h + 50).find(|&v| (w as u64 * v as u64).is_multiple_of(50)).unwrap_or(h);
     let mut m = [0u8; 68];
-    wu32(&mut m, 0, FB_W.saturating_mul(FB_H) / 1000 * 60);
-    for (i, v) in [FB_W, FB_W, FB_W, FB_W, 0].iter().enumerate() {
+    wu32(&mut m, 0, (w as u64 * vtotal as u64 * 60 / 1000) as u32);
+    for (i, v) in [w, w, w, w, 0].iter().enumerate() {
         m[4 + i * 2..6 + i * 2].copy_from_slice(&(*v as u16).to_le_bytes());
     }
-    for (i, v) in [FB_H, FB_H, FB_H, FB_H, 0].iter().enumerate() {
+    for (i, v) in [h, h, h, vtotal, 0].iter().enumerate() {
         m[14 + i * 2..16 + i * 2].copy_from_slice(&(*v as u16).to_le_bytes());
     }
     wu32(&mut m, 24, 60);
     wu32(&mut m, 28, 1 | 4); // PHSYNC | PVSYNC
     wu32(&mut m, 32, (1 << 3) | (1 << 6)); // PREFERRED | DRIVER
-    // name[32] starts at byte 36. The mode string is shorter than the field.
-    let name = b"1080x2400";
-    m[36..36 + name.len()].copy_from_slice(name);
+    // name[32] starts at byte 36, as drm_mode_set_name writes it: "1080x2400".
+    let name = format!("{w}x{h}");
+    let n = name.len().min(31);
+    m[36..36 + n].copy_from_slice(&name.as_bytes()[..n]);
     m
 }
 
@@ -409,6 +418,9 @@ struct Inner {
 
 pub struct Device {
     gpu: Arc<dyn GpuBackend>,
+    /// The screen the backend gives Android, which the KMS mode, connector and plane
+    /// describe.
+    display: gpu::Display,
     phys: Arc<PhysMem>,
     /// Bit i set when capset i exists. Cached: probing virgl on this renderer logs an error.
     capsets: u64,
@@ -419,6 +431,7 @@ impl Device {
     pub fn new(gpu: Arc<dyn GpuBackend>, phys: Arc<PhysMem>) -> Arc<Device> {
         let dev = Arc::new(Device {
             gpu: gpu.clone(),
+            display: gpu.display(),
             phys,
             capsets: capset_mask(gpu.as_ref()),
             inner: Mutex::new(Inner {
@@ -1274,7 +1287,7 @@ fn mode_getcrtc(o: &Open, arg: u64, io: &mut dyn Io) -> Result<i64, i64> {
     wu32(&mut b, 16, k.fb);
     wu32(&mut b, 32, u32::from(k.crtc_active));
     if k.crtc_active {
-        b[36..36 + 68].copy_from_slice(&modeinfo());
+        b[36..36 + 68].copy_from_slice(&modeinfo(o.dev.display));
     }
     store(io, arg, &b)?;
     Ok(0)
@@ -1304,7 +1317,7 @@ fn mode_encoder(o: &Open, arg: u64, io: &mut dyn Io) -> Result<i64, i64> {
 fn mode_connector(o: &Open, arg: u64, io: &mut dyn Io) -> Result<i64, i64> {
     card(o)?;
     let mut b = load(io, arg, 0xa7, 80)?;
-    let mode = modeinfo();
+    let mode = modeinfo(o.dev.display);
     write_bytes(io, ru64(&b, 8), ru32(&b, 32), &mode, 1)?;
     let props = [P_CRTC_ID, P_DPMS, P_LINK];
     let values = [ID_CRTC as u64, 0, 0];
@@ -1319,8 +1332,14 @@ fn mode_connector(o: &Open, arg: u64, io: &mut dyn Io) -> Result<i64, i64> {
     wu32(&mut b, 52, 15); // VIRTUAL
     wu32(&mut b, 56, 1);
     wu32(&mut b, 60, 1); // CONNECTED
-    wu32(&mut b, 64, 68);
-    wu32(&mut b, 68, 151);
+    // Its size in mm at the display's density, as a DRM-mode composer works out xdpi
+    // from it (composer3-ranchu's DrmConnector::getDpiX, with
+    // androidboot.hardware.hwcomposer.display_finder_mode=drm). The tested image's
+    // composer uses its goldfish finder instead, which takes the size, xdpi and rate
+    // from the renderer (rcGetFBParam): see docs/KNOWN-GAPS.md.
+    let (mm_w, mm_h) = o.dev.display.mm();
+    wu32(&mut b, 64, mm_w);
+    wu32(&mut b, 68, mm_h);
     store(io, arg, &b)?;
     Ok(0)
 }
@@ -1420,13 +1439,14 @@ fn mode_plane(o: &Open, arg: u64, io: &mut dyn Io) -> Result<i64, i64> {
     Ok(0)
 }
 
-fn obj_props(id: u32) -> Option<(&'static [u32], Vec<u64>)> {
+fn obj_props(id: u32, d: gpu::Display) -> Option<(&'static [u32], Vec<u64>)> {
+    let (w, h) = (d.width as u64, d.height as u64);
     match id {
         ID_CONN => Some((&[P_CRTC_ID, P_DPMS, P_LINK], vec![ID_CRTC as u64, 0, 0])),
         ID_CRTC => Some((&[P_ACTIVE, P_MODE_ID, P_OUT_FENCE], vec![1, 0, 0])),
         ID_PLANE => Some((
             &[P_TYPE, P_FB_ID, P_CRTC_ID, P_CRTC_X, P_CRTC_Y, P_CRTC_W, P_CRTC_H, P_SRC_X, P_SRC_Y, P_SRC_W, P_SRC_H, P_IN_FENCE],
-            vec![1, 0, ID_CRTC as u64, 0, 0, FB_W as u64, FB_H as u64, 0, 0, (FB_W as u64) << 16, (FB_H as u64) << 16, u64::MAX],
+            vec![1, 0, ID_CRTC as u64, 0, 0, w, h, 0, 0, w << 16, h << 16, u64::MAX],
         )),
         _ => None,
     }
@@ -1436,7 +1456,7 @@ fn mode_obj_props(o: &Open, arg: u64, io: &mut dyn Io) -> Result<i64, i64> {
     card(o)?;
     let mut b = load(io, arg, 0xb9, 32)?;
     let id = ru32(&b, 20);
-    let (props, mut values) = obj_props(id).ok_or(ENOENT)?;
+    let (props, mut values) = obj_props(id, o.dev.display).ok_or(ENOENT)?;
     if id == ID_PLANE || id == ID_CRTC {
         let fb = o.dev.inner.lock().unwrap().kms.fb as u64;
         if id == ID_PLANE {
@@ -1943,6 +1963,60 @@ mod tests {
         assert_eq!(&m.buf[0x100 + 32..0x100 + 42], b"virtio_gpu");
         assert_eq!(ru32(&m.buf, 0x100 + 64), 1, "first fence signaled");
         assert_eq!(ru32(&m.buf, 0x150 + 64), 0, "second pending");
+    }
+
+    /// Every preset's mode is its size at exactly 60 Hz, as the refresh rate is worked
+    /// out from the clock, and the default panel's is the mode it always was.
+    #[test]
+    fn modes_are_the_display_at_sixty_hz() {
+        let u16_at = |m: &[u8], o: usize| u16::from_le_bytes([m[o], m[o + 1]]) as u64;
+        for &(_, _, d) in gpu::Display::PRESETS {
+            let m = modeinfo(d);
+            let (htotal, vtotal) = (u16_at(&m, 10), u16_at(&m, 20));
+            assert_eq!((u16_at(&m, 4), u16_at(&m, 14)), (d.width as u64, d.height as u64));
+            assert!(htotal >= d.width as u64 && vtotal >= d.height as u64 && vtotal < d.height as u64 + 50);
+            assert_eq!(ru32(&m, 0) as u64 * 1000, htotal * vtotal * 60, "{}x{}", d.width, d.height);
+            assert_eq!(ru32(&m, 24), 60);
+            let name = format!("{}x{}", d.width, d.height);
+            assert_eq!(&m[36..36 + name.len()], name.as_bytes());
+            assert_eq!(m[36 + name.len()], 0);
+        }
+        let m = modeinfo(gpu::Display::DEFAULT);
+        assert_eq!((ru32(&m, 0), u16_at(&m, 10), u16_at(&m, 20)), (155_520, 1080, 2400));
+    }
+
+    /// A tablet's KMS pipeline is the tablet's screen: the connector's mode and size
+    /// in mm, and the plane's size, come from the backend's display.
+    #[test]
+    fn kms_describes_the_backends_display() {
+        let tablet = gpu::Display { width: 2560, height: 1600, dpi: 320 };
+        let dev = Device::new(gpu::fake::Fake::with_display(tablet), PhysMem::new(Arc::new(NoHv)));
+        let card = dev.open(card_rdev());
+        let mut m = Mem { buf: vec![0u8; 4096], syncs: Vec::new(), dmas: Vec::new() };
+
+        // GETCONNECTOR: one mode, written to 0x200.
+        wu64(&mut m.buf, 8, 0x200);
+        wu32(&mut m.buf, 32, 1);
+        ioctl(&card, ioc(3, 0xa7, 80), 0, &mut m).unwrap();
+        assert_eq!(&m.buf[0x200..0x200 + 68], &modeinfo(tablet));
+        assert_eq!(u16::from_le_bytes([m.buf[0x204], m.buf[0x205]]), 2560);
+        assert_eq!(u16::from_le_bytes([m.buf[0x20e], m.buf[0x20f]]), 1600);
+        assert_eq!(&m.buf[0x200 + 36..0x200 + 46], b"2560x1600\0");
+        assert_eq!((ru32(&m.buf, 64), ru32(&m.buf, 68)), (203, 127), "mm at 320 dpi");
+
+        // OBJ_GETPROPERTIES of the plane: CRTC_W/H and SRC_W/H (16.16).
+        m.buf[..32].fill(0);
+        wu64(&mut m.buf, 0, 0x300);
+        wu64(&mut m.buf, 8, 0x400);
+        wu32(&mut m.buf, 16, 12);
+        wu32(&mut m.buf, 20, ID_PLANE);
+        ioctl(&card, ioc(3, 0xb9, 32), 0, &mut m).unwrap();
+        let prop = |m: &Mem, id: u32| {
+            let i = (0..12).find(|&i| ru32(&m.buf, 0x300 + i * 4) == id).unwrap();
+            ru64(&m.buf, 0x400 + i * 8)
+        };
+        assert_eq!((prop(&m, P_CRTC_W), prop(&m, P_CRTC_H)), (2560, 1600));
+        assert_eq!((prop(&m, P_SRC_W), prop(&m, P_SRC_H)), (2560 << 16, 1600 << 16));
     }
 
     #[test]

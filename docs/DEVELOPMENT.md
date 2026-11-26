@@ -167,7 +167,10 @@ Behaviour:
   (`back`, `home`, `recents`, `notifications`, `settings`, `volume-up`, `volume-down`,
   `mute`, `power`, `lock`, `power-menu`, `rotate-left`, `rotate-right`, `screenshot`,
   `android-screenshot`); `menu Menu/Item` chooses a menu bar item by its titles
-  (`menu Device/Recent Apps`, `menu zeroemu/Quit zeroemu`); `toolbar NAME` clicks a
+  (`menu Device/Recent Apps`, `menu zeroemu/Quit zeroemu`, and in a submenu
+  `menu Device/Location/City Run`); `location off|LAT,LON|PRESET` moves the device as
+  Device > Location does (`location 28.6129,77.2295`, `location freeway-drive`; the
+  presets' ids are in src/location.rs); `toolbar NAME` clicks a
   toolbar item, named as the actions are; `keyeq MODS KEYCODE CHARS` types a key into
   the window with modifiers (`cmd`, `shift`, `alt`, `ctrl` joined by `+`, or `none`),
   its Mac key code and its character (or `up`, `down`, `left`, `right`), so that a

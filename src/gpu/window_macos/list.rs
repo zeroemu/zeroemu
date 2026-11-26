@@ -5,9 +5,12 @@
 //! the same raw messages as the device's window (super).
 
 use super::*;
-use crate::devices::{self, Device, Store};
+use crate::devices::{self, Device, Settings, Store};
+use crate::gpu::Display;
+use crate::location::{self, Source};
 use crate::sdk::{self, Image, Support};
 use std::cell::RefCell;
+use std::path::PathBuf;
 
 type Id = *mut c_void;
 
@@ -30,11 +33,24 @@ struct List {
 /// image replaces until the name is typed over.
 struct Form {
     field: Id,
+    /// The image popup; null when editing, as a device keeps its image.
     popup: Id,
+    /// The folders of the images in the popup, in its order: the list's own may be
+    /// scanned again before runModal returns (new_device).
+    images: Vec<PathBuf>,
     suggested: String,
+    settings: SettingsRows,
+    /// Advanced Settings is open.
+    advanced: bool,
 }
 
+/// What runModal returns when Advanced Settings is opened or closed: the form shows
+/// again at its new size, as an alert can't change size while it shows.
+const TOGGLE_ADVANCED: i64 = 1100;
+
 thread_local! {
+    /// Whether the form, shown again, has Advanced Settings open.
+    static ADVANCED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static LIST: RefCell<Option<List>> = const { RefCell::new(None) };
     static FORM: RefCell<Option<Form>> = const { RefCell::new(None) };
 }
@@ -147,11 +163,13 @@ pub fn snapshot(dir: &std::path::Path) -> Result<(), String> {
         set_app_icon(app);
         build(store, images);
         let (window, table) = with_list(|l| (l.window, l.table)).unwrap();
-        let (alert, _) = form_alert(None)?;
+        let (alert, _) = form_alert(None, false)?;
         let sheet = msg0(alert, sel("window"));
+        let (open, _) = form_alert(None, true)?;
+        let open_sheet = msg0(open, sel("window"));
         for (look, name) in [("light", "NSAppearanceNameAqua"), ("dark", "NSAppearanceNameDarkAqua")] {
             let appearance = msg_id_ret(cls("NSAppearance"), sel("appearanceNamed:"), ns_str(name));
-            for w in [window, sheet] {
+            for w in [window, sheet, open_sheet] {
                 msg_id(w, sel("setAppearance:"), appearance);
             }
             let content = msg0(window, sel("contentView"));
@@ -161,6 +179,8 @@ pub fn snapshot(dir: &std::path::Path) -> Result<(), String> {
             draw_view(content, appearance, &dir.join(format!("list-{look}.png")))?;
             msg_void(alert, sel("layout"));
             draw_view(msg0(sheet, sel("contentView")), appearance, &dir.join(format!("new-device-{look}.png")))?;
+            msg_void(open, sel("layout"));
+            draw_view(msg0(open_sheet, sel("contentView")), appearance, &dir.join(format!("new-device-advanced-{look}.png")))?;
         }
         Ok(())
     })
@@ -364,14 +384,19 @@ fn list_object() -> Id {
             return std::ptr::null_mut();
         }
         let action = "v24@0:8@16";
-        let methods: [(&str, *const c_void, &str); 16] = [
+        let methods: [(&str, *const c_void, &str); 21] = [
             ("numberOfRowsInTableView:", rows as *const c_void, "q24@0:8@16"),
             ("tableView:viewForTableColumn:row:", view_for_row as *const c_void, "@40@0:8@16@24q32"),
             ("startDevice:", start_device as *const c_void, action),
             ("startClicked:", start_clicked as *const c_void, action),
             ("newDevice:", new_device as *const c_void, action),
             ("deviceMenu:", device_menu as *const c_void, action),
-            ("renameDevice:", rename_device as *const c_void, action),
+            ("editDevice:", edit_device as *const c_void, action),
+            ("presetChosen:", preset_chosen as *const c_void, action),
+            ("advancedToggled:", advanced_toggled as *const c_void, action),
+            ("locationChosen:", location_chosen as *const c_void, action),
+            ("controlTextDidChange:", screen_typed as *const c_void, action),
+            ("comboBoxSelectionDidChange:", density_picked as *const c_void, action),
             ("wipeDevice:", wipe_device as *const c_void, action),
             ("revealDevice:", reveal_device as *const c_void, action),
             ("deleteDevice:", delete_device as *const c_void, action),
@@ -479,9 +504,14 @@ extern "C" fn new_device(_this: Id, _cmd: Id, _sender: Id) {
         }
         return;
     }
-    let mut entered: Option<(String, usize)> = None;
+    // The image by its folder, not its place in the popup: runModal orders the form out
+    // before it returns, the list window becomes key, and refresh scans the images
+    // again, so an image installed or removed meanwhile moves the others in the list's.
+    // The popup's place is read against the images the form showed (Form::images).
+    let mut entered: Option<(String, Option<PathBuf>, Raw)> = None;
+    ADVANCED.with(|a| a.set(false));
     loop {
-        let Ok((alert, form)) = (unsafe { form_alert(entered.as_ref()) }) else { return };
+        let Ok((alert, form)) = (unsafe { form_alert(entered.as_ref(), ADVANCED.with(|a| a.get())) }) else { return };
         let creates = form.is_some();
         FORM.with(|f| *f.borrow_mut() = form);
         let answer = unsafe { msg_i64_ret(alert, sel("runModal")) };
@@ -495,22 +525,35 @@ extern "C" fn new_device(_this: Id, _cmd: Id, _sender: Id) {
             }
             return;
         };
+        let name = unsafe { rust_str(msg0(form.field, sel("stringValue"))) };
+        let index = unsafe { msg_i64_ret(form.popup, sel("indexOfSelectedItem")) }.max(0) as usize;
+        let raw = unsafe { form.settings.read() };
+        let image = form.images.get(index).cloned();
+        if answer == TOGGLE_ADVANCED {
+            unsafe { msg_id(msg0(alert, sel("window")), sel("orderOut:"), std::ptr::null_mut()) };
+            entered = Some((name, image, raw));
+            continue;
+        }
         if answer != 1000 {
             return;
         }
-        let name = unsafe { rust_str(msg0(form.field, sel("stringValue"))) };
-        let index = unsafe { msg_i64_ret(form.popup, sel("indexOfSelectedItem")) }.max(0) as usize;
-        let made = with_list(|l| match (l.images.get(index), l.supports.as_ref().and_then(|s| s.get(index))) {
-            (Some(img), Some(support)) if support.boots() => l.store.create(&name, img),
-            _ => Err("choose a system image that can start".into()),
+        let made = raw.to_settings(&Settings::default()).and_then(|settings| {
+            with_list(|l| {
+                let Some(at) = image.as_ref().and_then(|dir| l.images.iter().position(|i| &i.dir == dir)) else {
+                    return Err("the system image chosen isn't installed any more: choose another".into());
+                };
+                let boots = l.supports.get_or_insert_with(|| l.images.iter().map(sdk::classify).collect()).get(at).is_some_and(Support::boots);
+                if boots { l.store.create_with(&name, &l.images[at], &settings) } else { Err("choose a system image that can start".into()) }
+            })
+            .ok_or_else(String::new)?
         });
         match made {
-            Some(Ok(d)) => return refresh(Some(&d.id)),
-            Some(Err(e)) => {
+            Ok(d) => return refresh(Some(&d.id)),
+            Err(e) if e.is_empty() => return,
+            Err(e) => {
                 show_alert("The device wasn't made", &e, &["OK"]);
-                entered = Some((name, index));
+                entered = Some((name, image, raw));
             }
-            None => return,
         }
     }
 }
@@ -520,7 +563,7 @@ extern "C" fn new_device(_this: Id, _cmd: Id, _sender: Id) {
 /// was typed and chosen before, when that was refused. When none of the images can
 /// boot, no Form: the images all shown but not chosen, why the one shown can't boot,
 /// and what to install, with Copy Command (if there's an SDK to say it for) and OK.
-unsafe fn form_alert(entered: Option<&(String, usize)>) -> Result<(Id, Option<Form>), String> {
+unsafe fn form_alert(entered: Option<&(String, Option<PathBuf>, Raw)>, advanced: bool) -> Result<(Id, Option<Form>), String> {
     let (images, supports, devices) = with_list(|l| {
         let supports = l.supports.get_or_insert_with(|| l.images.iter().map(sdk::classify).collect()).clone();
         (l.images.clone(), supports, l.devices.clone())
@@ -573,7 +616,9 @@ unsafe fn form_alert(entered: Option<&(String, usize)>) -> Result<(Id, Option<Fo
         }
         // None boots: the tested image shown, as the text speaks of it, else the first.
         let tested = || images.iter().position(|i| i.package() == sdk::tested_package());
-        let chosen = entered.map(|e| e.1).or(first).or_else(tested).unwrap_or(0);
+        // The one chosen before, if it is still there.
+        let before = entered.and_then(|e| e.1.as_ref()).and_then(|dir| images.iter().position(|i| &i.dir == dir));
+        let chosen = before.or(first).or_else(tested).unwrap_or(0);
         msg_i64(popup, sel("selectItemAtIndex:"), chosen as i64);
         msg0(popup, sel("autorelease"));
         pin_const(popup, "widthAnchor", 280.0);
@@ -603,17 +648,31 @@ unsafe fn form_alert(entered: Option<&(String, usize)>) -> Result<(Id, Option<Fo
         if supports.contains(&Support::Untested) {
             rows.push(note("zeroemu is tested with one image; others may not start all the way."));
         }
-        set_accessory(alert, &rows);
+        let raw = entered.map(|e| e.2.clone()).unwrap_or_else(|| Raw::from_settings(&Settings::default()));
+        let (settings, more, hidden) = SettingsRows::new(&raw, advanced);
+        rows.extend(more);
+        set_accessory_hiding(alert, &rows, hidden);
         msg_id(msg0(alert, sel("window")), sel("setInitialFirstResponder:"), field);
-        Ok((alert, Some(Form { field, popup, suggested })))
+        let images = images.iter().map(|i| i.dir.clone()).collect();
+        Ok((alert, Some(Form { field, popup, images, suggested, settings, advanced })))
     }
 }
 
 /// The form's rows, a label and its control each, under the alert's text.
 unsafe fn set_accessory(alert: Id, rows: &[[Id; 2]]) {
+    unsafe { set_accessory_hiding(alert, rows, 0) }
+}
+
+/// The form's rows, the last `hidden` of them there but not shown (Advanced Settings,
+/// closed): their controls still hold the values.
+unsafe fn set_accessory_hiding(alert: Id, rows: &[[Id; 2]], hidden: usize) {
     unsafe {
+        let count = rows.len();
         let rows: Vec<Id> = rows.iter().map(|r| ns_array(r)).collect();
         let grid = msg_id_ret(cls("NSGridView"), sel("gridViewWithViews:"), ns_array(&rows));
+        for i in count.saturating_sub(hidden)..count {
+            msg_bool(msg_i64_id_ret(grid, sel("rowAtIndex:"), i as i64), sel("setHidden:"), 1);
+        }
         msg_f64(grid, sel("setRowSpacing:"), 10.0);
         msg_f64(grid, sel("setColumnSpacing:"), 8.0);
         msg_i64(msg_i64_id_ret(grid, sel("columnAtIndex:"), 0), sel("setXPlacement:"), 3); // trailing
@@ -695,7 +754,7 @@ unsafe fn fill_menu(menu: Id, row: i64) {
         let me = list_object();
         let items: [(&str, &str, bool); 5] = [
             (if running.is_some() { "Show" } else { "Start" }, "startDevice:", true),
-            ("Rename…", "renameDevice:", true),
+            ("Edit…", "editDevice:", true),
             ("Wipe Data…", "wipeDevice:", running.is_none()),
             ("Show in Finder", "revealDevice:", true),
             ("Delete…", "deleteDevice:", running.is_none()),
@@ -731,15 +790,62 @@ extern "C" fn menu_needs_update(_this: Id, _cmd: Id, menu: Id) {
     unsafe { fill_menu(menu, row) };
 }
 
-extern "C" fn rename_device(_this: Id, _cmd: Id, sender: Id) {
-    let Some((d, _)) = device_at(unsafe { msg_i64_ret(sender, sel("tag")) }) else { return };
-    let Some(name) = (unsafe { ask_text("Rename Device", &format!("A new name for “{}”.", d.name), &d.name, "Rename") }) else { return };
-    match with_list(|l| l.store.rename(&d, &name)) {
-        Some(Ok(_)) => refresh(Some(&d.id)),
-        Some(Err(e)) => {
-            show_alert("The device wasn't renamed", &e, &["OK"]);
+/// Edit…: the device's name and settings, in the form New Device has, its image shown
+/// but kept. What changes applies at its next start.
+extern "C" fn edit_device(_this: Id, _cmd: Id, sender: Id) {
+    let Some((d, running)) = device_at(unsafe { msg_i64_ret(sender, sel("tag")) }) else { return };
+    let shown = with_list(|l| d.image_shown(&l.images)).unwrap_or_default();
+    let mut entered = (d.name.clone(), Raw::from_settings(&d.settings));
+    ADVANCED.with(|a| a.set(false));
+    loop {
+        let (alert, form) = unsafe { edit_alert(&d, &shown, running.is_some(), &entered, ADVANCED.with(|a| a.get())) };
+        FORM.with(|f| *f.borrow_mut() = Some(form));
+        let answer = unsafe { msg_i64_ret(alert, sel("runModal")) };
+        let Some(form) = FORM.with(|f| f.borrow_mut().take()) else { return };
+        let name = unsafe { rust_str(msg0(form.field, sel("stringValue"))) };
+        let raw = unsafe { form.settings.read() };
+        if answer == TOGGLE_ADVANCED {
+            unsafe { msg_id(msg0(alert, sel("window")), sel("orderOut:"), std::ptr::null_mut()) };
+            entered = (name, raw);
+            continue;
         }
-        None => {}
+        if answer != 1000 {
+            return;
+        }
+        // The name and the settings in one write: either both change, or neither has,
+        // as the alert says.
+        // What the form showed: the device's settings as the form reads them back, its
+        // defaults made none, so a field left alone counts as unchanged.
+        let shown = d.shown_as(Raw::from_settings(&d.settings).to_settings(&d.settings).unwrap_or_else(|_| d.settings.clone()));
+        let saved = raw.to_settings(&d.settings).and_then(|settings| with_list(|l| l.store.edit(&shown, &name, &settings)).ok_or_else(String::new)?);
+        match saved {
+            Ok(_) => return refresh(Some(&d.id)),
+            Err(e) if e.is_empty() => return,
+            Err(e) => {
+                show_alert("The device wasn't changed", &e, &["OK"]);
+                entered = (name, raw);
+            }
+        }
+    }
+}
+
+/// The form editing `d`, with Save and Cancel.
+unsafe fn edit_alert(d: &Device, image: &str, running: bool, entered: &(String, Raw), advanced: bool) -> (Id, Form) {
+    unsafe {
+        let alert = msg0(new_alert(), sel("autorelease"));
+        msg_id(alert, sel("setMessageText:"), ns_str(&format!("Edit “{}”", d.name)));
+        let when = if running { "It's running: changes apply when it next starts." } else { "Changes apply when it next starts." };
+        msg_id(alert, sel("setInformativeText:"), ns_str(when));
+        msg_id_ret(alert, sel("addButtonWithTitle:"), ns_str("Save"));
+        msg_id_ret(alert, sel("addButtonWithTitle:"), ns_str("Cancel"));
+        let field = msg_id_ret(cls("NSTextField"), sel("textFieldWithString:"), ns_str(&entered.0));
+        pin_const(field, "widthAnchor", 280.0);
+        let mut rows = vec![[label("Name:"), field], [label("System image:"), label(image)]];
+        let (settings, more, hidden) = SettingsRows::new(&entered.1, advanced);
+        rows.extend(more);
+        set_accessory_hiding(alert, &rows, hidden);
+        msg_id(msg0(alert, sel("window")), sel("setInitialFirstResponder:"), field);
+        (alert, Form { field, popup: std::ptr::null_mut(), images: Vec::new(), suggested: String::new(), settings, advanced })
     }
 }
 
@@ -802,6 +908,486 @@ extern "C" fn tick(_this: Id, _cmd: Id, _timer: Id) {
     let changed = with_list(|l| l.devices.iter().map(Device::running).collect::<Vec<_>>() != l.running).unwrap_or(false);
     if changed {
         refresh(None);
+    }
+}
+
+// ---- A device's settings in the form ----
+
+/// Memory a device can be given, in MB: as Android Studio offers, up to what zeroemu
+/// maps. The default, 4096, is stored as no setting.
+const RAM_CHOICES: [u64; 11] = [1024, 1536, 2048, 3072, 4096, 6144, 8192, 12288, 16384, 24576, 32768];
+const RAM_DEFAULT: u64 = 4096;
+
+/// What the form's location popup offers, in order (separators aside).
+#[derive(Clone, Debug, PartialEq)]
+enum Place {
+    /// No setting: its time zone's city (location::default_for_zone).
+    ZoneCity,
+    Fixed(Source),
+    /// Coordinates typed in the field below.
+    Custom,
+}
+
+fn places() -> Vec<Place> {
+    let mut out = vec![Place::ZoneCity, Place::Fixed(Source::Off)];
+    out.extend(location::PRESETS.iter().map(|p| Place::Fixed(Source::Preset(p.id))));
+    out.push(Place::Custom);
+    out
+}
+
+/// The settings as the form's controls hold them, before they are checked: what a
+/// refused form opens again with.
+#[derive(Clone, Debug, PartialEq)]
+struct Raw {
+    width: String,
+    height: String,
+    dpi: String,
+    ram_mb: u64,
+    /// 0 for all of the Mac's.
+    cpus: usize,
+    network: bool,
+    /// Empty for the Mac's.
+    zone: String,
+    place: Place,
+    coords: String,
+    /// The time zone box's entry for the Mac's, as the form showed it: the Mac's zone
+    /// may change while it shows.
+    mine: String,
+    /// Device says Custom, though the size and density may still be a preset's: it
+    /// was chosen, and Advanced Settings opened for them.
+    custom: bool,
+}
+
+impl Raw {
+    fn from_settings(s: &Settings) -> Raw {
+        let d = s.display.unwrap_or(Display::DEFAULT);
+        let (place, coords) = match &s.location {
+            None => (Place::ZoneCity, String::new()),
+            // As saved (to_ini's six decimals), so that an edit that doesn't touch
+            // them doesn't move the device.
+            Some(Source::Point { lat, lon }) => (Place::Custom, format!("{}, {}", trim_decimals(*lat), trim_decimals(*lon))),
+            Some(other) => (Place::Fixed(other.clone()), String::new()),
+        };
+        Raw {
+            width: d.width.to_string(),
+            height: d.height.to_string(),
+            dpi: d.dpi.to_string(),
+            ram_mb: s.ram_mb.unwrap_or(RAM_DEFAULT),
+            cpus: s.cpus.unwrap_or(0),
+            network: s.network != Some(false),
+            zone: s.time_zone.clone().unwrap_or_default(),
+            place,
+            coords,
+            mine: same_zone_label(),
+            custom: d.preset().is_none(),
+        }
+    }
+
+    /// The settings, or what is wrong with them. Defaults are stored as no setting, so
+    /// the device follows them if they change. What `base` (the device's settings
+    /// before) has that the form doesn't show stays.
+    fn to_settings(&self, base: &Settings) -> Result<Settings, String> {
+        let num = |what: &str, v: &str| v.trim().parse::<u32>().map_err(|_| format!("the screen's {what} is a number, not {:?}", v.trim()));
+        let display = Display::new(num("width", &self.width)?, num("height", &self.height)?, num("density", &self.dpi)?)?;
+        let zone = self.zone.trim();
+        let time_zone = if zone.is_empty() || zone == self.mine {
+            None
+        } else {
+            // One saved as it was (perhaps on a newer Mac) stays; one typed is checked.
+            if base.time_zone.as_deref() != Some(zone) {
+                devices::check_time_zone(zone)?;
+            }
+            Some(zone.to_string())
+        };
+        let location = match &self.place {
+            Place::ZoneCity => None,
+            Place::Fixed(s) => Some(s.clone()),
+            Place::Custom => match Source::parse(&self.coords)? {
+                p @ Source::Point { .. } => Some(p),
+                _ => return Err(format!("coordinates are a latitude and a longitude, such as 28.6129, 77.2295, not {:?}", self.coords.trim())),
+            },
+        };
+        Ok(Settings {
+            display: (display != Display::DEFAULT).then_some(display),
+            ram_mb: (self.ram_mb != RAM_DEFAULT).then_some(devices::check_ram(self.ram_mb)?),
+            cpus: (self.cpus != 0).then_some(self.cpus),
+            network: (!self.network).then_some(false),
+            time_zone,
+            location,
+            others: base.others.clone(),
+        })
+    }
+}
+
+/// A coordinate to six decimals (about 10 cm), without the zeros at the end.
+fn trim_decimals(v: f64) -> String {
+    let s = format!("{v:.6}");
+    s.trim_end_matches('0').trim_end_matches('.').to_string()
+}
+
+/// What the time zone box says for no setting, before the Mac's zone.
+const SAME_ZONE: &str = "Same as this Mac";
+
+/// The time zone box's entry for no setting, exactly: only it means the Mac's (text
+/// that merely starts the same is a zone, and checked as one).
+fn same_zone_label() -> String {
+    format!("{SAME_ZONE} ({})", devices::host_time_zone().unwrap_or_else(|| "unknown".into()))
+}
+
+/// The form's rows for a device's settings, as Android Studio's device wizard has
+/// them: the screen (a preset, or a size and density), memory, cores, network, time
+/// zone and location.
+struct SettingsRows {
+    preset: Id,
+    width: Id,
+    height: Id,
+    dpi: Id,
+    dp: Id,
+    ram: Id,
+    ram_choices: Vec<u64>,
+    cpus: Id,
+    network: Id,
+    zone: Id,
+    place: Id,
+    /// The place popup's items: Some(index into `places()`), None for a separator.
+    place_items: Vec<Option<usize>>,
+    coords: Id,
+    /// Raw::mine.
+    mine: String,
+    /// Advanced Settings' note on what isn't the default, while it is closed (else
+    /// null): it follows Device, the one of its settings shown.
+    summary: Id,
+}
+
+impl SettingsRows {
+    /// The controls, filled from `raw`, and their rows: Device, then Advanced Settings
+    /// and the rows under it, which are the last of them, and how many those are when
+    /// `advanced` is closed (to hide), else 0. Closed, they keep what `raw` has: the
+    /// defaults, for a new device, unless they were changed before.
+    unsafe fn new(raw: &Raw, advanced: bool) -> (SettingsRows, Vec<[Id; 2]>, usize) {
+        unsafe {
+            let me = list_object();
+            // The screen: a preset fills the size and density; typing a size or
+            // density makes it Custom.
+            let preset = popup(&Display::PRESETS.iter().map(|(_, name, d)| format!("{name} · {} × {} · {} dpi", d.width, d.height, d.dpi)).chain(["Custom".to_string()]).map(Some).collect::<Vec<_>>());
+            msg_id(preset, sel("setTarget:"), me);
+            msg_id(preset, sel("setAction:"), sel("presetChosen:"));
+            let width = number_field(&raw.width, 64.0);
+            let height = number_field(&raw.height, 64.0);
+            let dpi = msg0(msg0(cls("NSComboBox"), sel("alloc")), sel("init"));
+            let dpis: Vec<Id> = ["120", "160", "213", "240", "280", "320", "360", "400", "420", "440", "480", "560", "640"].iter().map(|d| ns_str(d)).collect();
+            msg_id(dpi, sel("addItemsWithObjectValues:"), ns_array(&dpis));
+            msg_id(dpi, sel("setStringValue:"), ns_str(&raw.dpi));
+            msg_i64(dpi, sel("setNumberOfVisibleItems:"), 13);
+            pin_const(dpi, "widthAnchor", 80.0);
+            msg0(dpi, sel("autorelease"));
+            for f in [width, height, dpi] {
+                msg_id(f, sel("setDelegate:"), me);
+            }
+            let dp = label("");
+            msg_id(dp, sel("setTextColor:"), msg0(cls("NSColor"), sel("secondaryLabelColor")));
+            let size_row = row_stack(&[width, label("×"), height, label("pixels")], 6.0);
+            let dpi_row = row_stack(&[dpi, label("dpi"), dp], 6.0);
+
+            let mut ram_choices: Vec<u64> = RAM_CHOICES.iter().copied().filter(|mb| devices::check_ram(*mb).is_ok()).collect();
+            if !ram_choices.contains(&raw.ram_mb) {
+                ram_choices.push(raw.ram_mb);
+                ram_choices.sort();
+            }
+            let ram = popup(&ram_choices.iter().map(|mb| Some(ram_shown(*mb))).collect::<Vec<_>>());
+            msg_i64(ram, sel("selectItemAtIndex:"), ram_choices.iter().position(|mb| *mb == raw.ram_mb).unwrap_or(0) as i64);
+
+            let host = crate::kernel::host_cpus();
+            let most = host.max(raw.cpus);
+            let cpus = popup(&std::iter::once(format!("All of this Mac's ({host})")).chain((1..=most).map(|n| n.to_string())).map(Some).collect::<Vec<_>>());
+            msg_i64(cpus, sel("selectItemAtIndex:"), raw.cpus.min(most) as i64);
+
+            let network = msg_id_id_ret_sel(cls("NSButton"), sel("checkboxWithTitle:target:action:"), ns_str("Connected to the internet"), std::ptr::null_mut(), std::ptr::null_mut());
+            msg_i64(network, sel("setState:"), raw.network as i64);
+
+            let zone = msg0(msg0(cls("NSComboBox"), sel("alloc")), sel("init"));
+            let mine = raw.mine.clone();
+            let zones: Vec<Id> = std::iter::once(mine.clone()).chain(devices::time_zones()).map(|z| ns_str(&z)).collect();
+            msg_id(zone, sel("addItemsWithObjectValues:"), ns_array(&zones));
+            msg_bool(zone, sel("setCompletes:"), 1);
+            msg_i64(zone, sel("setNumberOfVisibleItems:"), 15);
+            msg_id(zone, sel("setStringValue:"), ns_str(if raw.zone.is_empty() { &mine } else { &raw.zone }));
+            pin_const(zone, "widthAnchor", 280.0);
+            msg0(zone, sel("autorelease"));
+
+            // Where: its time zone's city, none, the places, the routes, or typed in.
+            let all = places();
+            let mut place_items = Vec::new();
+            let mut titles = Vec::new();
+            for (i, p) in all.iter().enumerate() {
+                let route = matches!(p, Place::Fixed(Source::Preset(id)) if location::PRESETS.iter().any(|q| q.id == *id && matches!(q.kind, location::Kind::Route { .. })));
+                let first_route = route && !all[..i].iter().any(|q| matches!(q, Place::Fixed(Source::Preset(id)) if location::PRESETS.iter().any(|r| r.id == *id && matches!(r.kind, location::Kind::Route { .. }))));
+                // A line before the places, before the routes, and before Custom.
+                if i == 2 || first_route || *p == Place::Custom {
+                    place_items.push(None);
+                    titles.push(None);
+                }
+                place_items.push(Some(i));
+                titles.push(Some(match p {
+                    Place::ZoneCity => "Its time zone's main city".to_string(),
+                    Place::Fixed(Source::Off) => "None (no GPS signal)".to_string(),
+                    Place::Fixed(s) if route => format!("{} (moving)", s.shown()),
+                    Place::Fixed(s) => s.shown(),
+                    Place::Custom => "Custom coordinates".to_string(),
+                }));
+            }
+            let place = popup(&titles);
+            let chosen = all.iter().position(|p| *p == raw.place).unwrap_or(0);
+            msg_i64(place, sel("selectItemAtIndex:"), place_items.iter().position(|i| *i == Some(chosen)).unwrap_or(0) as i64);
+            msg_id(place, sel("setTarget:"), me);
+            msg_id(place, sel("setAction:"), sel("locationChosen:"));
+            let coords = msg_id_ret(cls("NSTextField"), sel("textFieldWithString:"), ns_str(&raw.coords));
+            msg_id(coords, sel("setPlaceholderString:"), ns_str("latitude, longitude"));
+            pin_const(coords, "widthAnchor", 280.0);
+            msg_bool(coords, sel("setEnabled:"), (raw.place == Place::Custom) as i8);
+
+            let mut rows = SettingsRows { preset, width, height, dpi, dp, ram, ram_choices, cpus, network, zone, place, place_items, coords, mine, summary: std::ptr::null_mut() };
+            rows.screen_changed();
+            // Custom chosen stays chosen, until a size typed is a preset's.
+            if raw.custom {
+                msg_i64(preset, sel("selectItemAtIndex:"), Display::PRESETS.len() as i64);
+            }
+            // Advanced Settings: a disclosure triangle and its title, which both open
+            // and close it, and, closed, what it holds that isn't the default.
+            let triangle = msg0(msg0(cls("NSButton"), sel("alloc")), sel("init"));
+            msg_i64(triangle, sel("setBezelStyle:"), 5); // NSBezelStyleDisclosure
+            msg_i64(triangle, sel("setButtonType:"), 1); // NSButtonTypePushOnPushOff
+            msg_id(triangle, sel("setTitle:"), ns_str(""));
+            msg_i64(triangle, sel("setState:"), advanced as i64);
+            msg_id(triangle, sel("setTarget:"), me);
+            msg_id(triangle, sel("setAction:"), sel("advancedToggled:"));
+            msg0(triangle, sel("autorelease"));
+            let title = button("Advanced Settings", "advancedToggled:", 0);
+            msg_bool(title, sel("setBordered:"), 0);
+            let summary = label(&if advanced { String::new() } else { advanced_summary(raw) });
+            msg_id(summary, sel("setTextColor:"), msg0(cls("NSColor"), sel("secondaryLabelColor")));
+            msg_i64(summary, sel("setLineBreakMode:"), 4);
+            squeeze(summary);
+            if !advanced {
+                rows.summary = summary;
+            }
+            let disclosure = row_stack(&[triangle, title, summary], 4.0);
+            let lines = vec![
+                [label("Device:"), preset],
+                [msg0(cls("NSGridCell"), sel("emptyContentView")), disclosure],
+                [label("Screen:"), size_row],
+                [label("Density:"), dpi_row],
+                [label("Memory:"), ram],
+                [label("CPU cores:"), cpus],
+                [label("Network:"), network],
+                [label("Time zone:"), zone],
+                [label("Location:"), place],
+                [label("Coordinates:"), coords],
+            ];
+            let hidden = if advanced { 0 } else { lines.len() - 2 };
+            (rows, lines, hidden)
+        }
+    }
+
+    /// What the controls hold now.
+    unsafe fn read(&self) -> Raw {
+        unsafe {
+            let text = |f: Id| rust_str(msg0(f, sel("stringValue")));
+            let index = |p: Id| msg_i64_ret(p, sel("indexOfSelectedItem")).max(0) as usize;
+            let all = places();
+            Raw {
+                width: text(self.width),
+                height: text(self.height),
+                dpi: text(self.dpi),
+                ram_mb: self.ram_choices.get(index(self.ram)).copied().unwrap_or(RAM_DEFAULT),
+                cpus: index(self.cpus),
+                network: msg_i64_ret(self.network, sel("state")) != 0,
+                zone: text(self.zone),
+                place: self.place_items.get(index(self.place)).copied().flatten().and_then(|i| all.get(i).cloned()).unwrap_or(Place::ZoneCity),
+                coords: text(self.coords),
+                mine: self.mine.clone(),
+                custom: index(self.preset) >= Display::PRESETS.len(),
+            }
+        }
+    }
+
+    /// After the size or density changed: the preset it is, if any, and its size in dp.
+    unsafe fn screen_changed(&self) {
+        unsafe {
+            let raw = self.read();
+            let d = (|| Display::new(raw.width.trim().parse().ok()?, raw.height.trim().parse().ok()?, raw.dpi.trim().parse().ok()?).ok())();
+            let preset = d.and_then(|d| Display::PRESETS.iter().position(|p| p.2 == d)).unwrap_or(Display::PRESETS.len());
+            msg_i64(self.preset, sel("selectItemAtIndex:"), preset as i64);
+            let text = match d {
+                Some(d) => format!("{} × {} dp", d.dp().0, d.dp().1),
+                None => "not a screen Android can have".to_string(),
+            };
+            msg_id(self.dp, sel("setStringValue:"), ns_str(&text));
+            // Closed, its note says the screen chosen now.
+            if !self.summary.is_null() {
+                msg_id(self.summary, sel("setStringValue:"), ns_str(&advanced_summary(&self.read())));
+            }
+        }
+    }
+}
+
+/// The settings rows of the form showing now, copied: their handlers message AppKit,
+/// which may call back in, so never while FORM is borrowed.
+fn form_rows<R>(f: impl FnOnce(&SettingsRows) -> R) -> Option<R> {
+    FORM.with(|form| form.borrow().as_ref().map(|form| f(&form.settings)))
+}
+
+/// A preset chosen: its size and density in the fields.
+extern "C" fn preset_chosen(_this: Id, _cmd: Id, _sender: Id) {
+    let Some((preset, width, height, dpi)) = form_rows(|r| (r.preset, r.width, r.height, r.dpi)) else { return };
+    let advanced = FORM.with(|f| f.borrow().as_ref().is_some_and(|f| f.advanced));
+    unsafe {
+        let i = msg_i64_ret(preset, sel("indexOfSelectedItem")).max(0) as usize;
+        match Display::PRESETS.get(i) {
+            Some((_, _, d)) => {
+                msg_id(width, sel("setStringValue:"), ns_str(&d.width.to_string()));
+                msg_id(height, sel("setStringValue:"), ns_str(&d.height.to_string()));
+                msg_id(dpi, sel("setStringValue:"), ns_str(&d.dpi.to_string()));
+            }
+            // Custom: its size and density are under Advanced Settings, and it stays
+            // chosen until a size typed is a preset's (screen_changed would choose the
+            // preset the fields still hold).
+            None if !advanced => return toggle_advanced(),
+            None => return,
+        }
+    }
+    screen_changed();
+}
+
+/// Advanced Settings opened or closed: the form shows again, the other way.
+extern "C" fn advanced_toggled(_this: Id, _cmd: Id, _sender: Id) {
+    toggle_advanced();
+}
+
+fn toggle_advanced() {
+    let Some(advanced) = FORM.with(|f| f.borrow().as_ref().map(|f| f.advanced)) else { return };
+    ADVANCED.with(|a| a.set(!advanced));
+    unsafe { msg_i64(msg0(cls("NSApplication"), sel("sharedApplication")), sel("stopModalWithCode:"), TOGGLE_ADVANCED) };
+}
+
+/// Memory as the form shows it: "4 GB", "1.5 GB", or in MB when it isn't a half.
+fn ram_shown(mb: u64) -> String {
+    match mb % 1024 {
+        0 => format!("{} GB", mb / 1024),
+        512 => format!("{}.5 GB", mb / 1024),
+        _ => format!("{mb} MB"),
+    }
+}
+
+/// What Advanced Settings holds that isn't the default, for when it is closed.
+fn advanced_summary(raw: &Raw) -> String {
+    let mut parts = Vec::new();
+    let screen = (|| Display::new(raw.width.trim().parse().ok()?, raw.height.trim().parse().ok()?, raw.dpi.trim().parse().ok()?).ok())();
+    // A preset's screen shows in Device; one chosen as Custom, though it is a preset's
+    // size, is said here, as Device says only Custom.
+    if let Some(d) = screen.filter(|d| raw.custom || d.preset().is_none()) {
+        parts.push(format!("{} × {} at {} dpi", d.width, d.height, d.dpi));
+    }
+    if raw.ram_mb != RAM_DEFAULT {
+        parts.push(ram_shown(raw.ram_mb));
+    }
+    match raw.cpus {
+        0 => {}
+        1 => parts.push("1 core".into()),
+        n => parts.push(format!("{n} cores")),
+    }
+    if !raw.network {
+        parts.push("no network".into());
+    }
+    let zone = raw.zone.trim();
+    if !zone.is_empty() && zone != raw.mine {
+        parts.push(zone.to_string());
+    }
+    match &raw.place {
+        Place::ZoneCity => {}
+        Place::Fixed(Source::Off) => parts.push("no location".into()),
+        Place::Fixed(s) => parts.push(s.shown()),
+        Place::Custom => parts.push(raw.coords.trim().to_string()),
+    }
+    if parts.is_empty() { "(defaults)".into() } else { format!("({})", parts.join(", ")) }
+}
+
+fn screen_changed() {
+    let Some(rows) = FORM.with(|form| form.borrow().as_ref().map(|f| SettingsRowsIds::of(&f.settings))) else { return };
+    unsafe { rows.with(|r| r.screen_changed()) };
+}
+
+/// A size or density typed (NSControlTextDidChangeNotification).
+extern "C" fn screen_typed(_this: Id, _cmd: Id, _note: Id) {
+    screen_changed();
+}
+
+/// A density picked from the list: the box's text is the old one until this returns.
+extern "C" fn density_picked(_this: Id, _cmd: Id, note: Id) {
+    unsafe {
+        let combo = msg0(note, sel("object"));
+        let picked = msg0(combo, sel("objectValueOfSelectedItem"));
+        if !picked.is_null() {
+            msg_id(combo, sel("setStringValue:"), picked);
+        }
+    }
+    screen_changed();
+}
+
+/// A location chosen: the coordinates field is for Custom only.
+extern "C" fn location_chosen(_this: Id, _cmd: Id, _sender: Id) {
+    let Some((place, items, coords)) = form_rows(|r| (r.place, r.place_items.clone(), r.coords)) else { return };
+    unsafe {
+        let i = msg_i64_ret(place, sel("indexOfSelectedItem")).max(0) as usize;
+        let custom = items.get(i).copied().flatten().and_then(|i| places().get(i).cloned()) == Some(Place::Custom);
+        msg_bool(coords, sel("setEnabled:"), custom as i8);
+        if custom {
+            msg_id(msg0(coords, sel("window")), sel("makeFirstResponder:"), coords);
+        }
+    }
+}
+
+/// The ids of a SettingsRows, out of FORM, to work on without holding it.
+struct SettingsRowsIds(SettingsRows);
+
+impl SettingsRowsIds {
+    fn of(r: &SettingsRows) -> SettingsRowsIds {
+        SettingsRowsIds(SettingsRows { ram_choices: r.ram_choices.clone(), place_items: r.place_items.clone(), mine: r.mine.clone(), ..*r })
+    }
+
+    unsafe fn with(&self, f: impl FnOnce(&SettingsRows)) {
+        f(&self.0)
+    }
+}
+
+/// A popup button of these items (None a separator), added through its menu, as
+/// addItemWithTitle: drops an item whose title another has.
+unsafe fn popup(items: &[Option<String>]) -> Id {
+    unsafe {
+        let p = msg_init_popup(msg0(cls("NSPopUpButton"), sel("alloc")), sel("initWithFrame:pullsDown:"), NSRect { origin: NSPoint { x: 0.0, y: 0.0 }, size: NSSize { width: 280.0, height: 26.0 } }, 0);
+        msg_bool(p, sel("setAutoenablesItems:"), 0);
+        let menu = msg0(p, sel("menu"));
+        for item in items {
+            match item {
+                None => msg_id(menu, sel("addItem:"), msg0(cls("NSMenuItem"), sel("separatorItem"))),
+                Some(title) => {
+                    let it = menu_item(title, "", "", 0, 0, std::ptr::null_mut());
+                    msg_id(it, sel("setAction:"), std::ptr::null_mut());
+                    msg_id(menu, sel("addItem:"), it);
+                    msg_void(it, sel("release"));
+                }
+            }
+        }
+        pin_const(p, "widthAnchor", 280.0);
+        msg0(p, sel("autorelease"))
+    }
+}
+
+unsafe fn number_field(value: &str, width: f64) -> Id {
+    unsafe {
+        let f = msg_id_ret(cls("NSTextField"), sel("textFieldWithString:"), ns_str(value));
+        pin_const(f, "widthAnchor", width);
+        f
     }
 }
 
@@ -1107,6 +1693,61 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("build.prop"), format!("ro.build.version.release={release}\n")).unwrap();
         Image::from_dir(&dir)
+    }
+
+    #[test]
+    fn the_form_reads_back_what_a_device_has() {
+        // Nothing set: the form shows the defaults, and saves nothing.
+        let none = Raw::from_settings(&Settings::default());
+        assert_eq!((none.width.as_str(), none.height.as_str(), none.dpi.as_str(), none.ram_mb, none.cpus), ("1080", "2400", "420", 4096, 0));
+        assert_eq!(none.to_settings(&Settings::default()).unwrap(), Settings::default());
+        // Everything set comes back the same.
+        let all = Settings {
+            display: Some(Display::new(720, 1280, 320).unwrap()),
+            ram_mb: Some(2048),
+            cpus: Some(4),
+            network: Some(false),
+            time_zone: Some("Asia/Kolkata".into()),
+            location: Some(Source::Point { lat: 12.9716, lon: 77.5946 }),
+            others: vec!["future=yes".into()],
+        };
+        let raw = Raw::from_settings(&all);
+        assert_eq!(raw.place, Place::Custom);
+        assert_eq!(raw.to_settings(&all).unwrap(), all);
+        // What can't be: said, not saved.
+        let bad = Raw { width: "7".into(), ..raw.clone() };
+        assert!(bad.to_settings(&all).is_err());
+        let bad = Raw { coords: "north".into(), ..raw.clone() };
+        assert!(bad.to_settings(&all).is_err());
+        let mine = Raw { zone: same_zone_label(), place: Place::Fixed(Source::Off), ..raw.clone() };
+        let s = mine.to_settings(&all).unwrap();
+        assert_eq!((s.time_zone, s.location), (None, Some(Source::Off)));
+        let typo = Raw { zone: format!("{SAME_ZONE} typo"), ..raw };
+        assert!(typo.to_settings(&all).is_err(), "not the Mac's: a zone, and none");
+    }
+
+    #[test]
+    fn closed_advanced_settings_say_what_isnt_the_default() {
+        let defaults = Raw::from_settings(&Settings::default());
+        assert_eq!(advanced_summary(&defaults), "(defaults)");
+        // A preset screen shows in Device, so isn't repeated.
+        let tablet = Raw { width: "2560".into(), height: "1600".into(), dpi: "320".into(), ..defaults.clone() };
+        assert_eq!(advanced_summary(&tablet), "(defaults)");
+        // Custom, though a preset's size: said, as Device says only Custom.
+        let custom = Raw { width: "1080".into(), height: "2424".into(), dpi: "420".into(), custom: true, ..defaults.clone() };
+        assert_eq!(advanced_summary(&custom), "(1080 × 2424 at 420 dpi)");
+        let changed = Raw {
+            width: "1440".into(),
+            height: "3120".into(),
+            dpi: "560".into(),
+            ram_mb: 2048,
+            cpus: 2,
+            network: false,
+            zone: "Europe/Berlin".into(),
+            place: Place::Fixed(Source::Preset("city-run")),
+            ..defaults
+        };
+        assert_eq!(advanced_summary(&changed), "(1440 × 3120 at 560 dpi, 2 GB, 2 cores, no network, Europe/Berlin, City Run)");
     }
 
     #[test]

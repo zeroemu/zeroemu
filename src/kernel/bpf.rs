@@ -108,8 +108,10 @@ const ALLOW_MULTI: u32 = 2;
 static REG: LazyLock<Mutex<Registry>> = LazyLock::new(Mutex::default);
 static NEXT_ID: AtomicU32 = AtomicU32::new(1);
 
+/// The same count as /sys/devices/system/cpu/possible, which libbpf sizes per-CPU
+/// values by.
 fn ncpus() -> u32 {
-    std::thread::available_parallelism().map_or(1, |n| n.get()).min(64) as u32
+    super::cpus() as u32
 }
 
 fn is_array(ty: u32) -> bool {

@@ -28,20 +28,8 @@ struct NSRect {
     size: NSSize,
 }
 
-pub struct NativeWindow {
-    pub handle: *mut c_void,
-    /// Content size in points. `setupWindow` uses this as the NSView frame;
-    /// a pixel size is placed in point coordinates and hangs off the window
-    /// (on a 2x display, 810x1800 at y=-900, so only a quarter of it shows).
-    pub width: i32,
-    pub height: i32,
-    /// Same content size in pixels. The guest display matches the view's
-    /// backing store, so a Retina window is 1:1 with what Android renders.
-    pub px_width: i32,
-    pub px_height: i32,
-}
-
 pub mod list;
+mod location_menu;
 
 static APP: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
 /// The window's title: the device's name, for the Window menu and Mission Control.
@@ -203,7 +191,26 @@ pub fn background() -> bool {
     std::env::var_os("ZEROEMU_BACKGROUND").is_some_and(|v| !v.is_empty() && v != "0")
 }
 
-pub fn open(fb_w: u32, fb_h: u32) -> Result<NativeWindow, String> {
+/// How big the first window's content is, in points, for a device screen of `display`
+/// on a Mac screen with `room` points to spare (width, height) at `dpr` pixels a
+/// point: the device's shape, as large as fits, but with no more than one of the Mac
+/// screen's pixels to each of the device's, as more only blurs the picture. Except
+/// that one of Android's dp is never shown smaller than a point, the unit Mac apps
+/// are drawn in, as Android's text gets hard to read below that: for a device of low
+/// density on a Retina screen, that wins over sharpness, but never over fitting.
+fn first_size(display: super::Display, room: (f64, f64), dpr: f64) -> (f64, f64) {
+    let (w, h) = (display.width as f64, display.height as f64);
+    let fits = (room.0 / w).min(room.1 / h);
+    let sharp = 1.0 / dpr.max(1.0);
+    // Points to a pixel when a dp (dpi / 160 pixels) is a point.
+    let readable = 160.0 / display.dpi.max(1) as f64;
+    let scale = fits.min(sharp.max(readable));
+    ((w * scale).floor().max(1.0), (h * scale).floor().max(1.0))
+}
+
+/// Opens the window for a device screen of `display`, fitted to the Mac's.
+pub fn open(display: super::Display) -> Result<(), String> {
+    let (fb_w, fb_h) = (display.width, display.height);
     if unsafe { libc::pthread_main_np() } == 0 {
         return Err("gfxstream window must be created on the main thread".into());
     }
@@ -242,11 +249,8 @@ pub fn open(fb_w: u32, fb_h: u32) -> Result<NativeWindow, String> {
         // Fitted to the screen with the title bar and toolbar, which take whatever
         // height they take: measured, as adding the toolbar doesn't keep the content's.
         let chrome = msg_rect(window, sel("frame")).size.height - msg_rect(msg0(window, sel("contentView")), sel("bounds")).size.height;
-        let max_w = (vis.size.width - 48.0).max(320.0);
-        let max_h = (vis.size.height - chrome - 16.0).max(320.0);
-        let fit = (max_w / fb_w as f64).min(max_h / fb_h as f64).min(1.0);
-        let win_w = (fb_w as f64 * fit).floor().max(1.0);
-        let win_h = (fb_h as f64 * fit).floor().max(1.0);
+        let room = ((vis.size.width - 48.0).max(320.0), (vis.size.height - chrome - 16.0).max(320.0));
+        let (win_w, win_h) = first_size(display, room, dpr);
         msg_size(window, sel("setContentSize:"), NSSize { width: win_w, height: win_h });
         msg_void(window, sel("center"));
         set_up_menus(app);
@@ -284,18 +288,10 @@ pub fn open(fb_w: u32, fb_h: u32) -> Result<NativeWindow, String> {
         if number > 0 {
             WINDOW_ID.store(number as u64, Ordering::Release);
         }
-        let px_w = (win_w * dpr).round().max(1.0);
-        let px_h = (win_h * dpr).round().max(1.0);
         if crate::kernel::verbose() {
-            eprintln!("zeroemu: window {win_w:.0}x{win_h:.0} points ({px_w:.0}x{px_h:.0} px, dpr {dpr}) for {fb_w}x{fb_h} (id {number})");
+            eprintln!("zeroemu: window {win_w:.0}x{win_h:.0} points (dpr {dpr}) for a {fb_w}x{fb_h} screen at {} dpi (id {number})", display.dpi);
         }
-        Ok(NativeWindow {
-            handle: window,
-            width: win_w as i32,
-            height: win_h as i32,
-            px_width: px_w as i32,
-            px_height: px_h as i32,
-        })
+        Ok(())
     }
 }
 
@@ -882,14 +878,17 @@ impl ShownRect {
     }
 }
 
+/// The frame's own size, the panel's: (width, height).
+fn panel_size() -> (u32, u32) {
+    let size = SHOWN_SIZE.load(Ordering::Relaxed);
+    ((size >> 32) as u32, size as u32)
+}
+
 fn shown_rect(bounds: NSRect) -> ShownRect {
     let (bw, bh) = (bounds.size.width, bounds.size.height);
     let turns = super::controls::turns();
-    let size = SHOWN_SIZE.load(Ordering::Relaxed);
-    let (mut fw, mut fh) = ((size >> 32) as f64, (size & 0xffff_ffff) as f64);
-    if turns % 2 == 1 {
-        (fw, fh) = (fh, fw);
-    }
+    let (fw, fh) = super::controls::shown_size(panel_size(), turns);
+    let (fw, fh) = (fw as f64, fh as f64);
     if fw == 0.0 || fh == 0.0 {
         return ShownRect { x: 0.0, y: 0.0, w: bw, h: bh, turns };
     }
@@ -1070,8 +1069,9 @@ fn controls_object() -> *mut c_void {
             return std::ptr::null_mut();
         }
         // Type encodings as the runtime has them for these selectors' protocols.
-        let methods: [(&str, *const c_void, &str); 5] = [
+        let methods: [(&str, *const c_void, &str); 6] = [
             ("deviceAction:", device_action as *const c_void, "v24@0:8@16"),
+            ("validateMenuItem:", validate_menu_item as *const c_void, "B24@0:8@16"),
             ("toolbar:itemForItemIdentifier:willBeInsertedIntoToolbar:", toolbar_item as *const c_void, "@36@0:8@16@24B32"),
             ("toolbarDefaultItemIdentifiers:", toolbar_default as *const c_void, "@24@0:8@16"),
             ("toolbarAllowedItemIdentifiers:", toolbar_allowed as *const c_void, "@24@0:8@16"),
@@ -1096,12 +1096,23 @@ extern "C" fn device_action(_this: *mut c_void, _cmd: *mut c_void, sender: *mut 
         TAG_GAPS => open_url("https://github.com/zeroemu/zeroemu/blob/main/docs/KNOWN-GAPS.md"),
         TAG_ABOUT => about(),
         TAG_LIST => show_list(),
+        t if location_menu::is_tag(t) => location_menu::chosen(t),
         _ => {
             if let Some(a) = Action::from_tag(tag) {
                 super::controls::perform(a);
             }
         }
     }
+}
+
+/// Before a menu shows one of the items sent to the controls object: all of them can
+/// be chosen, and the Location menu's has a checkmark on the current one.
+extern "C" fn validate_menu_item(_this: *mut c_void, _cmd: *mut c_void, item: *mut c_void) -> bool {
+    let tag = unsafe { msg_i64_ret(item, sel("tag")) };
+    if location_menu::is_tag(tag) {
+        unsafe { location_menu::validate(item, tag) };
+    }
+    true
 }
 
 extern "C" fn toolbar_item(_this: *mut c_void, _cmd: *mut c_void, _toolbar: *mut c_void, ident: *mut c_void, _will_insert: bool) -> *mut c_void {
@@ -1435,6 +1446,8 @@ unsafe fn set_up_menus(app: *mut c_void) {
             }
             device.extend(group.iter().map(|&a| action_item(a)));
         }
+        device.push(none);
+        device.push(location_menu::item(me));
         submenu(bar, "Device", &device);
         let window = submenu(bar, "Window", &[
             menu_item("Minimize", "performMiniaturize:", "m", COMMAND_MASK, 0, none),
@@ -1472,8 +1485,28 @@ pub fn turned() {
     unsafe { dispatch_async_f(&raw const _dispatch_main_q, std::ptr::null_mut(), on_main) };
 }
 
-/// Gives the window the turned panel's shape, at the same scale, about the same
-/// middle, and on its screen. A window already that shape, or full screen, stays.
+/// Points per device pixel the picture is meant to be shown at, as f64 bits (0 for not
+/// yet known): the window's when it is first turned, or after the user resized it.
+/// Turning keeps it where the screen has room, so that a window turned and turned
+/// back, which a landscape tablet's may have to shrink for, is the size it was.
+static PREFERRED_SCALE: AtomicU64 = AtomicU64::new(0);
+/// The content size the last turn gave the window.
+static RESHAPED: Mutex<Option<(f64, f64)>> = Mutex::new(None);
+
+/// The window's content size for a picture now `shown` (device pixels) at `preferred`
+/// points per pixel, or smaller to fit `room` (points).
+fn turned_size(shown: (u32, u32), preferred: f64, room: (f64, f64)) -> (f64, f64) {
+    let (w, h) = (shown.0.max(1) as f64, shown.1.max(1) as f64);
+    let scale = preferred.min(room.0 / w).min(room.1 / h);
+    ((w * scale).floor().max(1.0), (h * scale).floor().max(1.0))
+}
+
+/// Gives the window the turned panel's shape, about the same middle, and on its
+/// screen: at the scale its picture is drawn at, or, while the window is still the size
+/// the last turn gave it, at PREFERRED_SCALE, so that a window the screen made smaller
+/// grows back; smaller still if the screen has no room. A window already that shape, or
+/// full screen, stays. The shape is the panel's own turned, so a tablet's window, wide
+/// to begin with, goes tall on its side.
 unsafe fn reshape(window: *mut c_void) {
     const FULL_SCREEN: i64 = 1 << 14;
     unsafe {
@@ -1483,8 +1516,8 @@ unsafe fn reshape(window: *mut c_void) {
         let frame = msg_rect(window, sel("frame"));
         let content = msg_rect_rect(window, sel("contentRectForFrameRect:"), frame);
         let (cw, ch) = (content.size.width, content.size.height);
-        let landscape = super::controls::turns() % 2 == 1;
-        if (cw > ch) == landscape {
+        let shown = super::controls::shown_size(panel_size(), super::controls::turns());
+        if !super::controls::other_way_round((cw, ch), shown) {
             return;
         }
         let chrome = frame.size.height - ch;
@@ -1494,8 +1527,19 @@ unsafe fn reshape(window: *mut c_void) {
             screen = msg0(cls("NSScreen"), sel("mainScreen"));
         }
         let vis = (!screen.is_null()).then(|| msg_rect(screen, sel("visibleFrame")));
-        let scale = vis.map_or(1.0, |v| ((v.size.width - 16.0) / ch).min((v.size.height - chrome - 16.0) / cw).min(1.0));
-        let (w, h) = ((ch * scale).floor(), (cw * scale).floor());
+        // The scale to keep: the window's now, unless it is still the size the last turn
+        // gave it, when the screen may have forced it smaller than the one before.
+        // The scale the picture is drawn at now, before the turn (letterboxed, so the
+        // smaller of the two): `shown` is after it, so the other way round.
+        let now = (cw / shown.1.max(1) as f64).min(ch / shown.0.max(1) as f64);
+        let last = *RESHAPED.lock().unwrap_or_else(|p| p.into_inner());
+        let untouched = last.is_some_and(|(w, h)| (w - cw).abs() < 1.5 && (h - ch).abs() < 1.5);
+        let kept = f64::from_bits(PREFERRED_SCALE.load(Ordering::Relaxed));
+        let preferred = if untouched && kept > 0.0 { kept } else { now };
+        PREFERRED_SCALE.store(preferred.to_bits(), Ordering::Relaxed);
+        let room = vis.map_or((f64::MAX, f64::MAX), |v| (v.size.width - 16.0, v.size.height - chrome - 16.0));
+        let (w, h) = turned_size(shown, preferred, room);
+        *RESHAPED.lock().unwrap_or_else(|p| p.into_inner()) = Some((w, h));
         let mut r = msg_rect_rect(window, sel("frameRectForContentRect:"), NSRect { origin: NSPoint { x: 0.0, y: 0.0 }, size: NSSize { width: w, height: h } });
         r.origin.x = frame.origin.x + (frame.size.width - r.size.width) / 2.0;
         r.origin.y = frame.origin.y + (frame.size.height - r.size.height) / 2.0;
@@ -1620,23 +1664,31 @@ fn on_ui_thread(job: Box<dyn FnOnce() + Send>) {
     unsafe { dispatch_async_f(&raw const _dispatch_main_q, Box::into_raw(Box::new(job)) as *mut c_void, run) };
 }
 
-/// `menu Top/Item`: chooses a menu item as a click would, by its menu's and its titles.
+/// `menu Top/Item`: chooses a menu item as a click would, by its menu's and its titles;
+/// `menu Top/Submenu/Item` one of a submenu's, such as Device/Location/City Run.
 pub fn choose_menu_item(path: &str) {
     let path = path.to_string();
     on_ui_thread(Box::new(move || unsafe {
-        let mut parts = path.split('/');
-        let (Some(top), Some(title)) = (parts.next(), parts.next()) else {
+        let parts: Vec<&str> = path.split('/').collect();
+        let [top, within @ .., title] = parts.as_slice() else {
             eprintln!("zeroemu: menu wants Menu/Item, not {path:?}");
             return;
         };
         let bar = msg0(APP.load(Ordering::Acquire), sel("mainMenu"));
         let n = if bar.is_null() { 0 } else { msg_i64_ret(bar, sel("numberOfItems")) };
         for i in 0..n {
-            let menu = msg0(msg_i64_id_ret(bar, sel("itemAtIndex:"), i), sel("submenu"));
-            if menu.is_null() || rust_str(msg0(menu, sel("title"))) != top {
+            let mut menu = msg0(msg_i64_id_ret(bar, sel("itemAtIndex:"), i), sel("submenu"));
+            if menu.is_null() || rust_str(msg0(menu, sel("title"))) != *top {
                 continue;
             }
-            let at = msg_id_i64_ret(menu, sel("indexOfItemWithTitle:"), ns_str(title));
+            for name in within {
+                let at = msg_id_i64_ret(menu, sel("indexOfItemWithTitle:"), ns_str(name));
+                menu = if at >= 0 { msg0(msg_i64_id_ret(menu, sel("itemAtIndex:"), at), sel("submenu")) } else { std::ptr::null_mut() };
+                if menu.is_null() {
+                    break;
+                }
+            }
+            let at = if menu.is_null() { -1 } else { msg_id_i64_ret(menu, sel("indexOfItemWithTitle:"), ns_str(title)) };
             if at >= 0 {
                 msg_i64(menu, sel("performActionForItemAtIndex:"), at);
                 return;
@@ -1733,4 +1785,43 @@ pub fn post_key(mods: &str, keycode: u16, chars: &str) {
             }
         }
     }));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{first_size, turned_size};
+    use crate::gpu::Display;
+
+    /// The first window: the device's shape fitted to the screen, never more than one
+    /// screen pixel to a device pixel, unless a dp would then be under a point.
+    #[test]
+    fn first_window_fits_and_stays_sharp() {
+        let phone = Display::DEFAULT;
+        let small = Display { width: 720, height: 1280, dpi: 320 };
+        let tablet = Display { width: 2560, height: 1600, dpi: 320 };
+        // A laptop's Retina screen: the phone fits its height, as before.
+        assert_eq!(first_size(phone, (1422.0, 888.0), 2.0), (399.0, 888.0));
+        // A big Retina screen: a device pixel to a screen pixel, not more.
+        assert_eq!(first_size(phone, (2512.0, 1370.0), 2.0), (540.0, 1200.0));
+        assert_eq!(first_size(small, (2512.0, 1370.0), 2.0), (360.0, 640.0));
+        assert_eq!(first_size(tablet, (1422.0, 888.0), 2.0), (1280.0, 800.0));
+        // Turned on that screen it has to shrink; turned back, it is as it was.
+        let tall = turned_size((1600, 2560), 0.5, (1496.0, 876.0));
+        assert_eq!(tall, (547.0, 876.0));
+        assert_eq!(turned_size((2560, 1600), 0.5, (1496.0, 876.0)), (1280.0, 800.0));
+        // A phone turned keeps its scale where there's room.
+        assert_eq!(turned_size((2400, 1080), 0.25, (1496.0, 876.0)), (600.0, 270.0));
+        // A screen at one pixel a point.
+        assert_eq!(first_size(small, (1872.0, 1350.0), 1.0), (720.0, 1280.0));
+        // A tablet on a small screen fits it, keeping its shape.
+        let (w, h) = first_size(tablet, (1232.0, 732.0), 1.0);
+        assert_eq!(h, 732.0);
+        assert!((w / h - 1.6).abs() < 0.01);
+        // At 160 dpi, a dp is a pixel: shown at a pixel a point, though that's two
+        // screen pixels to each on a Retina screen, so as to be readable.
+        let low = Display { width: 720, height: 1280, dpi: 160 };
+        assert_eq!(first_size(low, (2512.0, 1370.0), 2.0), (720.0, 1280.0));
+        // But still within the screen.
+        assert_eq!(first_size(low, (1422.0, 888.0), 2.0), (499.0, 888.0));
+    }
 }

@@ -107,8 +107,11 @@ SurfaceFlinger, which needs one: it never reaches the home screen.
 Android's graphics stack runs unmodified on a virtio-gpu device, as in the Android
 Emulator's virtio-gpu mode: the guest's gralloc is minigbm, and its GLES and Vulkan
 calls are encoded by the image's own gfxstream guest libraries and decoded by the
-renderer on the host. The display is one 1080x2400 panel. The renderer draws each
-frame into the window itself, at the screen's real pixel density.
+renderer on the host. The display is one panel of a fixed size and density
+(gpu::Display, 1080x2400 at 420 dpi by default), whatever the window's size: the KMS
+mode and the renderer's framebuffer are that size. The renderer draws each frame into
+the window itself, scaled to fit as the Android Emulator does, at the screen's real
+pixel density.
 
 In the window, the mouse is a finger and scrolling drags one (a person's flick
 becomes a fling). F1 is Home, Escape is Back, F2 is recent apps. Other keys go to
@@ -124,6 +127,17 @@ would on a phone, and the window shows the panel turned. The renderer turns the 
 as it draws it (gfxstream's setupSubWindow rotation), and clicks are turned back onto
 the panel, as Android expects. Quit stops the device as closing the window does, so
 that `/data` is saved.
+
+Device > Location (src/location.rs) is what the GPS reports. The image's GNSS HAL
+(android.hardware.gnss-service.ranchu) opens the qemud `gps` service through
+libqemupipe, as the sensors HAL opens `sensors`, and reads NMEA sentences from it.
+zeroemu sends a `$GPGGA` and a `$GPRMC` four times a second, with nothing before them,
+as the Android Emulator's gps service is a serial line that qemud doesn't frame. Not
+once a second: the HAL passes a fix on only when the interval an app asked for has
+passed since the last, so fixes a second apart that arrive a little early are dropped. With the
+location None it sends nothing, and Android keeps the last fix it had, as a phone
+with no sky in view does. A route is followed at its speed, heading along the leg it
+is on, and starts again from its beginning when chosen.
 
 ## Saving /data
 
@@ -194,8 +208,43 @@ on a device; `/data`'s tmpfs keeps ext4's inode flags and quota project ids
 Guest threads take their host priority from what Android says about them: real-time
 policies and nice -4 or better count as display work, the `top-app` cgroup as
 foreground, nice 10 or worse and the `background` and `dex2oat` cgroups as
-background. Background threads take turns on half the host's cores, as a phone
-would keep them to its little ones.
+background. Background threads take turns on half the cores Android is given or the
+Mac has, whichever is fewer (one of one), as a phone would keep them to its little
+ones.
+
+Android is given all of the host's cores unless a device asks for fewer. macOS cannot
+keep a thread to some of the cores, so then zeroemu lets no more guest threads run at
+once than the device has cores. A thread takes a core on its way into the guest and
+keeps it through its syscalls, as on Linux, until it blocks in the kernel, calls
+`sched_yield` while others wait, or has had a 10 ms turn while others wait. A core
+given up goes straight to the first thread in line, so one that comes for a core
+meanwhile cannot take it. Display work is served first: for each display thread in
+line, one thread of other work gives its core up at once, and only threads running
+guest code are kicked to make way, as one in the kernel makes way when it comes back.
+A display thread that has held its core 50 ms while only other work waits, or calls
+`sched_yield` then, takes 10 ms turns with the others until it next blocks, so a
+display thread that spins cannot shut them out, as Linux's real-time throttling
+ensures; one that blocks now and then is display work again each time it wakes.
+Display threads taking turns among themselves could still keep other work out, so
+once display work has kept other work out for 50 ms more than other work's running
+has paid for, the first of it goes first, display work making way after its own 50 ms,
+and keeps that core for a 10 ms turn: however busy display work is, other work has
+about 10 ms in every 50, as Linux's real-time throttling leaves fair threads a share
+of each second, and display work has the rest of the time. Each moment other work
+runs as other work pays for five of display work's, so a turn display work takes back
+at once, as when it blocks for a moment in a binder call, pays next to nothing, nor
+does a binder thread's time serving display work at its urgency. Other work is owed
+50 ms at most going into its turn, so a long stretch of display work doesn't make it
+go first for as long again afterwards. Only time while
+other work waits, and display work waits for a core too or holds them all, counts:
+display work on some of the cores leaves other work the others, as Linux throttles
+real-time threads only once they take a whole CPU. A thread handed a core looks again
+on its way into the guest, as display work that came meanwhile could not stop it
+there. A thread waiting for a core keeps its vCPU, which costs far less than destroying it and
+making another, unless the hypervisor's vCPUs run short. Every thread takes a
+background place, a core and a vCPU in that order, and waits for them only on its way
+into the guest, where it holds no kernel lock, so threads cannot deadlock over them.
+See `src/kernel/vcpus.rs`.
 
 zeroemu tells macOS its work is user-initiated, so App Nap doesn't throttle it while
 its window is covered: a device keeps running in the background, as a phone's apps do

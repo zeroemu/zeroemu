@@ -16,9 +16,10 @@
 //! in the app, and `zeroemu` and the device share that /data.
 
 use crate::gpu::Display;
-use crate::location::Source;
+use crate::location::{self, Source};
 use crate::sdk::{self, Image};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -321,6 +322,123 @@ fn same_file(file: &std::fs::File, path: &Path) -> std::io::Result<bool> {
     }
 }
 
+/// The device this zeroemu runs, once it follows its device.ini's location
+/// (`follow_location`, `followed`).
+static FOLLOWED: Mutex<Option<Followed>> = Mutex::new(None);
+
+/// What `follow_location` was given: the device this zeroemu boots, found once its
+/// /data is this zeroemu's.
+static WATCH: OnceLock<Watch> = OnceLock::new();
+
+struct Watch {
+    /// The device booted (--device); else the one whose /data is `data`, which
+    /// zeroemu.app's list may make of a terminal boot's /data at any time (Store::adopt).
+    device: Option<Device>,
+    data: PathBuf,
+    /// Whether this zeroemu keeps that /data (kernel::keeps_data): a second zeroemu
+    /// booted on it keeps nothing, and leaves the device's location alone.
+    keeps: fn() -> bool,
+}
+
+impl Watch {
+    /// The device, if there is one now.
+    fn find(&self) -> Option<Device> {
+        self.device.clone().or_else(|| Store::open()?.with_data(&self.data))
+    }
+}
+
+/// A running device, and the location its device.ini had when this zeroemu last read
+/// or wrote it there.
+struct Followed {
+    device: Device,
+    seen: Option<Source>,
+}
+
+impl Followed {
+    /// device.ini's location, if it isn't the one seen: another zeroemu saved it, as
+    /// Edit… in zeroemu.app's list does. It is the one seen from then on.
+    fn changed(&mut self) -> Option<Option<Source>> {
+        let now = read(&self.device.dir)?.settings.location;
+        if now == self.seen {
+            return None;
+        }
+        self.seen = now.clone();
+        Some(now)
+    }
+
+    /// Saves `source` as the device's location, under devices/.lock, if it is still
+    /// the device: the rest of device.ini stays as it is now.
+    fn save(&mut self, source: &Source) -> Result<(), String> {
+        let store = Store { dir: self.device.dir.parent().ok_or("a device's folder has no parent")?.to_path_buf() };
+        let _lock = store.lock()?;
+        let mut now = store.current(&self.device)?;
+        now.settings.location = Some(source.clone());
+        write(&now)?;
+        // As it reads back: coordinates are kept to six decimals (Source::to_ini), and
+        // ones typed with more would otherwise read as another's change.
+        self.seen = read(&self.device.dir).map_or(now.settings.location, |d| d.settings.location);
+        Ok(())
+    }
+}
+
+/// The device followed, held: found first, if it hasn't been yet and this zeroemu
+/// keeps its /data. A --device boot's is at the location it booted with, so that one
+/// saved in device.ini since moves it; one the list made of a terminal boot's /data is
+/// at the location its device.ini has when found, as the boot didn't start there.
+fn followed() -> MutexGuard<'static, Option<Followed>> {
+    let mut f = FOLLOWED.lock().unwrap_or_else(|p| p.into_inner());
+    if f.is_none()
+        && let Some(w) = WATCH.get()
+        && (w.keeps)()
+    {
+        *f = w.find().map(|device| Followed { seen: device.settings.location.clone(), device });
+    }
+    f
+}
+
+/// Has the device this zeroemu boots keep its location with its device.ini both ways:
+/// `device` (--device), else the one whose /data is `data`, once there is one (the list
+/// may make it of a terminal boot's /data while it runs), and only while `keeps` says
+/// this zeroemu keeps that /data. What its window's Location menu chooses is saved
+/// there (`choose_location`), so that it starts there next time. A location saved there
+/// by another zeroemu, as Edit… in zeroemu.app's list saves one while it runs, moves it
+/// at once: device.ini, a few lines, is read once a second for that. A location of none
+/// is the main city of `zone`, the time zone the boot uses, as at the start.
+pub fn follow_location(device: Option<Device>, data: PathBuf, zone: Option<String>, keeps: fn() -> bool) {
+    if WATCH.set(Watch { device, data, keeps }).is_err() {
+        return;
+    }
+    let spawned = std::thread::Builder::new().name("device.ini".into()).spawn(move || {
+        loop {
+            std::thread::sleep(Duration::from_secs(1));
+            // Held while the device moves, so that a place chosen in the window
+            // meanwhile (choose_location) comes after it, not before.
+            let mut f = followed();
+            let Some(f) = f.as_mut() else { continue };
+            if let Some(now) = f.changed() {
+                location::set(now.unwrap_or_else(|| location::default_for_zone(zone.as_deref())));
+            }
+        }
+    });
+    if let Err(e) = spawned {
+        eprintln!("zeroemu: {e}: a location saved while the device runs moves it when it next starts");
+    }
+}
+
+/// The device goes to `source`, chosen in its window, and that is saved as its
+/// location if this zeroemu follows one (`follow_location`). Both under the one lock,
+/// so that a location read from device.ini meanwhile can't move it after this and
+/// leave it somewhere other than device.ini says.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub fn choose_location(source: Source) -> Result<(), String> {
+    let mut f = followed();
+    location::set(source.clone());
+    match f.as_mut() {
+        Some(f) => f.save(&source),
+        None => Ok(()),
+    }
+}
+
 /// What a request about a device that is no longer there, or no longer the same, says.
 fn gone(d: &Device) -> String {
     format!("“{}” was changed or deleted meanwhile; look at the list again", d.name)
@@ -399,6 +517,11 @@ impl Store {
             Some(now) if dir == d.dir && now.package == d.package && now.data == d.data => Ok(now),
             _ => Err(gone(d)),
         }
+    }
+
+    /// The device whose /data is `data`.
+    fn with_data(&self, data: &Path) -> Option<Device> {
+        self.list().into_iter().find(|d| d.data == data)
     }
 
     /// Every device, by name.
@@ -916,6 +1039,58 @@ mod tests {
         let locked = lock_file(&lock_path(&d.data)).map_err(|e| e.to_string());
         drop(claim);
         locked
+    }
+
+    #[test]
+    fn a_running_device_keeps_its_location_with_device_ini() {
+        let root = scratch("follow");
+        let img = image(&root.join("sdk"), "android-36.1", "google_apis_playstore");
+        let store = Store::at(&root.join("devices"));
+        let d = store.create("Phone", &img).unwrap();
+        let mut f = Followed { device: d.clone(), seen: d.settings.location.clone() };
+        assert_eq!(f.changed(), None);
+        // Edit… in the list saves a place: it is read once, then it is where the device is.
+        let city_run = Settings { location: Some(Source::Preset("city-run")), ..Settings::default() };
+        let d = store.edit(&d, "Phone", &city_run).unwrap();
+        assert_eq!(f.changed(), Some(Some(Source::Preset("city-run"))));
+        assert_eq!(f.changed(), None);
+        // Set back to none: the time zone's city, which the caller works out.
+        let d = store.edit(&d, "Phone", &Settings::default()).unwrap();
+        assert_eq!(f.changed(), Some(None));
+        // Renamed, with more memory, meanwhile: a place chosen in the window is saved over
+        // device.ini as it is now, and isn't read back as another's change.
+        let more = Settings { ram_mb: Some(2048), ..d.settings.clone() };
+        store.edit(&d, "Renamed", &more).unwrap();
+        let point = Source::Point { lat: 12.9716, lon: 77.5946 };
+        f.save(&point).unwrap();
+        let now = store.find("Renamed").unwrap();
+        assert_eq!((now.settings.location.clone(), now.settings.ram_mb), (Some(point), Some(2048)));
+        assert_eq!(f.changed(), None);
+        // Typed to more decimals than device.ini keeps: what it keeps is no change either.
+        f.save(&Source::Point { lat: 12.971612345, lon: 77.594612345 }).unwrap();
+        assert_eq!(f.changed(), None);
+        // Deleted: nothing is saved, nor its folder made again.
+        store.delete(&now).unwrap();
+        assert!(f.save(&Source::Off).is_err() && !now.dir.exists());
+        assert_eq!(f.changed(), None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_terminal_boot_follows_the_device_the_list_makes_of_its_data_once_there_is_one() {
+        let root = scratch("watch");
+        let img = image(&root.join("sdk"), "android-36.1", "google_apis_playstore");
+        let store = Store::at(&root.join("devices"));
+        let data = root.join("data-of-the-image.img");
+        // The list hasn't made a device of it: none to follow yet.
+        assert_eq!(store.with_data(&data), None);
+        std::fs::write(&data, "saved").unwrap();
+        let made = store.make("Android 16", &img, Some(&data), &Settings::default()).unwrap();
+        assert_eq!(store.with_data(&data), Some(made.clone()));
+        // A --device boot's is the one it was given, found or not.
+        let watch = Watch { device: Some(made.clone()), data: PathBuf::from("/nowhere"), keeps: || true };
+        assert_eq!(watch.find(), Some(made));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

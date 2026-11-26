@@ -252,6 +252,10 @@ pub fn open(display: super::Display) -> Result<(), String> {
         let room = ((vis.size.width - 48.0).max(320.0), (vis.size.height - chrome - 16.0).max(320.0));
         let (win_w, win_h) = first_size(display, room, dpr);
         msg_size(window, sel("setContentSize:"), NSSize { width: win_w, height: win_h });
+        keep_shape(window, super::controls::shown_size((fb_w, fb_h), super::controls::turns()));
+        // For Zoom's size (windowWillUseStandardFrame:defaultFrame:), and to turn the
+        // window as it leaves full screen (windowDidExitFullScreen:).
+        msg_id(window, sel("setDelegate:"), controls_object());
         msg_void(window, sel("center"));
         set_up_menus(app);
         if background() {
@@ -1014,9 +1018,11 @@ pub fn pump_for(secs: f64) {
 
 use super::controls::{Action, Key, Shortcut};
 
-/// The one object that every toolbar item and zeroemu's own menu items send their
-/// action to, that the toolbar asks for its items, and that the application asks
-/// before it quits. AppKit holds it weakly in all three roles, so it is never let go.
+/// The one object that zeroemu's toolbar items and menu items send their action to
+/// (the Location button's by its menu's items), that the toolbar asks for its items,
+/// that the window asks for Zoom's frame and tells it left full screen, and that the
+/// application asks before it quits. AppKit holds it weakly in each role, so it is
+/// never let go.
 static CONTROLS: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
 
 /// Tags of the menu's own commands, after the device's (`Action::tag`).
@@ -1025,7 +1031,9 @@ const TAG_GAPS: i64 = 101;
 const TAG_ABOUT: i64 = 102;
 const TAG_LIST: i64 = 103;
 
-/// The toolbar's items at first, in order; Customize Toolbar offers these and `MORE`.
+/// The toolbar's items at first, in order, with the Location menu's
+/// (location_menu::TOOLBAR_ITEM) before the fourth; Customize Toolbar offers these and
+/// `MORE`.
 const TOOLBAR: [Action; 6] = [Action::Back, Action::Home, Action::Recents, Action::Screenshot, Action::RotateRight, Action::Power];
 const MORE: [Action; 9] = [
     Action::VolumeDown,
@@ -1069,13 +1077,15 @@ fn controls_object() -> *mut c_void {
             return std::ptr::null_mut();
         }
         // Type encodings as the runtime has them for these selectors' protocols.
-        let methods: [(&str, *const c_void, &str); 6] = [
+        let methods: [(&str, *const c_void, &str); 8] = [
             ("deviceAction:", device_action as *const c_void, "v24@0:8@16"),
             ("validateMenuItem:", validate_menu_item as *const c_void, "B24@0:8@16"),
             ("toolbar:itemForItemIdentifier:willBeInsertedIntoToolbar:", toolbar_item as *const c_void, "@36@0:8@16@24B32"),
             ("toolbarDefaultItemIdentifiers:", toolbar_default as *const c_void, "@24@0:8@16"),
             ("toolbarAllowedItemIdentifiers:", toolbar_allowed as *const c_void, "@24@0:8@16"),
             ("applicationShouldTerminate:", should_terminate as *const c_void, "Q24@0:8@16"),
+            ("windowWillUseStandardFrame:defaultFrame:", standard_frame as *const c_void, "{CGRect={CGPoint=dd}{CGSize=dd}}56@0:8@16{CGRect={CGPoint=dd}{CGSize=dd}}24"),
+            ("windowDidExitFullScreen:", left_full_screen as *const c_void, "v24@0:8@16"),
         ];
         for (selector, imp, types) in methods {
             let types = CString::new(types).unwrap();
@@ -1116,7 +1126,11 @@ extern "C" fn validate_menu_item(_this: *mut c_void, _cmd: *mut c_void, item: *m
 }
 
 extern "C" fn toolbar_item(_this: *mut c_void, _cmd: *mut c_void, _toolbar: *mut c_void, ident: *mut c_void, _will_insert: bool) -> *mut c_void {
-    let Some(a) = Action::from_name(&unsafe { rust_str(ident) }) else { return std::ptr::null_mut() };
+    let name = unsafe { rust_str(ident) };
+    if name == location_menu::TOOLBAR_ITEM {
+        return unsafe { location_menu::toolbar_item(ident, controls_object()) };
+    }
+    let Some(a) = Action::from_name(&name) else { return std::ptr::null_mut() };
     unsafe {
         let item = msg_id_ret(msg0(cls("NSToolbarItem"), sel("alloc")), sel("initWithItemIdentifier:"), ident);
         msg_id(item, sel("setLabel:"), ns_str(a.label()));
@@ -1171,6 +1185,7 @@ extern "C" fn toolbar_default(_this: *mut c_void, _cmd: *mut c_void, _toolbar: *
     unsafe {
         let mut ids: Vec<*mut c_void> = TOOLBAR[..3].iter().map(|a| ns_str(a.name())).collect();
         ids.push(NSToolbarFlexibleSpaceItemIdentifier);
+        ids.push(ns_str(location_menu::TOOLBAR_ITEM));
         ids.extend(TOOLBAR[3..].iter().map(|a| ns_str(a.name())));
         ns_array(&ids)
     }
@@ -1179,6 +1194,7 @@ extern "C" fn toolbar_default(_this: *mut c_void, _cmd: *mut c_void, _toolbar: *
 extern "C" fn toolbar_allowed(_this: *mut c_void, _cmd: *mut c_void, _toolbar: *mut c_void) -> *mut c_void {
     unsafe {
         let mut ids: Vec<*mut c_void> = TOOLBAR.iter().chain(MORE.iter()).map(|a| ns_str(a.name())).collect();
+        ids.push(ns_str(location_menu::TOOLBAR_ITEM));
         ids.push(NSToolbarFlexibleSpaceItemIdentifier);
         ns_array(&ids)
     }
@@ -1510,13 +1526,16 @@ fn turned_size(shown: (u32, u32), preferred: f64, room: (f64, f64)) -> (f64, f64
 unsafe fn reshape(window: *mut c_void) {
     const FULL_SCREEN: i64 = 1 << 14;
     unsafe {
+        let shown = super::controls::shown_size(panel_size(), super::controls::turns());
+        // Full screen too, for the window it leaves full screen as, which this then
+        // turns (left_full_screen).
+        keep_shape(window, shown);
         if msg_i64_ret(window, sel("styleMask")) & FULL_SCREEN != 0 {
             return;
         }
         let frame = msg_rect(window, sel("frame"));
         let content = msg_rect_rect(window, sel("contentRectForFrameRect:"), frame);
         let (cw, ch) = (content.size.width, content.size.height);
-        let shown = super::controls::shown_size(panel_size(), super::controls::turns());
         if !super::controls::other_way_round((cw, ch), shown) {
             return;
         }
@@ -1549,6 +1568,46 @@ unsafe fn reshape(window: *mut c_void) {
         }
         let set: unsafe extern "C" fn(*mut c_void, *mut c_void, NSRect, i8) = std::mem::transmute(objc_msgSend as *const ());
         set(window, sel("setFrame:display:"), r, 1);
+    }
+}
+
+/// Keeps the window's content the shape of the picture, `shown` (device pixels, as
+/// turned), while the user drags its edges (contentAspectRatio), so that a resized
+/// window has no bars beside the picture. Full screen, the window is the Mac screen's
+/// shape, and the picture has bars beside it (shown_rect).
+unsafe fn keep_shape(window: *mut c_void, shown: (u32, u32)) {
+    let ratio = NSSize { width: shown.0.max(1) as f64, height: shown.1.max(1) as f64 };
+    unsafe { msg_size(window, sel("setContentAspectRatio:"), ratio) };
+}
+
+/// The window left full screen, as it was when it entered: if the device turned
+/// meanwhile, the window turns now, as reshape skips a full-screen window.
+extern "C" fn left_full_screen(_this: *mut c_void, _cmd: *mut c_void, _note: *mut c_void) {
+    let window = WINDOW.load(Ordering::Acquire);
+    if !window.is_null() {
+        unsafe { reshape(window) };
+        relayout();
+    }
+}
+
+/// Zoom's window (Window > Zoom, an Option-click on the green button, whose plain click
+/// is full screen, or a double click on the title bar if the Mac is set to zoom then): as
+/// tall as its screen has room for, in the picture's shape, and where it is across the
+/// screen, kept on it. AppKit offers `room`, its screen's visible frame cut to the
+/// window's shape (keep_shape) but moved to the screen's left edge, which is where a
+/// zoomed window would jump to otherwise.
+extern "C" fn standard_frame(_this: *mut c_void, _cmd: *mut c_void, window: *mut c_void, room: NSRect) -> NSRect {
+    unsafe {
+        let screen = msg0(window, sel("screen"));
+        let vis = if screen.is_null() { room } else { msg_rect(screen, sel("visibleFrame")) };
+        let shown = super::controls::shown_size(panel_size(), super::controls::turns());
+        let content = msg_rect_rect(window, sel("contentRectForFrameRect:"), vis);
+        let (w, h) = turned_size(shown, f64::INFINITY, (content.size.width, content.size.height));
+        let mut r = msg_rect_rect(window, sel("frameRectForContentRect:"), NSRect { origin: NSPoint { x: 0.0, y: 0.0 }, size: NSSize { width: w, height: h } });
+        let now = msg_rect(window, sel("frame"));
+        r.origin.x = (now.origin.x + (now.size.width - r.size.width) / 2.0).min(vis.origin.x + vis.size.width - r.size.width).max(vis.origin.x);
+        r.origin.y = vis.origin.y + vis.size.height - r.size.height;
+        r
     }
 }
 
@@ -1689,28 +1748,55 @@ pub fn choose_menu_item(path: &str) {
                 }
             }
             let at = if menu.is_null() { -1 } else { msg_id_i64_ret(menu, sel("indexOfItemWithTitle:"), ns_str(title)) };
-            if at >= 0 {
-                msg_i64(menu, sel("performActionForItemAtIndex:"), at);
-                return;
+            if at < 0 {
+                continue;
             }
+            // One sent up the responder chain, as Window > Zoom is, to the device's window
+            // first: in a test, behind other windows (ZEROEMU_BACKGROUND), it isn't the
+            // key window it is when a user chooses the item, and AppKit would send the
+            // action nowhere.
+            let item = msg_i64_id_ret(menu, sel("itemAtIndex:"), at);
+            let window = WINDOW.load(Ordering::Acquire);
+            let try_perform: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void) -> i8 = std::mem::transmute(objc_msgSend as *const ());
+            if !(msg0(item, sel("target")).is_null() && !window.is_null() && try_perform(window, sel("tryToPerform:with:"), msg0(item, sel("action")), item) != 0) {
+                msg_i64(menu, sel("performActionForItemAtIndex:"), at);
+            }
+            return;
         }
         eprintln!("zeroemu: no menu item {path:?}");
     }));
 }
 
-/// `toolbar NAME`: clicks a toolbar item, found by its identifier (`Action::name`).
+/// `toolbar NAME`: clicks a toolbar item, found by its identifier (`Action::name`);
+/// `toolbar NAME/Item` chooses an item of a toolbar item's menu by its title, as
+/// `toolbar location/City Run` does the Location button's.
 pub fn click_toolbar_item(name: &str) {
     let name = name.to_string();
     on_ui_thread(Box::new(move || unsafe {
+        let (ident, title) = match name.split_once('/') {
+            Some((ident, title)) => (ident, Some(title)),
+            None => (name.as_str(), None),
+        };
         let window = WINDOW.load(Ordering::Acquire);
         let toolbar = if window.is_null() { std::ptr::null_mut() } else { msg0(window, sel("toolbar")) };
         let items = if toolbar.is_null() { std::ptr::null_mut() } else { msg0(toolbar, sel("items")) };
         let n = if items.is_null() { 0 } else { msg_i64_ret(items, sel("count")) };
         for i in 0..n {
             let item = msg_i64_id_ret(items, sel("objectAtIndex:"), i);
-            if rust_str(msg0(item, sel("itemIdentifier"))) == name {
+            if rust_str(msg0(item, sel("itemIdentifier"))) != ident {
+                continue;
+            }
+            let Some(title) = title else {
                 let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void, *mut c_void) -> bool = std::mem::transmute(objc_msgSend as *const ());
                 f(APP.load(Ordering::Acquire), sel("sendAction:to:from:"), msg0(item, sel("action")), msg0(item, sel("target")), item);
+                return;
+            };
+            // Only an NSMenuToolbarItem has a menu.
+            let responds: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> i8 = std::mem::transmute(objc_msgSend as *const ());
+            let menu = if responds(item, sel("respondsToSelector:"), sel("menu")) != 0 { msg0(item, sel("menu")) } else { std::ptr::null_mut() };
+            let at = if menu.is_null() { -1 } else { msg_id_i64_ret(menu, sel("indexOfItemWithTitle:"), ns_str(title)) };
+            if at >= 0 {
+                msg_i64(menu, sel("performActionForItemAtIndex:"), at);
                 return;
             }
         }

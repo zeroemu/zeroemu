@@ -72,7 +72,7 @@ behind other windows without taking focus, which the boot tests use.
 | `scripts/test-net.py` | zeroemu's host connections, which adb uses, from the host side | Apple Silicon, a signed `target/release/zeroemu` and the guests |
 | `scripts/test-tcp.py` | Guest sockets against real servers on the host, reached through 10.0.2.2 | Apple Silicon, a signed `target/release/zeroemu` and the guests |
 | `scripts/test-controls.sh` | Boots the tested image (its window behind others, `/data` in a scratch file), does each of the window's device controls through `ZEROEMU_INPUT_FIFO`, and checks with adb what Android did. Some go the way a user's would, as Device menu items, toolbar items, shortcuts and a click on a turned screen. Screenshots are compared with Android's own `screencap`. Ends with Quit, which must save `/data` and exit 0 | The same as `test-adb.sh` |
-| `scripts/test-devices.sh` | Boots two named devices of the same image in a scratch store and uses adb to check that each keeps its own `/data` across boots, and that a wipe clears it | The same as `test-adb.sh` |
+| `scripts/test-devices.sh` | Boots two named devices of the same image in a scratch store and uses adb to check that each keeps its own `/data` across boots, and that a wipe clears it; and that a place chosen in the window is saved in device.ini and reaches Android's GPS (Maps asks for it), that one saved there while the device runs moves it, and that it starts there next time | The same as `test-adb.sh`; Maps, which the Google Play images have |
 | `scripts/test-adb.sh` | Boots the tested image (ephemeral, its window behind others) and uses real adb against it: shell, logcat, push and pull, shared storage, screencap, input, install, reconnecting, and a key adbd doesn't know being refused | Apple Silicon, a signed `target/release/zeroemu`, and the SDK with `emulator`, `platform-tools` and the image (`IMG` picks another). With build-tools, a platform and a JDK it also installs a small app from `scripts/sdtest` |
 
 `ZEROEMU_TEST_IMAGE=<system.img>` picks the image the unit tests read. Without it, they
@@ -168,13 +168,16 @@ Behaviour:
   `mute`, `power`, `lock`, `power-menu`, `rotate-left`, `rotate-right`, `screenshot`,
   `android-screenshot`); `menu Menu/Item` chooses a menu bar item by its titles
   (`menu Device/Recent Apps`, `menu zeroemu/Quit zeroemu`, and in a submenu
-  `menu Device/Location/City Run`); `location off|LAT,LON|PRESET` moves the device as
-  Device > Location does (`location 28.6129,77.2295`, `location freeway-drive`; the
-  presets' ids are in src/location.rs); `toolbar NAME` clicks a
-  toolbar item, named as the actions are; `keyeq MODS KEYCODE CHARS` types a key into
-  the window with modifiers (`cmd`, `shift`, `alt`, `ctrl` joined by `+`, or `none`),
-  its Mac key code and its character (or `up`, `down`, `left`, `right`), so that a
-  shortcut takes a real key's route; `click U V` clicks the picture in the window at
+  `menu Device/Location/City Run`), one for the key window (`menu Window/Zoom`) going
+  to the device's window, which behind other windows isn't key;
+  `location off|LAT,LON|PRESET` moves the device as Device > Location does, but
+  without saving it in device.ini (`location 28.6129,77.2295`, `location
+  freeway-drive`; the presets' ids are in src/location.rs); `toolbar NAME` clicks a
+  toolbar item, named as the actions are, and `toolbar NAME/Item` chooses an item of a
+  toolbar item's menu (`toolbar location/City Run`); `keyeq MODS KEYCODE CHARS` types a
+  key into the window with modifiers (`cmd`, `shift`, `alt`, `ctrl` joined by `+`, or
+  `none`), its Mac key code and its character (or `up`, `down`, `left`, `right`), so
+  that a shortcut takes a real key's route; `click U V` clicks the picture in the window at
   U and V from 0 to 1 from its top left, as shown, so that a click on a turned device
   takes a real one's route. `toolbar NAME` finds only items in the toolbar as it is,
   customized or not. The FIFO must exist before zeroemu starts.

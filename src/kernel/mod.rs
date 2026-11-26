@@ -860,6 +860,16 @@ pub fn cpu_list() -> String {
     }
 }
 
+/// This zeroemu keeps its /data: it holds the file's lock, and saves it at exit.
+static DATA_KEPT: AtomicBool = AtomicBool::new(false);
+
+/// Whether this zeroemu keeps its /data, as it does once it has its lock, so that the
+/// device whose /data it is is this zeroemu's to change: a second zeroemu booted on the
+/// same file keeps nothing (devices::follow_location).
+pub fn keeps_data() -> bool {
+    DATA_KEPT.load(Ordering::Acquire)
+}
+
 /// Whether zeroemu's notes for its developers print: at ZEROEMU_LOG=I or more
 /// verbose, the default for a program.
 pub fn verbose() -> bool {
@@ -1270,6 +1280,7 @@ impl Kernel {
                 }
                 if keep {
                     persist = Some(p);
+                    DATA_KEPT.store(true, Ordering::Release);
                 }
             }
             if extras.network {

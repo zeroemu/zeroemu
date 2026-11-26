@@ -474,6 +474,13 @@ fn run(args: Vec<String>) -> Result<i32, String> {
     let data_path = data.as_ref().map(|d| d.path.clone());
     if boot {
         location::set(place.clone());
+        // The device's location, kept with its device.ini while it runs: the device
+        // booted, or the one zeroemu.app's list makes of this /data (Store::adopt), which
+        // it shows as running and lets Edit… change; once this zeroemu has the /data's
+        // lock, as a second one on it keeps nothing.
+        if let Some(path) = &data_path {
+            devices::follow_location(device_found.clone(), path.clone(), time_zone.clone(), kernel::keeps_data);
+        }
     }
     let extras = boot.then_some(kernel::BootExtras { push, run, data, network, time_zone: time_zone.clone() });
     let adb = if (boot && !no_adb) || adb_port.is_some() { kernel::adb::start(adb_port) } else { None };

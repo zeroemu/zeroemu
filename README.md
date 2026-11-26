@@ -160,10 +160,10 @@ you to make one: **New Device** (⌘N) takes a name and one of your installed im
 image zeroemu is tested with is chosen first, and images it can't boot are listed but
 can't be chosen; if none of them can, the form says why and what to install.
 
-A name, an image and a **Device** (a preset screen) are all a device needs. The rest is
-under **Advanced Settings**, closed at first, with these defaults, as in Android Studio's
-device wizard; closed, it says which aren't the default. Choosing Custom for the Device
-opens it.
+A name, an image and a **Device** (a preset screen) are all a device needs, and the
+form shows its **Location** too. The rest is under **Advanced Settings**, closed at
+first, with these defaults, as in Android Studio's device wizard; closed, it says which
+aren't the default. Choosing Custom for the Device opens it.
 
 | Setting | Default | |
 |---|---|---|
@@ -173,7 +173,7 @@ opens it.
 | CPU cores | All of the Mac's | Fewer cores, two at least, are what Android sees, and at most how many of its threads run at once, which leaves the Mac the rest |
 | Network | Connected | |
 | Time zone | The Mac's | Set again at every start, over a zone chosen inside Android |
-| Location | The main city of its time zone (the Googleplex for a zone with none, such as UTC) | Where its GPS says it is: none, a place, a moving route, or coordinates |
+| Location | The main city of its time zone (the Googleplex for a zone with none, such as UTC) | Shown always. Where its GPS says it is: none, a place, a moving route, or coordinates. Changed while the device runs, it moves it at once |
 
 - **Start** boots a device in the window. Closing its window brings the list back; Quit
   (⌘Q) stops it and quits.
@@ -182,9 +182,12 @@ opens it.
   another one: each runs in its own zeroemu, with its own adb serial. There is one list
   at a time: chosen again, it brings the open list forward.
 - A device's ⋯ menu, or a right click, edits it (its name and the settings above, for
-  its next start), wipes its data, shows its files in Finder, or deletes it.
-- Device > Location moves a running device, as Simulator's Features > Location does: to
-  a place, along a moving route, to coordinates you type, or to none.
+  its next start, but for its location, which moves a running device at once), wipes
+  its data, shows its files in Finder, or deletes it.
+- Device > Location, or the Location button in the window's toolbar, moves a running
+  device, as Simulator's Features > Location does: to a place, along a moving route, to
+  coordinates you type, or to none. That is its location from then on, where it starts
+  next time.
 - What `zeroemu` saved for an image in a terminal (without `--device`) shows up in the
   list as a device of that image, so nothing is lost: the device and `zeroemu` share
   that `/data`, and it shows as running while the terminal runs it.
@@ -300,12 +303,15 @@ that installs the tested one. Use `--image` to pick an untested image.
 
 What you see:
 
-- A window with the device's screen (1080x2400 by default), scaled to fit yours. Android finishes
+- A window with the device's screen (1080x2400 by default), scaled to fit yours. Resized,
+  it keeps the screen's shape, and Window > Zoom (or an Option-click on the green button)
+  makes it as large as your screen has room for. Android finishes
   booting about 17 seconds after start on a first boot, and about 12 seconds on later
   boots.
 - The mouse is a finger, and scrolling drags one (a flick becomes a fling). Other keys
   type into Android.
-- The toolbar in the title bar has Back, Home, Recents, Screenshot, Rotate and Power.
+- The toolbar in the title bar has Back, Home, Recents, Location, Screenshot, Rotate and
+  Power.
   View > Customize Toolbar adds Volume, Mute, Notifications, Settings, Lock and more.
 - The **Device** menu has every control, with shortcuts:
 
@@ -322,10 +328,12 @@ What you see:
   screenshots. On a MacBook keyboard, hold Fn for F1 and F2.
 - Rotating turns the phone: Android turns its screen as a phone does, if auto-rotate is
   on and the app allows it, and the window takes the new shape.
-- **Device > Location** sets where the phone's GPS says it is, as Simulator's Features >
-  Location does: None, a latitude and longitude of your own, one of a dozen places
-  round the world, or a route round the Googleplex (a run, a bicycle ride or a drive
-  on US 101) that the phone follows at its pace, over and over.
+- **Device > Location**, or the toolbar's Location button, sets where the phone's GPS
+  says it is, as Simulator's Features > Location does: None, a latitude and longitude
+  of your own, one of a dozen places round the world, or a route round the Googleplex
+  (a run, a bicycle ride or a drive on US 101) that the phone follows at its pace, over
+  and over. A device of zeroemu.app's list keeps the place chosen, and starts there when
+  it is next started from the list or with `--device`.
 - The terminal shows Android's warnings and errors, and the renderer's errors.
   `ZEROEMU_LOG=I` shows more of Android's log, and `ZEROEMU_LOG=S` hides it.
   `ZEROEMU_GPU_LOG=<S|E|W|I|D>` sets how much of the renderer's own log shows.

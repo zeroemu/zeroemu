@@ -143,12 +143,15 @@ with no sky in view does. A route is followed at its speed, heading along the le
 is on, and starts again from its beginning when chosen.
 
 A device's location is its device.ini's `location=` (src/devices.rs), and stays with
-it while it runs, both ways (devices::follow_location). What the Location menu, or the
-toolbar's Location button that opens it, chooses is saved there, so the device starts
-there next time. zeroemu reads device.ini once a second, and when its location is not
-the one it last read or wrote there, which is what Edit… in zeroemu.app's list does
-while the device runs, the device goes there. The device moves and device.ini is read
-or written under one lock, so that the two can't cross.
+it while it runs, both ways (devices::follow_location): the device booted with
+`--device`, or the one zeroemu.app's list makes of a terminal boot's `/data`, then or
+while it runs, and only in the zeroemu that holds the `/data`'s lock, as a second one
+on it keeps nothing. What the Location menu, or the toolbar's Location button that
+opens it, chooses is saved there, so the device starts there next time. zeroemu reads
+device.ini once a second, and when its location is not the one it last read or wrote
+there, which is what Edit… in zeroemu.app's list does while the device runs, the device
+goes there. The device moves and device.ini is read or written under one lock, so that
+the two can't cross.
 
 ## Saving /data
 

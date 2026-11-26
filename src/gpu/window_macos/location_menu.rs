@@ -3,8 +3,9 @@
 //! Features > Location: None, Custom Location…, then zeroemu's places, then its routes,
 //! with a checkmark on the one the GPS reports. The items send deviceAction: to the
 //! controls object, as the Device menu's others do, and it hands them here by their
-//! tags. What is chosen is the device's location from then on: saved in its
-//! device.ini (devices::choose_location), so that it starts there next time.
+//! tags. In a zeroemu running a device of zeroemu.app's list, what is chosen is the
+//! device's location from then on: saved in its device.ini (devices::choose_location),
+//! so that it starts there when it is next started as that device.
 
 use super::*;
 use crate::location::{self, Kind, PRESETS, Source};
@@ -98,7 +99,7 @@ pub(super) unsafe fn validate(item: Id, tag: i64) {
 }
 
 /// A Location item was chosen (UI thread): the device goes there, and that is saved
-/// as its location.
+/// as its location if it is a device of the list's (devices::choose_location).
 pub(super) fn chosen(tag: i64) {
     let source = match tag {
         TAG_OFF => Some(Source::Off),

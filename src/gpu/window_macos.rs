@@ -1575,7 +1575,8 @@ unsafe fn keep_shape(window: *mut c_void, shown: (u32, u32)) {
     unsafe { msg_size(window, sel("setContentAspectRatio:"), ratio) };
 }
 
-/// Zoom's window (the green button, a double click on the title bar, Window > Zoom): as
+/// Zoom's window (Window > Zoom, an Option-click on the green button, whose plain click
+/// is full screen, or a double click on the title bar if the Mac is set to zoom then): as
 /// tall as its screen has room for, in the picture's shape, and where it is across the
 /// screen, kept on it. AppKit offers `room`, its screen's visible frame cut to the
 /// window's shape (keep_shape) but moved to the screen's left edge, which is where a

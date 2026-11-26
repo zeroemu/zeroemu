@@ -19,7 +19,7 @@ use crate::gpu::Display;
 use crate::location::{self, Source};
 use crate::sdk::{self, Image};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -322,9 +322,30 @@ fn same_file(file: &std::fs::File, path: &Path) -> std::io::Result<bool> {
     }
 }
 
-/// The device this zeroemu runs, if it follows its device.ini's location
-/// (`follow_location`).
+/// The device this zeroemu runs, once it follows its device.ini's location
+/// (`follow_location`, `followed`).
 static FOLLOWED: Mutex<Option<Followed>> = Mutex::new(None);
+
+/// What `follow_location` was given: the device this zeroemu boots, found once its
+/// /data is this zeroemu's.
+static WATCH: OnceLock<Watch> = OnceLock::new();
+
+struct Watch {
+    /// The device booted (--device); else the one whose /data is `data`, which
+    /// zeroemu.app's list may make of a terminal boot's /data at any time (Store::adopt).
+    device: Option<Device>,
+    data: PathBuf,
+    /// Whether this zeroemu keeps that /data (kernel::keeps_data): a second zeroemu
+    /// booted on it keeps nothing, and leaves the device's location alone.
+    keeps: fn() -> bool,
+}
+
+impl Watch {
+    /// The device, if there is one now.
+    fn find(&self) -> Option<Device> {
+        self.device.clone().or_else(|| Store::open()?.with_data(&self.data))
+    }
+}
 
 /// A running device, and the location its device.ini had when this zeroemu last read
 /// or wrote it there.
@@ -360,26 +381,38 @@ impl Followed {
     }
 }
 
+/// The device followed, held: found first, if it hasn't been yet and this zeroemu
+/// keeps its /data, at the location its device.ini has then.
 fn followed() -> MutexGuard<'static, Option<Followed>> {
-    FOLLOWED.lock().unwrap_or_else(|p| p.into_inner())
+    let mut f = FOLLOWED.lock().unwrap_or_else(|p| p.into_inner());
+    if f.is_none()
+        && let Some(w) = WATCH.get()
+        && (w.keeps)()
+    {
+        *f = w.find().map(|device| Followed { seen: device.settings.location.clone(), device });
+    }
+    f
 }
 
-/// Has the device `d`, which this zeroemu boots, keep its location with its
-/// device.ini both ways. What its window's Location menu chooses is saved there
-/// (`choose_location`), so that it starts there next time. A location saved there by
-/// another zeroemu, as Edit… in zeroemu.app's list saves one while it runs, moves it
-/// at once: device.ini, a few lines, is read once a second for that. A location of
-/// none is the main city of `zone`, the time zone the boot uses, as at the start.
-pub fn follow_location(d: Device, zone: Option<String>) {
-    let seen = d.settings.location.clone();
-    *followed() = Some(Followed { device: d, seen });
+/// Has the device this zeroemu boots keep its location with its device.ini both ways:
+/// `device` (--device), else the one whose /data is `data`, once there is one (the list
+/// may make it of a terminal boot's /data while it runs), and only while `keeps` says
+/// this zeroemu keeps that /data. What its window's Location menu chooses is saved
+/// there (`choose_location`), so that it starts there next time. A location saved there
+/// by another zeroemu, as Edit… in zeroemu.app's list saves one while it runs, moves it
+/// at once: device.ini, a few lines, is read once a second for that. A location of none
+/// is the main city of `zone`, the time zone the boot uses, as at the start.
+pub fn follow_location(device: Option<Device>, data: PathBuf, zone: Option<String>, keeps: fn() -> bool) {
+    if WATCH.set(Watch { device, data, keeps }).is_err() {
+        return;
+    }
     let spawned = std::thread::Builder::new().name("device.ini".into()).spawn(move || {
         loop {
             std::thread::sleep(Duration::from_secs(1));
             // Held while the device moves, so that a place chosen in the window
             // meanwhile (choose_location) comes after it, not before.
             let mut f = followed();
-            let Some(f) = f.as_mut() else { return };
+            let Some(f) = f.as_mut() else { continue };
             if let Some(now) = f.changed() {
                 location::set(now.unwrap_or_else(|| location::default_for_zone(zone.as_deref())));
             }
@@ -482,6 +515,11 @@ impl Store {
             Some(now) if dir == d.dir && now.package == d.package && now.data == d.data => Ok(now),
             _ => Err(gone(d)),
         }
+    }
+
+    /// The device whose /data is `data`.
+    fn with_data(&self, data: &Path) -> Option<Device> {
+        self.list().into_iter().find(|d| d.data == data)
     }
 
     /// Every device, by name.
@@ -1033,6 +1071,23 @@ mod tests {
         store.delete(&now).unwrap();
         assert!(f.save(&Source::Off).is_err() && !now.dir.exists());
         assert_eq!(f.changed(), None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_terminal_boot_follows_the_device_the_list_makes_of_its_data_once_there_is_one() {
+        let root = scratch("watch");
+        let img = image(&root.join("sdk"), "android-36.1", "google_apis_playstore");
+        let store = Store::at(&root.join("devices"));
+        let data = root.join("data-of-the-image.img");
+        // The list hasn't made a device of it: none to follow yet.
+        assert_eq!(store.with_data(&data), None);
+        std::fs::write(&data, "saved").unwrap();
+        let made = store.make("Android 16", &img, Some(&data), &Settings::default()).unwrap();
+        assert_eq!(store.with_data(&data), Some(made.clone()));
+        // A --device boot's is the one it was given, found or not.
+        let watch = Watch { device: Some(made.clone()), data: PathBuf::from("/nowhere"), keeps: || true };
+        assert_eq!(watch.find(), Some(made));
         let _ = std::fs::remove_dir_all(&root);
     }
 

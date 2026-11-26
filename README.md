@@ -304,8 +304,8 @@ that installs the tested one. Use `--image` to pick an untested image.
 What you see:
 
 - A window with the device's screen (1080x2400 by default), scaled to fit yours. Resized,
-  it keeps the screen's shape, and Zoom (the green button) makes it as large as your
-  screen has room for. Android finishes
+  it keeps the screen's shape, and Window > Zoom (or an Option-click on the green button)
+  makes it as large as your screen has room for. Android finishes
   booting about 17 seconds after start on a first boot, and about 12 seconds on later
   boots.
 - The mouse is a finger, and scrolling drags one (a flick becomes a fling). Other keys
@@ -332,8 +332,8 @@ What you see:
   says it is, as Simulator's Features > Location does: None, a latitude and longitude
   of your own, one of a dozen places round the world, or a route round the Googleplex
   (a run, a bicycle ride or a drive on US 101) that the phone follows at its pace, over
-  and over. A device made in zeroemu.app keeps the place chosen, and starts there next
-  time.
+  and over. A device of zeroemu.app's list keeps the place chosen, and starts there when
+  it is next started from the list or with `--device`.
 - The terminal shows Android's warnings and errors, and the renderer's errors.
   `ZEROEMU_LOG=I` shows more of Android's log, and `ZEROEMU_LOG=S` hides it.
   `ZEROEMU_GPU_LOG=<S|E|W|I|D>` sets how much of the renderer's own log shows.

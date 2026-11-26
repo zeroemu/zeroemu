@@ -1,8 +1,8 @@
 class Zeroemu < Formula
   desc "Run Android's system image on Apple Silicon with no guest kernel"
   homepage "https://github.com/zeroemu/zeroemu"
-  url "https://github.com/zeroemu/zeroemu/archive/refs/tags/v0.3.1.tar.gz"
-  sha256 "062b312e25c0360ae793515e695906dad4515fa2fde6bc68cd4407ac3d3ef2b1"
+  url "https://github.com/zeroemu/zeroemu/archive/refs/tags/v0.4.0.tar.gz"
+  sha256 "1e117244f26e275de30778a387dfbc0f60f112a1e5a032c71228ca1d4c33be3b"
   license "Apache-2.0"
   head "https://github.com/zeroemu/zeroemu.git", branch: "main"
 

@@ -494,6 +494,12 @@ impl<R: Runner> Held<R> {
         !self.spent && self.who.is_display()
     }
 
+    /// How long its turn has lasted at `now`: none before it started, however long ago
+    /// it was handed the core.
+    fn held(&self, now: Instant) -> Duration {
+        if self.started { now.saturating_duration_since(self.since) } else { Duration::ZERO }
+    }
+
     /// How long it has held its core as the rest, at `now`.
     fn rest_time(&self, now: Instant) -> Duration {
         self.rest_held + self.rest_since.map_or(Duration::ZERO, |since| now.saturating_duration_since(since))
@@ -739,7 +745,7 @@ impl<R: Runner> Cores<R> {
                 // should make way for it.
                 let first_display = st.first_is_display(now);
                 let n = if first_display { st.display.len() } else { st.rest.len() };
-                let holders = st.holders.iter().filter(|(_, h)| h.who.in_guest()).map(|(id, h)| (*id, h.display(), h.shielded(), now.saturating_duration_since(h.since))).collect();
+                let holders = st.holders.iter().filter(|(_, h)| h.who.in_guest()).map(|(id, h)| (*id, h.display(), h.shielded(), h.held(now))).collect();
                 for id in to_kick(holders, first_display, n) {
                     st.holders[&id].who.stop_in_guest();
                 }
@@ -958,6 +964,16 @@ struct Inner {
     flush_asked: bool,
 }
 
+impl Inner {
+    /// Its place in the cores gate and since when its turn has lasted, for whether it
+    /// makes way: from now if it hasn't gone into the guest with it yet, as Cores::start
+    /// will count it. A thread the host was slow to wake, handed the rest's due turn,
+    /// would otherwise give it up on its way in having run nothing.
+    fn turn(&self) -> Option<(u64, Instant)> {
+        self.core.map(|(id, since)| (id, if self.fresh { Instant::now() } else { since }))
+    }
+}
+
 /// One guest thread's vCPU, made and destroyed on its own host thread.
 struct Slot {
     hv: Arc<dyn Hypervisor>,
@@ -1047,7 +1063,7 @@ impl Slot {
         let Some(c) = &self.pool.cores else { return Ok(false) };
         let (core, spent) = {
             let i = self.inner.borrow();
-            (i.core, i.spent)
+            (i.turn(), i.spent)
         };
         match core {
             Some((id, since)) => match c.give_way(id, !spent && self.thread.urgency() == Urgency::Display, since, false) {
@@ -1116,7 +1132,7 @@ impl Slot {
             return false;
         }
         let mut i = self.inner.borrow_mut();
-        let Some((id, since)) = i.core else { return false };
+        let Some((id, since)) = i.turn() else { return false };
         let Some(gave) = c.give_way(id, !i.spent && self.thread.urgency() == Urgency::Display, since, false) else { return false };
         i.core = None;
         i.spent |= gave;
@@ -1927,6 +1943,33 @@ mod tests {
             let h = &st.holders[&id];
             assert!(h.started && h.since == since && h.rest_since == Some(since));
         }
+        gate.release(id);
+        assert_eq!(gate.usage().0, 0);
+    }
+
+    #[test]
+    fn a_due_turn_the_host_is_slow_to_start_lasts_a_slice_from_its_start() {
+        // One core: the rest's first is handed its due turn as display work blocks, and the
+        // host takes a slice and more to wake it. Display work back in line meanwhile
+        // neither stops it nor has it make way as it goes in: its slice counts from then.
+        let gate = Arc::new(Cores::<Fake>::waiting_rest(1, NEVER_DUE));
+        let (id, _) = gate.try_take(&Fake::new(false), false).unwrap();
+        let slow = Fake::new(false);
+        let r = queue(&gate, &slow, false);
+        gate.set_rest_wait(Duration::ZERO);
+        gate.release(id);
+        let (id, handed) = r.join().unwrap().expect("the core");
+        assert!(gate.st.lock().unwrap().holders[&id].due);
+        gate.st.lock().unwrap().holders.get_mut(&id).unwrap().since = handed - SLICE;
+        let d = queue(&gate, &Fake::new(true), false);
+        std::thread::sleep(Duration::from_millis(10));
+        assert_eq!(slow.kicks.load(Ordering::Relaxed), 0, "not stopped before it starts");
+        // On its way in, it is judged as held from now (Inner::turn).
+        assert_eq!(gate.give_way(id, false, Instant::now(), false), None);
+        let since = gate.start(id);
+        assert_eq!(gate.give_way(id, false, since, false), None, "its slice starts now");
+        assert_eq!(gate.give_way(id, false, since - SLICE, false), Some(false));
+        let (id, _) = d.join().unwrap().expect("the core");
         gate.release(id);
         assert_eq!(gate.usage().0, 0);
     }

@@ -231,9 +231,10 @@ has paid for, the first of it goes first, display work making way after its own 
 and keeps that core for a 10 ms turn: however busy display work is, other work has
 about 10 ms in every 50, as Linux's real-time throttling leaves fair threads a share
 of each second, and display work has the rest of the time. Each moment other work
-runs as other work pays for five of display work's, so a turn display work takes back
-at once, as when it blocks for a moment in a binder call, pays next to nothing, nor
-does a binder thread's time serving display work at its urgency. Other work is owed
+runs as other work pays for five of display work's, counted from when its thread goes
+into the guest with the core, so a turn display work takes back at once, as when it
+blocks for a moment in a binder call, pays nothing, nor does the Mac's time waking the
+thread, nor a binder thread's time serving display work at its urgency. Other work is owed
 50 ms at most going into its turn, so a long stretch of display work doesn't make it
 go first for as long again afterwards. Only time while
 other work waits, and display work waits for a core too or holds them all, counts:

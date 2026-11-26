@@ -109,8 +109,9 @@ const DISPLAY_SLICE: Duration = Duration::from_millis(50);
 const REST_WAIT: Duration = DISPLAY_SLICE;
 
 /// How much of display work's time keeping the rest out each moment of theirs on a core,
-/// as the rest (Held::rest_time), pays for: a slice pays for REST_WAIT. Paid for what
-/// they run, not for being handed a core: display threads that hand one to and fro through blocks of a few microseconds
+/// as the rest and from when the thread goes into the guest with it (Held::rest_time,
+/// Held::started), pays for: a slice pays for REST_WAIT. Paid for what they run, not for
+/// being handed a core, nor for the host's time waking them: display threads that hand one to and fro through blocks of a few microseconds
 /// (a binder call and its reply, a futex) hand it the rest at each, and take it back at
 /// once (makes_way). Had being handed it paid for everything, the rest would never come
 /// due however long that went on, and would run next to nothing.
@@ -474,10 +475,16 @@ struct Held<R> {
     /// had only blocked for a moment is back in line by then. No more of the rest are
     /// due while it lasts (CoresState::rest_due).
     due: bool,
-    /// How long it has held its core as the rest, for what that pays (CoresState::pay):
-    /// `rest_held`, and since `rest_since` too while it is of the rest now. A binder
-    /// thread is lent its caller's urgency for a call and is the rest again before it
-    /// blocks (binder_read's settle_urgency): its time serving display work pays nothing.
+    /// Its thread has gone into the guest with the core (Cores::start): until then it has
+    /// run nothing on it. The host's time waking a thread handed a core, or making it a
+    /// vCPU, is none of its time on the core, and a thread display work takes the core
+    /// back from on its way in never ran.
+    started: bool,
+    /// How long it has held its core as the rest since it started, for what that pays
+    /// (CoresState::pay): `rest_held`, and since `rest_since` too while it is of the rest
+    /// now. A binder thread is lent its caller's urgency for a call and is the rest again
+    /// before it blocks (binder_read's settle_urgency): its time serving display work pays
+    /// nothing.
     rest_held: Duration,
     rest_since: Option<Instant>,
 }
@@ -492,8 +499,12 @@ impl<R: Runner> Held<R> {
         self.rest_held + self.rest_since.map_or(Duration::ZERO, |since| now.saturating_duration_since(since))
     }
 
-    /// Its urgency may have changed (reclassify): starts or ends a stretch as the rest.
+    /// Its urgency may have changed (reclassify): starts or ends a stretch as the rest,
+    /// once it has started.
     fn restretch(&mut self, now: Instant) {
+        if !self.started {
+            return;
+        }
         match (self.display(), self.rest_since) {
             (true, Some(since)) => {
                 self.rest_held += now.saturating_duration_since(since);
@@ -630,8 +641,7 @@ impl<R: Runner> CoresState<R> {
         }
         self.next += 1;
         self.used += 1;
-        let rest_since = (spent || !who.is_display()).then_some(now);
-        self.holders.insert(self.next, Held { who: who.clone(), since: now, spent, due, rest_held: Duration::ZERO, rest_since });
+        self.holders.insert(self.next, Held { who: who.clone(), since: now, spent, due, started: false, rest_held: Duration::ZERO, rest_since: None });
         self.track(now);
         (self.next, now)
     }
@@ -702,7 +712,8 @@ impl<R: Runner> Cores<R> {
         loop {
             if who.is_dying() {
                 match st.handed.remove(&ticket) {
-                    // Handed one as it died: on to the next in line.
+                    // Handed one as it died: on to the next in line. It never started,
+                    // so it pays nothing.
                     Some((id, _)) => self.give_up(&mut st, id, Instant::now()),
                     None => self.leave_line(&mut st, ticket),
                 }
@@ -866,6 +877,20 @@ impl<R: Runner> Cores<R> {
         self.give_up(&mut self.st.lock().unwrap(), id, Instant::now());
     }
 
+    /// Place `id`'s thread goes into the guest with it for the first time: its turn starts
+    /// now, for its slice and for what it pays (Held::started). Returns since when, as
+    /// held from now on.
+    fn start(&self, id: u64) -> Instant {
+        let mut st = self.st.lock().unwrap();
+        let now = Instant::now();
+        if let Some(h) = st.holders.get_mut(&id) {
+            h.since = now;
+            h.started = true;
+            h.rest_since = (!h.display()).then_some(now);
+        }
+        now
+    }
+
     /// Whether a holder that has held its core since `since` may have to give it up now,
     /// at the door, for those in line: give_way decides, under the lock. Read on every
     /// way into the guest: the clock only when someone waits.
@@ -915,8 +940,11 @@ struct Inner {
     held: Option<(u64, Arc<Holder>)>,
     /// Holder id in the background pool, while it has a place there.
     gated: Option<u64>,
-    /// Its place in the cores gate, and when it took it, while it has one.
+    /// Its place in the cores gate, and when it took it (or first went into the guest
+    /// with it), while it has one.
     core: Option<(u64, Instant)>,
+    /// It has a core it hasn't gone into the guest with yet (Cores::start).
+    fresh: bool,
     /// Display work that gave its core up to the rest (Held::spent): it waits and runs as
     /// the rest until it next blocks.
     spent: bool,
@@ -1034,7 +1062,9 @@ impl Slot {
             },
             None => {
                 if let Some(got) = c.try_take(&self.thread, spent) {
-                    self.inner.borrow_mut().core = Some(got);
+                    let mut i = self.inner.borrow_mut();
+                    i.core = Some(got);
+                    i.fresh = true;
                     return Ok(false);
                 }
             }
@@ -1043,7 +1073,10 @@ impl Slot {
         let kept = self.idle();
         let mut give_up = || self.park_vcpu();
         let Some(got) = c.take(&self.thread, spent, if kept { Some(&mut give_up) } else { None }) else { return Err("dying".into()) };
-        self.inner.borrow_mut().core = Some(got);
+        let mut i = self.inner.borrow_mut();
+        i.core = Some(got);
+        i.fresh = true;
+        drop(i);
         // Awake again, if it kept its vCPU: an ask `reclaim` made of it as it got its
         // core no longer stands.
         self.running();
@@ -1088,6 +1121,18 @@ impl Slot {
         i.core = None;
         i.spent |= gave;
         true
+    }
+
+    /// Going into the guest, past give_way_on_entry: if it is the first time with this
+    /// core, its turn starts now (Cores::start).
+    fn start_core(&self) {
+        let mut i = self.inner.borrow_mut();
+        if !std::mem::take(&mut i.fresh) {
+            return;
+        }
+        if let (Some(c), Some((id, _))) = (&self.pool.cores, i.core) {
+            i.core = Some((id, c.start(id)));
+        }
     }
 
     /// Tells the host how urgent this thread is now.
@@ -1209,7 +1254,7 @@ pub struct LazyVcpu(Rc<Slot>);
 
 impl LazyVcpu {
     pub fn new(hv: Arc<dyn Hypervisor>, pool: Arc<Pool>, thread: Arc<Thread>, root: PageTableRoot, state: CpuState) -> LazyVcpu {
-        let slot = Rc::new(Slot { hv, pool, thread, inner: RefCell::new(Inner { vcpu: None, state, root, held: None, gated: None, core: None, spent: false, told: None, flush_wanted: false, flush_asked: false }) });
+        let slot = Rc::new(Slot { hv, pool, thread, inner: RefCell::new(Inner { vcpu: None, state, root, held: None, gated: None, core: None, fresh: false, spent: false, told: None, flush_wanted: false, flush_asked: false }) });
         CURRENT.with(|c| *c.borrow_mut() = Some(slot.clone()));
         LazyVcpu(slot)
     }
@@ -1288,6 +1333,7 @@ impl Vcpu for LazyVcpu {
             // SeqCst: see Cores::take.
             self.0.thread.in_guest.store(true, Ordering::SeqCst);
             if !self.0.give_way_on_entry() {
+                self.0.start_core();
                 break;
             }
             // In line again for a core, through ensure.
@@ -1450,9 +1496,10 @@ mod tests {
         }
     }
 
-    /// Makes holder `id` have held its core since `at`, for what its turn pays, as the
-    /// rest if it is of them now: returns `at`, for give_way.
-    fn held_since(gate: &Cores<Fake>, id: u64, at: Instant) -> Instant {
+    /// Makes holder `id`'s thread have gone into the guest with its core at `at`
+    /// (Cores::start), for its slice and what it pays: returns `at`, for give_way.
+    fn ran_since(gate: &Cores<Fake>, id: u64, at: Instant) -> Instant {
+        gate.start(id);
         let mut st = gate.st.lock().unwrap();
         let h = st.holders.get_mut(&id).expect("a holder");
         h.since = at;
@@ -1762,7 +1809,7 @@ mod tests {
         // No more of the rest are due meanwhile.
         assert!(!gate.st.lock().unwrap().rest_due(Instant::now()));
         let before = Instant::now();
-        let since = held_since(&gate, id, before - SLICE);
+        let since = ran_since(&gate, id, before - SLICE);
         assert_eq!(gate.give_way(id, false, since, false), Some(false));
         let (id, _) = v1.join().unwrap().expect("the core");
         {
@@ -1826,15 +1873,16 @@ mod tests {
         std::thread::sleep(Duration::from_millis(60));
         // d1 blocks: the rest's first has the core, not being due.
         gate.release(id);
-        let (id, _) = w.join().unwrap().expect("the core");
+        let (id, since) = w.join().unwrap().expect("the core");
         assert!(!gate.st.lock().unwrap().holders[&id].due);
-        // d2 comes a moment later, and the rest make way at once.
+        // d2 comes while the host still wakes the one handed the core, which makes way
+        // for it at once on its way in, having run nothing.
         let v = queue(&gate, &d2, false);
-        let since = held_since(&gate, id, Instant::now());
+        std::thread::sleep(Duration::from_millis(5));
         assert_eq!(gate.give_way(id, false, since, false), Some(false));
         let (id, _) = v.join().unwrap().expect("the core");
         let w = queue(&gate, &r, false);
-        assert!(gate.st.lock().unwrap().rest_waited(Instant::now()).unwrap() >= Duration::from_millis(15), "its moment on the core paid next to nothing");
+        assert!(gate.st.lock().unwrap().rest_waited(Instant::now()).unwrap() >= Duration::from_millis(55), "a turn it never started paid nothing");
         // Due: when d2 blocks, the rest's first has the core as its due turn, though no
         // display work waits then, and keeps it a slice though d2 is back.
         gate.set_rest_wait(Duration::from_millis(15));
@@ -1844,7 +1892,7 @@ mod tests {
         let v = queue(&gate, &d2, false);
         assert_eq!(gate.give_way(id, false, Instant::now() + Duration::from_secs(60), false), None, "its due turn lasts a slice");
         let before = Instant::now();
-        let since = held_since(&gate, id, before - SLICE);
+        let since = ran_since(&gate, id, before - SLICE);
         assert_eq!(gate.give_way(id, false, since, false), Some(false));
         let (id, _) = v.join().unwrap().expect("the core");
         // That slice paid for what they were owed.
@@ -1861,6 +1909,29 @@ mod tests {
     }
 
     #[test]
+    fn a_turn_starts_when_its_thread_goes_into_the_guest() {
+        // One core held by display work, and one of the rest in line: handed the core as
+        // display work blocks, its turn starts, for its slice and what it pays, only when
+        // its thread goes into the guest with it.
+        let gate = Arc::new(Cores::<Fake>::waiting_rest(1, NEVER_DUE));
+        let (id, _) = gate.try_take(&Fake::new(true), false).unwrap();
+        let r = queue(&gate, &Fake::new(false), false);
+        gate.release(id);
+        let (id, handed) = r.join().unwrap().expect("the core");
+        std::thread::sleep(Duration::from_millis(5));
+        assert_eq!(gate.st.lock().unwrap().holders[&id].rest_time(Instant::now()), Duration::ZERO, "not started");
+        let since = gate.start(id);
+        assert!(since >= handed + Duration::from_millis(5));
+        {
+            let st = gate.st.lock().unwrap();
+            let h = &st.holders[&id];
+            assert!(h.started && h.since == since && h.rest_since == Some(since));
+        }
+        gate.release(id);
+        assert_eq!(gate.usage().0, 0);
+    }
+
+    #[test]
     fn only_time_on_a_core_as_the_rest_pays() {
         // A binder thread lent display work's urgency for a call holds its core as display
         // work, and is the rest again before it blocks: the call's time pays nothing.
@@ -1871,7 +1942,7 @@ mod tests {
         let r2 = queue(&gate, &Fake::new(false), false);
         std::thread::sleep(Duration::from_millis(60));
         // Serving display work for a second, as far as the pay goes.
-        held_since(&gate, id, Instant::now() - Duration::from_secs(1));
+        ran_since(&gate, id, Instant::now() - Duration::from_secs(1));
         server.set_display(false);
         gate.reclassify(Arc::as_ptr(&server));
         gate.release(id);

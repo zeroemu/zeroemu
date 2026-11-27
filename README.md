@@ -19,6 +19,20 @@ your SDK, into a window on your Mac.
 
 ## Quick start
 
+### Mac app
+
+```sh
+brew install --cask zeroemu/tap/zeroemu-app
+```
+
+Install [the Android SDK pieces](#the-android-sdk-pieces), then open `zeroemu.app`
+from Applications. Click **New Device** to choose an installed system image.
+macOS blocks the first open, because the app isn't notarized, and the app looks for
+the SDK only in `~/Library/Android/sdk`; [As a Mac app](#as-a-mac-app) says what to do
+about both.
+
+### Command line
+
 ```sh
 # 1. Install zeroemu, in a new folder. This short form checks nothing; see Install
 #    for a checked download, Homebrew and source builds.
@@ -40,17 +54,19 @@ sdkmanager "emulator" "platform-tools" "system-images;android-36.1;google_apis_p
 
 ## Install
 
-zeroemu comes as a command-line program and a Mac app. macOS lets a program create a virtual machine only
-if it is signed with the `com.apple.security.hypervisor` entitlement. An ad-hoc
-signature can carry it, so no Apple developer account is needed. The release binary and
-the Homebrew build are signed already; if you build zeroemu yourself, you sign it.
+zeroemu comes as a command-line program and a Mac app. macOS lets a program create a
+virtual machine only if it is signed with the `com.apple.security.hypervisor`
+entitlement. An ad-hoc signature can carry it, so no Apple developer account is needed.
+The release downloads and Homebrew packages are signed.
 
 You need a Mac with Apple Silicon (M1 or later). zeroemu has been tested on macOS 26 on
 an M1 Pro. Older versions of macOS are untested.
 
 ### From GitHub Releases
 
-The short form downloads and unpacks in one step, and checks nothing:
+For the GUI, download the app ZIP from [the release](https://github.com/zeroemu/zeroemu/releases/tag/v0.5.0).
+For the command-line program, this short form downloads and unpacks in one step and
+checks nothing:
 
 ```sh
 mkdir zeroemu && cd zeroemu
@@ -95,11 +111,26 @@ xattr -d com.apple.quarantine ./zeroemu
 
 ### With Homebrew
 
+| What you want | Package | Install |
+|---|---|---|
+| `zeroemu.app` in Applications | Cask | `brew install --cask zeroemu/tap/zeroemu-app` |
+| `zeroemu` in your terminal | Formula | `brew install zeroemu/tap/zeroemu` |
+
+Homebrew loads a package from a tap other than its own only once it is trusted.
+Installing it by its full name, as above, trusts it. To run `brew info` on a package
+before installing it, or to install it by its short name, trust it yourself first:
+
 ```sh
-brew install zeroemu/tap/zeroemu
+brew trust --cask zeroemu/tap/zeroemu-app    # the app
+brew trust --formula zeroemu/tap/zeroemu     # the command-line program
 ```
 
-The formula builds zeroemu from source (Homebrew installs Rust for the build) and signs it.
+`brew trust zeroemu/tap` trusts everything in the tap, including packages it gains
+later.
+
+The formula builds and signs the command-line program from source (Homebrew installs
+Rust for the build). It does not install or update the Mac app. See
+[As a Mac app](#as-a-mac-app) for upgrades and moving from a manual install.
 
 ### From source
 
@@ -145,7 +176,8 @@ Applications if it is there, and install the cask once. Open the Applications co
 from then on, and replace any Dock shortcut that pointed to the old copy. Your saved
 devices are kept outside the bundle and don't need to be moved.
 
-The app is signed ad hoc and isn't notarized. If macOS blocks it, review
+The app is signed ad hoc and isn't notarized, so macOS blocks a downloaded copy, the
+cask's included, the first time you open it. To open it anyway, follow
 [Apple's guidance on opening downloaded apps](https://support.apple.com/en-us/102445).
 You can check the ZIP's checksum and provenance on the GitHub release before opening it.
 
@@ -250,6 +282,9 @@ example, keeps its SDK here:
 ```sh
 export ANDROID_HOME="$(brew --prefix)/share/android-commandlinetools"
 ```
+
+The Mac app doesn't see `ANDROID_HOME` and looks only in `~/Library/Android/sdk`.
+[As a Mac app](#as-a-mac-app) shows how to link an SDK from elsewhere there.
 
 `ZEROEMU_GFXSTREAM=<path>` loads the renderer library from a path of your choice.
 

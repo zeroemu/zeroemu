@@ -116,16 +116,20 @@ the README already say 0.1.0, so start at step 3.
 9. **Copy the formula and generate the cask in the tap,** then commit and push it:
 
    ```sh
+   version=X.Y.Z
    cp packaging/homebrew/zeroemu.rb ../homebrew-tap/Formula/zeroemu.rb
    mkdir -p ../homebrew-tap/Casks
-   version=X.Y.Z
-   app_sha=$(shasum -a 256 "zeroemu-$version-aarch64-apple-darwin.app.zip" | cut -d' ' -f1)
+   # The checksum file that step 7 checked the app ZIP against.
+   app_sha=$(curl -fsSL "https://github.com/zeroemu/zeroemu/releases/download/v$version/zeroemu-$version-aarch64-apple-darwin.app.zip.sha256" | cut -d' ' -f1)
+   echo "$app_sha"   # 64 hex digits; if it is empty, the download failed: stop here
    sed -e "s/@VERSION@/$version/g" -e "s/@SHA256@/$app_sha/g" \
      packaging/homebrew/zeroemu-app.rb.in > ../homebrew-tap/Casks/zeroemu-app.rb
    ```
 
 10. **Install and test it** on an Apple Silicon Mac (`brew update` first if the tap is
-    already tapped):
+    already tapped). Install before testing: installing by the full name trusts the
+    formula, and on a Mac that has never installed it, `brew test` and `brew audit`
+    refuse an untrusted one.
 
     ```sh
     brew install --build-from-source zeroemu/tap/zeroemu

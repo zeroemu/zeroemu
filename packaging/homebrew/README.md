@@ -1,21 +1,21 @@
-# Homebrew formula
+# Homebrew packages
 
-`zeroemu.rb` is the formula for the tap `zeroemu/tap`, which lives in its own repository,
-`zeroemu/homebrew-tap`. Users install with:
+The [zeroemu tap](https://github.com/zeroemu/homebrew-tap) has two packages:
 
-```sh
-brew install zeroemu/tap/zeroemu
-```
+| Package | Installs | Command |
+|---|---|---|
+| Cask | The signed `zeroemu.app` bundle in Applications | `brew install --cask zeroemu/tap/zeroemu-app` |
+| Formula | The signed `zeroemu` command-line program | `brew install zeroemu/tap/zeroemu` |
 
-The formula builds zeroemu from the release's source tarball and signs it ad hoc with
-`entitlements.plist`, as homebrew-core's `lume` formula does for its own entitlements.
-A formula rather than a cask, because Homebrew disables casks that fail Gatekeeper's
-checks, and an ad-hoc signed binary fails them. Files a formula builds aren't
-quarantined, so Gatekeeper never sees zeroemu.
+The formula builds from the tagged source tarball and signs the binary with the
+hypervisor entitlement. The cask installs the app ZIP from GitHub Releases. The app
+is signed ad hoc, not notarized.
 
-[docs/RELEASING.md](../../docs/RELEASING.md) says how to create the tap (once) and how
-to update the formula for each release: fill in `sha256` from the tag's source tarball,
-copy the formula to the tap, then `brew install --build-from-source` and `brew test`.
+Homebrew loads a package from a tap other than its own only once it is trusted.
+Installing it by its full name, as the commands above do, trusts it, so the install
+instructions need no `brew trust` step. `brew info`, `brew test` and `brew audit`
+refuse a package that was neither installed that way nor trusted with `brew trust`.
 
-Keep `packaging/homebrew/zeroemu.rb` in this repository the same as the tap's copy, so
-the formula's history stays next to the code it builds.
+Keep [`zeroemu.rb`](zeroemu.rb) in sync with the tap's formula. Generate the tap's
+cask from [`zeroemu-app.rb.in`](zeroemu-app.rb.in) using the release version and the
+app ZIP's SHA-256. See [the release steps](../../docs/RELEASING.md) for details.

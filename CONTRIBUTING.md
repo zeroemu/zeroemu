@@ -86,7 +86,7 @@ The maintainers' own commits don't carry it.
 ## Releases
 
 [docs/RELEASING.md](docs/RELEASING.md) has the one-time GitHub setup and the steps for
-each release: the version bump, the tag, the release workflow and the Homebrew formula.
+each release: the version bump, the tag, the release workflow and the Homebrew packages.
 
 ## Licence
 

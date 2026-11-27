@@ -4,10 +4,11 @@ cask "zeroemu-app" do
 
   url "https://github.com/zeroemu/zeroemu/releases/download/v#{version}/zeroemu-#{version}-aarch64-apple-darwin.app.zip"
   name "zeroemu"
-  desc "Run Android system images in a Mac app"
+  desc "Desktop app that runs Android's system image with no guest kernel"
   homepage "https://github.com/zeroemu/zeroemu"
 
   depends_on arch: :arm64
+  depends_on :macos
 
   app "zeroemu.app"
 end

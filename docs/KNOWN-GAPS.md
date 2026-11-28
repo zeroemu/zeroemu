@@ -109,6 +109,11 @@ Emulator. [INTERNALS.md](INTERNALS.md) says how each part works.
   where the default ACL vold sets would let `ext_data_rw` (adb's shell) read it.
 - File capabilities (`security.capability`) aren't applied on `execve`, so `run-as`
   can't change its ids and fails.
+- memfds have Linux's seals (mm/memfd.c), but a memfd can't be reopened through
+  `/proc/<pid>/fd/<n>` (ENOENT), fchmod and fchown on one return EBADF, and MFD_HUGETLB
+  gives ordinary pages. No file can have a hole punched in it (EOPNOTSUPP). `/data` is a
+  tmpfs, so F_GET_SEALS on a file there returns F_SEAL_SEAL where a phone's ext4 or f2fs
+  returns EINVAL.
 - userfaultfd has only what ART's compacting collector uses: SIGBUS mode, on private
   anonymous memory.
 - `madvise` isn't Linux's (mm/madvise.c) in three ways:

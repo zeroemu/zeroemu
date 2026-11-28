@@ -14,9 +14,9 @@ use super::inotify;
 use super::{BACKSTOP, ERESTARTSYS, Kernel, Thread, int};
 use crate::arch::Sysno;
 use crate::errno::*;
-use crate::mm::SharedObject;
+use crate::mm::{SharedObject, WriteHold};
 use crate::phys;
-use crate::tmpfs::MemFile;
+use crate::tmpfs::{F_ALL_SEALS, F_SEAL_EXEC, F_SEAL_FUTURE_WRITE, F_SEAL_SEAL, F_SEAL_WRITE, MemFile};
 use crate::vfs::{Dirent, Node, S_IFDIR, S_IFLNK, S_IFMT, S_IFREG, Stat};
 use std::collections::VecDeque;
 use std::io::{Read, Write};
@@ -58,6 +58,8 @@ const F_UNLCK: i16 = 2;
 const F_DUPFD_CLOEXEC: u64 = 1030;
 const F_SETPIPE_SZ: u64 = 1031;
 const F_GETPIPE_SZ: u64 = 1032;
+const F_ADD_SEALS: u64 = 1033;
+const F_GET_SEALS: u64 = 1034;
 const FD_CLOEXEC: u64 = 1;
 /// A new pipe's capacity (F_SETPIPE_SZ changes it).
 const PIPE_CAP: usize = 64 << 10;
@@ -859,17 +861,12 @@ impl Kernel {
                     }
                     F_GETFL => {
                         let f = files.get(fd)?;
-                        // bionic's fdopen goes by this: it refuses "r+" on a descriptor
-                        // that's not O_RDWR, and a socket always is. getaddrinfo needs that.
-                        let acc = match &f.kind {
-                            _ if f.opened_for.get().is_some() => *f.opened_for.get().unwrap(),
-                            Kind::Stdout | Kind::Stderr => O_WRONLY,
-                            Kind::Pipe(p) if p.write => O_WRONLY,
-                            Kind::Mem(m) if m.writable => O_RDWR, // made, not opened: a memfd
-                            Kind::Socket(_) | Kind::Netlink(_) | Kind::Inet(_) | Kind::Vsock(_) | Kind::Event(_) | Kind::Timer(_) | Kind::Signal(_) | Kind::Epoll(_) | Kind::Pty(_) | Kind::Binder(_) => O_RDWR,
-                            _ => 0,
-                        };
-                        Ok((acc | f.flags.load(Ordering::Relaxed)) as i64)
+                        Ok((access_mode(&f) | f.flags.load(Ordering::Relaxed)) as i64)
+                    }
+                    F_ADD_SEALS | F_GET_SEALS => {
+                        let f = files.get(fd)?;
+                        drop(files);
+                        self.seals(&f, a[1], a[2] as u32)
                     }
                     F_SETFL => {
                         let f = files.get(fd)?;
@@ -1682,9 +1679,14 @@ impl Kernel {
                 } else if (a[2] as i64) < 0 || (a[3] as i64) <= 0 {
                     return Err(EINVAL);
                 } else if a[1] & !1 != 0 {
+                    // A hole can't be punched in a file sealed against writing (it can't be
+                    // here at all). FALLOC_FL_PUNCH_HOLE (2) comes with FALLOC_FL_KEEP_SIZE.
+                    if a[1] == 3 && m.file.seals() & (F_SEAL_WRITE | F_SEAL_FUTURE_WRITE) != 0 {
+                        return Err(EPERM);
+                    }
                     return Err(EOPNOTSUPP); // punching holes and so on: say so, and they cope
-                } else if a[2].saturating_add(a[3]) > m.file.size() && a[1] & 1 == 0 {
-                    m.file.truncate(a[2].saturating_add(a[3]))?; // FALLOC_FL_KEEP_SIZE (1) unset: extend
+                } else {
+                    m.file.allocate(a[2].saturating_add(a[3]), a[1] & 1 != 0)?; // FALLOC_FL_KEEP_SIZE (1)
                 }
                 if let Some(n) = &m.node {
                     inotify::notify(&n.path, inotify::IN_MODIFY, 0);
@@ -1756,11 +1758,44 @@ impl Kernel {
             }
             sync | fsync | fdatasync => Ok(0),
             memfd_create => {
-                const MFD_CLOEXEC: u64 = 1;
-                let name = t.proc.mm().read_cstr(a[0])?;
+                const MFD_CLOEXEC: u64 = 0x1;
+                const MFD_ALLOW_SEALING: u64 = 0x2;
+                const MFD_HUGETLB: u64 = 0x4;
+                const MFD_NOEXEC_SEAL: u64 = 0x8;
+                const MFD_EXEC: u64 = 0x10;
+                /// With MFD_HUGETLB, the huge page size's log2.
+                const MFD_HUGE_MASK: u64 = 0x3f << 26;
+                // Checked as mm/memfd.c does, flags (an unsigned int) first.
+                let flags = a[1] as u32 as u64;
+                let known = MFD_CLOEXEC | MFD_ALLOW_SEALING | MFD_HUGETLB | MFD_NOEXEC_SEAL | MFD_EXEC;
+                let known = if flags & MFD_HUGETLB != 0 { known | MFD_HUGE_MASK } else { known };
+                if flags & !known != 0 || flags & (MFD_EXEC | MFD_NOEXEC_SEAL) == MFD_EXEC | MFD_NOEXEC_SEAL {
+                    return Err(EINVAL);
+                }
+                // MFD_NAME_MAX_LEN: NAME_MAX less the "memfd:" it is shown with.
+                let name = match t.proc.mm().read_cstr(a[0]) {
+                    Err(ENAMETOOLONG) => return Err(EINVAL),
+                    r => r?,
+                };
+                if name.len() > 249 {
+                    return Err(EINVAL);
+                }
+                // MFD_HUGETLB gets ordinary pages: nothing here can tell them apart.
                 let file = MemFile::new(self.phys.clone());
-                let m = MemOpen { node: None, opened: Stat::default(), name: format!("/memfd:{name} (deleted)"), file, pos: Mutex::new(0), readable: true, writable: true };
-                t.files().alloc(File::new(Kind::Mem(m), 0), a[1] & MFD_CLOEXEC != 0, 0)
+                // Without MFD_NOEXEC_SEAL it is executable, as with vm.memfd_noexec's
+                // default 0. With it, it can be sealed even without MFD_ALLOW_SEALING.
+                let mode = if flags & MFD_NOEXEC_SEAL != 0 {
+                    file.start_seals(F_SEAL_EXEC);
+                    0o666
+                } else {
+                    if flags & MFD_ALLOW_SEALING != 0 {
+                        file.start_seals(0);
+                    }
+                    0o777
+                };
+                let opened = Stat { mode: S_IFREG | mode, ..Stat::default() };
+                let m = MemOpen { node: None, opened, name: format!("/memfd:{name} (deleted)"), file, pos: Mutex::new(0), readable: true, writable: true };
+                t.files().alloc(File::new(Kind::Mem(m), 0), flags & MFD_CLOEXEC != 0, 0)
             }
             _ => Err(ENOSYS),
         }
@@ -1814,13 +1849,27 @@ impl Kernel {
         Ok((rw, noexec))
     }
 
-    /// For MAP_SHARED of a file: the shared pages behind a writable file.
-    pub(super) fn fd_shared_object(&self, t: &Thread, fd: i64) -> Result<Option<Arc<SharedObject>>, i64> {
-        let f = t.files().get(fd)?;
-        Ok(match &f.kind {
-            Kind::Mem(m) => Some(m.file.obj.clone()),
+    /// fcntl's F_GET_SEALS and F_ADD_SEALS (memfd_fcntl in mm/memfd.c). Only tmpfs
+    /// files have seals, and one that wasn't made by memfd_create can't be given more.
+    fn seals(&self, f: &File, cmd: u64, add: u32) -> Result<i64, i64> {
+        let m = match &f.kind {
+            Kind::Mem(m) if m.node.as_ref().is_none_or(|n| self.vfs().is_ok_and(|v| v.fs_type(n) == "tmpfs")) => Some(m),
             _ => None,
-        })
+        };
+        if cmd == F_GET_SEALS {
+            return m.map(|m| m.file.seals() as i64).ok_or(EINVAL);
+        }
+        // In memfd_add_seals' order: write access first, so a read-only descriptor of
+        // anything gets EPERM.
+        if !matches!(access_mode(f), O_WRONLY | O_RDWR) {
+            return Err(EPERM);
+        }
+        if add & !F_ALL_SEALS != 0 {
+            return Err(EINVAL);
+        }
+        let m = m.ok_or(EINVAL)?;
+        m.file.add_seals(add, m.opened.mode & 0o111 != 0)?;
+        Ok(0)
     }
 
     fn node_data(&self, nf: &mut NodeFile) -> Result<Arc<[u8]>, i64> {
@@ -1995,8 +2044,34 @@ impl Kernel {
     }
 
     fn write_at(&self, t: &Arc<Thread>, fd: i64, buf: u64, count: u64, at: Option<u64>) -> Result<i64, i64> {
-        let data = t.proc.mm().read_vec(buf, count.min(IO_MAX) as usize)?;
-        self.write_vec(t, fd, data, at)
+        // A file in memory takes all of a longer write, as Linux's does up to its
+        // MAX_RW_COUNT: hwui parcels a bitmap with one write, and gives up on a short
+        // one. It is copied from the caller IO_MAX at a time.
+        const MAX_RW_COUNT: u64 = 0x7fff_f000;
+        if count <= IO_MAX || !matches!(t.files().get(fd)?.kind, Kind::Mem(_)) {
+            let data = t.proc.mm().read_vec(buf, count.min(IO_MAX) as usize)?;
+            return self.write_vec(t, fd, data, at);
+        }
+        let count = count.min(MAX_RW_COUNT);
+        let mut done = 0;
+        while done < count {
+            let want = (count - done).min(IO_MAX);
+            // The address space is let go before the write, which takes the files
+            // table: FIONBIO takes the table and then the address space.
+            let data = t.proc.mm().read_vec(buf.wrapping_add(done), want as usize);
+            match data.and_then(|data| self.write_vec(t, fd, data, at.map(|o| o + done))) {
+                Ok(n) => {
+                    done += n as u64;
+                    if (n as u64) < want {
+                        break;
+                    }
+                }
+                // What was written stays written: say how much, as Linux does.
+                Err(e) if done == 0 => return Err(e),
+                Err(_) => break,
+            }
+        }
+        Ok(done as i64)
     }
 
     fn write_vec(&self, t: &Arc<Thread>, fd: i64, data: Vec<u8>, at: Option<u64>) -> Result<i64, i64> {
@@ -2153,7 +2228,8 @@ impl Kernel {
                     Err(ENOENT) => Stat { nlink: 0, size: m.file.size(), ..m.opened.clone() },
                     other => other?,
                 },
-                None => Stat { mode: S_IFREG | 0o600, nlink: 1, size: m.file.size(), ..Default::default() },
+                // A memfd: the mode it was made with.
+                None => Stat { mode: m.opened.mode, nlink: 1, size: m.file.size(), ..Default::default() },
             },
         })
     }
@@ -2524,6 +2600,51 @@ pub(super) fn node_of(f: &File) -> Option<Node> {
         Kind::Mem(m) => m.node.clone(),
         _ => None,
     }
+}
+
+/// The access mode F_GETFL reports. bionic's fdopen goes by it: it refuses "r+" on
+/// a descriptor that's not O_RDWR, and a socket always is. getaddrinfo needs that.
+fn access_mode(f: &File) -> u32 {
+    match &f.kind {
+        _ if f.opened_for.get().is_some() => *f.opened_for.get().unwrap(),
+        Kind::Stdout | Kind::Stderr => O_WRONLY,
+        Kind::Pipe(p) if p.write => O_WRONLY,
+        Kind::Mem(m) if m.writable => O_RDWR, // made, not opened: a memfd
+        Kind::Socket(_) | Kind::Netlink(_) | Kind::Inet(_) | Kind::Vsock(_) | Kind::Event(_) | Kind::Timer(_) | Kind::Signal(_) | Kind::Epoll(_) | Kind::Pty(_) | Kind::Binder(_) => O_RDWR,
+        _ => 0,
+    }
+}
+
+/// For MAP_SHARED of a file: the shared pages behind it, if it is in memory.
+pub(super) fn shared_object(f: &File) -> Option<Arc<SharedObject>> {
+    match &f.kind {
+        Kind::Mem(m) => Some(m.file.obj.clone()),
+        _ => None,
+    }
+}
+
+/// For MAP_SHARED of a file in memory: its write seals (Linux's seal_check_write),
+/// which are the file's and not DAC, so they hold with ZEROEMU_DAC=0 too. No new
+/// shared mapping may write it, and one that can't now never may (`max_prot`).
+/// One that may write a memfd that can still be sealed is counted while it lasts
+/// (the hold), so that F_SEAL_WRITE can refuse while there is one. That is how
+/// Linux 6.7 counts; 6.6 also counted read-only ones, and refused them once sealed,
+/// which is why hwui and ART seal with F_SEAL_FUTURE_WRITE instead.
+pub(super) fn map_shared_seals(f: &File, prot: u32, max_prot: &mut u32) -> Result<Option<WriteHold>, i64> {
+    const PROT_WRITE: u32 = 2;
+    let Kind::Mem(m) = &f.kind else { return Ok(None) };
+    let seals = m.file.seals();
+    if seals & (F_SEAL_WRITE | F_SEAL_FUTURE_WRITE) != 0 {
+        if prot & PROT_WRITE != 0 {
+            return Err(EPERM);
+        }
+        *max_prot &= !PROT_WRITE;
+        return Ok(None);
+    }
+    if seals & F_SEAL_SEAL != 0 || !m.writable || *max_prot & PROT_WRITE == 0 {
+        return Ok(None);
+    }
+    m.file.obj.hold_writable().map(Some)
 }
 
 /// What /proc/<pid>/fd/<n> points at.

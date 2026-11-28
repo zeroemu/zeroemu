@@ -182,12 +182,20 @@ impl Kernel {
             }
         }
         let shared = flags & MAP_SHARED != 0;
+        // A memfd's seals, on the same open file that is mapped.
+        let hold = match &file {
+            Some(f) if shared => match super::files::map_shared_seals(f, prot, &mut max_prot) {
+                Ok(h) => h,
+                Err(e) => return -e,
+            },
+            _ => None,
+        };
         let backing = if flags & MAP_ANONYMOUS != 0 {
             if shared { Backing::Shared { obj: SharedObject::new(self.phys.clone()), offset: 0 } } else { Backing::Anon }
         } else {
-            match self.fd_shared_object(t, fd) {
-                Ok(Some(obj)) if shared => Backing::Shared { obj, offset },
-                Err(e) => return -e,
+            let Some(f) = &file else { return -EBADF };
+            match super::files::shared_object(f) {
+                Some(obj) if shared => Backing::Shared { obj, offset },
                 // Private mappings, and read-only image files, share pages until written.
                 _ => match self.fd_page_source(t, fd) {
                     Ok(src) => Backing::File { src, offset },
@@ -206,6 +214,9 @@ impl Kernel {
         }
         if max_prot != PROT_ALL {
             mm.limit_prot(a, len, max_prot);
+        }
+        if let Some(h) = hold {
+            mm.hold_writer(a, len, h);
         }
         drop(mm);
         // Best effort, as on Linux (populate_vma_page_range in mm/gup.c): a writable

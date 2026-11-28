@@ -8,7 +8,7 @@ use crate::pagecache::{PageCache, PageSource};
 use crate::paging::{self, KERNEL_WINDOW, PROT_EXEC, PROT_READ, PROT_WRITE, USER_TOP};
 use crate::phys::{PAGE, PhysMem};
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 /// Lowest mappable address (Linux's mmap_min_addr on Android).
@@ -102,6 +102,29 @@ pub struct SharedObject {
     me: Weak<SharedObject>,
     pager: Option<Arc<PageCache>>,
     pages: Mutex<Vec<Slot>>,
+    /// How many shared mappings may write it, or -1 once a memfd's F_SEAL_WRITE has
+    /// forbidden them (Linux's i_mmap_writable). Only memfds that can still be
+    /// sealed are counted: see `WriteHold`.
+    writers: AtomicI64,
+}
+
+/// A shared mapping that may write its object, counted on the object for as long
+/// as it lasts (a copy for each VMA, so splits, forks and mremap count too), so that
+/// F_SEAL_WRITE can refuse while one exists, as Linux's EBUSY.
+pub struct WriteHold(Arc<SharedObject>);
+
+impl Clone for WriteHold {
+    fn clone(&self) -> WriteHold {
+        // There is a hold already, so the count is positive and not denied.
+        self.0.writers.fetch_add(1, Ordering::AcqRel);
+        WriteHold(self.0.clone())
+    }
+}
+
+impl Drop for WriteHold {
+    fn drop(&mut self) {
+        self.0.writers.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 impl SharedObject {
@@ -110,7 +133,24 @@ impl SharedObject {
     }
 
     pub fn with_pager(phys: Arc<PhysMem>, pager: Option<Arc<PageCache>>) -> Arc<SharedObject> {
-        Arc::new_cyclic(|me| SharedObject { phys, me: me.clone(), pager, pages: Mutex::new(Vec::new()) })
+        Arc::new_cyclic(|me| SharedObject { phys, me: me.clone(), pager, pages: Mutex::new(Vec::new()), writers: AtomicI64::new(0) })
+    }
+
+    /// For a shared mapping that may write: counted, unless F_SEAL_WRITE came first
+    /// (EPERM, as Linux's mapping_map_writable).
+    pub fn hold_writable(self: &Arc<Self>) -> Result<WriteHold, i64> {
+        self.writers.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| (n >= 0).then_some(n + 1)).map_err(|_| EPERM)?;
+        Ok(WriteHold(self.clone()))
+    }
+
+    /// For F_SEAL_WRITE: forbids shared mappings that may write from now on, or EBUSY
+    /// if there is one (mapping_deny_writable).
+    pub fn deny_writable(&self) -> Result<(), i64> {
+        match self.writers.compare_exchange(0, -1, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => Ok(()),
+            Err(n) if n < 0 => Ok(()),
+            Err(_) => Err(EBUSY),
+        }
     }
 
     /// The frame holding page `idx`, which must exist in `pages`, brought into memory
@@ -463,6 +503,12 @@ pub struct TlbGen {
     changed: AtomicU64,
     /// Every flush asked for up to this generation has run in the guest.
     flushed: AtomicU64,
+    /// Write holds of mappings that are gone, each with the generation whose flush
+    /// ends them: until then a vCPU may still write through what its TLB holds, so
+    /// F_SEAL_WRITE must wait too. Any thread's flush that covers them lets them go,
+    /// since a flush reaches every vCPU, so they don't wait for the thread that took
+    /// the frames (`Stale`) to come back out of the guest.
+    holds: Mutex<Vec<(u64, WriteHold)>>,
 }
 
 impl TlbGen {
@@ -470,7 +516,7 @@ impl TlbGen {
     /// ASID before anything runs. An ASID is used again once its address space has
     /// gone, and nothing flushed what the TLBs held for it then.
     fn fresh() -> TlbGen {
-        TlbGen { changed: AtomicU64::new(1), flushed: AtomicU64::new(0) }
+        TlbGen { changed: AtomicU64::new(1), flushed: AtomicU64::new(0), holds: Mutex::default() }
     }
 
     /// Whether translations the page tables no longer allow may still be cached.
@@ -487,6 +533,34 @@ impl TlbGen {
     /// A flush asked for at generation `g` has run.
     pub fn flushed_to(&self, g: u64) {
         self.flushed.fetch_max(g, Ordering::Release);
+        self.drop_holds();
+    }
+
+    /// Under the address space's lock: the write holds of mappings just removed. They
+    /// go after the flush for the latest change, which is the unmap's own when it
+    /// cleared entries, or an earlier one still owed (MADV_DONTNEED's); or now, when
+    /// no flush is owed.
+    fn park(&self, holds: Vec<WriteHold>) {
+        if holds.is_empty() {
+            return;
+        }
+        let g = self.current();
+        self.holds.lock().unwrap().extend(holds.into_iter().map(|h| (g, h)));
+        // A flush that ended since `current` was read either finds them in the list
+        // or moved `flushed` before this looks.
+        self.drop_holds();
+    }
+
+    fn drop_holds(&self) {
+        let flushed = self.flushed.load(Ordering::Acquire);
+        let mut parked = self.holds.lock().unwrap();
+        if parked.is_empty() {
+            return;
+        }
+        // Dropped once the lock is let go: the last hold of an object may free it.
+        let gone: Vec<_> = parked.extract_if(.., |(g, _)| *g <= flushed).collect();
+        drop(parked);
+        drop(gone);
     }
 
     /// Under the address space's lock, after the entries changed and with what they
@@ -671,6 +745,9 @@ pub struct Vma {
     pub name: Option<Arc<str>>,
     /// The userfaultfd that supplies this mapping's missing pages.
     pub uffd: Option<Arc<UffdCtx>>,
+    /// A shared mapping that may write a memfd that can still be sealed holds it
+    /// off F_SEAL_WRITE (see `WriteHold`).
+    pub writer: Option<WriteHold>,
 }
 
 impl Vma {
@@ -966,8 +1043,20 @@ impl AddressSpace {
                 if h != 0 && self.is_free(h, h.saturating_add(len)) { h } else { self.gap(len)? }
             }
         };
-        self.vmas.insert(start, Vma { end: start + len, prot, max_prot: PROT_ALL, backing, on_fork: OnFork::Copy, name: None, uffd: None });
+        self.vmas.insert(start, Vma { end: start + len, prot, max_prot: PROT_ALL, backing, on_fork: OnFork::Copy, name: None, uffd: None, writer: None });
         Ok(start)
+    }
+
+    /// Marks [start, start+len), just mapped shared, as able to write a memfd, which
+    /// keeps F_SEAL_WRITE off it until the mapping goes.
+    pub fn hold_writer(&mut self, start: u64, len: u64, hold: WriteHold) {
+        let end = start.saturating_add(page_up(len));
+        self.split(start);
+        self.split(end);
+        for (_, v) in self.vmas.range_mut(start..end) {
+            v.writer = Some(hold.clone());
+        }
+        self.merge(start, end);
     }
 
     /// Limits what mprotect may later grant the mappings in [start, start+len)
@@ -1006,6 +1095,7 @@ impl AddressSpace {
                 && a.max_prot == b.max_prot
                 && a.on_fork == b.on_fork
                 && a.name == b.name
+                && a.writer.is_some() == b.writer.is_some()
                 && match (a.uffd(), b.uffd()) {
                     (None, None) => true,
                     (Some(x), Some(y)) => Arc::ptr_eq(x, y),
@@ -1108,16 +1198,20 @@ impl AddressSpace {
         self.split(end);
         let freed = self.clear_pages(start, end);
         let doomed: Vec<u64> = self.vmas.range(start..end).map(|(&s, _)| s).collect();
+        let mut holds = Vec::new();
         for s in doomed {
-            match self.vmas.remove(&s).map(|v| v.backing) {
-                Some(Backing::Shared { obj, .. }) => self.stale.objs.push(obj),
-                Some(Backing::Dev { mem, .. }) => self.stale.devs.push(mem),
+            let Some(v) = self.vmas.remove(&s) else { continue };
+            holds.extend(v.writer);
+            match v.backing {
+                Backing::Shared { obj, .. } => self.stale.objs.push(obj),
+                Backing::Dev { mem, .. } => self.stale.devs.push(mem),
                 _ => {}
             }
         }
         if freed {
             self.tlb_changed(TlbChange::Unmap, (end - start == PAGE).then_some(start));
         }
+        self.tlb.park(holds);
         Ok(())
     }
 
@@ -1336,7 +1430,8 @@ impl AddressSpace {
         if dont_unmap && (old_len != new_len || !matches!(vma.backing, Backing::Anon)) {
             return Err(EINVAL);
         }
-        let (prot, max_prot, on_fork, mut backing, vma_name) = (vma.prot, vma.max_prot, vma.on_fork, vma.backing.clone(), vma.name.clone());
+        // The moved mapping keeps its hold on a memfd; if this fails, the copy is dropped.
+        let (prot, max_prot, on_fork, mut backing, vma_name, writer) = (vma.prot, vma.max_prot, vma.on_fork, vma.backing.clone(), vma.name.clone(), vma.writer.clone());
         if !dont_unmap && fixed.is_none() && new_len <= old_len {
             self.unmap(old + new_len, old_len - new_len)?;
             return Ok(old);
@@ -1387,7 +1482,7 @@ impl AddressSpace {
         if !dont_unmap {
             self.unmap(old, old_len)?;
         }
-        self.vmas.insert(dst, Vma { end: dst + new_len, prot, max_prot, backing, on_fork, name: vma_name, uffd: None });
+        self.vmas.insert(dst, Vma { end: dst + new_len, prot, max_prot, backing, on_fork, name: vma_name, uffd: None, writer });
         for (off, e) in moves {
             // These exist now, so this can't fail, and it can't use up anything.
             let slot = walk(&self.phys, owner, &mut self.tables, self.root.root, 0, dst + off, true)?.unwrap();
@@ -2258,6 +2353,50 @@ mod tests {
         drop(b);
         // Only the tables' fixed part of the kernel window's stays.
         assert!(phys.frames_in_use() < 16, "{} left", phys.frames_in_use());
+    }
+
+    /// An unmapped writable mapping of a memfd holds off F_SEAL_WRITE until no TLB can
+    /// still have its pages: after the next flush, whichever thread runs it, when its own
+    /// unmap or an earlier MADV_DONTNEED owes one; at once when nothing does.
+    #[test]
+    fn a_write_hold_lasts_until_the_flush_that_covers_it() {
+        let phys = PhysMem::new(Arc::new(crate::hv::NoHv));
+        let kernel = KernelWindow::new(&phys, &[]).unwrap();
+        let mut a = AddressSpace::new(phys.clone(), &kernel, 1).unwrap();
+        let tlb = a.tlb.clone();
+        // A new address space owes its first flush.
+        tlb.flushed_to(tlb.current());
+        let mut mapped = |a: &mut AddressSpace| {
+            let obj = SharedObject::new(phys.clone());
+            let at = a.map(Placement::Hint(0), PAGE * 2, PROT_READ | PROT_WRITE, Backing::Shared { obj: obj.clone(), offset: 0 }).unwrap();
+            a.hold_writer(at, PAGE * 2, obj.hold_writable().unwrap());
+            (obj, at)
+        };
+
+        let (written, at) = mapped(&mut a);
+        a.write(at, &[1]).unwrap();
+        a.unmap(at, PAGE * 2).unwrap();
+        assert_eq!(written.deny_writable(), Err(EBUSY), "its page may be in a TLB");
+        // Another thread took the frames and is still in the guest; this one's flush
+        // covers them all the same.
+        let elsewhere = a.take_stale();
+        tlb.flushed_to(tlb.current());
+        assert_eq!(written.deny_writable(), Ok(()));
+
+        let (discarded, at) = mapped(&mut a);
+        a.write(at, &[1]).unwrap();
+        a.discard(at, PAGE).unwrap();
+        a.unmap(at, PAGE * 2).unwrap();
+        assert_eq!(discarded.deny_writable(), Err(EBUSY), "MADV_DONTNEED's flush is still owed");
+        tlb.flushed_to(tlb.current());
+        assert_eq!(discarded.deny_writable(), Ok(()));
+
+        let (untouched, at) = mapped(&mut a);
+        a.unmap(at, PAGE * 2).unwrap();
+        assert_eq!(untouched.deny_writable(), Ok(()), "nothing was in the tables");
+        let mut stale = a.take_stale();
+        stale.absorb(elsewhere);
+        stale.release(&phys);
     }
 
     /// The pages a walk of the tables finds, as `usage` counted them before it kept a count.

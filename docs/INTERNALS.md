@@ -77,7 +77,7 @@ Guest pages are 4 KB. There is no 16 KB mode, so images built for 16 KB pages
 
 M3 so far adds the IPC Android's system services stand on: `eventfd`,
 `epoll`, `timerfd`, `signalfd`, Unix sockets with `SCM_RIGHTS`, tmpfs
-(`/dev`, `/data`, `/tmp`, …) with `MAP_SHARED` and `memfd`, `/proc`, `/sys`,
+(`/dev`, `/data`, `/tmp`, …) with `MAP_SHARED` and `memfd` (with its seals), `/proc`, `/sys`,
 a permissive selinuxfs built from the image's CIL policy, the property area
 and property service (as init provides them), a binder driver, and logd's
 sockets. Android's own
@@ -196,11 +196,11 @@ link, the sticky bit, chmod and utimes by the owner, chown by `CAP_CHOWN` (and s
 set-gid dropped as Linux drops them), execute permission and `noexec` mounts for `execve`
 and executable mappings, write permission on a socket to connect to it, a descriptor open
 for reading to map it and for writing to map it shared and writable (which `mprotect`
-can't add later, nor past ashmem's protection mask), the xattr namespaces' rules, and
-`CAP_SYS_ADMIN` for device-mapper. Root with its capabilities passes as on Linux; an app's
-uid is held to them. zeroemu's own device nodes have the modes and owners ueventd.rc
-gives them. `src/kernel/perm.rs` has the shared checks and says which filesystems they
-cover.
+can't add later, nor past ashmem's protection mask or a memfd's write seals), the xattr
+namespaces' rules, and `CAP_SYS_ADMIN` for device-mapper. Root with its capabilities
+passes as on Linux; an app's uid is held to them. zeroemu's own device nodes have the
+modes and owners ueventd.rc gives them. `src/kernel/perm.rs` has the shared checks and
+says which filesystems they cover.
 
 ## Shared storage
 

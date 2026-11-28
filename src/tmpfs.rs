@@ -9,7 +9,7 @@ use crate::phys::PhysMem;
 use crate::vfs::{Dirent, FileSystem, S_IFDIR, S_IFLNK, S_IFMT, S_IFREG, Stat, XATTR_CREATE, XATTR_REPLACE, XATTR_SELINUX};
 use std::collections::{BTreeMap, HashMap};
 use std::io;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -47,10 +47,24 @@ fn pages(bytes: u64) -> u64 {
 /// Longest a file can be.
 const MAX_FILE: u64 = 1 << 40;
 
+/// fcntl's file seals (include/uapi/linux/fcntl.h).
+pub const F_SEAL_SEAL: u32 = 0x1;
+pub const F_SEAL_SHRINK: u32 = 0x2;
+pub const F_SEAL_GROW: u32 = 0x4;
+pub const F_SEAL_WRITE: u32 = 0x8;
+pub const F_SEAL_FUTURE_WRITE: u32 = 0x10;
+pub const F_SEAL_EXEC: u32 = 0x20;
+pub const F_ALL_SEALS: u32 = 0x3f;
+
 /// A regular file's contents: shared pages plus a length.
 pub struct MemFile {
     pub obj: Arc<SharedObject>,
     size: Mutex<u64>,
+    /// Its seals (F_ADD_SEALS), which belong to the file as Linux's belong to the
+    /// inode: every descriptor of it shares them. Changed and checked under `size`,
+    /// as Linux does under the inode lock. A file starts sealed against seals, as
+    /// every tmpfs file does; memfd_create opens a memfd to them.
+    seals: AtomicU32,
     /// The filesystem's limit, and the pages charged to it (up to the furthest write).
     quota: Option<(Arc<Quota>, AtomicU64)>,
     /// A memfd's extended attributes (it has no tmpfs node to hold them).
@@ -70,11 +84,11 @@ impl Drop for MemFile {
 
 impl MemFile {
     pub fn new(phys: Arc<PhysMem>) -> Arc<MemFile> {
-        Arc::new(MemFile { obj: SharedObject::new(phys), size: Mutex::new(0), quota: None, xattrs: Mutex::default(), mtime: AtomicU64::new(now()) })
+        Arc::new(MemFile { obj: SharedObject::new(phys), size: Mutex::new(0), seals: AtomicU32::new(F_SEAL_SEAL), quota: None, xattrs: Mutex::default(), mtime: AtomicU64::new(now()) })
     }
 
     fn with_quota(phys: Arc<PhysMem>, quota: Arc<Quota>, pager: Option<Arc<PageCache>>) -> Arc<MemFile> {
-        Arc::new(MemFile { obj: SharedObject::with_pager(phys, pager), size: Mutex::new(0), quota: Some((quota, AtomicU64::new(0))), xattrs: Mutex::default(), mtime: AtomicU64::new(now()) })
+        Arc::new(MemFile { obj: SharedObject::with_pager(phys, pager), size: Mutex::new(0), seals: AtomicU32::new(F_SEAL_SEAL), quota: Some((quota, AtomicU64::new(0))), xattrs: Mutex::default(), mtime: AtomicU64::new(now()) })
     }
 
     /// A file's length, with its pages to be read from where they were saved. It is
@@ -107,15 +121,63 @@ impl MemFile {
         Ok(buf)
     }
 
+    pub fn seals(&self) -> u32 {
+        self.seals.load(Ordering::Acquire)
+    }
+
+    /// memfd_create's seals for a new memfd, before anyone else has it.
+    pub fn start_seals(&self, seals: u32) {
+        self.seals.store(seals, Ordering::Release);
+    }
+
+    /// F_ADD_SEALS, past the checks on the descriptor (memfd_add_seals in mm/memfd.c).
+    /// `executable`: its mode has an exec bit, so F_SEAL_EXEC seals writing too.
+    pub fn add_seals(&self, mut add: u32, executable: bool) -> Result<(), i64> {
+        let _size = self.size.lock().unwrap();
+        let had = self.seals();
+        if had & F_SEAL_SEAL != 0 {
+            return Err(EPERM);
+        }
+        // Only when asked for, as Linux: the write seal F_SEAL_EXEC implies below
+        // doesn't wait for writable mappings, which keep working.
+        if add & F_SEAL_WRITE != 0 && had & F_SEAL_WRITE == 0 {
+            self.obj.deny_writable()?;
+        }
+        if add & F_SEAL_EXEC != 0 && executable {
+            add |= F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE | F_SEAL_FUTURE_WRITE;
+        }
+        self.seals.store(had | add, Ordering::Release);
+        Ok(())
+    }
+
     /// Writes `data` at `off`. Under a size= limit only the pages that fit
     /// are written, as Linux's tmpfs does: a short count, or ENOSPC for none.
     pub fn write_at(&self, off: u64, data: &[u8]) -> Result<usize, i64> {
+        // Nothing to write changes nothing, a sealed file or the size (Linux returns
+        // before its checks).
+        if data.is_empty() {
+            return Ok(0);
+        }
         let end = off.checked_add(data.len() as u64).ok_or(EFBIG)?;
         if end > MAX_FILE {
             return Err(EFBIG);
         }
         let mut size = self.size.lock().unwrap();
         let mut data = data;
+        let seals = self.seals();
+        if seals & (F_SEAL_WRITE | F_SEAL_FUTURE_WRITE) != 0 {
+            return Err(EPERM);
+        }
+        if seals & F_SEAL_GROW != 0 && end > *size {
+            // shmem_write_begin refuses each page-sized piece that would pass the end,
+            // so a write over it stops at the last page boundary before it.
+            let stop = off.max(*size & !4095);
+            if stop == off {
+                return Err(EPERM);
+            }
+            data = &data[..(stop - off) as usize];
+        }
+        let end = off + data.len() as u64;
         if let Some((q, charged)) = &self.quota {
             let had = charged.load(Ordering::Relaxed);
             if pages(end) > had {
@@ -135,11 +197,36 @@ impl MemFile {
         Ok(data.len())
     }
 
+    /// fallocate of everything up to `end`: the file grows to it unless `keep_size`.
+    /// Its pages come when written, as everywhere here. Room past the end is refused
+    /// under F_SEAL_GROW even when the size would stay (shmem_fallocate).
+    pub fn allocate(&self, end: u64, keep_size: bool) -> Result<(), i64> {
+        if end > MAX_FILE {
+            return Err(EFBIG);
+        }
+        let mut size = self.size.lock().unwrap();
+        if end <= *size {
+            return Ok(());
+        }
+        if self.seals() & F_SEAL_GROW != 0 {
+            return Err(EPERM);
+        }
+        if !keep_size {
+            *size = end;
+            self.set_mtime(now());
+        }
+        Ok(())
+    }
+
     pub fn truncate(&self, len: u64) -> Result<(), i64> {
         if len > MAX_FILE {
             return Err(EFBIG);
         }
         let mut size = self.size.lock().unwrap();
+        let seals = self.seals();
+        if (len < *size && seals & F_SEAL_SHRINK != 0) || (len > *size && seals & F_SEAL_GROW != 0) {
+            return Err(EPERM);
+        }
         if len < *size {
             self.obj.zero_from(len)?;
         }
